@@ -769,24 +769,10 @@ type ListIssuesOptions struct {
 	Limit int
 }
 
-// Forge is the driver contract. Every method takes a context and surfaces
-// redacted errors (the PAT never appears in an error string). Implementations
-// paginate internally and return complete result sets.
-type Forge interface {
-	// RepositoryAuthorEligibility assesses a stable user ID independently of the
-	// authenticated bot's ProjectRole. Missing/deleted identities and incomplete
-	// evidence return AuthorUnknown with an error.
-	RepositoryAuthorEligibility(ctx context.Context, projectID, authorForgeUserID int64) (AuthorEligibility, error)
-	// VerifyToken confirms the PAT works and returns the bot identity.
-	VerifyToken(ctx context.Context) (BotIdentity, error)
-	// ListProjects returns every project the bot has at least Developer access
-	// to (membership=true).
-	ListProjects(ctx context.Context) ([]Project, error)
-	// GetProject freshly reads bounded metadata by positive numeric ID, without
-	// inventory enumeration or cached identity. It requires complete, coherent
-	// identity and WebURL; DefaultBranch may be empty. Any failure returns zero
-	// Project and invalidates the requested ID's cached slug.
-	GetProject(ctx context.Context, projectID int64) (Project, error)
+// IssueTracker is the issue-side half of the driver contract: issues, labels,
+// comments and issue state. It is split out of Forge (PRD #8) so a later phase
+// can let a non-forge tracker implement it without the code-host methods.
+type IssueTracker interface {
 	// ListLabels returns all labels defined on a project.
 	ListLabels(ctx context.Context, projectID int64) ([]Label, error)
 	// EnsureLabels creates any of the given labels that do not already exist on
@@ -822,12 +808,6 @@ type Forge interface {
 	// (GitLab's state_event close/reopen, GitHub's state+state_reason, Forgejo's
 	// state), sending state alone so nothing else on the issue is clobbered.
 	SetIssueState(ctx context.Context, projectID, issueIID int64, state IssueState) error
-	// UserExists reports whether a user with the given username exists on the
-	// forge. It backs the best-effort verification of a user's self-declared
-	// human_username (PRD #19 M3): a false — or an error — downgrades a save to
-	// "saved with a warning", never a hard failure. A blank username is not a
-	// forge lookup; it returns (false, nil).
-	UserExists(ctx context.Context, username string) (bool, error)
 	// ListIssueLabelEvents returns the issue's resource label events (who added or
 	// removed which label, when), oldest first, paginated internally. Autopilot
 	// uses it to attribute the autopilot label to the human who added it (PRD #19
@@ -846,6 +826,32 @@ type Forge interface {
 	// link — back on the forge so a forge-only user is never left waiting (PRD #19
 	// Decision 6). No caller until the autopilot trigger/execution milestones.
 	CreateIssueNote(ctx context.Context, projectID, issueIID int64, body string) (IssueNote, error)
+}
+
+// CodeHost is the code-host half of the driver contract: repository and identity
+// reads, merge requests, CI pipelines and checks, artifacts and refs. It holds
+// every Forge method that is not on IssueTracker.
+type CodeHost interface {
+	// RepositoryAuthorEligibility assesses a stable user ID independently of the
+	// authenticated bot's ProjectRole. Missing/deleted identities and incomplete
+	// evidence return AuthorUnknown with an error.
+	RepositoryAuthorEligibility(ctx context.Context, projectID, authorForgeUserID int64) (AuthorEligibility, error)
+	// VerifyToken confirms the PAT works and returns the bot identity.
+	VerifyToken(ctx context.Context) (BotIdentity, error)
+	// ListProjects returns every project the bot has at least Developer access
+	// to (membership=true).
+	ListProjects(ctx context.Context) ([]Project, error)
+	// GetProject freshly reads bounded metadata by positive numeric ID, without
+	// inventory enumeration or cached identity. It requires complete, coherent
+	// identity and WebURL; DefaultBranch may be empty. Any failure returns zero
+	// Project and invalidates the requested ID's cached slug.
+	GetProject(ctx context.Context, projectID int64) (Project, error)
+	// UserExists reports whether a user with the given username exists on the
+	// forge. It backs the best-effort verification of a user's self-declared
+	// human_username (PRD #19 M3): a false — or an error — downgrades a save to
+	// "saved with a warning", never a hard failure. A blank username is not a
+	// forge lookup; it returns (false, nil).
+	UserExists(ctx context.Context, username string) (bool, error)
 	// GetMergeRequest returns one merge request by its project-scoped IID. The
 	// MR-close watcher (PRD #24) polls this for cards parked in Human Review to
 	// detect an opened→closed (reviewer rejected the MR) edge.
@@ -1021,6 +1027,18 @@ type Forge interface {
 	// AncestryAncestor. Every driver's compare requests refuse redirects (a 3xx is
 	// AncestryUnknown with an error). Errors are PAT-redacted.
 	CompareAncestry(ctx context.Context, projectID int64, head, candidate string) (Ancestry, error)
+}
+
+// Forge is the driver contract. Every method takes a context and surfaces
+// redacted errors (the PAT never appears in an error string). Implementations
+// paginate internally and return complete result sets.
+//
+// Forge is the union of IssueTracker and CodeHost; the two halves are disjoint
+// and pinned by interface_split_test.go. From PRD #8 M2 on, callers take the
+// narrower half they need instead of the whole Forge.
+type Forge interface {
+	IssueTracker
+	CodeHost
 }
 
 // New constructs a driver for the given forge type. baseURL must already be
