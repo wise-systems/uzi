@@ -829,8 +829,9 @@ type IssueTracker interface {
 }
 
 // CodeHost is the code-host half of the driver contract: repository and identity
-// reads, merge requests, CI pipelines and checks, artifacts and refs. It holds
-// every Forge method that is not on IssueTracker.
+// reads, the guardrail reads (token, role, branch protection), merge requests, CI
+// pipelines and checks, artifacts and refs. It holds every Forge method that is
+// not on IssueTracker.
 type CodeHost interface {
 	// RepositoryAuthorEligibility assesses a stable user ID independently of the
 	// authenticated bot's ProjectRole. Missing/deleted identities and incomplete
