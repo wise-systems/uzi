@@ -17,9 +17,10 @@ var (
 	_ CodeHost     = (*forgejo)(nil)
 )
 
-// TestIssueTrackerAndCodeHostDisjoint pins the one property the compiler does not:
-// an interface may embed two interfaces that share an identical method, so a
-// method declared on both halves would still build.
+// TestIssueTrackerAndCodeHostDisjoint pins what the compiler does not: an
+// interface may embed two interfaces that share an identical method, so a method
+// declared on both halves would still build, and a method declared on Forge
+// itself would leave it wider than the union of its halves.
 func TestIssueTrackerAndCodeHostDisjoint(t *testing.T) {
 	tracker := reflect.TypeFor[IssueTracker]()
 	host := reflect.TypeFor[CodeHost]()
@@ -28,5 +29,8 @@ func TestIssueTrackerAndCodeHostDisjoint(t *testing.T) {
 		if _, ok := host.MethodByName(name); ok {
 			t.Fatalf("method %s is on both IssueTracker and CodeHost", name)
 		}
+	}
+	if got, want := reflect.TypeFor[Forge]().NumMethod(), tracker.NumMethod()+host.NumMethod(); got != want {
+		t.Fatalf("Forge has %d methods, want %d (IssueTracker + CodeHost only)", got, want)
 	}
 }
