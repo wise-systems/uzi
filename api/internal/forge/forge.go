@@ -190,8 +190,8 @@ type Project struct {
 // paginate internally and return complete result sets.
 //
 // Forge is the union of IssueTracker (issuetracker.go) and CodeHost (codehost.go).
-// interface_split_test.go asserts at compile time that every driver implements
-// both halves, and checks that no method is on both and that Forge adds none.
+// Each driver (github.go, gitlab.go, forgejo.go) and forgetest.BaseFake asserts
+// at compile time that it implements both halves.
 // From PRD #8 M2 on, callers take the narrower half they need instead of the
 // whole Forge.
 type Forge interface {
