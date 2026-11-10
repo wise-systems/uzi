@@ -189,7 +189,7 @@ type Project struct {
 // redacted errors (the PAT never appears in an error string). Implementations
 // paginate internally and return complete result sets.
 //
-// Forge is the union of IssueTracker (tracker.go) and CodeHost (codehost.go).
+// Forge is the union of IssueTracker (issuetracker.go) and CodeHost (codehost.go).
 // interface_split_test.go asserts at compile time that every driver implements
 // both halves, and checks that no method is on both and that Forge adds none.
 // From PRD #8 M2 on, callers take the narrower half they need instead of the
