@@ -22,6 +22,8 @@ const (
 	// minTokenLen is the shortest token a constructor accepts. A shorter secret
 	// could not be scrubbed without mangling unrelated text.
 	minTokenLen = 16
+	// maxTokenLen is the longest token a constructor accepts.
+	maxTokenLen = 4096
 	// minSegmentLen is the shortest dot-separated token segment scrubbed alone.
 	minSegmentLen = 8
 )
@@ -31,6 +33,14 @@ const (
 func validateToken(token string) error {
 	if len(token) < minTokenLen {
 		return errors.New("issuetracker: token shorter than the minimum length")
+	}
+	if len(token) > maxTokenLen {
+		return errors.New("issuetracker: token longer than the maximum length")
+	}
+	for _, c := range token {
+		if unicode.IsControl(c) || unicode.Is(unicode.Cf, c) {
+			return errors.New("issuetracker: token contains a control or format character")
+		}
 	}
 	return nil
 }

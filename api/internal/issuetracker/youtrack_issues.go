@@ -60,7 +60,9 @@ func (y *youTrack) GetIssue(ctx context.Context, _, issueIID int64) (forge.Issue
 
 // CreateIssue implements forge.IssueTracker. The issue is created first, then
 // each label is attached as a tag (created when missing), and the result is
-// read back, so it has the shape GetIssue returns.
+// read back, so it has the shape GetIssue returns. There is no rollback: when
+// attaching a tag or the read-back fails, the error is returned (redacted) but
+// the issue stays created.
 func (y *youTrack) CreateIssue(ctx context.Context, _ int64, title, description string, labels []string) (forge.Issue, error) {
 	p, err := y.requireProject()
 	if err != nil {

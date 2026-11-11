@@ -36,6 +36,9 @@ func TestYouTrackContract(t *testing.T) {
 					srv.SeedTagActivity(iid, username, nil, []string{label})
 				}
 			},
+			SeedDeletedComment: func(t *testing.T, iid int64, username, body string) {
+				srv.SeedDeletedComment(iid, username, body)
+			},
 			MoveIssue: func(t *testing.T, iid int64) {
 				srv.MoveIssue(iid, youtracktest.OtherProjectID)
 			},

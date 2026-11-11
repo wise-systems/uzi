@@ -15,6 +15,8 @@ import (
 // *forge.IssueNotFoundError. YouTrack keeps answering an old SHORT-n after the
 // issue moves to another project, so this check is what makes a moved issue
 // read as gone. Follow-up calls address the issue by the returned entity id.
+// The check is a read: YouTrack has no conditional write, so an issue moved
+// after resolveIssue returns can still be written by the follow-up call.
 func (y *youTrack) resolveIssue(ctx context.Context, issueIID int64) (ytIssue, error) {
 	p, err := y.requireProject()
 	if err != nil {
@@ -41,8 +43,8 @@ func (y *youTrack) resolveIssue(ctx context.Context, issueIID int64) (ytIssue, e
 	if !y.inBoundProject(w) || w.NumberInProject != issueIID {
 		return ytIssue{}, &forge.IssueNotFoundError{Err: y.fail("youtrack: issue %s is not in the bound project", readable)}
 	}
-	if !entityIDRE.MatchString(w.ID) || !idReadableRE.MatchString(w.IDReadable) {
-		return ytIssue{}, y.fail("youtrack: issue with a malformed id in the response")
+	if err := y.checkIssue(w); err != nil {
+		return ytIssue{}, err
 	}
 	return w, nil
 }

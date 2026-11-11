@@ -21,11 +21,17 @@ import (
 // tlsDriver builds a bound driver over a TLS test server running h.
 func tlsDriver(t *testing.T, h http.Handler) (*youTrack, *httptest.Server) {
 	t.Helper()
+	return tlsDriverToken(t, h, credential())
+}
+
+// tlsDriverToken is tlsDriver with a chosen token.
+func tlsDriverToken(t *testing.T, h http.Handler, token string) (*youTrack, *httptest.Server) {
+	t.Helper()
 	srv := httptest.NewTLSServer(h)
 	t.Cleanup(srv.Close)
 	y, err := newYouTrackOver(Options{
 		BaseURL:     srv.URL,
-		Token:       credential(),
+		Token:       token,
 		Project:     ProjectRef{ID: "0-1", ShortName: "UZI"},
 		OpenState:   "Open",
 		ClosedState: "Fixed",

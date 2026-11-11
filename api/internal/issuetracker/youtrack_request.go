@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -78,7 +79,7 @@ func (y *youTrack) do(ctx context.Context, c ytCall, out any) (status, n int, er
 		if err != nil {
 			return status, 0, y.red.errorStatus(err, status)
 		}
-		return status, len(body), y.red.errorStatus(fmt.Errorf("youtrack: %s %s: HTTP %d: %s", c.method, path, status, errorText(body)), status)
+		return status, len(body), y.red.errorStatus(fmt.Errorf("youtrack: %s %s: HTTP %d: %s", c.method, path, status, y.errorText(body)), status)
 	}
 	body, err := readBounded(resp.Body, c.limit, c.prov, status)
 	if err != nil {
@@ -93,28 +94,43 @@ func (y *youTrack) do(ctx context.Context, c ytCall, out any) (status, n int, er
 }
 
 // errorText renders a YouTrack error body: its error and error_description
-// members, or a bounded prefix of the raw text. The caller's redactor scrubs
-// and truncates the result.
-func errorText(body []byte) string {
+// members joined by ": ", or the raw text. The text is scrubbed whole before it
+// is cut to rawLimit, so a token that straddles the cut cannot leave a prefix
+// behind; the caller's redactor scrubs and truncates the result again.
+func (y *youTrack) errorText(body []byte) string {
 	var e struct {
 		Error       string `json:"error"`
 		Description string `json:"error_description"`
 	}
 	if json.Unmarshal(body, &e) == nil && (e.Error != "" || e.Description != "") {
-		return strings.TrimSpace(e.Error + ": " + e.Description)
+		var parts []string
+		for _, p := range []string{e.Error, e.Description} {
+			if p != "" {
+				parts = append(parts, p)
+			}
+		}
+		return strings.Join(parts, ": ")
 	}
 	const rawLimit = 200
-	if len(body) > rawLimit {
-		body = body[:rawLimit]
-	}
-	return string(body)
+	return truncate(y.red.scrub(string(body)), rawLimit)
+}
+
+// maxNestedItems caps the tags of one issue or one activity.
+const maxNestedItems = 1000
+
+// nester is implemented by a wire type that carries nested arrays; ytPages
+// counts them toward maxItems and caps them at maxNestedItems.
+type nester interface {
+	nestedCount() int
 }
 
 // ytPages walks every page of a list endpoint under paginate's ceilings and
-// calls visit with each page. visit returns true to stop early. Errors come
+// calls visit with each page. visit returns true to stop early. Items that
+// implement nester count their nested entries toward maxItems. Errors come
 // back redacted.
 func ytPages[T any](ctx context.Context, y *youTrack, path []string, query url.Values, visit func([]T) bool) error {
 	var fetchErr error
+	seen := 0
 	_, err := paginate(func(skip, top int) ([]T, int, error) {
 		q := url.Values{}
 		for k, v := range query {
@@ -127,6 +143,21 @@ func ytPages[T any](ctx context.Context, y *youTrack, path []string, query url.V
 		if err != nil {
 			fetchErr = err
 			return nil, 0, err
+		}
+		seen += len(items)
+		for _, it := range items {
+			if nn, ok := any(it).(nester); ok {
+				c := nn.nestedCount()
+				if c > maxNestedItems {
+					fetchErr = y.fail("youtrack: an item carries more than %d nested entries", maxNestedItems)
+					return nil, 0, fetchErr
+				}
+				seen += c
+			}
+		}
+		if seen > maxItems {
+			fetchErr = errors.New("issuetracker: listing exceeds the item ceiling")
+			return nil, 0, fetchErr
 		}
 		if visit(items) {
 			// A short page ends the walk; the items were already consumed.

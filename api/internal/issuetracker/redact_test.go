@@ -233,6 +233,30 @@ func TestValidateToken(t *testing.T) {
 	}
 }
 
+func TestValidateTokenBoundsAndCharacters(t *testing.T) {
+	if err := validateToken(strings.Repeat("a", maxTokenLen)); err != nil {
+		t.Errorf("a token of the maximum length: %v", err)
+	}
+	cases := map[string]string{
+		"too long":   strings.Repeat("a", maxTokenLen+1),
+		"newline":    strings.Repeat("a", 20) + "\n",
+		"nul":        strings.Repeat("a", 20) + "\x00",
+		"zero width": strings.Repeat("a", 20) + "\u200b",
+		"bidi":       strings.Repeat("a", 20) + "\u202e",
+		"delete":     strings.Repeat("a", 20) + "\x7f",
+	}
+	for name, tok := range cases {
+		err := validateToken(tok)
+		if err == nil {
+			t.Errorf("%s: accepted", name)
+			continue
+		}
+		if strings.Contains(err.Error(), tok) {
+			t.Errorf("%s: error leaks the token", name)
+		}
+	}
+}
+
 // TestRedactorScrubsMixedCaseEscapes covers a percent-escaped token whose hex
 // digits are upper case in one escape and lower case in another.
 func TestRedactorScrubsMixedCaseEscapes(t *testing.T) {

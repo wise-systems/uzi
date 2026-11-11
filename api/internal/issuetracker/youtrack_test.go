@@ -1,9 +1,17 @@
 package issuetracker
 
 import (
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 
+	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/issuetracker/youtracktest"
 )
 
@@ -52,4 +60,176 @@ func newFakeDriverWithField(t *testing.T, field string) (*youtracktest.Server, *
 		t.Fatal(err)
 	}
 	return srv, y
+}
+
+func TestConstructorValidation(t *testing.T) {
+	good := Options{BaseURL: "https://yt.example.com", Token: credential(), Project: ProjectRef{ID: "0-1", ShortName: "UZI"}}
+	mutate := func(f func(*Options)) Options { o := good; f(&o); return o }
+	if _, err := New(KindYouTrack, good); err != nil {
+		t.Fatalf("good options: %v", err)
+	}
+	if _, err := New(KindYouTrack, mutate(func(o *Options) { o.Project = ProjectRef{} })); err != nil {
+		t.Fatalf("unbound options: %v", err)
+	}
+	bad := map[string]Options{
+		"http":        mutate(func(o *Options) { o.BaseURL = "http://yt.example.com" }),
+		"path":        mutate(func(o *Options) { o.BaseURL = "https://yt.example.com/youtrack" }),
+		"userinfo":    mutate(func(o *Options) { o.BaseURL = "https://u:p@yt.example.com" }),
+		"query":       mutate(func(o *Options) { o.BaseURL = "https://yt.example.com?x=1" }),
+		"fragment":    mutate(func(o *Options) { o.BaseURL = "https://yt.example.com#x" }),
+		"no host":     mutate(func(o *Options) { o.BaseURL = "https://" }),
+		"empty":       mutate(func(o *Options) { o.BaseURL = "" }),
+		"short token": mutate(func(o *Options) { o.Token = "short" }),
+		"bad short":   mutate(func(o *Options) { o.Project.ShortName = "1X" }),
+		"bad id":      mutate(func(o *Options) { o.Project.ID = "abc" }),
+		"half bound":  mutate(func(o *Options) { o.Project.ID = "" }),
+	}
+	for name, o := range bad {
+		if _, err := New(KindYouTrack, o); err == nil {
+			t.Errorf("%s: constructor accepted %+v", name, o)
+		}
+	}
+	if _, err := New(KindYouTrack, mutate(func(o *Options) { o.BaseURL = "https://yt.example.com/" })); err != nil {
+		t.Errorf("trailing slash rejected: %v", err)
+	}
+}
+
+// requestLog counts the requests a raw handler receives, by method.
+type requestLog struct {
+	mu    sync.Mutex
+	calls []string
+}
+
+func (l *requestLog) record(r *http.Request) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.calls = append(l.calls, r.Method+" "+r.URL.EscapedPath())
+}
+
+func (l *requestLog) all() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return slices.Clone(l.calls)
+}
+
+// writes returns the logged requests that are not GETs.
+func (l *requestLog) writes() []string {
+	var out []string
+	for _, c := range l.all() {
+		if !strings.HasPrefix(c, "GET ") {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// loggedDriver builds a bound driver over a raw handler and logs every request.
+func loggedDriver(t *testing.T, h http.HandlerFunc) (*youTrack, *requestLog) {
+	t.Helper()
+	log := &requestLog{}
+	y, _ := tlsDriver(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		log.record(r)
+		h(w, r)
+	}))
+	return y, log
+}
+
+// rawIssue renders an issue as the API would, in project projectID.
+func rawIssue(id, readable string, number int64, projectID, tags string) string {
+	return fmt.Sprintf(`{"id":%q,"idReadable":%q,"numberInProject":%d,"summary":"s","created":1,"updated":2000,`+
+		`"project":{"id":%q,"shortName":"UZI"},"tags":[%s]}`, id, readable, number, projectID, tags)
+}
+
+func writeRaw(w http.ResponseWriter, body string) {
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write([]byte(body))
+}
+
+// everyMethod lists the eleven forge.IssueTracker methods as closures over y.
+func everyMethod(y *youTrack) map[string]func() error {
+	ctx := context.Background()
+	return map[string]func() error{
+		"ListLabels":             func() error { _, err := y.ListLabels(ctx, 1); return err },
+		"EnsureLabels":           func() error { return y.EnsureLabels(ctx, 1, []forge.Label{{Name: "a"}}) },
+		"ListIssues":             func() error { _, err := y.ListIssues(ctx, 1, forge.ListIssuesOptions{}); return err },
+		"GetIssue":               func() error { _, err := y.GetIssue(ctx, 1, 1); return err },
+		"CreateIssue":            func() error { _, err := y.CreateIssue(ctx, 1, "t", "d", []string{"a"}); return err },
+		"UpdateIssueLabels":      func() error { return y.UpdateIssueLabels(ctx, 1, 1, []string{"a"}, []string{"b"}) },
+		"UpdateIssueDescription": func() error { return y.UpdateIssueDescription(ctx, 1, 1, "d") },
+		"SetIssueState":          func() error { return y.SetIssueState(ctx, 1, 1, forge.StateClosed) },
+		"ListIssueLabelEvents":   func() error { _, err := y.ListIssueLabelEvents(ctx, 1, 1); return err },
+		"ListIssueComments":      func() error { _, err := y.ListIssueComments(ctx, 1, 1); return err },
+		"CreateIssueNote":        func() error { _, err := y.CreateIssueNote(ctx, 1, 1, "n"); return err },
+	}
+}
+
+// TestUnboundDriverRefusesEveryMethod builds a driver with no project and
+// checks that every IssueTracker method refuses before sending a request.
+func TestUnboundDriverRefusesEveryMethod(t *testing.T) {
+	log := &requestLog{}
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		log.record(r)
+		writeRaw(w, "[]")
+	}))
+	t.Cleanup(srv.Close)
+	y, err := newYouTrackOver(Options{BaseURL: srv.URL, Token: credential(), OpenState: "Open", ClosedState: "Fixed"}, srv.Client().Transport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls := everyMethod(y)
+	if len(calls) != 11 {
+		t.Fatalf("table covers %d methods, want 11", len(calls))
+	}
+	for name, call := range calls {
+		if err := call(); !errors.Is(err, ErrProjectNotBound) {
+			t.Errorf("%s = %v, want ErrProjectNotBound", name, err)
+		}
+	}
+	if got := log.all(); len(got) != 0 {
+		t.Errorf("unbound driver sent %v", got)
+	}
+	// ListProjects needs no binding.
+	if _, err := y.ListProjects(context.Background()); err != nil {
+		t.Errorf("ListProjects on an unbound driver: %v", err)
+	}
+}
+
+// TestBaseURLTrailingSlashIsNormalised checks that a base URL with a trailing
+// slash never yields a double slash in a request path.
+func TestBaseURLTrailingSlashIsNormalised(t *testing.T) {
+	log := &requestLog{}
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		log.record(r)
+		writeRaw(w, `{"id":"1-1","login":"u"}`)
+	}))
+	t.Cleanup(srv.Close)
+	y, err := newYouTrackOver(Options{BaseURL: srv.URL + "/", Token: credential()}, srv.Client().Transport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.HasSuffix(y.baseURL, "/") {
+		t.Errorf("baseURL = %q, want no trailing slash", y.baseURL)
+	}
+	if _, err := y.VerifyToken(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := log.all(); len(got) != 1 || got[0] != "GET /api/users/me" {
+		t.Errorf("requests = %v, want one GET /api/users/me", got)
+	}
+}
+
+// TestPinnedLimits pins the literal byte limits.
+func TestPinnedLimits(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		got, want int64
+	}{
+		{"listPageBytes", listPageBytes, 8 << 20},
+		{"objectBytes", objectBytes, 2 << 20},
+		{"errorBodyBytes", errorBodyBytes, 4 << 10},
+	} {
+		if tc.got != tc.want {
+			t.Errorf("%s = %d, want %d", tc.name, tc.got, tc.want)
+		}
+	}
 }

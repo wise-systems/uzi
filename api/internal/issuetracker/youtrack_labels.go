@@ -68,17 +68,23 @@ func (y *youTrack) tagIDsFor(ctx context.Context, names []string) (map[string]st
 }
 
 // ListLabels implements forge.IssueTracker. Labels are YouTrack tags, global
-// to the account; projectID is ignored.
+// to the account; projectID is ignored. A name carried by several tags is
+// listed once.
 func (y *youTrack) ListLabels(ctx context.Context, _ int64) ([]forge.Label, error) {
 	if _, err := y.requireProject(); err != nil {
 		return nil, err
 	}
-	_, tags, err := y.listTags(ctx)
+	byName, tags, err := y.listTags(ctx)
 	if err != nil {
 		return nil, err
 	}
-	out := make([]forge.Label, 0, len(tags))
+	out := make([]forge.Label, 0, len(byName))
+	seen := make(map[string]bool, len(byName))
 	for _, t := range tags {
+		if seen[t.Name] {
+			continue
+		}
+		seen[t.Name] = true
 		out = append(out, forge.Label{Name: t.Name})
 	}
 	return out, nil

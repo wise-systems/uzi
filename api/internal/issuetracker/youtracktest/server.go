@@ -29,9 +29,10 @@ type Server struct {
 	// Token is the bearer token the server accepts.
 	Token string
 
-	t  testing.TB
-	mu sync.Mutex // guards every field below
-	m  *model
+	t   testing.TB
+	mux *http.ServeMux // built once by NewServer
+	mu  sync.Mutex     // guards every field below
+	m   *model
 	// requests logs every request in arrival order.
 	requests   []Request
 	unmodelled []string
@@ -46,6 +47,7 @@ func NewServer(t testing.TB) *Server {
 		m:     newModel(),
 		Token: strings.Join([]string{"perm", ":", "fixture-", "id.", "Yk3mQ8vR2xTn5Lw7"}, ""),
 	}
+	s.mux = s.routes()
 	s.Server = httptest.NewTLSServer(http.HandlerFunc(s.serve))
 	t.Cleanup(func() {
 		s.Server.Close()
@@ -88,7 +90,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "Unauthorized", "invalid or missing bearer token")
 		return
 	}
-	s.routes().ServeHTTP(w, r)
+	s.mux.ServeHTTP(w, r)
 }
 
 func (s *Server) unmodelledRoute(w http.ResponseWriter, r *http.Request) {

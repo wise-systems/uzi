@@ -51,6 +51,10 @@ type ytIssue struct {
 	Project         *ytProject `json:"project"`
 }
 
+func (w ytIssue) nestedCount() int { return len(w.Tags) }
+
+func (a ytActivity) nestedCount() int { return len(a.Added) + len(a.Removed) }
+
 type ytComment struct {
 	ID      string  `json:"id"`
 	Text    string  `json:"text"`
@@ -67,11 +71,29 @@ type ytActivity struct {
 	Removed   []ytTag `json:"removed"`
 }
 
+// checkIssue refuses an issue whose entity id, id-readable or tag ids are not
+// well formed, or whose tag count exceeds maxNestedItems: those ids end up in
+// request paths and in WebURL.
+func (y *youTrack) checkIssue(w ytIssue) error {
+	if !entityIDRE.MatchString(w.ID) || !idReadableRE.MatchString(w.IDReadable) {
+		return y.fail("youtrack: issue with a malformed id in the response")
+	}
+	if len(w.Tags) > maxNestedItems {
+		return y.fail("youtrack: issue carries more than %d tags", maxNestedItems)
+	}
+	for _, t := range w.Tags {
+		if !entityIDRE.MatchString(t.ID) {
+			return y.fail("youtrack: tag with a malformed id in the response")
+		}
+	}
+	return nil
+}
+
 // toIssue maps a wire issue to the neutral type. The issue must carry a valid
 // entity id and id-readable.
 func (y *youTrack) toIssue(w ytIssue) (forge.Issue, error) {
-	if !entityIDRE.MatchString(w.ID) || !idReadableRE.MatchString(w.IDReadable) {
-		return forge.Issue{}, y.fail("youtrack: issue with a malformed id in the response")
+	if err := y.checkIssue(w); err != nil {
+		return forge.Issue{}, err
 	}
 	issue := forge.Issue{
 		IID:         w.NumberInProject,

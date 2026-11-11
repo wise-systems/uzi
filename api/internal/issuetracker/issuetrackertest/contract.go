@@ -23,6 +23,9 @@ type Subject struct {
 	// SeedLabelEvent records that username added ("add") or removed ("remove")
 	// label on issue iid, bypassing the IssueTracker under test.
 	SeedLabelEvent func(t *testing.T, iid int64, action, label, username string)
+	// SeedDeletedComment adds a comment that the issue tracker reports as
+	// deleted. Nil means the implementation has no such comment.
+	SeedDeletedComment func(t *testing.T, iid int64, username, body string)
 	// MoveIssue moves issue iid to another project. Nil means issues do not
 	// move on this implementation.
 	MoveIssue func(t *testing.T, iid int64)
@@ -199,6 +202,9 @@ func caseListIssues(t *testing.T, c *contract) {
 	if len(limited) != 1 {
 		t.Fatalf("Limit 1 returned %d issues", len(limited))
 	}
+	if limited[0] != both.IID && limited[0] != onlyOne.IID {
+		t.Errorf("Limit 1 returned %d, want one of the matches %d or %d", limited[0], both.IID, onlyOne.IID)
+	}
 }
 
 func caseUpdate(t *testing.T, c *contract) {
@@ -274,6 +280,19 @@ func caseComments(t *testing.T, c *contract) {
 			noteAt = i
 		}
 	}
+	if c.SeedDeletedComment != nil {
+		gone := unique("contract deleted")
+		c.SeedDeletedComment(t, issue.IID, "carol", gone)
+		again, err := c.IssueTracker.ListIssueComments(c.ctx, c.ProjectID, issue.IID)
+		if err != nil {
+			t.Fatalf("ListIssueComments: %v", err)
+		}
+		for _, cm := range again {
+			if cm.Body == gone {
+				t.Errorf("a deleted comment was listed: %+v", cm)
+			}
+		}
+	}
 	if humanAt < 0 || noteAt < 0 {
 		t.Fatalf("comments %+v are missing the seeded comment or the note", comments)
 	}
@@ -300,6 +319,9 @@ func caseLabelEvents(t *testing.T, c *contract) {
 	}
 	if len(mine) != 2 {
 		t.Fatalf("events for %q = %+v, want an add then a remove", label, mine)
+	}
+	if mine[1].CreatedAt.Before(mine[0].CreatedAt) {
+		t.Errorf("events out of order: %v before %v", mine[1].CreatedAt, mine[0].CreatedAt)
 	}
 	if mine[0].Action != "add" || mine[0].Username != "alice" {
 		t.Errorf("first event = %+v, want add by alice", mine[0])
