@@ -15,22 +15,22 @@ var errNestedCeiling = errors.New("issuetracker: an item carries more nested ent
 
 // Structural budgets, applied by a byte scan before any response is handed to
 // json.Unmarshal. A value is counted as one comma or one opening bracket
-// outside a string, an upper bound on the number of JSON values. Real YouTrack
-// adds a "$type" member to every entity, so a tag with $type, id and name costs
-// 4 (its brace, the commas between its three members and the comma after it).
-// An activity carries up to maxNestedItems such tags in each of "added" and
-// "removed" (8*maxNestedItems values), so one item is allowed
-// 10*maxNestedItems+256, which leaves headroom for one more member per tag; a single object (an
-// issue holds one tags array, plus a few members of its own) is allowed
-// 6*maxNestedItems+256, which leaves headroom for $type and one more member per
-// tag. Three totals are enforced: pageValueBudget for a whole list page,
-// itemValueBudget for each element of it and objectValueBudget for one
-// single-object response. The budgets bound the structure, not the cost of a
-// type error: 13 bytes of bad scalar fit many times inside a page budget, and
-// encoding/json keeps decoding after a type error, building one error (about
-// 150 bytes) per bad value. So decodePage also decodes element by element and
-// stops at the first error, which leaves one element, at most itemValueBudget
-// values, to amplify.
+// outside a string, which approximates the number of JSON values (at most
+// 2*count+1). Real YouTrack adds a "$type" member to every entity, so a tag
+// with $type, id, name and one more member such as "color" costs 5 (its brace,
+// the commas between its four members and the comma after it). An activity
+// carries up to maxNestedItems such tags in each of "added" and "removed"
+// (10*maxNestedItems values), so one item is allowed 10*maxNestedItems+256. A
+// single object (an issue holds one tags array, plus a few members of its own)
+// is allowed 6*maxNestedItems+256, which holds 5*maxNestedItems for the tags.
+// The real-shaped tests pin that headroom. Three totals are enforced:
+// pageValueBudget for a whole list page, itemValueBudget for each element of
+// it and objectValueBudget for one single-object response. The budgets bound
+// the structure, not the cost of a type error: 13 bytes of bad scalar fit many
+// times inside a page budget, and encoding/json keeps decoding after a type
+// error, building one error (about 150 bytes) per bad value. So decodePage
+// also decodes element by element and stops at the first error, which leaves
+// one element, at most itemValueBudget values, to amplify.
 const (
 	itemValueBudget   = 10*maxNestedItems + 256
 	objectValueBudget = 6*maxNestedItems + 256
@@ -60,6 +60,12 @@ type ytTags []ytTag
 
 // UnmarshalJSON implements json.Unmarshaler. b is already-validated JSON.
 func (t *ytTags) UnmarshalJSON(b []byte) error {
+	if trimmed := trimJSONSpace(b); string(trimmed) == "null" {
+		// null is an empty list; keep the backing array so a repeated key does
+		// not force a reallocation per call.
+		*t = (*t)[:0]
+		return nil
+	}
 	if n, _ := topLevelCount(b); n > maxNestedItems {
 		return errNestedCeiling
 	}
@@ -186,7 +192,8 @@ func onlyObjects(b []byte) bool {
 }
 
 // valueCount returns the number of commas and opening brackets outside strings
-// in b, at every depth: an upper bound on the number of JSON values.
+// in b, at every depth: approximately the number of JSON values (at most
+// 2*count+1).
 func valueCount(b []byte) int {
 	n, inStr, esc := 0, false, false
 	for _, c := range b {
@@ -229,7 +236,8 @@ func isJSONSpace(c byte) bool { return c == ' ' || c == '\t' || c == '\n' || c =
 // are counted by byte scans before any element is decoded, so an oversized page
 // allocates nothing for its items. A JSON null is an empty page. Whitespace is
 // JSON's own, so a form feed is refused (errNotArray, or errTrailingData after
-// the array) rather than skipped as padding. The whole page is validated first,
+// the array) rather than skipped as padding, and a form feed inside the array
+// is a syntax error. The whole page is validated first,
 // then each element is decoded on its own and the first error ends the decode:
 // encoding/json would otherwise go on past a type error and build an error per
 // bad value, allocating in proportion to the page's bytes.

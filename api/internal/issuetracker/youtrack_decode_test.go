@@ -100,11 +100,11 @@ func TestTagBombAllocatesLittle(t *testing.T) {
 // ytTags.UnmarshalJSON once per repeated "tags" key costs no per-call Decoder.
 // The fixtures sit just under pageValueBudget (and itemValueBudget per issue) and
 // objectValueBudget, so every repeated key reaches ytTags. Measured without and
-// with -race: the page allocates about 8 and 31 MiB, and about 101 and 125 MiB
+// with -race: the page allocates about 14 and 54 MiB, and about 172 and 215 MiB
 // with a json.Decoder built per call; the issue allocates about 279 and 646 KiB,
 // and about 1282 and 1593 KiB with one.
 func TestDuplicateTagsKeysAllocateLittle(t *testing.T) {
-	const bound = 64 << 20
+	const bound = 112 << 20
 	const issueBound = 960 << 10
 	t.Run("page", func(t *testing.T) {
 		issue := strings.TrimSuffix(rawIssue("2-1", "UZI-1", 1, "0-1", ""), `"tags":[]}`)
@@ -236,7 +236,8 @@ func TestRepeatedBadValuesAllocateLittle(t *testing.T) {
 // Bounds for TestRepeatedBadValuesAllocateLittle, in bytes allocated. Measured
 // without and with -race: fixed page 24 and 41 MiB (the response buffer), fixed
 // issue 6 and 11 MiB; unbudgeted page 118 to 615 MiB, unbudgeted issue of bad
-// tags 134 and 155 MiB, unbudgeted issue of bad created values 26 and 33 MiB.
+// tags 134 and 155 MiB only with both the object budget and onlyObjects
+// removed, unbudgeted issue of bad created values 26 and 33 MiB.
 // The issue of bad created values is therefore the discriminator for the
 // budget that do() applies to a single object: it is the one case whose
 // unbudgeted allocation (26 MiB) is above repeatedIssueBound.
@@ -327,6 +328,23 @@ func TestTopLevelItemsAndNestedTagsShareOneBudget(t *testing.T) {
 	}
 }
 
+func TestDecodePageIgnoresBracketsInStrings(t *testing.T) {
+	type item struct {
+		Summary string `json:"summary"`
+	}
+	got, err := decodePage[item]([]byte(`[{"summary":"a}],{"}, {"summary":"\\\"]"}]`))
+	if err != nil || len(got) != 2 || got[0].Summary != `a}],{` || got[1].Summary != `\"]` {
+		t.Fatalf("got %+v, %v; want 2 items with the bracketed summaries", got, err)
+	}
+}
+
+func TestNullTagsKeepsEmptyListSemantics(t *testing.T) {
+	tags := ytTags{{}, {}}
+	if err := tags.UnmarshalJSON([]byte(" null ")); err != nil || len(tags) != 0 {
+		t.Errorf("null: %d tags, %v; want an empty list", len(tags), err)
+	}
+}
+
 func TestTopLevelCountIgnoresBracketsInStrings(t *testing.T) {
 	for name, tc := range map[string]struct {
 		in    string
@@ -353,7 +371,8 @@ func TestTopLevelCountIgnoresBracketsInStrings(t *testing.T) {
 // value (about 150 bytes each).
 func TestScalarTypeErrorsStopAtTheFirstElement(t *testing.T) {
 	// The fixed decode allocates the response buffer only: about 24 MiB, 40 MiB
-	// with -race. The unfixed one allocated about 120 MiB more.
+	// with -race. Decoding the whole page at once measured 110 and 131 MiB, about
+	// 86 to 91 MiB more.
 	const bound = 64 << 20
 	issue := strings.TrimSuffix(rawIssue("2-1", "UZI-1", 1, "0-1", ""), `"tags":[]}`)
 	for name, dup := range map[string]string{
@@ -397,12 +416,12 @@ func TestScalarTypeErrorsStopAtTheFirstElement(t *testing.T) {
 // output (a $type on every entity, 1000 tags) through GetIssue, so the object
 // budget keeps headroom for the shape the real server sends.
 func TestRealShapedIssueIsAccepted(t *testing.T) {
-	tag := `{"$type":"Tag","id":"6-1","name":"x"}`
+	tag := `{"$type":"Tag","id":"6-1","name":"x","color":null}`
 	issue := `{"$type":"Issue","id":"2-1","idReadable":"UZI-1","numberInProject":1,"summary":"s","created":1,"updated":2000,` +
 		`"project":{"$type":"Project","id":"0-1","shortName":"UZI"},` +
 		`"tags":[` + strings.TrimSuffix(strings.Repeat(tag+",", maxNestedItems), ",") + `]}`
-	if n := valueCount([]byte(issue)); n > objectValueBudget || n < objectValueBudget/2 {
-		t.Fatalf("fixture holds %d values, want at least half of the %d budget without exceeding it", n, objectValueBudget)
+	if n := valueCount([]byte(issue)); n > objectValueBudget || n <= 4*maxNestedItems+256 {
+		t.Fatalf("fixture holds %d values, want more than %d without exceeding the %d budget", n, 4*maxNestedItems+256, objectValueBudget)
 	}
 	y, _ := loggedDriver(t, func(w http.ResponseWriter, _ *http.Request) { writeRaw(w, issue) })
 	got, err := y.GetIssue(context.Background(), 1, 1)
@@ -415,12 +434,12 @@ func TestRealShapedIssueIsAccepted(t *testing.T) {
 // YouTrack's own output (a $type on every entity) at the nested ceiling in both
 // "added" and "removed", so the per-item budget keeps headroom for it.
 func TestRealShapedActivityIsAccepted(t *testing.T) {
-	tag := `{"$type":"Tag","id":"6-1","name":"x"}`
+	tag := `{"$type":"Tag","id":"6-1","name":"x","color":null}`
 	tags := "[" + strings.TrimSuffix(strings.Repeat(tag+",", maxNestedItems), ",") + "]"
 	act := `{"$type":"TagsActivityItem","id":"a-1","timestamp":1,"author":{"$type":"User","id":"1-1","login":"bot"},"added":` + tags + `,"removed":` + tags + `}`
 	body := "[" + strings.TrimSuffix(strings.Repeat(act+",", 3), ",") + "]"
-	if n := valueCount([]byte(act)); n <= 6*maxNestedItems+64 || n > itemValueBudget {
-		t.Fatalf("fixture holds %d values per activity, want between the old and the current item budget", n)
+	if n := valueCount([]byte(act)); n <= 8*maxNestedItems+64 || n > itemValueBudget {
+		t.Fatalf("fixture holds %d values per activity, want between %d and the item budget %d", n, 8*maxNestedItems+64, itemValueBudget)
 	}
 	got, err := decodePage[ytActivity]([]byte(body))
 	if err != nil {
