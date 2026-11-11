@@ -2,7 +2,9 @@ package issuetracker
 
 import "fmt"
 
-// Constructor builds a driver from options.
+// Constructor builds a driver from options. A build error never carries the
+// token, a part of it or any other remote content, because callers show it to
+// the user.
 type Constructor func(Options) (Driver, error)
 
 // constructors maps each Kind to its driver constructor. A driver adds one
@@ -10,6 +12,7 @@ type Constructor func(Options) (Driver, error)
 var constructors = map[Kind]Constructor{KindYouTrack: newYouTrack}
 
 // New constructs the driver for kind. An unknown kind wraps ErrUnsupportedKind.
+// Like every Constructor, it never puts the token in an error.
 func New(kind Kind, opts Options) (Driver, error) {
 	ctor, ok := constructors[kind]
 	if !ok {

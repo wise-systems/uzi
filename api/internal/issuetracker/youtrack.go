@@ -1,7 +1,6 @@
 package issuetracker
 
 import (
-	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -42,22 +41,17 @@ func newYouTrack(opts Options) (Driver, error) {
 }
 
 // buildYouTrack validates opts and builds the driver over base, which is nil
-// outside tests.
+// outside tests. A build error never carries the token or any part of it.
 func buildYouTrack(opts Options, base http.RoundTripper) (*youTrack, error) {
 	baseURL, err := strictBaseURL(opts.BaseURL)
 	if err != nil {
 		return nil, err
 	}
-	if err := validateToken(opts.Token); err != nil {
+	if err := ValidateToken(opts.Token); err != nil {
 		return nil, err
 	}
-	if opts.Project != (ProjectRef{}) {
-		if !shortNameRE.MatchString(opts.Project.ShortName) {
-			return nil, errors.New("issuetracker: invalid project short name")
-		}
-		if !entityIDRE.MatchString(opts.Project.ID) {
-			return nil, errors.New("issuetracker: invalid project id")
-		}
+	if err := ValidProjectRef(opts.Project); err != nil {
+		return nil, err
 	}
 	stateField := opts.StateField
 	if stateField == "" {

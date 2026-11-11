@@ -135,7 +135,13 @@ func newHarness(t *testing.T) *harness {
 }
 
 // testToken assembles a token-shaped value at runtime.
-func testToken(parts ...string) string { return strings.Join(append([]string{"perm"}, parts...), "-") }
+// The fixed tail keeps it above the driver's minimum token length.
+func testToken(parts ...string) string {
+	return strings.Join(append([]string{"perm"}, parts...), "-") + "-0123456789abcdef"
+}
+
+// testMaxTokenLen is the longest token the service accepts.
+const testMaxTokenLen = 4096
 
 func wantKind(t *testing.T, err error, want Kind) *Error {
 	t.Helper()
@@ -160,23 +166,26 @@ func TestConnectRefusesWhenAllowlistEmpty(t *testing.T) {
 }
 
 func TestConnectRefusesBadInput(t *testing.T) {
+	validToken := testToken("v")
 	cases := []struct{ name, kind, url, token string }{
-		{"unknown kind", "jira", testHost, "tok"},
-		{"empty kind", "", testHost, "tok"},
+		{"unknown kind", "jira", testHost, validToken},
+		{"empty kind", "", testHost, validToken},
 		{"empty token", "youtrack", testHost, "  "},
-		{"http", "youtrack", "http://issues.example.com", "tok"},
-		{"path", "youtrack", testHost + "/youtrack", "tok"},
-		{"userinfo", "youtrack", "https://issues.example.com@evil.example.com", "tok"},
-		{"userinfo with password", "youtrack", "https://u:p@issues.example.com", "tok"},
-		{"query", "youtrack", testHost + "?a=b", "tok"},
-		{"bare question mark", "youtrack", testHost + "?", "tok"},
-		{"fragment", "youtrack", testHost + "#x", "tok"},
-		{"bare hash", "youtrack", testHost + "#", "tok"},
-		{"escaped percent in host", "youtrack", "https://x%25y.example.com", "tok"},
-		{"empty hostname with port", "youtrack", "https://:443", "tok"},
-		{"no host", "youtrack", "https://", "tok"},
-		{"not allowlisted", "youtrack", "https://evil.example.com", "tok"},
-		{"explicit default port is a different origin string", "youtrack", testHost + ":443", "tok"},
+		{"http", "youtrack", "http://issues.example.com", validToken},
+		{"path", "youtrack", testHost + "/youtrack", validToken},
+		{"userinfo", "youtrack", "https://issues.example.com@evil.example.com", validToken},
+		{"userinfo with password", "youtrack", "https://u:p@issues.example.com", validToken},
+		{"query", "youtrack", testHost + "?a=b", validToken},
+		{"bare question mark", "youtrack", testHost + "?", validToken},
+		{"fragment", "youtrack", testHost + "#x", validToken},
+		{"bare hash", "youtrack", testHost + "#", validToken},
+		{"escaped percent in host", "youtrack", "https://x%25y.example.com", validToken},
+		{"empty hostname with port", "youtrack", "https://:443", validToken},
+		{"zero-width character in host", "youtrack", "https://issues.exam\u200bple.com", validToken},
+		{"bidi override in host", "youtrack", "https://issues.example.com\u202e", validToken},
+		{"no host", "youtrack", "https://", validToken},
+		{"not allowlisted", "youtrack", "https://evil.example.com", validToken},
+		{"explicit default port is a different origin string", "youtrack", testHost + ":443", validToken},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -192,25 +201,30 @@ func TestConnectRefusesBadInput(t *testing.T) {
 
 func TestConnectRefusesBadToken(t *testing.T) {
 	cases := map[string]string{
-		"8 MiB":         strings.Repeat("a", 8<<20),
-		"just too long": strings.Repeat("a", maxTokenLen+1),
-		"embedded CRLF": strings.Join([]string{"perm", "abc\r\nX-Evil: 1", "def"}, "-"),
-		"zero width":    strings.Join([]string{"perm", "abc\u200bdef", "ghi"}, "-"),
-		"bidi override": strings.Join([]string{"perm", "abc\u202edef", "ghi"}, "-"),
-		"embedded NUL":  strings.Join([]string{"perm", "abc\x00def", "ghi"}, "-"),
+		"8 MiB":          strings.Repeat("a", 8<<20),
+		"just too long":  strings.Repeat("a", testMaxTokenLen+1),
+		"embedded CRLF":  strings.Join([]string{"perm", "abc\r\nX-Evil: 1", "def"}, "-"),
+		"zero width":     strings.Join([]string{"perm", "abc\u200bdef", "ghi"}, "-"),
+		"bidi override":  strings.Join([]string{"perm", "abc\u202edef", "ghi"}, "-"),
+		"embedded NUL":   strings.Join([]string{"perm", "abc\x00def", "ghi"}, "-"),
+		"line separator": strings.Join([]string{"perm", "abc\u2028def", "ghi"}, "-"),
+		"too short":      "tok",
 	}
 	for name, tok := range cases {
 		t.Run(name, func(t *testing.T) {
 			h := newHarness(t)
 			_, err := h.svc.Connect(context.Background(), uuid.New(), "youtrack", testHost, tok)
-			wantKind(t, err, KindBadRequest)
+			e := wantKind(t, err, KindBadRequest)
+			if e.Message != "invalid token" {
+				t.Errorf("message = %q, want the fixed invalid token message", e.Message)
+			}
 			if len(h.built) != 0 || len(h.q.rows) != 0 {
 				t.Error("driver built or row stored for a refused token")
 			}
 		})
 	}
 	h := newHarness(t)
-	if _, err := h.svc.Connect(context.Background(), uuid.New(), "youtrack", testHost, strings.Repeat("a", maxTokenLen)); err != nil {
+	if _, err := h.svc.Connect(context.Background(), uuid.New(), "youtrack", testHost, strings.Repeat("a", testMaxTokenLen)); err != nil {
 		t.Errorf("a token of exactly the limit must pass: %v", err)
 	}
 }
@@ -275,10 +289,10 @@ func TestConnectRefusesBadAccount(t *testing.T) {
 		"empty login":     {ID: "1", Login: ""},
 		"control in id":   {ID: "1\x00", Login: "bot"},
 		"newline login":   {ID: "1", Login: "bo\nt"},
-		"bidi override":   {ID: "1", Login: "bot‮"},
-		"zero width":      {ID: "1", Login: "bo​t"},
-		"line separator":  {ID: "1", Login: "bo t"},
-		"para separator":  {ID: "1", Login: "bo t"},
+		"bidi override":   {ID: "1", Login: "bot\u202e"},
+		"zero width":      {ID: "1", Login: "bo\u200bt"},
+		"line separator":  {ID: "1", Login: "bo\u2028t"},
+		"para separator":  {ID: "1", Login: "bo\u2029t"},
 		"login too long":  {ID: "1", Login: strings.Repeat("a", 256)},
 		"id too long":     {ID: strings.Repeat("1", 256), Login: "bot"},
 		"control in both": {ID: "\x07", Login: "\x07"},
@@ -548,5 +562,26 @@ func TestNewDefaultsToRegistry(t *testing.T) {
 	}
 	if _, err := s.Connect(context.Background(), uuid.New(), "youtrack", testHost, "tok"); err == nil {
 		t.Fatal("a nil allowlist must refuse")
+	}
+}
+
+// TestConnectRefusesAnInvisibleHostCharacterBeforeTheAllowlist uses an
+// allowlist that accepts anything, so only the base URL check can refuse.
+func TestConnectRefusesAnInvisibleHostCharacterBeforeTheAllowlist(t *testing.T) {
+	for name, u := range map[string]string{
+		"zero width":     "https://issues.exam​ple.com",
+		"bidi override":  "https://issues.example.com‮",
+		"line separator": "https://issues.exam ple.com",
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := newHarness(t)
+			asked := 0
+			h.svc.allowed = func(string) bool { asked++; return true }
+			_, err := h.svc.Connect(context.Background(), uuid.New(), "youtrack", u, testToken("v"))
+			wantKind(t, err, KindBadRequest)
+			if asked != 0 || len(h.built) != 0 {
+				t.Errorf("allowlist asked %d times, driver built %d times", asked, len(h.built))
+			}
+		})
 	}
 }

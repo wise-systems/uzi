@@ -89,6 +89,9 @@ func TestRedirectsAreRefused(t *testing.T) {
 				if !errors.Is(err, ErrRedirectRefused) {
 					t.Errorf("%s: %v, want ErrRedirectRefused", name, err)
 				}
+				if err != nil && !strings.Contains(err.Error(), fmt.Sprintf("HTTP %d", code)) {
+					t.Errorf("%s: message %q does not name the status", name, err)
+				}
 				assertScrubbed(t, err)
 			}
 			if n := hits.Load(); n != 0 {
@@ -121,12 +124,12 @@ func TestOversizedResponses(t *testing.T) {
 
 func TestErrorBodiesAreScrubbed(t *testing.T) {
 	c := credential()
-	nasty := "\r\n\x1b[31m‮"
+	nasty := "\r\n\x1b[31m\u202e"
 	j, _ := json.Marshal(c)
 	bodies := map[string][]byte{
 		"raw":     []byte("echo " + c + nasty),
 		"query":   []byte("echo " + url.QueryEscape(c) + nasty),
-		"json":    []byte(`{"error":"bad","error_description":"echo ` + string(j[1:len(j)-1]) + `\r\n\u001b[31m‮"}`),
+		"json":    []byte(`{"error":"bad","error_description":"echo ` + string(j[1:len(j)-1]) + `\r\n\u001b[31m\u202e"}`),
 		"marshal": mustJSON(t, map[string]string{"error": c + nasty, "error_description": url.QueryEscape(c) + nasty}),
 	}
 	for name, body := range bodies {
@@ -153,7 +156,7 @@ func mustJSON(t *testing.T, v any) []byte {
 func TestEveryMethodScrubsItsErrors(t *testing.T) {
 	y, _ := tlsDriver(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
-		_, _ = w.Write(mustJSON(t, map[string]string{"error": "boom", "error_description": "token " + credential() + " ‮"}))
+		_, _ = w.Write(mustJSON(t, map[string]string{"error": "boom", "error_description": "token " + credential() + " \u202e"}))
 	}))
 	ctx := context.Background()
 	calls := map[string]func() error{

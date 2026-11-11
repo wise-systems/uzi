@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net/url"
 	"strings"
+	"unicode"
 
 	"github.com/vtmocanu/uzi/api/internal/config"
 )
@@ -41,8 +42,16 @@ func strictBaseURL(raw string) (string, error) {
 	if err != nil || again != norm {
 		return "", errors.New("invalid base URL: it must be an https URL with a host")
 	}
-	if nu, err := url.Parse(norm); err != nil || nu.Hostname() == "" {
+	nu, err := url.Parse(norm)
+	if err != nil || nu.Hostname() == "" {
 		return "", errors.New("invalid base URL: it must be an https URL with a host")
+	}
+	// A control or format character in the host (a zero-width or bidi
+	// character) would look like another host once it is shown.
+	for _, r := range nu.Host {
+		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) || r == '\u2028' || r == '\u2029' {
+			return "", errors.New("invalid base URL: the host holds a control or invisible character")
+		}
 	}
 	return norm, nil
 }

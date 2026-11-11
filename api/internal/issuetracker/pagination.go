@@ -5,20 +5,26 @@ import "errors"
 // pageSize is the $top of every list request.
 const pageSize = 100
 
+// errItemCeiling is returned when a listing carries more than the item budget
+// (maxItems) or a page carries more than pageSize items. It carries no remote
+// content.
+var errItemCeiling = errors.New("issuetracker: listing exceeds the item ceiling")
+
 // maxItems, maxPages and maxTotalBytes are sanity ceilings against a server
-// that never ends a listing. Vars so tests can lower them.
+// that never ends a listing. maxItems is one combined budget: it counts the
+// top-level items of every page plus the nested entries (tags) they carry. Vars
+// so tests can lower them.
 var (
 	maxItems      = 100_000
 	maxPages      = 2_000
 	maxTotalBytes = 64 << 20
 )
 
-// paginate calls fetch with a growing skip until a short page. A positive limit
-// stops once that many items are collected and truncates to it; zero means no
-// cap. fetch returns the page and its raw byte count; the counts are summed
-// across pages. Exceeding maxItems, maxPages or maxTotalBytes is an error
-// carrying no remote content.
-func paginate[T any](fetch func(skip, top int) ([]T, int, error), limit int) ([]T, error) {
+// paginate calls fetch with a growing skip until a short page. fetch returns
+// the page and its raw byte count; the counts are summed across pages.
+// Exceeding maxItems, maxPages or maxTotalBytes is an error carrying no remote
+// content.
+func paginate[T any](fetch func(skip, top int) ([]T, int, error)) ([]T, error) {
 	var all []T
 	total := 0
 	for page := 0; ; page++ {
@@ -34,11 +40,8 @@ func paginate[T any](fetch func(skip, top int) ([]T, int, error), limit int) ([]
 			return nil, errors.New("issuetracker: listing exceeds the byte ceiling")
 		}
 		all = append(all, items...)
-		if limit > 0 && len(all) >= limit {
-			return all[:limit], nil
-		}
 		if len(all) > maxItems {
-			return nil, errors.New("issuetracker: listing exceeds the item ceiling")
+			return nil, errItemCeiling
 		}
 		if len(items) < pageSize {
 			return all, nil

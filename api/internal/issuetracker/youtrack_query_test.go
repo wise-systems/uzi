@@ -26,7 +26,7 @@ func TestIssueQuery(t *testing.T) {
 func TestLabelNameGuard(t *testing.T) {
 	y, _ := newFakeDriver(t)
 	ctx := context.Background()
-	for _, name := range []string{"", "  ", "a}b", "a{b", "a\nb", "a‮b"} {
+	for _, name := range []string{"", "  ", "a}b", "a{b", "a\nb", "a\u202eb", "a\u2028b", "a\u2029b"} {
 		if err := y.EnsureLabels(ctx, 1, []forge.Label{{Name: name}}); !errors.Is(err, ErrInvalidLabelName) {
 			t.Errorf("EnsureLabels(%q) = %v, want ErrInvalidLabelName", name, err)
 		}

@@ -221,20 +221,20 @@ func TestClassifyStatusServerErrorRange(t *testing.T) {
 }
 
 func TestValidateToken(t *testing.T) {
-	if validateToken(strings.Repeat("a", minTokenLen-1)) == nil {
+	if ValidateToken(strings.Repeat("a", minTokenLen-1)) == nil {
 		t.Fatal("short token accepted")
 	}
-	if err := validateToken(strings.Repeat("a", minTokenLen)); err != nil {
+	if err := ValidateToken(strings.Repeat("a", minTokenLen)); err != nil {
 		t.Fatal(err)
 	}
 	short := strings.Repeat("q", minTokenLen-1)
-	if strings.Contains(validateToken(short).Error(), short) {
+	if strings.Contains(ValidateToken(short).Error(), short) {
 		t.Fatal("error leaks token")
 	}
 }
 
 func TestValidateTokenBoundsAndCharacters(t *testing.T) {
-	if err := validateToken(strings.Repeat("a", maxTokenLen)); err != nil {
+	if err := ValidateToken(strings.Repeat("a", maxTokenLen)); err != nil {
 		t.Errorf("a token of the maximum length: %v", err)
 	}
 	cases := map[string]string{
@@ -244,9 +244,11 @@ func TestValidateTokenBoundsAndCharacters(t *testing.T) {
 		"zero width": strings.Repeat("a", 20) + "\u200b",
 		"bidi":       strings.Repeat("a", 20) + "\u202e",
 		"delete":     strings.Repeat("a", 20) + "\x7f",
+		"line sep":   strings.Repeat("a", 20) + "\u2028",
+		"para sep":   strings.Repeat("a", 20) + "\u2029",
 	}
 	for name, tok := range cases {
-		err := validateToken(tok)
+		err := ValidateToken(tok)
 		if err == nil {
 			t.Errorf("%s: accepted", name)
 			continue

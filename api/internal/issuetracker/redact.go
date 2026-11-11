@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
-	"unicode"
 	"unicode/utf8"
 
 	"github.com/vtmocanu/uzi/api/internal/forge"
@@ -27,23 +26,6 @@ const (
 	// minSegmentLen is the shortest dot-separated token segment scrubbed alone.
 	minSegmentLen = 8
 )
-
-// validateToken rejects a token too short to redact safely. The message never
-// includes the token.
-func validateToken(token string) error {
-	if len(token) < minTokenLen {
-		return errors.New("issuetracker: token shorter than the minimum length")
-	}
-	if len(token) > maxTokenLen {
-		return errors.New("issuetracker: token longer than the maximum length")
-	}
-	for _, c := range token {
-		if unicode.IsControl(c) || unicode.Is(unicode.Cf, c) {
-			return errors.New("issuetracker: token contains a control or format character")
-		}
-	}
-	return nil
-}
 
 // redactor scrubs one token out of every error a driver returns. Build it from
 // the token once, in the constructor.
@@ -156,7 +138,7 @@ func (r redactor) string(s string) string {
 // with a space. It uses the predicate of issueinput.AuthorName.
 func sanitize(s string) string {
 	return strings.Map(func(c rune) rune {
-		if unicode.IsControl(c) || unicode.Is(unicode.Cf, c) || c == '\u2028' || c == '\u2029' {
+		if invisible(c) {
 			return ' '
 		}
 		return c

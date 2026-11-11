@@ -47,7 +47,7 @@ type ytIssue struct {
 	Updated         int64      `json:"updated"`
 	Resolved        *int64     `json:"resolved"`
 	Reporter        *ytUser    `json:"reporter"`
-	Tags            []ytTag    `json:"tags"`
+	Tags            ytTags     `json:"tags"`
 	Project         *ytProject `json:"project"`
 }
 
@@ -67,19 +67,16 @@ type ytActivity struct {
 	ID        string  `json:"id"`
 	Timestamp int64   `json:"timestamp"`
 	Author    *ytUser `json:"author"`
-	Added     []ytTag `json:"added"`
-	Removed   []ytTag `json:"removed"`
+	Added     ytTags  `json:"added"`
+	Removed   ytTags  `json:"removed"`
 }
 
 // checkIssue refuses an issue whose entity id, id-readable or tag ids are not
-// well formed, or whose tag count exceeds maxNestedItems: those ids end up in
-// request paths and in WebURL.
+// well formed: those ids end up in request paths and in WebURL. The tag count is
+// capped while decoding (ytTags).
 func (y *youTrack) checkIssue(w ytIssue) error {
 	if !entityIDRE.MatchString(w.ID) || !idReadableRE.MatchString(w.IDReadable) {
 		return y.fail("youtrack: issue with a malformed id in the response")
-	}
-	if len(w.Tags) > maxNestedItems {
-		return y.fail("youtrack: issue carries more than %d tags", maxNestedItems)
 	}
 	for _, t := range w.Tags {
 		if !entityIDRE.MatchString(t.ID) {

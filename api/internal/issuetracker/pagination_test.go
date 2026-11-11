@@ -19,7 +19,7 @@ func serve(total int, calls *[][2]int) func(skip, top int) ([]int, int, error) {
 
 func TestPaginateCollectsAll(t *testing.T) {
 	var calls [][2]int
-	got, err := paginate(serve(250, &calls), 0)
+	got, err := paginate(serve(250, &calls))
 	if err != nil || len(got) != 250 {
 		t.Fatalf("len %d, err %v", len(got), err)
 	}
@@ -30,23 +30,15 @@ func TestPaginateCollectsAll(t *testing.T) {
 
 func TestPaginateExactMultipleFetchesEmptyPage(t *testing.T) {
 	var calls [][2]int
-	got, err := paginate(serve(200, &calls), 0)
+	got, err := paginate(serve(200, &calls))
 	if err != nil || len(got) != 200 || len(calls) != 3 {
-		t.Fatalf("len %d, calls %d, err %v", len(got), len(calls), err)
-	}
-}
-
-func TestPaginateLimit(t *testing.T) {
-	var calls [][2]int
-	got, err := paginate(serve(1000, &calls), 150)
-	if err != nil || len(got) != 150 || len(calls) != 2 {
 		t.Fatalf("len %d, calls %d, err %v", len(got), len(calls), err)
 	}
 }
 
 func TestPaginateFetchError(t *testing.T) {
 	want := errors.New("boom")
-	_, err := paginate(func(int, int) ([]int, int, error) { return nil, 0, want }, 0)
+	_, err := paginate(func(int, int) ([]int, int, error) { return nil, 0, want })
 	if !errors.Is(err, want) {
 		t.Fatalf("err = %v", err)
 	}
@@ -58,8 +50,8 @@ func TestPaginateCaps(t *testing.T) {
 		maxItems = 250
 		t.Cleanup(func() { maxItems = old })
 		var calls [][2]int
-		if _, err := paginate(serve(10_000, &calls), 0); err == nil {
-			t.Fatal("expected item ceiling error")
+		if _, err := paginate(serve(10_000, &calls)); !errors.Is(err, errItemCeiling) {
+			t.Fatalf("err = %v, want errItemCeiling", err)
 		}
 	})
 	t.Run("pages", func(t *testing.T) {
@@ -67,7 +59,7 @@ func TestPaginateCaps(t *testing.T) {
 		maxPages = 3
 		t.Cleanup(func() { maxPages = old })
 		var calls [][2]int
-		if _, err := paginate(serve(10_000, &calls), 0); err == nil {
+		if _, err := paginate(serve(10_000, &calls)); err == nil {
 			t.Fatal("expected page ceiling error")
 		}
 		if len(calls) != 3 {
@@ -83,7 +75,7 @@ func TestPaginateCaps(t *testing.T) {
 			calls++
 			return make([]int, top), 400, nil
 		}
-		if _, err := paginate(full, 0); err == nil {
+		if _, err := paginate(full); err == nil {
 			t.Fatal("expected byte ceiling error")
 		}
 		if calls != 3 {
@@ -96,7 +88,7 @@ func TestPaginateCaps(t *testing.T) {
 			calls++
 			return make([]int, top), 1 << 20, nil
 		}
-		if _, err := paginate(same, 0); err == nil {
+		if _, err := paginate(same); err == nil {
 			t.Fatal("expected an error")
 		}
 		if calls > maxPages {

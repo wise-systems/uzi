@@ -19,3 +19,10 @@ func NewYouTrackOver(opts Options, base http.RoundTripper) (Driver, error) {
 	}
 	return y, nil
 }
+
+// Credential and TokenForms share the internal tests' token fixtures with the
+// external test package, so there is one copy of them.
+var (
+	Credential = credential
+	TokenForms = tokenForms
+)

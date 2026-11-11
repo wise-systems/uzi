@@ -218,7 +218,7 @@ func TestBaseURLTrailingSlashIsNormalised(t *testing.T) {
 	}
 }
 
-// TestPinnedLimits pins the literal byte limits.
+// TestPinnedLimits pins the literal limits.
 func TestPinnedLimits(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
@@ -227,6 +227,16 @@ func TestPinnedLimits(t *testing.T) {
 		{"listPageBytes", listPageBytes, 8 << 20},
 		{"objectBytes", objectBytes, 2 << 20},
 		{"errorBodyBytes", errorBodyBytes, 4 << 10},
+		{"pageSize", pageSize, 100},
+		{"maxItems", int64(maxItems), 100000},
+		{"maxPages", int64(maxPages), 2000},
+		{"maxTotalBytes", int64(maxTotalBytes), 64 << 20},
+		{"maxNestedItems", maxNestedItems, 1000},
+		{"maxLabelNameLen", maxLabelNameLen, 200},
+		{"minTokenLen", minTokenLen, 16},
+		{"maxTokenLen", maxTokenLen, 4096},
+		{"maxMessageBytes", maxMessageBytes, 512},
+		{"minSegmentLen", minSegmentLen, 8},
 	} {
 		if tc.got != tc.want {
 			t.Errorf("%s = %d, want %d", tc.name, tc.got, tc.want)

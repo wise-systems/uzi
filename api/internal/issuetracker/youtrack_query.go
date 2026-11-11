@@ -3,7 +3,6 @@ package issuetracker
 import (
 	"strings"
 	"time"
-	"unicode"
 
 	"github.com/vtmocanu/uzi/api/internal/forge"
 )
@@ -17,7 +16,7 @@ const maxLabelNameLen = 200
 func (y *youTrack) checkLabelName(name string) error {
 	bad := strings.TrimSpace(name) == "" || len(name) > maxLabelNameLen
 	for _, c := range name {
-		if c == '{' || c == '}' || unicode.IsControl(c) || unicode.Is(unicode.Cf, c) || c == '\u2028' || c == '\u2029' {
+		if c == '{' || c == '}' || invisible(c) {
 			bad = true
 		}
 	}
