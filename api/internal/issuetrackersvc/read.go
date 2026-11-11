@@ -34,6 +34,8 @@ func (s *Service) Get(ctx context.Context, userID, connID uuid.UUID) (Connection
 }
 
 // Delete removes one of the user's connections; a missing or foreign id is NotFound.
+// A connection that a repo links to is a Conflict (checked first, and again by the
+// foreign key when a link lands in between): a link cannot be removed.
 func (s *Service) Delete(ctx context.Context, userID, connID uuid.UUID) error {
 	// The owner-scoped read first, so a foreign id is NotFound and the link count
 	// below can never reveal that another user's connection exists.

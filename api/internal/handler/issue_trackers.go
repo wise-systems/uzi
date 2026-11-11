@@ -4,6 +4,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -24,6 +25,18 @@ type issueTrackerConnectionDTO struct {
 	AccountLogin   string    `json:"account_login"`
 	CreatedAt      time.Time `json:"created_at"`
 	LastVerifiedAt time.Time `json:"last_verified_at"`
+}
+
+// cleanTrackerText drops control, bidirectional, zero-width and other invisible characters
+// from text that came from the issue tracker, so a hostile name cannot reorder or hide
+// text in the browser. The predicate is the one the driver and the service already use.
+func cleanTrackerText(s string) string {
+	return strings.Map(func(r rune) rune {
+		if issuetracker.InvisibleRune(r) {
+			return -1
+		}
+		return r
+	}, s)
 }
 
 func toIssueTrackerConnectionDTO(c issuetrackersvc.Connection) issueTrackerConnectionDTO {
@@ -56,10 +69,10 @@ func toIssueTrackerSharingDTO(s issuetracker.SharingSettings) issueTrackerSharin
 		Users:  make([]issueTrackerAccountDTO, 0, len(s.Users)),
 	}
 	for _, g := range s.Groups {
-		out.Groups = append(out.Groups, issueTrackerGroupDTO{ID: g.ID, Name: g.Name, AllUsers: g.AllUsers, UsersCount: g.UsersCount})
+		out.Groups = append(out.Groups, issueTrackerGroupDTO{ID: g.ID, Name: cleanTrackerText(g.Name), AllUsers: g.AllUsers, UsersCount: g.UsersCount})
 	}
 	for _, u := range s.Users {
-		out.Users = append(out.Users, issueTrackerAccountDTO{ID: u.ID, Login: u.Login})
+		out.Users = append(out.Users, issueTrackerAccountDTO{ID: u.ID, Login: cleanTrackerText(u.Login)})
 	}
 	return out
 }
@@ -217,7 +230,7 @@ func (h *Handler) ListIssueTrackerProjects(w http.ResponseWriter, r *http.Reques
 	}
 	out := make([]issueTrackerProjectDTO, 0, len(projects))
 	for _, p := range projects {
-		out = append(out, issueTrackerProjectDTO{ID: p.ID, ShortName: p.ShortName, Name: p.Name})
+		out = append(out, issueTrackerProjectDTO{ID: p.ID, ShortName: cleanTrackerText(p.ShortName), Name: cleanTrackerText(p.Name)})
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"projects": out})
 }
@@ -242,8 +255,8 @@ func (h *Handler) ListIssueTrackerTags(w http.ResponseWriter, r *http.Request) {
 	out := make([]issueTrackerTagDTO, 0, len(views))
 	for _, v := range views {
 		out = append(out, issueTrackerTagDTO{
-			ID: v.Tag.ID, Name: v.Tag.Name,
-			Owner:           issueTrackerAccountDTO{ID: v.Tag.Owner.ID, Login: v.Tag.Owner.Login},
+			ID: v.Tag.ID, Name: cleanTrackerText(v.Tag.Name),
+			Owner:           issueTrackerAccountDTO{ID: v.Tag.Owner.ID, Login: cleanTrackerText(v.Tag.Owner.Login)},
 			Read:            toIssueTrackerSharingDTO(v.Tag.Read),
 			Use:             toIssueTrackerSharingDTO(v.Tag.Use),
 			AccountCanApply: v.AccountCanApply,

@@ -12,6 +12,11 @@ SET account_id       = EXCLUDED.account_id,
     account_login    = EXCLUDED.account_login,
     token_ciphertext = EXCLUDED.token_ciphertext,
     last_verified_at = now()
+-- The reconnect rule (PRD #4173 M4 owner guidance), enforced in the statement itself: a
+-- conflicting row whose account would change is left alone while a repo links to it, and
+-- the statement then returns no row.
+WHERE issue_tracker_connections.account_id = EXCLUDED.account_id
+   OR NOT EXISTS (SELECT 1 FROM repos WHERE repos.issue_tracker_connection_id = issue_tracker_connections.id)
 RETURNING *;
 
 -- name: ListIssueTrackerConnectionsByUser :many

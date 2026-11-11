@@ -161,6 +161,8 @@ SET account_id       = EXCLUDED.account_id,
     account_login    = EXCLUDED.account_login,
     token_ciphertext = EXCLUDED.token_ciphertext,
     last_verified_at = now()
+WHERE issue_tracker_connections.account_id = EXCLUDED.account_id
+   OR NOT EXISTS (SELECT 1 FROM repos WHERE repos.issue_tracker_connection_id = issue_tracker_connections.id)
 RETURNING id, user_id, kind, base_url, account_id, account_login, token_ciphertext, created_at, last_verified_at
 `
 
@@ -177,6 +179,9 @@ type UpsertIssueTrackerConnectionParams struct {
 // Connect or reconnect/rotate: one connection per (user, kind, base_url).
 // Reconnecting with a fresh token updates the ciphertext and account identity
 // in place, keeps the row id, and stamps last_verified_at.
+// The reconnect rule (PRD #4173 M4 owner guidance), enforced in the statement itself: a
+// conflicting row whose account would change is left alone while a repo links to it, and
+// the statement then returns no row.
 func (q *Queries) UpsertIssueTrackerConnection(ctx context.Context, arg UpsertIssueTrackerConnectionParams) (IssueTrackerConnection, error) {
 	row := q.db.QueryRow(ctx, upsertIssueTrackerConnection,
 		arg.UserID,

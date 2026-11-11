@@ -45,7 +45,7 @@ func (d *itDriver) VerifyToken(context.Context) (issuetracker.Account, error) {
 }
 
 func (*itDriver) ListProjects(context.Context) ([]issuetracker.Project, error) {
-	return []issuetracker.Project{{ID: "0-1", ShortName: "UZI", Name: "Uzi"}}, nil
+	return []issuetracker.Project{{ID: "0-1", ShortName: "UZI", Name: "Uzi\u202e"}}, nil
 }
 
 func (*itDriver) ListTags(context.Context) ([]issuetracker.Tag, error) {
@@ -53,6 +53,9 @@ func (*itDriver) ListTags(context.Context) ([]issuetracker.Tag, error) {
 	return []issuetracker.Tag{
 		{ID: "5-1", Name: "uzi-ready", Owner: itBot, Use: issuetracker.SharingSettings{Groups: []issuetracker.Group{all}}},
 		{ID: "5-2", Name: "private", Owner: itBot},
+		// Hostile names: a bidi override and a newline must not reach the browser.
+		{ID: "5-3", Name: "evil\u202ename\n", Owner: issuetracker.Account{ID: "1-2", Login: "mal\u202elory"},
+			Use: issuetracker.SharingSettings{Groups: []issuetracker.Group{{ID: "675-9", Name: "gr\noup\u200b"}}, Users: []issuetracker.Account{{ID: "1-3", Login: "us\u202eer"}}}},
 	}, nil
 }
 
@@ -137,6 +140,7 @@ func TestIssueTrackerConnectionRoutesLiveDB(t *testing.T) {
 		t.Fatalf("list = %d %s", rec.Code, rec.Body.String())
 	}
 	rec = f.do(f.jwt, http.MethodGet, "/api/issue-trackers/connections/"+conn.String()+"/projects", "")
+	projectsBody := rec.Body.String()
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"short_name":"UZI"`) {
 		t.Fatalf("projects = %d %s", rec.Code, rec.Body.String())
 	}
@@ -148,14 +152,28 @@ func TestIssueTrackerConnectionRoutesLiveDB(t *testing.T) {
 			OthersCanApply  bool   `json:"others_can_apply"`
 		} `json:"tags"`
 	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &tags); err != nil || rec.Code != http.StatusOK || len(tags.Tags) != 2 {
+	if err := json.Unmarshal(rec.Body.Bytes(), &tags); err != nil || rec.Code != http.StatusOK || len(tags.Tags) != 3 {
 		t.Fatalf("tags = %d %s (%v)", rec.Code, rec.Body.String(), err)
 	}
 	for _, tg := range tags.Tags {
+		if tg.ID == "5-3" {
+			continue
+		}
 		want := tg.ID == "5-1" // the shared tag; the private one has no one else
 		if !tg.AccountCanApply || tg.OthersCanApply != want {
 			t.Errorf("tag %s: verdicts = %v/%v", tg.ID, tg.AccountCanApply, tg.OthersCanApply)
 		}
+	}
+	// Names from the tracker reach the browser without control, bidi or zero-width characters.
+	for _, resp := range []string{projectsBody, rec.Body.String()} {
+		for _, bad := range []string{`\u202e`, `\u200b`, `\n`} {
+			if strings.Contains(resp, bad) {
+				t.Errorf("response still carries %s: %s", bad, resp)
+			}
+		}
+	}
+	if !strings.Contains(rec.Body.String(), `"name":"evilname"`) || !strings.Contains(rec.Body.String(), `"login":"mallory"`) || !strings.Contains(projectsBody, `"name":"Uzi"}`) {
+		t.Errorf("sanitised names missing: %s | %s", rec.Body.String(), projectsBody)
 	}
 	if rec = f.do(f.jwt, http.MethodDelete, "/api/issue-trackers/connections/"+conn.String(), ""); rec.Code != http.StatusNoContent {
 		t.Fatalf("delete = %d %s", rec.Code, rec.Body.String())
@@ -186,7 +204,7 @@ func TestIssueTrackerRoutesAreOwnerScopedLiveDB(t *testing.T) {
 		{http.MethodGet, "/api/issue-trackers/connections/" + conn.String() + "/projects", ""},
 		{http.MethodGet, "/api/issue-trackers/connections/" + conn.String() + "/tags", ""},
 		{http.MethodDelete, "/api/issue-trackers/connections/" + conn.String(), ""},
-		// Another user's connection on the stranger's own repo is a 404 too.
+		// The owner's repo is not the stranger's: the link route answers 404 for it too.
 		{http.MethodPut, "/api/repos/" + repo.String() + "/issue-tracker-link", linkBody(conn, "5-1")},
 	} {
 		if rec := f.do(sjwt, rt.method, rt.path, rt.body); rec.Code != http.StatusNotFound {
@@ -205,7 +223,7 @@ func TestIssueTrackerRoutesAreOwnerScopedLiveDB(t *testing.T) {
 	}
 }
 
-func TestLinkRouteLiveDB(t *testing.T) {
+func TestIssueTrackerLinkRouteLiveDB(t *testing.T) {
 	f := newITFixture(t, true)
 	_, _, conn := f.connect(f.jwt, itToken("a"))
 	path := func(repo uuid.UUID) string { return "/api/repos/" + repo.String() + "/issue-tracker-link" }

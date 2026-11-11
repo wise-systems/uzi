@@ -19,6 +19,11 @@ import (
 // verification, account check, seal, upsert. A refused base URL never reaches the driver factory, so no outbound
 // request or token use happens for it. The token is trimmed of surrounding
 // whitespace, and it appears in no returned error or log line.
+//
+// Reconnecting never changes the account of a connection that a repo links to
+// (PRD #4173 D11, D14): the new token must belong to the stored account, else the
+// result is a Conflict. The refusal is made by the upsert statement itself and,
+// when UseTransactions is wired, also by a locked check before it.
 func (s *Service) Connect(ctx context.Context, userID uuid.UUID, kind, baseURL, token string) (Connection, error) {
 	parsedKind, ok := issuetracker.ParseKind(strings.TrimSpace(kind))
 	if !ok {
@@ -83,8 +88,7 @@ func (s *Service) Connect(ctx context.Context, userID uuid.UUID, kind, baseURL, 
 				return err
 			}
 			if n > 0 {
-				return conflict("this connection is linked to a repo and the new token belongs to a different account; " +
-					"use a token of the account the connection already stands for, or connect to a different base URL")
+				return errReconnectChangesAccount()
 			}
 		}
 		row, err = q.UpsertIssueTrackerConnection(ctx, store.UpsertIssueTrackerConnectionParams{
@@ -95,10 +99,21 @@ func (s *Service) Connect(ctx context.Context, userID uuid.UUID, kind, baseURL, 
 			AccountLogin:    account.Login,
 			TokenCiphertext: sealed,
 		})
+		if errors.Is(err, pgx.ErrNoRows) {
+			// The statement's own WHERE refused: a repo links to the row and the account
+			// would change. This holds without the lock above, and closes the race of a
+			// first connect against a link.
+			return errReconnectChangesAccount()
+		}
 		return err
 	})
 	if err != nil {
 		return Connection{}, s.txError("connect issue tracker", err)
 	}
 	return toConnection(row), nil
+}
+
+func errReconnectChangesAccount() *Error {
+	return conflict("this connection is linked to a repo and the new token belongs to a different account; " +
+		"use a token of the account the connection already stands for, or connect to a different base URL")
 }

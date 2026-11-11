@@ -545,3 +545,74 @@ func TestLinkRacingAReconnectLiveDB(t *testing.T) {
 		t.Logf("link won %d, reconnect won %d, reconnect then link %d", refusedReconnect, refusedLink, both)
 	})
 }
+
+// The link reads the connection FOR SHARE. A reconnect holds the row FOR UPDATE; the link
+// must wait for it and then see the new account. A plain read would not wait and would link
+// against the account it verified.
+func TestLinkWaitsForAReconnectHoldingTheConnectionRowLiveDB(t *testing.T) {
+	ctx := context.Background()
+	h := newLiveHarness(t)
+	repo := h.freshRepo()
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // no-op after Commit
+	if _, err := h.q.WithTx(tx).LockIssueTrackerConnectionByIdentityForUpdate(ctx, store.LockIssueTrackerConnectionByIdentityForUpdateParams{
+		UserID: h.user, Kind: "youtrack", BaseUrl: testHost,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	result := make(chan error, 1)
+	go func() { result <- h.link(repo) }()
+
+	waitForLockWait(t, h.pool, "FOR SHARE")
+	select {
+	case err := <-result:
+		t.Fatalf("the link finished (%v) while the connection row was locked FOR UPDATE", err)
+	default:
+	}
+	if _, err := tx.Exec(ctx, `UPDATE issue_tracker_connections SET account_id = $2 WHERE id = $1`, h.conn, linkOther.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	e := wantKind(t, <-result, KindConflict)
+	if !strings.Contains(e.Message, "reconnect") {
+		t.Errorf("message %q", e.Message)
+	}
+	if h.repoRow(repo).IssueTrackerConnectionID.Valid {
+		t.Fatal("the repo was linked")
+	}
+}
+
+// blindQuerier hides the locked pre-check from Connect: the identity lock finds no row and the
+// link count is zero, as when a link commits between those reads and the upsert.
+type blindQuerier struct{ *store.Queries }
+
+func (blindQuerier) LockIssueTrackerConnectionByIdentityForUpdate(context.Context, store.LockIssueTrackerConnectionByIdentityForUpdateParams) (store.IssueTrackerConnection, error) {
+	return store.IssueTrackerConnection{}, pgx.ErrNoRows
+}
+
+// The upsert statement refuses an account change on a linked connection by itself: with the
+// locked pre-check blinded and no transactions wired, only its WHERE stands in the way.
+func TestUpsertRefusesAnAccountChangeOnALinkedConnectionLiveDB(t *testing.T) {
+	ctx := context.Background()
+	h := newLiveHarness(t)
+	bare := New(blindQuerier{h.q}, h.svc.box, h.svc.allowed, h.svc.newDriver)
+	bare.log = h.svc.log
+	if err := h.link(h.freshRepo()); err != nil {
+		t.Fatal(err)
+	}
+	_, err := bare.Connect(ctx, h.user, "youtrack", testHost, tokenB)
+	if e := wantKind(t, err, KindConflict); !strings.Contains(e.Message, "different account") {
+		t.Errorf("message %q", e.Message)
+	}
+	if h.connAccount() != linkBot.ID {
+		t.Fatal("the account changed")
+	}
+	if _, err := bare.Connect(ctx, h.user, "youtrack", testHost, testToken("rotated")); err != nil {
+		t.Fatalf("same-account rotation: %v", err)
+	}
+}

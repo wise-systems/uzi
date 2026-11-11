@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -10,6 +11,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/auth"
 	"github.com/vtmocanu/uzi/api/internal/config"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // issueTrackerRoutes is every issue tracker route of PRD #4173 M4, with a method and a path
@@ -70,6 +72,33 @@ func TestIssueTrackerRoutesRefuseAStateChangeWithoutCSRF(t *testing.T) {
 			router.ServeHTTP(rec, bearer)
 			if rec.Code != http.StatusUnauthorized {
 				t.Fatalf("bearer status = %d, want 401\n%s", rec.Code, rec.Body.String())
+			}
+		})
+	}
+}
+
+// A handler with no issue tracker service answers an authenticated request with 503, and an
+// unauthenticated one with 401, rather than panicking.
+func TestIssueTrackerRoutesAnswer503WithoutAService(t *testing.T) {
+	h := &Handler{}
+	handlers := map[string]http.HandlerFunc{
+		"create": h.CreateIssueTrackerConnection, "list": h.ListIssueTrackerConnections,
+		"delete": h.DeleteIssueTrackerConnection, "projects": h.ListIssueTrackerProjects,
+		"tags": h.ListIssueTrackerTags, "link": h.LinkRepoToIssueTracker,
+	}
+	for name, fn := range handlers {
+		t.Run(name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/", nil)
+			rec := httptest.NewRecorder()
+			fn(rec, req)
+			if rec.Code != http.StatusUnauthorized {
+				t.Fatalf("no user: status = %d, want 401", rec.Code)
+			}
+			req = req.WithContext(mw.ContextWithUser(context.Background(), store.User{}))
+			rec = httptest.NewRecorder()
+			fn(rec, req)
+			if rec.Code != http.StatusServiceUnavailable || !strings.Contains(rec.Body.String(), "issue trackers are not configured") {
+				t.Fatalf("status = %d %s, want 503 naming the missing configuration", rec.Code, rec.Body.String())
 			}
 		})
 	}
