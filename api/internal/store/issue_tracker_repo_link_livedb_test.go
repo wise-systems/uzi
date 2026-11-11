@@ -36,6 +36,15 @@ func itlExec(t *testing.T, pool *pgxpool.Pool, sql string, args ...any) {
 	}
 }
 
+func itlLinked(t *testing.T, pool *pgxpool.Pool, repo uuid.UUID) bool {
+	t.Helper()
+	var b bool
+	if err := pool.QueryRow(context.Background(), `SELECT issue_tracker_connection_id IS NOT NULL FROM repos WHERE id=$1`, repo).Scan(&b); err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
 func itlAwaiting(t *testing.T, pool *pgxpool.Pool, repo uuid.UUID) bool {
 	t.Helper()
 	var b bool
@@ -111,8 +120,9 @@ func TestIssueTrackerRepoLinkMigrationLiveDB(t *testing.T) {
 			t.Fatal("disabling must not re-mark")
 		}
 		_, err = pool.Exec(ctx, `UPDATE repos SET awaiting_first_enable=true WHERE id=$1`, repo.ID)
-		if err == nil {
-			t.Fatal("setting the marker back must raise")
+		var pe *pgconn.PgError
+		if !errors.As(err, &pe) || !strings.Contains(pe.Message, "is never set back once cleared") {
+			t.Fatalf("setting the marker back must raise the trigger's refusal, got %v", err)
 		}
 		// Enabling and setting it in one statement still ends cleared, never raises.
 		itlExec(t, pool, `UPDATE repos SET enabled=true, awaiting_first_enable=true WHERE id=$1`, repo.ID)
@@ -173,7 +183,7 @@ func TestIssueTrackerRepoLinkMigrationLiveDB(t *testing.T) {
 		if _, err := pool.Exec(ctx, `UPDATE issues SET repo_id=$1 WHERE repo_id=$2 AND forge_issue_iid=7`, aw.ID, f.legacy); sqlState(err) != issueNumberGuardSQLState {
 			t.Errorf("moving an issue to an awaiting repo: want %s, got %v", issueNumberGuardSQLState, err)
 		}
-		// UPDATE OF the number column on a run.
+		// UPDATE OF repo_id on a run that carries an issue number.
 		if _, err := pool.Exec(ctx, `UPDATE runs SET repo_id=$1 WHERE id=$2`, aw.ID, runID); sqlState(err) != issueNumberGuardSQLState {
 			t.Errorf("moving a run to an awaiting repo: want %s, got %v", issueNumberGuardSQLState, err)
 		}
@@ -191,17 +201,65 @@ func TestIssueTrackerRepoLinkMigrationLiveDB(t *testing.T) {
 	})
 
 	t.Run("continued_issue_iid", func(t *testing.T) {
-		// runs.continued_issue_iid is nullable only alongside a NOT NULL issue_iid, so no
-		// run row can isolate it; assert the trigger is declared over it.
-		var def string
-		if err := pool.QueryRow(ctx, `SELECT pg_get_triggerdef(oid) FROM pg_trigger WHERE tgname='runs_awaiting_first_enable_guard'`).Scan(&def); err != nil {
+		// A task run continues an issue through continued_issue_iid while issue_iid stays
+		// NULL (runs_continued_issue_shape), so this column alone carries the number.
+		repo, err := q.UpsertRepo(ctx, store.UpsertRepoParams{ConnectionID: f.forgeConn, ForgeProjectID: 40, PathWithNamespace: "o/cont", WebUrl: "https://example.com/o/cont"})
+		if err != nil {
 			t.Fatal(err)
 		}
-		for _, col := range []string{"repo_id", "issue_iid", "continued_issue_iid"} {
-			if !strings.Contains(def, col) {
-				t.Errorf("runs guard trigger %q does not mention %s", def, col)
+		const ins = `INSERT INTO runs (user_id,repo_id,kind,branch,continued_issue_iid,issue_title,issue_description) VALUES ($1,$2,'task','b',5,'t','d')`
+		if _, err := pool.Exec(ctx, ins, f.user, repo.ID); sqlState(err) != issueNumberGuardSQLState {
+			t.Fatalf("a task run continuing an issue on an awaiting repo: want %s, got %v", issueNumberGuardSQLState, err)
+		}
+		itlExec(t, pool, `UPDATE repos SET enabled=true WHERE id=$1`, repo.ID)
+		itlExec(t, pool, ins, f.user, repo.ID)
+	})
+
+	t.Run("number_set_by_update", func(t *testing.T) {
+		// Insert with a NULL number (allowed), then UPDATE the number onto the awaiting repo.
+		aw, err := q.UpsertRepo(ctx, store.UpsertRepoParams{ConnectionID: f.forgeConn, ForgeProjectID: 41, PathWithNamespace: "o/upd", WebUrl: "https://example.com/o/upd"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		runID := uuid.New()
+		itlExec(t, pool, `INSERT INTO runs (id,user_id,repo_id,issue_iid,issue_title,issue_description) VALUES ($1,$2,$3,2,'t','d')`, runID, f.user, f.legacy)
+		reviewID := uuid.New()
+		itlExec(t, pool, `INSERT INTO run_reviews (id,target_run_id,user_id,verdict) VALUES ($1,$2,$3,'issues')`, reviewID, runID, f.user)
+		for _, c := range []struct {
+			table, insert, update string
+			args                  []any
+		}{
+			{"issue_proposals", `INSERT INTO issue_proposals (id,run_id,repo_id,title,description) VALUES ($1,$2,$3,'t','d')`, `UPDATE issue_proposals SET created_issue_iid=5 WHERE id=$1`, []any{runID, aw.ID}},
+			{"finding_dispositions", `INSERT INTO finding_dispositions (id,user_id,repo_id,location) VALUES ($1,$2,$3,'upd')`, `UPDATE finding_dispositions SET filed_issue_iid=5 WHERE id=$1`, []any{f.user, aw.ID}},
+			{"finding_group_operations", `INSERT INTO finding_group_operations (id,user_id,repo_id,deadline_at) VALUES ($1,$2,$3,now())`, `UPDATE finding_group_operations SET issue_iid=5, issue_url='u' WHERE id=$1`, []any{f.user, aw.ID}},
+			{"recommendation_filed_issues", `INSERT INTO recommendation_filed_issues (id,review_id,category,filed_repo_id) VALUES ($1,$2,'upd',$3)`, `UPDATE recommendation_filed_issues SET filed_issue_iid=5 WHERE id=$1`, []any{reviewID, aw.ID}},
+		} {
+			id := uuid.New()
+			itlExec(t, pool, c.insert, append([]any{id}, c.args...)...)
+			if _, err := pool.Exec(ctx, c.update, id); sqlState(err) != issueNumberGuardSQLState {
+				t.Errorf("%s: UPDATE setting a number on an awaiting repo: want %s, got %v", c.table, issueNumberGuardSQLState, err)
 			}
 		}
+	})
+
+	t.Run("guard_fails_closed_on_missing_column", func(t *testing.T) {
+		// A trigger argument naming no column of the row must raise, never pass silently.
+		itlExec(t, pool, `CREATE TABLE itl_guard_probe (id int, repo_id uuid, num bigint)`)
+		itlExec(t, pool, `CREATE TRIGGER itl_probe_bad_num BEFORE INSERT ON itl_guard_probe
+			FOR EACH ROW EXECUTE FUNCTION issue_number_awaiting_first_enable_guard('repo_id', 'no_such_num')`)
+		_, err := pool.Exec(ctx, `INSERT INTO itl_guard_probe (id) VALUES (1)`)
+		var pe *pgconn.PgError
+		if !errors.As(err, &pe) || !strings.Contains(pe.Message, "no column no_such_num") {
+			t.Errorf("missing number column: want the guard's refusal, got %v", err)
+		}
+		itlExec(t, pool, `DROP TRIGGER itl_probe_bad_num ON itl_guard_probe`)
+		itlExec(t, pool, `CREATE TRIGGER itl_probe_bad_repo BEFORE INSERT ON itl_guard_probe
+			FOR EACH ROW EXECUTE FUNCTION issue_number_awaiting_first_enable_guard('no_such_repo', 'num')`)
+		_, err = pool.Exec(ctx, `INSERT INTO itl_guard_probe (id) VALUES (1)`)
+		if !errors.As(err, &pe) || !strings.Contains(pe.Message, "no column no_such_repo") {
+			t.Errorf("missing repo column: want the guard's refusal, got %v", err)
+		}
+		itlExec(t, pool, `DROP TABLE itl_guard_probe`)
 	})
 
 	t.Run("issue_key", func(t *testing.T) {
@@ -253,6 +311,26 @@ func TestIssueTrackerRepoLinkMigrationLiveDB(t *testing.T) {
 			}
 		}
 
+		// issue_key is 64 wide (checked on the legacy repo, which the guard lets store a number): a 44-character short plus "-" plus 19 digits is the widest key.
+		bound := func(short string) error {
+			_, err := pool.Exec(ctx, full, repo.ID, f.itc, "0-1", short, "9-1", "tag")
+			return err
+		}
+		if err := bound("A" + strings.Repeat("b", 45)); sqlState(err) != "23514" {
+			t.Errorf("a 46-character short must be refused: %v", err)
+		}
+		if err := bound("A" + strings.Repeat("b", 44)); sqlState(err) != "23514" {
+			t.Errorf("a 45-character short must be refused: %v", err)
+		}
+		long := "A" + strings.Repeat("b", 43)
+		if err := bound(long); err != nil {
+			t.Fatalf("a 44-character short must link: %v", err)
+		}
+		itlExec(t, pool, `INSERT INTO issues (repo_id,forge_issue_iid,issue_key,title,state,web_url,forge_updated_at,synced_at) VALUES ($1,9223372036854775807,$2,'t','opened','u',now(),now())`, f.legacy, long+"-9223372036854775807")
+		itlExec(t, pool, `DELETE FROM issues WHERE issue_key=$1`, long+"-9223372036854775807")
+		itlExec(t, pool, `UPDATE repos SET issue_tracker_connection_id=NULL, issue_tracker_project_id=NULL, issue_tracker_project_short=NULL,
+			eligibility_tag_id=NULL, eligibility_tag_name=NULL, issue_tracker_linked_at=NULL WHERE id=$1`, repo.ID)
+
 		// Link queries.
 		src, err := q.GetRepoIssueSourceForUser(ctx, store.GetRepoIssueSourceForUserParams{ID: repo.ID, UserID: f.user})
 		if err != nil || src.LinkedConnectionID.Valid {
@@ -266,6 +344,25 @@ func TestIssueTrackerRepoLinkMigrationLiveDB(t *testing.T) {
 		if _, err := q.LockRepoForLinkForUser(ctx, store.LockRepoForLinkForUserParams{ID: repo.ID, UserID: other}); !errors.Is(err, pgx.ErrNoRows) {
 			t.Errorf("LockRepoForLinkForUser must be owner-scoped: %v", err)
 		}
+		// A cross-user connection or a foreign repo yields no row and writes nothing.
+		otherITC := uuid.New()
+		itlExec(t, pool, `INSERT INTO issue_tracker_connections (id,user_id,kind,base_url,account_id,account_login,token_ciphertext)
+			VALUES ($1,$2,'youtrack','https://yt2.example.com','b','bl','x')`, otherITC, other)
+		if _, err := q.SetRepoIssueTrackerLink(ctx, store.SetRepoIssueTrackerLinkParams{
+			ConnectionID: otherITC, ProjectID: "0-1", ProjectShort: "ABC", TagID: "9-1", TagName: "uzi", RepoID: repo.ID, UserID: f.user}); !errors.Is(err, pgx.ErrNoRows) {
+			t.Errorf("linking to another user's connection must be refused: %v", err)
+		}
+		if _, err := q.SetRepoIssueTrackerLink(ctx, store.SetRepoIssueTrackerLinkParams{
+			ConnectionID: otherITC, ProjectID: "0-1", ProjectShort: "ABC", TagID: "9-1", TagName: "uzi", RepoID: repo.ID, UserID: other}); !errors.Is(err, pgx.ErrNoRows) {
+			t.Errorf("another user linking a repo they do not own must be refused: %v", err)
+		}
+		if _, err := q.SetRepoIssueTrackerLink(ctx, store.SetRepoIssueTrackerLinkParams{
+			ConnectionID: f.itc, ProjectID: "0-1", ProjectShort: "ABC", TagID: "9-1", TagName: "uzi", RepoID: repo.ID, UserID: other}); !errors.Is(err, pgx.ErrNoRows) {
+			t.Errorf("a foreign repo with the foreign user's own connection id must be refused: %v", err)
+		}
+		if itlLinked(t, pool, repo.ID) {
+			t.Fatal("a refused link must write nothing")
+		}
 		tx, err := pool.Begin(ctx)
 		if err != nil {
 			t.Fatal(err)
@@ -276,7 +373,7 @@ func TestIssueTrackerRepoLinkMigrationLiveDB(t *testing.T) {
 			t.Fatalf("lock: %+v %v", lock, err)
 		}
 		linked, err := qt.SetRepoIssueTrackerLink(ctx, store.SetRepoIssueTrackerLinkParams{
-			ConnectionID: f.itc, ProjectID: "0-1", ProjectShort: "ABC", TagID: "9-1", TagName: "uzi", RepoID: repo.ID})
+			ConnectionID: f.itc, ProjectID: "0-1", ProjectShort: "ABC", TagID: "9-1", TagName: "uzi", RepoID: repo.ID, UserID: f.user})
 		if err != nil || !linked.IssueTrackerLinkedAt.Valid {
 			t.Fatalf("SetRepoIssueTrackerLink: %+v %v", linked, err)
 		}
@@ -293,17 +390,24 @@ func TestIssueTrackerRepoLinkMigrationLiveDB(t *testing.T) {
 		}
 		// Already linked: refused (no row).
 		if _, err := q.SetRepoIssueTrackerLink(ctx, store.SetRepoIssueTrackerLinkParams{
-			ConnectionID: f.itc, ProjectID: "0-2", ProjectShort: "XYZ", TagID: "9-2", TagName: "t2", RepoID: repo.ID}); !errors.Is(err, pgx.ErrNoRows) {
+			ConnectionID: f.itc, ProjectID: "0-2", ProjectShort: "XYZ", TagID: "9-2", TagName: "t2", RepoID: repo.ID, UserID: f.user}); !errors.Is(err, pgx.ErrNoRows) {
 			t.Errorf("relinking must be refused: %v", err)
 		}
 		// FK: deleting a referenced connection fails.
 		if _, err := pool.Exec(ctx, `DELETE FROM issue_tracker_connections WHERE id=$1`, f.itc); sqlState(err) != "23503" {
 			t.Errorf("deleting a linked connection must fail on the FK: %v", err)
 		}
-		// Enabled-once repo refuses the link.
-		itlExec(t, pool, `UPDATE repos SET enabled=true WHERE id=$1`, f.legacy)
+		// Owner binding of the read: a link to another user's connection, forced past the
+		// query by a raw UPDATE, must not read back as a linked connection.
+		itlExec(t, pool, `UPDATE repos SET issue_tracker_connection_id=$2 WHERE id=$1`, repo.ID, otherITC)
+		src, err = q.GetRepoIssueSourceForUser(ctx, store.GetRepoIssueSourceForUserParams{ID: repo.ID, UserID: f.user})
+		if err != nil || src.LinkedConnectionID.Valid {
+			t.Errorf("a connection of another user must not read as linked: %+v %v", src, err)
+		}
+		itlExec(t, pool, `UPDATE repos SET issue_tracker_connection_id=$2 WHERE id=$1`, repo.ID, f.itc)
+		// A repo that existed before the migration counts as previously enabled and refuses the link.
 		if _, err := q.SetRepoIssueTrackerLink(ctx, store.SetRepoIssueTrackerLinkParams{
-			ConnectionID: f.itc, ProjectID: "0-1", ProjectShort: "ABC", TagID: "9-1", TagName: "uzi", RepoID: f.legacy}); !errors.Is(err, pgx.ErrNoRows) {
+			ConnectionID: f.itc, ProjectID: "0-1", ProjectShort: "ABC", TagID: "9-1", TagName: "uzi", RepoID: f.legacy, UserID: f.user}); !errors.Is(err, pgx.ErrNoRows) {
 			t.Errorf("an enabled-once repo must refuse the link: %v", err)
 		}
 		// Unlinking (all six to NULL) satisfies the CHECK.

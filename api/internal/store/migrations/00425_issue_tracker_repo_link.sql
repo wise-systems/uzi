@@ -1,5 +1,10 @@
 -- +goose Up
 
+-- Lock-cheap: this migration takes ACCESS EXCLUSIVE on repos (new columns, CHECK, trigger)
+-- and SHARE ROW EXCLUSIVE on nine other tables (CREATE TRIGGER); fail fast instead of
+-- queueing behind a long transaction and stalling every reader behind us (the 00402 pattern).
+SET LOCAL lock_timeout = '5s';
+
 -- PRD #4173 M4: link a repo to an external issue tracker project, and keep that
 -- link from ever being made once the repo has issue numbers of its own (D13).
 
@@ -31,6 +36,8 @@ CREATE TRIGGER repos_awaiting_first_enable_guard
     BEFORE INSERT OR UPDATE ON repos
     FOR EACH ROW EXECUTE FUNCTION repos_awaiting_first_enable_guard();
 
+-- The short name is capped at 44 characters so "<short>-<n>" always fits the 64
+-- characters of issues.issue_key (64 - 1 for the dash - 19 digits of a bigint).
 -- The link from a repo to one project of one issue tracker connection, plus the
 -- eligibility tag that selects which issues the sync reads. All six columns are set
 -- together or not at all. The connection FK keeps the default NO ACTION (checked at
@@ -59,7 +66,7 @@ ALTER TABLE repos ADD CONSTRAINT repos_issue_tracker_link_shape CHECK (
         AND eligibility_tag_name IS NOT NULL
         AND issue_tracker_linked_at IS NOT NULL
         AND char_length(issue_tracker_project_id) BETWEEN 1 AND 128
-        AND char_length(issue_tracker_project_short) BETWEEN 1 AND 128
+        AND char_length(issue_tracker_project_short) BETWEEN 1 AND 44
         AND char_length(eligibility_tag_id) BETWEEN 1 AND 128
         AND char_length(eligibility_tag_name) BETWEEN 1 AND 256
         AND issue_tracker_project_id !~ '[[:cntrl:]]'
@@ -98,6 +105,16 @@ DECLARE
     has_num  boolean := false;
     i        int;
 BEGIN
+    -- Fail closed: a trigger argument that names no column of the row (a rename or a
+    -- typo) must not turn the guard into a silent pass.
+    IF NOT (j ? TG_ARGV[0]) THEN
+        RAISE EXCEPTION 'issue number guard on %: no column %', TG_TABLE_NAME, TG_ARGV[0];
+    END IF;
+    FOR i IN 1 .. TG_NARGS - 1 LOOP
+        IF NOT (j ? TG_ARGV[i]) THEN
+            RAISE EXCEPTION 'issue number guard on %: no column %', TG_TABLE_NAME, TG_ARGV[i];
+        END IF;
+    END LOOP;
     IF repo_val IS NULL THEN
         RETURN NEW;
     END IF;

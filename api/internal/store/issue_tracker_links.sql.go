@@ -141,15 +141,19 @@ func (q *Queries) RepoStoresIssueNumber(ctx context.Context, repoID uuid.UUID) (
 }
 
 const setRepoIssueTrackerLink = `-- name: SetRepoIssueTrackerLink :one
-UPDATE repos
+UPDATE repos r
 SET issue_tracker_connection_id = $1::uuid,
     issue_tracker_project_id    = $2::text,
     issue_tracker_project_short = $3::text,
     eligibility_tag_id          = $4::text,
     eligibility_tag_name        = $5::text,
     issue_tracker_linked_at     = now()
-WHERE id = $6 AND awaiting_first_enable AND issue_tracker_connection_id IS NULL
-RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, awaiting_first_enable, issue_tracker_connection_id, issue_tracker_project_id, issue_tracker_project_short, eligibility_tag_id, eligibility_tag_name, issue_tracker_linked_at
+FROM forge_connections c, issue_tracker_connections itc
+WHERE r.id = $6
+  AND c.id = r.connection_id AND c.user_id = $7
+  AND itc.id = $1::uuid AND itc.user_id = $7
+  AND r.awaiting_first_enable AND r.issue_tracker_connection_id IS NULL
+RETURNING r.id, r.connection_id, r.forge_project_id, r.path_with_namespace, r.web_url, r.default_branch, r.enabled, r.repo_skills_enabled, r.repo_devbox_opt_in, r.repo_claudemd_enabled, r.guardrail_override_reason, r.guardrail_override_by, r.guardrail_override_at, r.required_capabilities, r.fold_improve_uzi_backlog, r.code_cross_check_guidance, r.cross_check_repo_instructions_enabled, r.ignored_inferred_capabilities, r.agent_source_default, r.awaiting_first_enable, r.issue_tracker_connection_id, r.issue_tracker_project_id, r.issue_tracker_project_short, r.eligibility_tag_id, r.eligibility_tag_name, r.issue_tracker_linked_at
 `
 
 type SetRepoIssueTrackerLinkParams struct {
@@ -159,11 +163,13 @@ type SetRepoIssueTrackerLinkParams struct {
 	TagID        string    `json:"tag_id"`
 	TagName      string    `json:"tag_name"`
 	RepoID       uuid.UUID `json:"repo_id"`
+	UserID       uuid.UUID `json:"user_id"`
 }
 
-// Writes the link. Only a repo that has never been enabled and is not yet linked
-// matches; no row means refused. Call after LockRepoForLinkForUser in the same
-// transaction.
+// Writes the link, owner-scoped in the one statement: the repo must belong to @user_id
+// through its forge connection and the issue tracker connection must belong to the same
+// user. Only a repo that has never been enabled and is not yet linked matches; no row
+// means refused. Call after LockRepoForLinkForUser in the same transaction.
 func (q *Queries) SetRepoIssueTrackerLink(ctx context.Context, arg SetRepoIssueTrackerLinkParams) (Repo, error) {
 	row := q.db.QueryRow(ctx, setRepoIssueTrackerLink,
 		arg.ConnectionID,
@@ -172,6 +178,7 @@ func (q *Queries) SetRepoIssueTrackerLink(ctx context.Context, arg SetRepoIssueT
 		arg.TagID,
 		arg.TagName,
 		arg.RepoID,
+		arg.UserID,
 	)
 	var i Repo
 	err := row.Scan(
