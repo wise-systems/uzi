@@ -23,15 +23,15 @@ func AssertGolden(t testing.TB, name string, lines []string) {
 		got += "\n"
 	}
 	if os.Getenv(UpdateGoldenEnv) == "1" {
-		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
 			t.Fatalf("golden %s: mkdir: %v", path, err)
 		}
-		if err := os.WriteFile(path, []byte(got), 0o644); err != nil {
+		if err := os.WriteFile(path, []byte(got), 0o600); err != nil {
 			t.Fatalf("golden %s: write: %v", path, err)
 		}
 		return
 	}
-	want, err := os.ReadFile(path)
+	want, err := os.ReadFile(path) //nolint:gosec // G304: a golden file under the calling test package testdata dir
 	if err != nil {
 		t.Fatalf("golden %s unreadable (%v); generate it with %s=1", path, err, UpdateGoldenEnv)
 	}

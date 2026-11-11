@@ -54,7 +54,7 @@ func TestAssertGoldenWritesThenMatches(t *testing.T) {
 	AssertGolden(t, "x.golden", []string{"A()", "B(1)"})
 	t.Setenv(UpdateGoldenEnv, "")
 	AssertGolden(t, "x.golden", []string{"A()", "B(1)"})
-	b, err := os.ReadFile(filepath.Join(dir, "testdata", "x.golden"))
+	b, err := os.ReadFile(filepath.Join(dir, "testdata", "x.golden")) //nolint:gosec // G304: the test temp dir
 	if err != nil || string(b) != "A()\nB(1)\n" {
 		t.Fatalf("golden = %q, %v", b, err)
 	}
