@@ -19,7 +19,7 @@ func TestClientDoesNotFollowRedirect(t *testing.T) {
 	}))
 	defer first.Close()
 
-	resp, err := newHTTPClient(0).Get(first.URL)
+	resp, err := newHTTPClient(0, nil).Get(first.URL)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -49,7 +49,7 @@ func TestClientNotModifiedWithoutLocation(t *testing.T) {
 		w.WriteHeader(http.StatusNotModified)
 	}))
 	defer srv.Close()
-	resp, err := newHTTPClient(0).Get(srv.URL)
+	resp, err := newHTTPClient(0, nil).Get(srv.URL)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -60,10 +60,10 @@ func TestClientNotModifiedWithoutLocation(t *testing.T) {
 }
 
 func TestClientTimeout(t *testing.T) {
-	if got := newHTTPClient(0).Timeout; got != defaultTimeout {
+	if got := newHTTPClient(0, nil).Timeout; got != defaultTimeout {
 		t.Fatalf("default timeout = %v", got)
 	}
-	if got := newHTTPClient(3 * time.Second).Timeout; got != 3*time.Second {
+	if got := newHTTPClient(3*time.Second, nil).Timeout; got != 3*time.Second {
 		t.Fatalf("timeout = %v", got)
 	}
 }

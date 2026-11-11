@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/vtmocanu/uzi/api/internal/forge"
@@ -41,42 +42,80 @@ type redactor struct {
 }
 
 // newRedactor lists the token's raw, query-escaped, path-escaped and
-// JSON-escaped forms, plus its final '.'-separated segment when long enough
-// (a permanent token has the shape prefix:id.secret).
+// JSON-escaped forms (percent-hex in both cases, JSON with and without "\/"),
+// plus the same escaped forms of its final '.'-separated segment when long
+// enough (a permanent token has the shape prefix:id.secret). The token's own
+// forms are always listed whatever its length; minSegmentLen applies to the
+// segment only. The list has no duplicates.
 func newRedactor(token string) redactor {
 	var secrets []string
+	seen := map[string]bool{}
 	add := func(s string) {
-		if s != "" && len(s) >= minSegmentLen {
+		if s != "" && !seen[s] {
+			seen[s] = true
 			secrets = append(secrets, s)
 		}
 	}
-	add(token)
-	add(url.QueryEscape(token))
-	add(url.PathEscape(token))
-	if b, err := json.Marshal(token); err == nil && len(b) >= 2 {
-		add(string(b[1 : len(b)-1]))
+	addForms := func(v string) {
+		add(v)
+		q, p := url.QueryEscape(v), url.PathEscape(v)
+		add(q)
+		add(lowerPercent(q))
+		add(p)
+		add(lowerPercent(p))
+		if b, err := json.Marshal(v); err == nil && len(b) >= 2 {
+			j := string(b[1 : len(b)-1])
+			add(j)
+			add(strings.ReplaceAll(j, "/", `\/`))
+		}
 	}
-	if i := strings.LastIndexByte(token, '.'); i >= 0 {
-		add(token[i+1:])
+	addForms(token)
+	if i := strings.LastIndexByte(token, '.'); i >= 0 && len(token)-i-1 >= minSegmentLen {
+		addForms(token[i+1:])
 	}
 	return redactor{secrets: secrets}
 }
 
-// string scrubs secrets, strips control and bidi characters, and truncates.
-func (r redactor) string(s string) string {
+// lowerPercent lower-cases the hex digits of every %XX escape in s.
+func lowerPercent(s string) string {
+	b := []byte(s)
+	for i := 0; i+2 < len(b); i++ {
+		if b[i] == '%' {
+			b[i+1] = lowerHex(b[i+1])
+			b[i+2] = lowerHex(b[i+2])
+			i += 2
+		}
+	}
+	return string(b)
+}
+
+func lowerHex(c byte) byte {
+	if c >= 'A' && c <= 'F' {
+		return c + ('a' - 'A')
+	}
+	return c
+}
+
+// scrub replaces every listed secret form in s.
+func (r redactor) scrub(s string) string {
 	for _, secret := range r.secrets {
 		s = strings.ReplaceAll(s, secret, redactPlaceholder)
 	}
-	return truncate(sanitize(s), maxMessageBytes)
+	return s
 }
 
-// sanitize replaces C0/C1 control characters and bidi overrides with a space.
+// string scrubs secrets, strips control and format characters, scrubs again
+// (stripping can join fragments of a secret), and truncates.
+func (r redactor) string(s string) string {
+	return truncate(r.scrub(sanitize(r.scrub(s))), maxMessageBytes)
+}
+
+// sanitize replaces control characters, Unicode format characters (bidi
+// controls, zero-width characters, BOM) and the line and paragraph separators
+// with a space. It uses the predicate of issueinput.AuthorName.
 func sanitize(s string) string {
 	return strings.Map(func(c rune) rune {
-		switch {
-		case c < 0x20, c >= 0x7f && c <= 0x9f,
-			c >= 0x202a && c <= 0x202e,
-			c >= 0x2066 && c <= 0x2069:
+		if unicode.IsControl(c) || unicode.Is(unicode.Cf, c) || c == '\u2028' || c == '\u2029' {
 			return ' '
 		}
 		return c
@@ -128,7 +167,14 @@ func (r redactor) errorStatus(err error, status int) error {
 	}
 	var large *forge.ResponseTooLargeError
 	if errors.As(err, &large) {
-		return &forge.ResponseTooLargeError{Provenance: large.Provenance, Outcome: large.Class()}
+		outcome := large.Class()
+		if outcome == forge.ErrorClassOther && status != 0 {
+			outcome = classifyStatus(status)
+		}
+		return &forge.ResponseTooLargeError{Provenance: large.Provenance, Outcome: outcome}
+	}
+	if errors.Is(err, forge.ErrResponseTooLarge) {
+		return &forge.ResponseTooLargeError{Outcome: classifyStatus(status)}
 	}
 	return &classifiedError{message: r.string(err.Error()), class: classify(err, status)}
 }
@@ -136,14 +182,32 @@ func (r redactor) errorStatus(err error, status int) error {
 // sentinel returns a redacted error for sentinel with extra context in its
 // message. errors.Is(result, sentinel) holds; the chain exposes nothing else.
 func (r redactor) sentinel(sentinel error, status int, detail string) error {
-	msg := sentinel.Error()
-	if detail != "" {
-		msg += ": " + detail
+	if !isPackageSentinel(sentinel) {
+		return &classifiedError{message: r.string(sentinel.Error() + detailSuffix(detail)), class: classifyStatus(status)}
 	}
+	msg := sentinel.Error() + detailSuffix(detail)
 	return &sentinelError{
 		classifiedError: classifiedError{message: r.string(msg), class: classifyStatus(status)},
 		sentinel:        sentinel,
 	}
+}
+
+func detailSuffix(detail string) string {
+	if detail == "" {
+		return ""
+	}
+	return ": " + detail
+}
+
+// isPackageSentinel reports whether err is one of this package's fixed
+// sentinels; only those may stay in an error chain.
+func isPackageSentinel(err error) bool {
+	for _, s := range []error{ErrUnsupportedKind, ErrProjectNotBound, ErrStateMappingUnset, ErrInvalidLabelName, ErrRedirectRefused} {
+		if err == s {
+			return true
+		}
+	}
+	return false
 }
 
 func classify(err error, status int) forge.ErrorClass {
@@ -166,7 +230,7 @@ func classifyStatus(status int) forge.ErrorClass {
 		return forge.ErrorClassAuth
 	case status == http.StatusTooManyRequests:
 		return forge.ErrorClassRateLimited
-	case status >= 500:
+	case status >= 500 && status < 600:
 		return forge.ErrorClassServerError
 	}
 	return forge.ErrorClassOther

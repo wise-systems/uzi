@@ -10,24 +10,19 @@ import (
 // defaultTimeout bounds one request when Options.Timeout is zero.
 const defaultTimeout = 15 * time.Second
 
-// testTransport, when non-nil, replaces the production transport. It is nil
-// outside tests: export_test.go sets it to trust an httptest server's roots,
-// which Options deliberately cannot express.
-var testTransport http.RoundTripper
-
-// newHTTPClient builds the client a driver uses: an independent transport, a
-// finite timeout, and no redirect following, so a Location header cannot carry
-// the token to another host.
-func newHTTPClient(timeout time.Duration) *http.Client {
+// newHTTPClient builds the client a driver uses: a finite timeout and no
+// redirect following, so a Location header cannot carry the token to another
+// host. A nil base means an independent httptransport.New(http.DefaultTransport);
+// a driver sets base only through a test-only constructor helper.
+func newHTTPClient(timeout time.Duration, base http.RoundTripper) *http.Client {
 	if timeout <= 0 {
 		timeout = defaultTimeout
 	}
-	var rt http.RoundTripper = httptransport.New(http.DefaultTransport)
-	if testTransport != nil {
-		rt = testTransport
+	if base == nil {
+		base = httptransport.New(http.DefaultTransport)
 	}
 	return &http.Client{
-		Transport: rt,
+		Transport: base,
 		Timeout:   timeout,
 		CheckRedirect: func(*http.Request, []*http.Request) error {
 			return http.ErrUseLastResponse

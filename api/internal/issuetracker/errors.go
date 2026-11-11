@@ -5,8 +5,8 @@ import "errors"
 var (
 	// ErrUnsupportedKind is returned by New for a Kind with no driver.
 	ErrUnsupportedKind = errors.New("issuetracker: unsupported kind")
-	// ErrProjectNotBound is returned when a project-scoped call names a project
-	// other than the one the connection is bound to.
+	// ErrProjectNotBound is returned by an IssueTracker method on a driver built
+	// with no bound project (Options.Project empty).
 	ErrProjectNotBound = errors.New("issuetracker: project not bound to this connection")
 	// ErrStateMappingUnset is returned when open/closed state mapping is needed
 	// but the connection has not configured it.

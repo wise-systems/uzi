@@ -6,14 +6,14 @@ import (
 )
 
 // serve returns a fetch over total synthetic items, recording each call.
-func serve(total int, calls *[][2]int) func(skip, top int) ([]int, error) {
-	return func(skip, top int) ([]int, error) {
+func serve(total int, calls *[][2]int) func(skip, top int) ([]int, int, error) {
+	return func(skip, top int) ([]int, int, error) {
 		*calls = append(*calls, [2]int{skip, top})
 		var out []int
 		for i := skip; i < skip+top && i < total; i++ {
 			out = append(out, i)
 		}
-		return out, nil
+		return out, len(out), nil
 	}
 }
 
@@ -46,7 +46,7 @@ func TestPaginateLimit(t *testing.T) {
 
 func TestPaginateFetchError(t *testing.T) {
 	want := errors.New("boom")
-	_, err := paginate(func(int, int) ([]int, error) { return nil, want }, 0)
+	_, err := paginate(func(int, int) ([]int, int, error) { return nil, 0, want }, 0)
 	if !errors.Is(err, want) {
 		t.Fatalf("err = %v", err)
 	}
@@ -72,6 +72,35 @@ func TestPaginateCaps(t *testing.T) {
 		}
 		if len(calls) != 3 {
 			t.Fatalf("calls = %d", len(calls))
+		}
+	})
+	t.Run("bytes", func(t *testing.T) {
+		old := maxTotalBytes
+		maxTotalBytes = 1000
+		t.Cleanup(func() { maxTotalBytes = old })
+		calls := 0
+		full := func(skip, top int) ([]int, int, error) {
+			calls++
+			return make([]int, top), 400, nil
+		}
+		if _, err := paginate(full, 0); err == nil {
+			t.Fatal("expected byte ceiling error")
+		}
+		if calls != 3 {
+			t.Fatalf("calls = %d, want 3 (stop once the budget is crossed)", calls)
+		}
+	})
+	t.Run("server ignoring skip", func(t *testing.T) {
+		calls := 0
+		same := func(skip, top int) ([]int, int, error) {
+			calls++
+			return make([]int, top), 1 << 20, nil
+		}
+		if _, err := paginate(same, 0); err == nil {
+			t.Fatal("expected an error")
+		}
+		if calls > maxPages {
+			t.Fatalf("calls = %d", calls)
 		}
 	})
 }

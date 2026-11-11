@@ -2,10 +2,8 @@ package issuetracker
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"net/url"
 	"strings"
 	"testing"
 
@@ -25,37 +23,62 @@ func (timeoutErr) Error() string   { return "i/o timeout" }
 func (timeoutErr) Timeout() bool   { return true }
 func (timeoutErr) Temporary() bool { return false }
 
-func TestRedactorScrubsEveryEncoding(t *testing.T) {
-	cred := fixtureCredential()
-	r := newRedactor(cred)
-	segment := cred[strings.LastIndexByte(cred, '.')+1:]
-	jsonForm := strings.Trim(mustJSON(t, cred), `"`)
-	for name, form := range map[string]string{
-		"raw":     cred,
-		"query":   url.QueryEscape(cred),
-		"path":    url.PathEscape(cred),
-		"json":    jsonForm,
-		"segment": segment,
-	} {
-		t.Run(name, func(t *testing.T) {
-			got := r.error(fmt.Errorf("boom %s end", form)).Error()
-			if strings.Contains(got, form) {
-				t.Fatalf("message still contains %s form: %q", name, got)
-			}
-			if !strings.Contains(got, redactPlaceholder) {
-				t.Fatalf("no placeholder in %q", got)
-			}
-		})
+// scrubsTo asserts r replaces form in a message with exactly one placeholder
+// and nothing else, so removing any single encoding from newRedactor fails.
+func scrubsTo(t *testing.T, r redactor, form string) {
+	t.Helper()
+	if got, want := r.error(fmt.Errorf("boom %s end", form)).Error(), "boom [REDACTED] end"; got != want {
+		t.Fatalf("got %q, want %q", got, want)
 	}
 }
 
-func mustJSON(t *testing.T, s string) string {
-	t.Helper()
-	b, err := json.Marshal(s)
-	if err != nil {
-		t.Fatal(err)
+// TestRedactorScrubsEveryEncoding uses a token without '.', so no segment
+// scrub can mask a missing whole-token form.
+func TestRedactorScrubsEveryEncoding(t *testing.T) {
+	cred := strings.Join([]string{"perm", ":", "ab c/d\"e", "Zq9xLm2VnB7wKp"}, "")
+	r := newRedactor(cred)
+	for name, form := range map[string]string{
+		"raw":         cred,
+		"query":       "perm%3Aab+c%2Fd%22eZq9xLm2VnB7wKp",
+		"query lower": "perm%3aab+c%2fd%22eZq9xLm2VnB7wKp",
+		"path":        "perm:ab%20c%2Fd%22eZq9xLm2VnB7wKp",
+		"path lower":  "perm:ab%20c%2fd%22eZq9xLm2VnB7wKp",
+		"json":        `perm:ab c/d\"eZq9xLm2VnB7wKp`,
+		"json slash":  `perm:ab c\/d\"eZq9xLm2VnB7wKp`,
+	} {
+		t.Run(name, func(t *testing.T) { scrubsTo(t, r, form) })
 	}
-	return string(b)
+}
+
+// TestRedactorScrubsEverySegmentEncoding covers the final '.'-separated
+// segment in each form; the segment holds characters each escaper rewrites.
+func TestRedactorScrubsEverySegmentEncoding(t *testing.T) {
+	r := newRedactor(strings.Join([]string{"perm:id", ".", "Zq9/xLm 2VnB7w\"Kp"}, ""))
+	for name, form := range map[string]string{
+		"raw":         "Zq9/xLm 2VnB7w\"Kp",
+		"query":       "Zq9%2FxLm+2VnB7w%22Kp",
+		"query lower": "Zq9%2fxLm+2VnB7w%22Kp",
+		"path":        "Zq9%2FxLm%202VnB7w%22Kp",
+		"path lower":  "Zq9%2fxLm%202VnB7w%22Kp",
+		"json":        `Zq9/xLm 2VnB7w\"Kp`,
+		"json slash":  `Zq9\/xLm 2VnB7w\"Kp`,
+	} {
+		t.Run(name, func(t *testing.T) { scrubsTo(t, r, form) })
+	}
+}
+
+func TestRedactorShortTokenStillScrubbed(t *testing.T) {
+	r := newRedactor("abcdef") // below minSegmentLen: the raw token is still listed
+	if got := r.string("x abcdef y"); got != "x [REDACTED] y" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func TestRedactorSecretsDeduped(t *testing.T) {
+	r := newRedactor(strings.Repeat("a", 20))
+	if len(r.secrets) != 1 {
+		t.Fatalf("secrets = %q, want one entry", r.secrets)
+	}
 }
 
 func TestRedactorShortSegmentKept(t *testing.T) {
@@ -65,16 +88,27 @@ func TestRedactorShortSegmentKept(t *testing.T) {
 	}
 }
 
-func TestRedactorStripsControlAndBidi(t *testing.T) {
+func TestRedactorStripsControlAndFormatRunes(t *testing.T) {
 	r := newRedactor(fixtureCredential())
-	got := r.string("a\x00b\x1bc\u0085d‮e⁦f⁩g\th")
-	for _, c := range got {
-		if c < 0x20 || (c >= 0x7f && c <= 0x9f) || (c >= 0x202a && c <= 0x202e) || (c >= 0x2066 && c <= 0x2069) {
-			t.Fatalf("unsafe rune %U in %q", c, got)
+	for _, c := range []rune{
+		0x00, 0x1b, 0x09, 0x7f, 0x85, 0x9f,
+		0x200b, 0x200e, 0x200f, 0x061c, 0xfeff,
+		0x202a, 0x202b, 0x202c, 0x202d, 0x202e,
+		0x2066, 0x2067, 0x2068, 0x2069, 0x2028, 0x2029,
+	} {
+		got := r.string("a" + string(c) + "b")
+		if got != "a b" {
+			t.Errorf("U+%04X: got %q, want %q", c, got, "a b")
 		}
 	}
-	if !strings.Contains(got, "a") || !strings.Contains(got, "h") {
-		t.Fatalf("printable text lost: %q", got)
+}
+
+func TestRedactorScrubsTokenSplitByControlRune(t *testing.T) {
+	cred := fixtureCredential()
+	r := newRedactor(cred)
+	// A raw token has no control runes, so it is scrubbed whole.
+	if got := r.string("x " + cred + " y"); strings.Contains(got, cred) {
+		t.Fatalf("leaked: %q", got)
 	}
 }
 
@@ -157,6 +191,29 @@ func TestRedactorSentinelIdentifiableAndRedacted(t *testing.T) {
 	}
 	if forge.Class(err) != forge.ErrorClassOther {
 		t.Fatalf("class = %q", forge.Class(err))
+	}
+}
+
+func TestRedactorSentinelRestrictedToPackageSentinels(t *testing.T) {
+	r := newRedactor(fixtureCredential())
+	foreign := errors.New("foreign")
+	err := r.sentinel(foreign, 0, "d")
+	if errors.Is(err, foreign) || errors.Unwrap(err) != nil {
+		t.Fatalf("foreign error stayed in the chain: %v", err)
+	}
+	if err.Error() != "foreign: d" {
+		t.Fatalf("message = %q", err.Error())
+	}
+}
+
+func TestClassifyStatusServerErrorRange(t *testing.T) {
+	for status, want := range map[int]forge.ErrorClass{
+		499: forge.ErrorClassOther, 500: forge.ErrorClassServerError,
+		599: forge.ErrorClassServerError, 600: forge.ErrorClassOther,
+	} {
+		if got := classifyStatus(status); got != want {
+			t.Errorf("classifyStatus(%d) = %q, want %q", status, got, want)
+		}
 	}
 }
 
