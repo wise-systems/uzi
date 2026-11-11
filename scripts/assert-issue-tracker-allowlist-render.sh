@@ -5,9 +5,9 @@
 # usage: scripts/assert-issue-tracker-allowlist-render.sh [chart-dir]
 #
 # WHY THIS EXISTS. The issue tracker allowlist is SEPARATE from the forge one: it is https
-# only, empty by default (no tracker connection can be created), and must NEVER feed the
+# only, empty by default (no issue tracker connection can be created), and must NEVER feed the
 # worker egress lists, because a worker never calls an issue tracker (PRD #4173 S5). A
-# guard that stopped firing, a lost key or a tracker host leaking into the FQDN egress
+# guard that stopped firing, a lost key or an issue tracker host leaking into the FQDN egress
 # rules would render and lint clean, so every property is asserted on the parsed render.
 #
 # OFFLINE, AND NON-VACUOUS. `helm template` against a temp copy of the chart with the CNPG
@@ -121,7 +121,7 @@ expect_fail "(c) value + api.config.ISSUE_TRACKER_ALLOWED_BASE_URLS" "EITHER iss
   --set 'issueTracker.allowedBaseURLs[0]=https://tracker.example.org' \
   --set-string api.config.ISSUE_TRACKER_ALLOWED_BASE_URLS=https://other.example.org
 
-# --- (d) the tracker host never reaches the worker egress lists -----------------------------
+# --- (d) the issue tracker host never reaches the worker egress lists -----------------------------
 # Both providers, with a forge host present so the egress render is non-vacuous.
 for provider in antrea ovn; do
   case "$provider" in

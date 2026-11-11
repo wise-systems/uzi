@@ -20,7 +20,7 @@ Not shipped yet: the repo link, `IssueTrackerForRepo` returning an issue tracker
 ### D6. The package and the `Driver` seam
 
 - `Driver` is `forge.IssueTracker` plus `VerifyToken`, `ListProjects`, `ListTags` and `ListStates(project)`. It never embeds `forge.CodeHost`, so passing a driver where a code host is required is a compile error (S1).
-- A new tracker is one `Kind` constant, one entry in the `constructors` map in `registry.go` and one driver. There is no init-time registration.
+- A new issue tracker is one `Kind` constant, one entry in the `constructors` map in `registry.go` and one driver. There is no init-time registration.
 - The package ships one shared in-memory fake, `issuetrackertest.BaseFake` (loud not-stubbed defaults, for the tests of callers), and each driver ships its HTTP fake (YouTrack: `youtracktest`, an in-process HTTPS server).
 - `issuetrackertest.RunContract` is the one contract suite. It runs on the real YouTrack driver against its HTTPS fake, and on the three real forge drivers against `e2e/forge-fake` in contract mode. Passing it on an in-memory fake is not evidence of parity.
 
