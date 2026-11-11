@@ -14,16 +14,21 @@ const maxLabelNameLen = 200
 // that carries invisible characters: braces (the query's quoting), control and
 // format characters, and an empty name. The error never echoes the name.
 func (y *youTrack) checkLabelName(name string) error {
+	if labelNameProblem(name) {
+		return y.red.sentinel(ErrInvalidLabelName, 0, "name is empty, too long, or has a brace or control character")
+	}
+	return nil
+}
+
+// labelNameProblem reports whether name is one checkLabelName refuses.
+func labelNameProblem(name string) bool {
 	bad := strings.TrimSpace(name) == "" || len(name) > maxLabelNameLen
 	for _, c := range name {
 		if c == '{' || c == '}' || InvisibleRune(c) {
 			bad = true
 		}
 	}
-	if bad {
-		return y.red.sentinel(ErrInvalidLabelName, 0, "name is empty, too long, or has a brace or control character")
-	}
-	return nil
+	return bad
 }
 
 func (y *youTrack) checkLabelNames(names ...[]string) error {
@@ -59,16 +64,18 @@ func issueQuery(shortName string, opts forge.ListIssuesOptions) string {
 	return strings.Join(parts, " ")
 }
 
-// matchesIssue is the client-side filter that backs the query: exact tag
-// names, exact state, the exact update instant, and the bound project.
-func (y *youTrack) matchesIssue(w ytIssue, opts forge.ListIssuesOptions) bool {
+// matchesIssue is the client-side filter that backs the query: the resolved tag
+// id of every label (tagIDs, from resolveTagIDs, so a same-named tag of someone
+// else does not match), exact state, the exact update instant, and the bound
+// project.
+func (y *youTrack) matchesIssue(w ytIssue, opts forge.ListIssuesOptions, tagIDs map[string]string) bool {
 	if !y.inBoundProject(w) {
 		return false
 	}
 	for _, l := range opts.Labels {
 		found := false
 		for _, t := range w.Tags {
-			if t.Name == l {
+			if t.ID == tagIDs[l] {
 				found = true
 				break
 			}

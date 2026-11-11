@@ -2,6 +2,7 @@ package youtracktest
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 )
@@ -15,9 +16,25 @@ const (
 	// target of MoveIssue.
 	OtherProjectID        = "0-2"
 	OtherProjectShortName = "OTH"
-	// BotLogin is the account the bearer token authenticates as.
+	// BotLogin and BotID are the account the bearer token authenticates as.
 	BotLogin = "uzi-bot"
-	botID    = "1-1"
+	BotID    = "1-1"
+	// OtherLogin and OtherUserID are a second user, who owns the default
+	// eligibility tag.
+	OtherLogin  = "maintainer"
+	OtherUserID = "1-2"
+	// The fake's user groups. AllUsersGroupID covers every user; TeamGroupID is
+	// a named group of both users; SoloGroupID is a named group of the other
+	// user only.
+	AllUsersGroupID = "675-0"
+	TeamGroupID     = "675-1"
+	SoloGroupID     = "675-2"
+	// The default seed has an eligibility tag owned by the other user and shared
+	// with All Users, and a tag of the same name owned by the bot, shared with
+	// nobody. The ids are high so the ids the fake hands out never reach them.
+	EligibilityTagID   = "5-9001"
+	EligibilityTagName = "uzi-eligible"
+	SameNameTagID      = "5-9002"
 	// DefaultStateField is the name of the State custom field.
 	DefaultStateField = "State"
 )
@@ -27,8 +44,33 @@ type project struct {
 	next                int64 // last number handed out in this project
 }
 
+type user struct{ id, login string }
+
+// group is a user group; members are user ids. An all-users group has every user.
+type group struct {
+	id, name string
+	allUsers bool
+	members  []string
+}
+
+// fakeUsers and fakeGroups are the fixed identities of the fake.
+var (
+	fakeUsers  = []user{{BotID, BotLogin}, {OtherUserID, OtherLogin}}
+	fakeGroups = []group{
+		{id: AllUsersGroupID, name: "All Users", allUsers: true, members: []string{BotID, OtherUserID}},
+		{id: TeamGroupID, name: "Team", members: []string{BotID, OtherUserID}},
+		{id: SoloGroupID, name: "Solo", members: []string{OtherUserID}},
+	}
+)
+
+// sharing is who a tag is shared with, by group id and user id.
+type sharing struct{ groups, users []string }
+
 type tag struct {
 	id, name string
+	owner    string // user id
+	read     sharing
+	use      sharing
 }
 
 type comment struct {
@@ -88,6 +130,13 @@ func newModel() *model {
 			{id: ProjectID, shortName: ProjectShortName, name: "Uzi"},
 			{id: OtherProjectID, shortName: OtherProjectShortName, name: "Other"},
 		},
+		// The bot's own tag comes first, so a driver that takes the first tag
+		// of a name picks it rather than the eligibility tag.
+		tags: []*tag{
+			{id: SameNameTagID, name: EligibilityTagName, owner: BotID},
+			{id: EligibilityTagID, name: EligibilityTagName, owner: OtherUserID,
+				read: sharing{groups: []string{AllUsersGroupID}}, use: sharing{groups: []string{AllUsersGroupID}}},
+		},
 		aliases: map[string]*issue{},
 		states: []stateValue{
 			{id: "10-1", name: "Open", resolved: false, ordinal: 0},
@@ -138,16 +187,37 @@ func (m *model) tagByID(id string) *tag {
 	return nil
 }
 
-// tagByName returns the tag called name, creating it when missing.
-func (m *model) ensureTag(name string) *tag {
-	for _, t := range m.tags {
-		if t.name == name {
-			return t
+// covers reports whether s reaches user id: the user is named, or is in a
+// named group, or a group covers all users.
+func covers(s sharing, userID string) bool {
+	if slices.Contains(s.users, userID) {
+		return true
+	}
+	for _, gid := range s.groups {
+		for _, g := range fakeGroups {
+			if g.id == gid && (g.allUsers || slices.Contains(g.members, userID)) {
+				return true
+			}
 		}
 	}
-	t := &tag{id: m.nextID(5), name: name}
-	m.tags = append(m.tags, t)
-	return t
+	return false
+}
+
+// visibleTo reports whether the user can see the tag.
+func (t *tag) visibleTo(userID string) bool { return t.owner == userID || covers(t.read, userID) }
+
+// usableBy reports whether the user can apply the tag to an issue.
+func (t *tag) usableBy(userID string) bool { return t.owner == userID || covers(t.use, userID) }
+
+// visibleTags returns the tags the bot can see.
+func (m *model) visibleTags() []*tag {
+	var out []*tag
+	for _, t := range m.tags {
+		if t.visibleTo(BotID) {
+			out = append(out, t)
+		}
+	}
+	return out
 }
 
 func (m *model) newIssue(p *project, summary, description string) *issue {
@@ -227,7 +297,7 @@ func (m *model) issueJSON(i *issue) map[string]any {
 	tags := make([]map[string]any, 0, len(i.tags))
 	for _, id := range i.tags {
 		if t := m.tagByID(id); t != nil {
-			tags = append(tags, map[string]any{"id": t.id, "name": t.name, "$type": "Tag"})
+			tags = append(tags, m.tagJSON(t))
 		}
 	}
 	var resolved any
@@ -250,15 +320,61 @@ func (m *model) issueJSON(i *issue) map[string]any {
 	}
 }
 
+// userJSON is the wire user for a login. A login the fake does not know is
+// given the bot's id, as comment authors such as "alice" always were.
 func userJSON(login string) map[string]any {
-	return map[string]any{"$type": "User", "id": botID, "login": login}
+	for _, u := range fakeUsers {
+		if u.login == login {
+			return map[string]any{"$type": "User", "id": u.id, "login": u.login}
+		}
+	}
+	return map[string]any{"$type": "User", "id": BotID, "login": login}
+}
+
+func userJSONByID(id string) map[string]any {
+	for _, u := range fakeUsers {
+		if u.id == id {
+			return userJSON(u.login)
+		}
+	}
+	return map[string]any{"$type": "User", "id": id, "login": id}
+}
+
+func (m *model) sharingJSON(s sharing, typ string) map[string]any {
+	groups := []map[string]any{}
+	for _, gid := range s.groups {
+		for _, g := range fakeGroups {
+			if g.id != gid {
+				continue
+			}
+			gt := "UserGroup"
+			if g.allUsers {
+				gt = "AllUsersGroup"
+			}
+			groups = append(groups, map[string]any{"$type": gt, "id": g.id, "name": g.name, "allUsersGroup": g.allUsers, "usersCount": len(g.members)})
+		}
+	}
+	users := []map[string]any{}
+	for _, uid := range s.users {
+		users = append(users, userJSONByID(uid))
+	}
+	return map[string]any{"$type": typ, "permittedGroups": groups, "permittedUsers": users}
+}
+
+// tagJSON is the full wire object of a tag; callers project it through a fields spec.
+func (m *model) tagJSON(t *tag) map[string]any {
+	return map[string]any{
+		"$type": "Tag", "id": t.id, "name": t.name, "owner": userJSONByID(t.owner),
+		"readSharingSettings": m.sharingJSON(t.read, "WatchFolderSharingSettings"),
+		"tagSharingSettings":  m.sharingJSON(t.use, "TagSharingSettings"),
+	}
 }
 
 func (m *model) tagsJSON(ids []string) []map[string]any {
 	out := make([]map[string]any, 0, len(ids))
 	for _, id := range ids {
 		if t := m.tagByID(id); t != nil {
-			out = append(out, map[string]any{"id": t.id, "name": t.name, "$type": "Tag"})
+			out = append(out, m.tagJSON(t))
 		}
 	}
 	return out

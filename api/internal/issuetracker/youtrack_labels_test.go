@@ -40,7 +40,8 @@ func TestLabelGuardOnEveryGuardedMethod(t *testing.T) {
 
 func TestUpdateIssueLabelsSkipsAbsentTagRemoval(t *testing.T) {
 	y, srv := newFakeDriver(t)
-	n := srv.SeedIssue("t", "", "keep", "drop")
+	keep, drop := srv.SeedOwnTag("keep"), srv.SeedOwnTag("drop")
+	n := srv.SeedIssue("t", "", keep, drop)
 	srv.ResetRequests()
 	if err := y.UpdateIssueLabels(context.Background(), 1, n, nil, []string{"never-there", "drop"}); err != nil {
 		t.Fatal(err)
@@ -54,18 +55,22 @@ func TestUpdateIssueLabelsSkipsAbsentTagRemoval(t *testing.T) {
 	if deletes != 1 {
 		t.Errorf("sent %d DELETE requests, want 1 (only the tag on the issue)", deletes)
 	}
-	if got := srv.IssueTags(n); !slices.Equal(got, []string{"keep"}) {
-		t.Errorf("tags = %v, want [keep]", got)
+	if got := srv.IssueTagIDs(n); !slices.Equal(got, []string{keep}) {
+		t.Errorf("tags = %v, want [%s]", got, keep)
 	}
 }
 
-func TestTagIDsForTakesTheFirstTagOfADuplicatedName(t *testing.T) {
-	y, _ := loggedDriver(t, func(w http.ResponseWriter, _ *http.Request) {
-		writeRaw(w, `[{"id":"5-1","name":"dup"},{"id":"5-2","name":"dup"}]`)
+func TestResolveTagIDsTakesTheFirstTagTheAccountOwns(t *testing.T) {
+	y, _ := loggedDriver(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/users/me" {
+			writeRaw(w, rawMe)
+			return
+		}
+		writeRaw(w, `[{"id":"5-1","name":"dup","owner":{"id":"1-2"}},{"id":"5-2","name":"dup","owner":{"id":"`+rawMeID+`"}},{"id":"5-3","name":"dup","owner":{"id":"`+rawMeID+`"}}]`)
 	})
-	ids, err := y.tagIDsFor(context.Background(), []string{"dup"})
-	if err != nil || ids["dup"] != "5-1" {
-		t.Fatalf("tagIDsFor = %v, %v; want the first tag, 5-1", ids, err)
+	ids, err := y.resolveTagIDs(context.Background(), []string{"dup"}, false)
+	if err != nil || ids["dup"] != "5-2" {
+		t.Fatalf("resolveTagIDs = %v, %v; want the first tag the account owns, 5-2", ids, err)
 	}
 	labels, err := y.ListLabels(context.Background(), 1)
 	if err != nil || len(labels) != 1 || labels[0].Name != "dup" {
@@ -106,11 +111,14 @@ func TestMalformedTagIDsNeverReachAPath(t *testing.T) {
 	})
 	t.Run("in the tag list", func(t *testing.T) {
 		y, log := loggedDriver(t, func(w http.ResponseWriter, r *http.Request) {
-			if r.URL.Path == "/api/tags" {
-				writeRaw(w, `[{"id":"`+bad+`","name":"x"}]`)
-				return
+			switch r.URL.Path {
+			case "/api/users/me":
+				writeRaw(w, rawMe)
+			case "/api/tags":
+				writeRaw(w, `[{"id":"`+bad+`","name":"x","owner":{"id":"`+rawMeID+`"}}]`)
+			default:
+				writeRaw(w, rawIssue("2-1", "UZI-1", 1, "0-1", ""))
 			}
-			writeRaw(w, rawIssue("2-1", "UZI-1", 1, "0-1", ""))
 		})
 		ctx := context.Background()
 		if _, err := y.ListLabels(ctx, 1); err == nil {
@@ -125,15 +133,18 @@ func TestMalformedTagIDsNeverReachAPath(t *testing.T) {
 	})
 	t.Run("in a created tag", func(t *testing.T) {
 		y, log := loggedDriver(t, func(w http.ResponseWriter, r *http.Request) {
-			if r.URL.Path == "/api/tags" && r.Method == http.MethodGet {
+			switch {
+			case r.URL.Path == "/api/users/me":
+				writeRaw(w, rawMe)
+			case r.URL.Path == "/api/tags" && r.Method == http.MethodGet:
 				writeRaw(w, `[]`)
-				return
-			}
-			if r.URL.Path == "/api/tags" {
+			case r.URL.Path == "/api/tags":
 				writeRaw(w, `{"id":"`+bad+`","name":"x"}`)
-				return
+			case strings.HasPrefix(r.URL.Path, "/api/tags/"):
+				writeRaw(w, rawNoSharing)
+			default:
+				writeRaw(w, rawIssue("2-1", "UZI-1", 1, "0-1", ""))
 			}
-			writeRaw(w, rawIssue("2-1", "UZI-1", 1, "0-1", ""))
 		})
 		if err := y.UpdateIssueLabels(context.Background(), 1, 1, []string{"x"}, nil); err == nil {
 			t.Error("UpdateIssueLabels attached a malformed created tag id")

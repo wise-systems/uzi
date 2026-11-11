@@ -90,6 +90,11 @@ func (*BaseFake) ListProjects(context.Context) ([]issuetracker.Project, error) {
 	return nil, notStubbed("ListProjects")
 }
 
+// ListTags implements issuetracker.Driver.
+func (*BaseFake) ListTags(context.Context) ([]issuetracker.Tag, error) {
+	return nil, notStubbed("ListTags")
+}
+
 // ListStates implements issuetracker.Driver.
 func (*BaseFake) ListStates(context.Context, string) ([]issuetracker.State, error) {
 	return nil, notStubbed("ListStates")

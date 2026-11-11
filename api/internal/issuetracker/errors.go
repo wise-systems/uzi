@@ -8,6 +8,9 @@ var (
 	// ErrProjectNotBound is returned by an IssueTracker method on a driver built
 	// with no bound project (Options.Project empty).
 	ErrProjectNotBound = errors.New("issuetracker: project not bound to this connection")
+	// ErrProjectMismatch is returned by an IssueTracker method called with a
+	// project id other than the one the driver is bound to.
+	ErrProjectMismatch = errors.New("issuetracker: project id does not match the one this connection is bound to")
 	// ErrStateMappingUnset is returned when open/closed state mapping is needed
 	// but the connection has not configured it.
 	ErrStateMappingUnset = errors.New("issuetracker: state mapping not configured")
@@ -20,4 +23,4 @@ var (
 
 // packageSentinels lists every sentinel above. redactor.sentinel keeps only
 // these in an error chain, so a new sentinel must be added here too.
-var packageSentinels = []error{ErrUnsupportedKind, ErrProjectNotBound, ErrStateMappingUnset, ErrInvalidLabelName, ErrRedirectRefused}
+var packageSentinels = []error{ErrUnsupportedKind, ErrProjectNotBound, ErrProjectMismatch, ErrStateMappingUnset, ErrInvalidLabelName, ErrRedirectRefused}

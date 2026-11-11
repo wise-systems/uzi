@@ -29,6 +29,48 @@ type Subject struct {
 	// MoveIssue moves issue iid to another project. Nil means issues do not
 	// move on this implementation.
 	MoveIssue func(t *testing.T, iid int64)
+	// OtherProjectID is a project id the subject is not bound to; the
+	// ProjectGuard case calls every method with it. Required.
+	OtherProjectID int64
+	// WantProjectGuardErr, when set, is a sentinel every guarded call must
+	// match with errors.Is; nil only requires some error.
+	WantProjectGuardErr error
+	// NoteIDUnset says CreateIssueNote returns ID 0, because the issue tracker's
+	// comment ids have no numeric form. When false the case requires a non-zero ID.
+	NoteIDUnset bool
+	// SameName carries the seams of the SameNameTagUsesEligibilityTag case. Nil
+	// means labels on this implementation have no owners, so the case is skipped.
+	SameName *SameNameSeams
+}
+
+// SameNameSeams put server-side state in a subject whose labels are tags with
+// owners, and read it back. The subject is bound to an eligibility tag owned by
+// another user. Besides it, the connection's own account owns a tag with the
+// same name.
+type SameNameSeams struct {
+	// EligibilityName is the eligibility tag's label name.
+	EligibilityName string
+	// EligibilityTagID is the id of the eligibility tag the subject is bound to.
+	EligibilityTagID string
+	// SameNameTagID is the id of the account's own tag that has the eligibility name.
+	SameNameTagID string
+	// SeedIssue creates an issue carrying the tags with the given ids, bypassing
+	// the IssueTracker under test, and returns its number.
+	SeedIssue func(t *testing.T, tagIDs ...string) int64
+	// IssueTagIDs returns the ids of the tags on issue iid, server side.
+	IssueTagIDs func(t *testing.T, iid int64) []string
+	// TagsNamed returns every tag with the name, server side.
+	TagsNamed func(t *testing.T, name string) []TagView
+}
+
+// TagView is one server-side tag, as far as the SameName case judges it.
+type TagView struct {
+	ID string
+	// OwnedByAccount is true when the connection's own account owns the tag.
+	OwnedByAccount bool
+	// SharedLikeEligibility is true when the tag's read and tag sharing settings
+	// equal the eligibility tag's.
+	SharedLikeEligibility bool
 }
 
 // uniqueSeq makes every name the suite creates unique within the process, so
@@ -57,6 +99,8 @@ func RunContract(t *testing.T, newSubject func(t *testing.T) Subject) {
 		{"LabelEventsOldestFirst", caseLabelEvents},
 		{"MissingIssueIsNotFound", caseMissing},
 		{"MovedIssueIsRefused", caseMoved},
+		{"ProjectGuard", caseProjectGuard},
+		{"SameNameTagUsesEligibilityTag", caseSameNameTag},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -261,8 +305,14 @@ func caseComments(t *testing.T, c *contract) {
 	if err != nil {
 		t.Fatalf("CreateIssueNote: %v", err)
 	}
-	if created.ID == 0 || created.Body != note {
-		t.Errorf("CreateIssueNote = %+v, want a non-zero ID and body %q", created, note)
+	if created.Body != note {
+		t.Errorf("CreateIssueNote body = %q, want %q", created.Body, note)
+	}
+	if c.NoteIDUnset && created.ID != 0 {
+		t.Errorf("CreateIssueNote ID = %d, want 0 (no numeric comment id)", created.ID)
+	}
+	if !c.NoteIDUnset && created.ID == 0 {
+		t.Errorf("CreateIssueNote ID = 0, want a non-zero ID")
 	}
 	comments, err := c.IssueTracker.ListIssueComments(c.ctx, c.ProjectID, issue.IID)
 	if err != nil {
@@ -362,5 +412,115 @@ func caseMoved(t *testing.T, c *contract) {
 		if err := call(); !errors.As(err, &notFound) {
 			t.Errorf("%s on a moved issue = %v, want *forge.IssueNotFoundError", name, err)
 		}
+	}
+}
+
+// caseProjectGuard calls every method with a project id the subject is not bound
+// to. Each must fail, and none may have changed the issue made under the right id.
+func caseProjectGuard(t *testing.T, c *contract) {
+	if c.OtherProjectID == 0 || c.OtherProjectID == c.ProjectID {
+		t.Fatalf("Subject.OtherProjectID = %d must differ from ProjectID %d and be set", c.OtherProjectID, c.ProjectID)
+	}
+	label := unique("contract-label")
+	c.ensure(t, label)
+	issue := c.create(t, "guarded", label)
+	it, pid, iid := c.IssueTracker, c.OtherProjectID, issue.IID
+	calls := map[string]func() error{
+		"ListLabels":   func() error { _, err := it.ListLabels(c.ctx, pid); return err },
+		"EnsureLabels": func() error { return it.EnsureLabels(c.ctx, pid, []forge.Label{{Name: unique("contract-label")}}) },
+		"ListIssues":   func() error { _, err := it.ListIssues(c.ctx, pid, forge.ListIssuesOptions{}); return err },
+		"GetIssue":     func() error { _, err := it.GetIssue(c.ctx, pid, iid); return err },
+		"CreateIssue": func() error {
+			_, err := it.CreateIssue(c.ctx, pid, unique("contract guarded"), "x", []string{label})
+			return err
+		},
+		"UpdateIssueLabels":      func() error { return it.UpdateIssueLabels(c.ctx, pid, iid, nil, []string{label}) },
+		"UpdateIssueDescription": func() error { return it.UpdateIssueDescription(c.ctx, pid, iid, "changed") },
+		"SetIssueState":          func() error { return it.SetIssueState(c.ctx, pid, iid, forge.StateClosed) },
+		"ListIssueLabelEvents":   func() error { _, err := it.ListIssueLabelEvents(c.ctx, pid, iid); return err },
+		"ListIssueComments":      func() error { _, err := it.ListIssueComments(c.ctx, pid, iid); return err },
+		"CreateIssueNote":        func() error { _, err := it.CreateIssueNote(c.ctx, pid, iid, "x"); return err },
+	}
+	if len(calls) != 11 {
+		t.Fatalf("table covers %d methods, want 11", len(calls))
+	}
+	for name, call := range calls {
+		err := call()
+		if err == nil {
+			t.Errorf("%s with another project id succeeded", name)
+		} else if c.WantProjectGuardErr != nil && !errors.Is(err, c.WantProjectGuardErr) {
+			t.Errorf("%s with another project id = %v, want %v", name, err, c.WantProjectGuardErr)
+		}
+	}
+	got := c.get(t, iid)
+	if got.Description != "guarded" || got.State != string(forge.StateOpened) || !sameSet(got.Labels, []string{label}) {
+		t.Errorf("a guarded call changed the issue: %+v", got)
+	}
+	comments, err := it.ListIssueComments(c.ctx, c.ProjectID, iid)
+	if err != nil {
+		t.Fatalf("ListIssueComments: %v", err)
+	}
+	if len(comments) != 0 {
+		t.Errorf("a guarded call left comments: %+v", comments)
+	}
+}
+
+// caseSameNameTag shows that the eligibility label name always means the
+// eligibility tag, though the connection's account owns another tag of that
+// name, and that other names only ever mean tags the account owns.
+func caseSameNameTag(t *testing.T, c *contract) {
+	s := c.SameName
+	if s == nil {
+		t.Skip("labels have no owners on this implementation")
+	}
+	elig := s.EligibilityName
+	fresh := unique("contract-label")
+
+	// EnsureLabels: no eligibility tag is created, the account's same-named tag
+	// is left alone, and a new tag is the account's, shared like the eligibility tag.
+	c.ensure(t, elig, fresh)
+	c.ensure(t, elig, fresh)
+	var ids []string
+	for _, tv := range s.TagsNamed(t, elig) {
+		ids = append(ids, tv.ID)
+	}
+	if !sameSet(ids, []string{s.EligibilityTagID, s.SameNameTagID}) {
+		t.Errorf("tags named %q = %v after EnsureLabels, want only the eligibility tag and the account's own", elig, ids)
+	}
+	made := s.TagsNamed(t, fresh)
+	if len(made) != 1 || !made[0].OwnedByAccount || !made[0].SharedLikeEligibility {
+		t.Errorf("tags named %q = %+v, want one owned by the account and shared like the eligibility tag", fresh, made)
+	}
+
+	// CreateIssue attaches the eligibility tag, not the account's tag.
+	created := c.create(t, "eligible", elig)
+	if got := s.IssueTagIDs(t, created.IID); !slices.Equal(got, []string{s.EligibilityTagID}) {
+		t.Errorf("created issue carries tags %v, want only the eligibility tag %s", got, s.EligibilityTagID)
+	}
+	if got := c.get(t, created.IID).Labels; !slices.Equal(got, []string{elig}) {
+		t.Errorf("created issue labels = %v, want [%s]", got, elig)
+	}
+
+	// ListIssues by the eligibility name finds the eligibility issue and not
+	// one that carries only the same-named tag; GetIssue of that one does not
+	// report the eligibility name.
+	lookalike := s.SeedIssue(t, s.SameNameTagID)
+	wantIIDs(t, c.listIIDs(t, forge.ListIssuesOptions{Labels: []string{elig}}), created.IID)
+	if got := c.get(t, lookalike).Labels; slices.Contains(got, elig) {
+		t.Errorf("an issue with only a same-named tag reports labels %v", got)
+	}
+
+	// UpdateIssueLabels touches only the eligibility id.
+	if err := c.IssueTracker.UpdateIssueLabels(c.ctx, c.ProjectID, lookalike, []string{elig}, nil); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	if got := s.IssueTagIDs(t, lookalike); !sameSet(got, []string{s.SameNameTagID, s.EligibilityTagID}) {
+		t.Errorf("after add the issue carries %v, want the same-named tag and the eligibility tag", got)
+	}
+	if err := c.IssueTracker.UpdateIssueLabels(c.ctx, c.ProjectID, lookalike, nil, []string{elig}); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	if got := s.IssueTagIDs(t, lookalike); !slices.Equal(got, []string{s.SameNameTagID}) {
+		t.Errorf("after remove the issue carries %v, want only the same-named tag", got)
 	}
 }

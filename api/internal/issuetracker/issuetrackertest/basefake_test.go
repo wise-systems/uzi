@@ -33,10 +33,11 @@ func TestBaseFakeMethodsNotStubbed(t *testing.T) {
 		{"CreateIssueNote", func(b *BaseFake) error { _, err := b.CreateIssueNote(ctx, 1, 2, "b"); return err }},
 		{"VerifyToken", func(b *BaseFake) error { _, err := b.VerifyToken(ctx); return err }},
 		{"ListProjects", func(b *BaseFake) error { _, err := b.ListProjects(ctx); return err }},
+		{"ListTags", func(b *BaseFake) error { _, err := b.ListTags(ctx); return err }},
 		{"ListStates", func(b *BaseFake) error { _, err := b.ListStates(ctx, "p"); return err }},
 	}
-	if len(methods) != 14 {
-		t.Fatalf("expected 14 methods, got %d", len(methods))
+	if len(methods) != 15 {
+		t.Fatalf("expected 15 methods, got %d", len(methods))
 	}
 	b := &BaseFake{}
 	for _, m := range methods {

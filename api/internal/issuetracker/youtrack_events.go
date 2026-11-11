@@ -11,9 +11,10 @@ import (
 
 // ListIssueLabelEvents implements forge.IssueTracker from the issue's tag
 // activities. Events are oldest first, one per added or removed tag; ID is the
-// 1-based position in that order.
-func (y *youTrack) ListIssueLabelEvents(ctx context.Context, _, issueIID int64) ([]forge.LabelEvent, error) {
-	w, err := y.resolveIssue(ctx, issueIID)
+// 1-based position in that order. A tag that has the eligibility name but is not
+// the eligibility tag is left out.
+func (y *youTrack) ListIssueLabelEvents(ctx context.Context, projectID, issueIID int64) ([]forge.LabelEvent, error) {
+	w, err := y.resolveIssue(ctx, projectID, issueIID)
 	if err != nil {
 		return nil, err
 	}
@@ -34,6 +35,9 @@ func (y *youTrack) ListIssueLabelEvents(ctx context.Context, _, issueIID int64) 
 	out := []forge.LabelEvent{}
 	emit := func(a ytActivity, action string, tags []ytTag) {
 		for _, t := range tags {
+			if y.foreignEligibility(t) {
+				continue
+			}
 			out = append(out, forge.LabelEvent{
 				ID:        int64(len(out) + 1),
 				Action:    action,
