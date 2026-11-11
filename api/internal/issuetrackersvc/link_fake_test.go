@@ -125,3 +125,15 @@ func (f *fakeQuerier) LockIssueTrackerConnectionByIdentityForUpdate(_ context.Co
 func (f *fakeQuerier) LockIssueTrackerConnectionForShareForUser(ctx context.Context, a store.LockIssueTrackerConnectionForShareForUserParams) (store.IssueTrackerConnection, error) {
 	return f.GetIssueTrackerConnectionForUser(ctx, store.GetIssueTrackerConnectionForUserParams(a))
 }
+
+func (f *fakeQuerier) InsertIssueTrackerConnectionIfAbsent(ctx context.Context, a store.InsertIssueTrackerConnectionIfAbsentParams) (store.IssueTrackerConnection, error) {
+	f.mu.Lock()
+	for _, r := range f.rows {
+		if r.UserID == a.UserID && r.Kind == a.Kind && r.BaseUrl == a.BaseUrl {
+			f.mu.Unlock()
+			return store.IssueTrackerConnection{}, pgx.ErrNoRows
+		}
+	}
+	f.mu.Unlock()
+	return f.UpsertIssueTrackerConnection(ctx, store.UpsertIssueTrackerConnectionParams(a))
+}

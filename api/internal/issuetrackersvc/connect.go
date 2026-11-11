@@ -22,8 +22,8 @@ import (
 //
 // Reconnecting never changes the account of a connection that a repo links to
 // (PRD #4173 D11, D14): the new token must belong to the stored account, else the
-// result is a Conflict. The refusal is made by the upsert statement itself and,
-// when UseTransactions is wired, also by a locked check before it.
+// result is a Conflict. The check takes the row lock FOR UPDATE and then counts the
+// linked repos in a separate statement; the upsert's own WHERE is only a last defence.
 func (s *Service) Connect(ctx context.Context, userID uuid.UUID, kind, baseURL, token string) (Connection, error) {
 	parsedKind, ok := issuetracker.ParseKind(strings.TrimSpace(kind))
 	if !ok {
@@ -66,46 +66,63 @@ func (s *Service) Connect(ctx context.Context, userID uuid.UUID, kind, baseURL, 
 		s.log.Error("seal issue tracker token", "error", err)
 		return Connection{}, internal()
 	}
+	params := store.UpsertIssueTrackerConnectionParams{
+		UserID:          userID,
+		Kind:            string(parsedKind),
+		BaseUrl:         norm,
+		AccountID:       account.ID,
+		AccountLogin:    account.Login,
+		TokenCiphertext: sealed,
+	}
 	var row store.IssueTrackerConnection
 	err = s.inTx(ctx, func(q Querier) error {
-		// The existing row is locked FOR UPDATE first, so a link (which holds the
-		// row FOR SHARE) and this reconnect cannot interleave: the link either
-		// commits before the count below and is seen by it, or waits and then
-		// finds the new account.
-		existing, err := q.LockIssueTrackerConnectionByIdentityForUpdate(ctx, store.LockIssueTrackerConnectionByIdentityForUpdateParams{
-			UserID: userID, Kind: string(parsedKind), BaseUrl: norm,
-		})
-		switch {
-		case errors.Is(err, pgx.ErrNoRows):
-			// A first connect: no repo can be linked to a row that does not exist.
-		case err != nil:
-			return err
-		case existing.AccountID != account.ID:
-			// A separate statement after the lock, so READ COMMITTED sees every link
-			// committed before the lock was granted.
-			n, err := q.CountReposLinkedToIssueTrackerConnection(ctx, existing.ID)
-			if err != nil {
+		// The existing row is locked FOR UPDATE first, so a link (which holds the row
+		// FOR SHARE) and this reconnect cannot interleave: the link either commits
+		// before the count below and is seen by it, or the lock waits for it.
+		//
+		// When no row exists yet the row is inserted with ON CONFLICT DO NOTHING. If
+		// someone else inserted it meanwhile that returns no row, and the locked path
+		// is entered once more: the row exists now, may already carry a link, and only
+		// the lock and a fresh count statement can see that. An upsert's own WHERE
+		// cannot: its subquery reads the statement's snapshot, taken before the wait
+		// on a link's lock, so it is kept only as a last defence (see the query).
+		for attempt := 0; ; attempt++ {
+			existing, err := q.LockIssueTrackerConnectionByIdentityForUpdate(ctx, store.LockIssueTrackerConnectionByIdentityForUpdateParams{
+				UserID: userID, Kind: string(parsedKind), BaseUrl: norm,
+			})
+			switch {
+			case errors.Is(err, pgx.ErrNoRows):
+				if attempt == 0 {
+					row, err = q.InsertIssueTrackerConnectionIfAbsent(ctx, store.InsertIssueTrackerConnectionIfAbsentParams(params))
+					if err == nil {
+						return nil // a first connect: nothing can link to a row that did not exist
+					}
+					if errors.Is(err, pgx.ErrNoRows) {
+						continue // inserted by another connect meanwhile: lock it and count
+					}
+					return err
+				}
+				// Still no row to lock after the re-entry: fall through to the upsert.
+			case err != nil:
 				return err
+			case existing.AccountID != account.ID:
+				// A separate statement after the lock, so READ COMMITTED sees every link
+				// committed before the lock was granted.
+				n, err := q.CountReposLinkedToIssueTrackerConnection(ctx, existing.ID)
+				if err != nil {
+					return err
+				}
+				if n > 0 {
+					return errReconnectChangesAccount()
+				}
 			}
-			if n > 0 {
+			row, err = q.UpsertIssueTrackerConnection(ctx, params)
+			if errors.Is(err, pgx.ErrNoRows) {
+				// The upsert's WHERE refused (defence in depth; see the query).
 				return errReconnectChangesAccount()
 			}
+			return err
 		}
-		row, err = q.UpsertIssueTrackerConnection(ctx, store.UpsertIssueTrackerConnectionParams{
-			UserID:          userID,
-			Kind:            string(parsedKind),
-			BaseUrl:         norm,
-			AccountID:       account.ID,
-			AccountLogin:    account.Login,
-			TokenCiphertext: sealed,
-		})
-		if errors.Is(err, pgx.ErrNoRows) {
-			// The statement's own WHERE refused: a repo links to the row and the account
-			// would change. This holds without the lock above, and closes the race of a
-			// first connect against a link.
-			return errReconnectChangesAccount()
-		}
-		return err
 	})
 	if err != nil {
 		return Connection{}, s.txError("connect issue tracker", err)

@@ -69,10 +69,10 @@ func toIssueTrackerSharingDTO(s issuetracker.SharingSettings) issueTrackerSharin
 		Users:  make([]issueTrackerAccountDTO, 0, len(s.Users)),
 	}
 	for _, g := range s.Groups {
-		out.Groups = append(out.Groups, issueTrackerGroupDTO{ID: g.ID, Name: cleanTrackerText(g.Name), AllUsers: g.AllUsers, UsersCount: g.UsersCount})
+		out.Groups = append(out.Groups, issueTrackerGroupDTO{ID: cleanTrackerText(g.ID), Name: cleanTrackerText(g.Name), AllUsers: g.AllUsers, UsersCount: g.UsersCount})
 	}
 	for _, u := range s.Users {
-		out.Users = append(out.Users, issueTrackerAccountDTO{ID: u.ID, Login: cleanTrackerText(u.Login)})
+		out.Users = append(out.Users, issueTrackerAccountDTO{ID: cleanTrackerText(u.ID), Login: cleanTrackerText(u.Login)})
 	}
 	return out
 }
@@ -230,7 +230,7 @@ func (h *Handler) ListIssueTrackerProjects(w http.ResponseWriter, r *http.Reques
 	}
 	out := make([]issueTrackerProjectDTO, 0, len(projects))
 	for _, p := range projects {
-		out = append(out, issueTrackerProjectDTO{ID: p.ID, ShortName: cleanTrackerText(p.ShortName), Name: cleanTrackerText(p.Name)})
+		out = append(out, issueTrackerProjectDTO{ID: cleanTrackerText(p.ID), ShortName: cleanTrackerText(p.ShortName), Name: cleanTrackerText(p.Name)})
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"projects": out})
 }
@@ -255,8 +255,8 @@ func (h *Handler) ListIssueTrackerTags(w http.ResponseWriter, r *http.Request) {
 	out := make([]issueTrackerTagDTO, 0, len(views))
 	for _, v := range views {
 		out = append(out, issueTrackerTagDTO{
-			ID: v.Tag.ID, Name: cleanTrackerText(v.Tag.Name),
-			Owner:           issueTrackerAccountDTO{ID: v.Tag.Owner.ID, Login: cleanTrackerText(v.Tag.Owner.Login)},
+			ID: cleanTrackerText(v.Tag.ID), Name: cleanTrackerText(v.Tag.Name),
+			Owner:           issueTrackerAccountDTO{ID: cleanTrackerText(v.Tag.Owner.ID), Login: cleanTrackerText(v.Tag.Owner.Login)},
 			Read:            toIssueTrackerSharingDTO(v.Tag.Read),
 			Use:             toIssueTrackerSharingDTO(v.Tag.Use),
 			AccountCanApply: v.AccountCanApply,

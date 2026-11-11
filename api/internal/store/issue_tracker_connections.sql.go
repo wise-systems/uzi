@@ -54,6 +54,50 @@ func (q *Queries) GetIssueTrackerConnectionForUser(ctx context.Context, arg GetI
 	return i, err
 }
 
+const insertIssueTrackerConnectionIfAbsent = `-- name: InsertIssueTrackerConnectionIfAbsent :one
+INSERT INTO issue_tracker_connections (
+    user_id, kind, base_url, account_id, account_login, token_ciphertext, last_verified_at
+) VALUES ($1, $2, $3, $4, $5, $6, now())
+ON CONFLICT (user_id, kind, base_url) DO NOTHING
+RETURNING id, user_id, kind, base_url, account_id, account_login, token_ciphertext, created_at, last_verified_at
+`
+
+type InsertIssueTrackerConnectionIfAbsentParams struct {
+	UserID          uuid.UUID `json:"user_id"`
+	Kind            string    `json:"kind"`
+	BaseUrl         string    `json:"base_url"`
+	AccountID       string    `json:"account_id"`
+	AccountLogin    string    `json:"account_login"`
+	TokenCiphertext []byte    `json:"token_ciphertext"`
+}
+
+// The first-connect insert: never updates, so it cannot overwrite a row (and its account)
+// that another connect created. No row returned means the identity exists already, and the
+// caller re-enters the locked reconnect path.
+func (q *Queries) InsertIssueTrackerConnectionIfAbsent(ctx context.Context, arg InsertIssueTrackerConnectionIfAbsentParams) (IssueTrackerConnection, error) {
+	row := q.db.QueryRow(ctx, insertIssueTrackerConnectionIfAbsent,
+		arg.UserID,
+		arg.Kind,
+		arg.BaseUrl,
+		arg.AccountID,
+		arg.AccountLogin,
+		arg.TokenCiphertext,
+	)
+	var i IssueTrackerConnection
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.Kind,
+		&i.BaseUrl,
+		&i.AccountID,
+		&i.AccountLogin,
+		&i.TokenCiphertext,
+		&i.CreatedAt,
+		&i.LastVerifiedAt,
+	)
+	return i, err
+}
+
 const listIssueTrackerConnectionsByUser = `-- name: ListIssueTrackerConnectionsByUser :many
 SELECT id, user_id, kind, base_url, account_id, account_login, token_ciphertext, created_at, last_verified_at FROM issue_tracker_connections WHERE user_id = $1 ORDER BY created_at ASC, id ASC
 `
@@ -179,9 +223,12 @@ type UpsertIssueTrackerConnectionParams struct {
 // Connect or reconnect/rotate: one connection per (user, kind, base_url).
 // Reconnecting with a fresh token updates the ciphertext and account identity
 // in place, keeps the row id, and stamps last_verified_at.
-// The reconnect rule (PRD #4173 M4 owner guidance), enforced in the statement itself: a
-// conflicting row whose account would change is left alone while a repo links to it, and
-// the statement then returns no row.
+// Defence in depth for the reconnect rule (PRD #4173 M4 owner guidance): a conflicting row
+// whose account would change is left alone while a repo links to it, and the statement then
+// returns no row. NOT a complete guard: under READ COMMITTED the subquery reads the snapshot
+// of the statement, taken before it waits on a concurrent link's row lock, so it cannot see
+// a link that commits during that wait. The service takes the row lock and counts in a
+// separate statement first (LockIssueTrackerConnectionByIdentityForUpdate).
 func (q *Queries) UpsertIssueTrackerConnection(ctx context.Context, arg UpsertIssueTrackerConnectionParams) (IssueTrackerConnection, error) {
 	row := q.db.QueryRow(ctx, upsertIssueTrackerConnection,
 		arg.UserID,

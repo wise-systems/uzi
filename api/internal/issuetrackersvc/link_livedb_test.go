@@ -595,9 +595,11 @@ func (blindQuerier) LockIssueTrackerConnectionByIdentityForUpdate(context.Contex
 	return store.IssueTrackerConnection{}, pgx.ErrNoRows
 }
 
-// The upsert statement refuses an account change on a linked connection by itself: with the
-// locked pre-check blinded and no transactions wired, only its WHERE stands in the way.
-func TestUpsertRefusesAnAccountChangeOnALinkedConnectionLiveDB(t *testing.T) {
+// The upsert's WHERE is a last defence for the reconnect rule: with the locked pre-check
+// blinded and no transactions wired, it still refuses when the link was committed before the
+// statement began. (It cannot see a link that commits during its own wait; see
+// TestFirstConnectRacingAnotherConnectAndALinkLiveDB.)
+func TestUpsertWhereRefusesAnAccountChangeOnALinkedConnectionLiveDB(t *testing.T) {
 	ctx := context.Background()
 	h := newLiveHarness(t)
 	bare := New(blindQuerier{h.q}, h.svc.box, h.svc.allowed, h.svc.newDriver)
@@ -614,5 +616,96 @@ func TestUpsertRefusesAnAccountChangeOnALinkedConnectionLiveDB(t *testing.T) {
 	}
 	if _, err := bare.Connect(ctx, h.user, "youtrack", testHost, testToken("rotated")); err != nil {
 		t.Fatalf("same-account rotation: %v", err)
+	}
+}
+
+// gateQuerier pauses the first identity lock after it has found no row, so a test can
+// interleave other connects and a link between that read and the statement that follows.
+type gateQuerier struct {
+	*store.Queries
+	once    *sync.Once
+	locked  chan struct{}
+	release chan struct{}
+}
+
+func (g gateQuerier) LockIssueTrackerConnectionByIdentityForUpdate(ctx context.Context, a store.LockIssueTrackerConnectionByIdentityForUpdateParams) (store.IssueTrackerConnection, error) {
+	row, err := g.Queries.LockIssueTrackerConnectionByIdentityForUpdate(ctx, a)
+	g.once.Do(func() {
+		close(g.locked)
+		<-g.release
+	})
+	return row, err
+}
+
+// T1 is a first connect (account A) whose identity lock found no row. T2, another connect of
+// the same identity (account B), inserts and commits. T3 links a repo to that row and has not
+// committed yet. T1 must not overwrite the row's account once T3 commits: with a plain upsert
+// its NOT EXISTS subquery reads the snapshot from before it waited on T3 and does not see the
+// link. The fix inserts with DO NOTHING and re-enters the locked path (lock, then a fresh count).
+func TestFirstConnectRacingAnotherConnectAndALinkLiveDB(t *testing.T) {
+	ctx := context.Background()
+	h := newLiveHarness(t)
+
+	// A second user with no connection yet, so T1's identity lock finds no row.
+	user := uuid.New()
+	h.exec(`INSERT INTO users (id, email, password_hash, is_admin, vault_mode) VALUES ($1, $2, 'x', false, 'unprotected')`,
+		user, fmt.Sprintf("itsvc-%s@e2e", user))
+	t.Cleanup(func() { _, _ = h.pool.Exec(context.Background(), `DELETE FROM users WHERE id = $1`, user) })
+	forgeConn := uuid.New()
+	h.exec(`INSERT INTO forge_connections (id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext)
+	        VALUES ($1, $2, 'gitlab', $3, 'bot', 1, $4)`, forgeConn, user, "https://"+forgeConn.String()+".e2e", []byte{0x1})
+	repo, err := h.q.UpsertRepo(ctx, store.UpsertRepoParams{ConnectionID: forgeConn, ForgeProjectID: 4242, PathWithNamespace: "g/r", WebUrl: "https://forge.e2e/g/r"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	g := gateQuerier{Queries: h.q, once: new(sync.Once), locked: make(chan struct{}), release: make(chan struct{})}
+	t1 := New(g, h.svc.box, h.svc.allowed, h.svc.newDriver).
+		UseTransactions(h.pool, func(tx pgx.Tx) Querier {
+			return gateQuerier{Queries: h.q.WithTx(tx), once: g.once, locked: g.locked, release: g.release}
+		})
+	t1.log = h.svc.log
+	result := make(chan error, 1)
+	go func() {
+		_, err := t1.Connect(ctx, user, "youtrack", testHost, tokenA) // account A (the bot)
+		result <- err
+	}()
+	<-g.locked // T1 looked, found no row, and is paused
+
+	c2, err := h.svc.Connect(ctx, user, "youtrack", testHost, tokenB) // T2: account B, committed
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := h.pool.Begin(ctx) // T3: the link, held open
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // no-op after Commit
+	qtx := h.q.WithTx(tx)
+	if _, err := qtx.LockIssueTrackerConnectionForShareForUser(ctx, store.LockIssueTrackerConnectionForShareForUserParams{ID: c2.ID, UserID: user}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := qtx.SetRepoIssueTrackerLink(ctx, store.SetRepoIssueTrackerLinkParams{
+		ConnectionID: c2.ID, ProjectID: "0-1", ProjectShort: "UZI", TagID: "5-1", TagName: "uzi-ready", RepoID: repo.ID, UserID: user,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	close(g.release) // T1 goes on and must now wait on T3's row lock
+	// Whichever statement T1 runs next (the lock, or an upsert) waits on the connection row.
+	waitForLockWait(t, h.pool, "issue_tracker_connections")
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	e := wantKind(t, <-result, KindConflict)
+	if !strings.Contains(e.Message, "different account") {
+		t.Errorf("message %q", e.Message)
+	}
+	row, err := h.q.GetIssueTrackerConnectionForUser(ctx, store.GetIssueTrackerConnectionForUserParams{ID: c2.ID, UserID: user})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.AccountID != linkOther.ID {
+		t.Fatalf("the linked connection's account changed to %q", row.AccountID)
 	}
 }

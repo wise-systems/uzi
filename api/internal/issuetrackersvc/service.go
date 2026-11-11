@@ -15,6 +15,7 @@ import (
 // Querier is the slice of *store.Queries the service uses.
 type Querier interface {
 	UpsertIssueTrackerConnection(ctx context.Context, arg store.UpsertIssueTrackerConnectionParams) (store.IssueTrackerConnection, error)
+	InsertIssueTrackerConnectionIfAbsent(ctx context.Context, arg store.InsertIssueTrackerConnectionIfAbsentParams) (store.IssueTrackerConnection, error)
 	ListIssueTrackerConnectionsByUser(ctx context.Context, userID uuid.UUID) ([]store.IssueTrackerConnection, error)
 	GetIssueTrackerConnectionForUser(ctx context.Context, arg store.GetIssueTrackerConnectionForUserParams) (store.IssueTrackerConnection, error)
 	DeleteIssueTrackerConnectionForUser(ctx context.Context, arg store.DeleteIssueTrackerConnectionForUserParams) (int64, error)
