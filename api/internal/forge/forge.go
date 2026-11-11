@@ -1,6 +1,6 @@
 // Package forge is uzi's forge-generic integration layer. Callers depend only
 // on the Forge interface and the neutral domain types in this package; a driver
-// (GitLab today, Forgejo later) is selected by New and never imported directly.
+// (GitLab, GitHub or Forgejo) is selected by New and never imported directly.
 // This is the seam that lets a second forge land without touching handlers,
 // schema, or UI flows.
 package forge
@@ -192,7 +192,7 @@ type Project struct {
 // Forge is the union of IssueTracker (issuetracker.go) and CodeHost (codehost.go).
 // Each driver (github.go, gitlab.go, forgejo.go) and forgetest.BaseFake asserts
 // at compile time that it implements both halves.
-// From PRD #8 M2 on, callers take the narrower half they need instead of the
+// From PRD #4173 M2 on, callers take the narrower half they need instead of the
 // whole Forge.
 type Forge interface {
 	IssueTracker
