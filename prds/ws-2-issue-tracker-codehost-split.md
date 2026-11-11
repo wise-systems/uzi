@@ -2,7 +2,7 @@
 
 **Issue:** [wise-systems/uzi#2](https://github.com/wise-systems/uzi/issues/2). Numbered `ws-2` so it never collides with an upstream `vtmocanu/uzi` PRD number (upstream already has `prds/done/2-forge-integration-kanban.md`).  
 **Priority:** Medium  
-**Status:** In progress, r2 2026-11-10: M1 delivered (wise-systems/uzi#1). r1 2026-11-05. Source anchors checked against upstream `main` 6a76d09f7. Line numbers drift; cite by symbol.  
+**Status:** In progress, r3 2026-11-10: M2 delivered (every caller on its half; PR for wise-systems/uzi#2). r2 2026-11-10: M1 delivered (wise-systems/uzi#1). r1 2026-11-05. Source anchors checked against upstream `main` 6a76d09f7. Line numbers drift; cite by symbol.  
 **Part of:** external issue trackers. This PRD is phase 1 and is complete on its own. M1 to M3 change no visible behaviour: GitLab, GitHub and Forgejo issues keep working as today, now through the issue-tracker layer. M4 and M5 add the new behaviours on GitLab, GitHub and Forgejo: the living comment with retried writes, automatic withdrawal, comments that reach the agent and `/uzi` commands. Phase 2 (connections, Settings → Issue trackers, board mapping) is a separate PRD that builds on it; Jira and Asana come later, one PRD each.  
 **Related:**  
 **Delivery:** one PRD, one PR per milestone, each merged before the next starts. No implementation or validation step touches `.github/workflows/**`.  
@@ -116,7 +116,7 @@ This PRD separates the two jobs inside uzi, makes GitLab, GitHub and Forgejo the
 ### 2. Resolving a repo's two sides: `api/internal/forgesvc`
 
 - `IssueTrackerForRepo` and `CodeHostForRepo` sit beside `ForgeForConnection` (`forgesvc/service.go:499`); in this PRD both return the driver it builds today (D8).
-- Sync, the board, close and reopen and the PRD link patch take `IssueTracker`; the merge request watchers take `CodeHost` to read the MR and `IssueTracker` to move the card (D3).
+- Sync, the board, close and reopen and the PRD link patch take `IssueTracker`; the merge request watchers take `CodeHost` to read the MR and `IssueTracker` to move the card (D3). (M2 refined this: the PRD link patch also reads the MR and takes both halves; see the Decision Log, 2026-11-10.)
 
 ### 3. Callers on their half (M2)
 
@@ -165,7 +165,7 @@ This PRD separates the two jobs inside uzi, makes GitLab, GitHub and Forgejo the
 Progress (one PR per milestone, each merged before the next starts):
 
 - [x] **M1:** the `IssueTracker` and `CodeHost` interfaces (wise-systems/uzi#1)
-- [ ] **M2:** every caller on its half
+- [x] **M2:** every caller on its half (PR for wise-systems/uzi#2). Verified in the run: the type-checked inventory shows 0 issue-side calls through `forge.Forge` and 45 through `IssueTracker` (plus `GetIssueBounded` and `EnsureBoardColumns`), and handing `privcheck` an `IssueTracker`-only value fails to compile. `task gate:api` slots green except `deadcode:api` (not run). The full E2E phases are pending exact-head PR CI.
 - [ ] **M3:** neutral references, `MoveToColumn` and text keys
 - [ ] **M4:** one living comment, retried writes and automatic withdrawal
 - [ ] **M5:** comments and `/uzi` commands from the issue
@@ -221,3 +221,7 @@ D9 and D10. Comment delivery through `/inputs`; `IssueComment.UpdatedAt` in the 
 - **2026-11-10: one file per interface.** `issuetracker.go` and `codehost.go`, with `forge.go` keeping only the shared pieces; r1 had both interfaces in `forge.go`, which review rejected as a split in name only.
 - **2026-11-10: D4 moves from a reflection test to compile-time assertions in M1.** The assertions sit next to each driver and `forgetest.BaseFake`. The structural test (disjoint halves, nothing extra on `Forge`, no bare-number first parameter) is written in M3, where the bare-number rule gives it something the compiler cannot check.
 - **2026-11-10: the PRD lives at `prds/ws-2-issue-tracker-codehost-split.md`.** Work moved from the internal GitLab tracker to wise-systems/uzi on GitHub; M1 landed as wise-systems/uzi#1.
+- **2026-11-10: M2 test edits are mechanical only (owner decision).** Narrowing a method that a test fake implements changes that fake's parameter type (`forge.Forge` to the half), and a caller that needs both halves is called with the same fake twice (`f, f`; an inline literal fake is first hoisted into a local). No assertion or expectation changes; "every existing test passes unchanged" in M2 is read with these two mechanical classes allowed.
+- **2026-11-10: M2 wires `IssueTrackerForRepo`/`CodeHostForRepo` (D8) where a repo is in hand without new test fakes.** They are `forgesvc.(*Service)` methods in `forgesvc/repo_sides.go` taking `(ctx, repoID, forgeType, baseURL, tokenCiphertext)` (the caller's own owner-scoped lookup, never the unscoped `GetRepoByID`), used by the repo-scoped handlers and the merged-predecessor check. `workersvc`, `schedsvc`, `runlifecycle`, `privcheck`, `provisionsvc` and `seed` keep their own `ForgeForConnection` factory interfaces (adding the resolvers there would add methods to about 30 test fakes) and narrow at the first use; phase 2 routes them through the resolvers. Connection-scoped handlers, the run-scoped worker forge proxy (`resolveForgeRun`), `ProjectSyncService`'s own factory and the poll loop build one driver and narrow it at each use or pass it as both halves.
+- **2026-11-10: the PRD link patch takes both halves.** D3 placed it on `IssueTracker`, but it also reads the merge request (`GetMergeRequest`), so `SyncPRDLinkPatches` takes `(ch forge.CodeHost, tr forge.IssueTracker)`. Comment intake (`issueinput.Fetch`), the autopilot, CI-autofix and MR-rework detectors, the MR state watcher, self-improve and the worker get-issue route are mixed the same way.
+- **2026-11-10: "`privcheck` compiles against `CodeHost` only" means every privcheck parameter, local and forge call is `CodeHost`.** Its `ForgeBuilder` factory interface still returns `forge.Forge`, converted to `CodeHost` straight after the build; handing privcheck an `IssueTracker`-only value is a compile error.
