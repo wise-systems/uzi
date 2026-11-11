@@ -352,6 +352,7 @@ tasks:
       - task: test:renovate-schedule-groups
       - task: test:forge-fake
       - task: test:forge-fake-contract
+      - task: test:issue-tracker-forge-fake-contract
       # Hermetic bot-provisioning regressions (issues #2010 and #2016): fake glab,
       # no network, covering host selection, JSON, PAT headers and safe diagnostics.
       - task: test:create-gitlab-bot
@@ -1212,6 +1213,17 @@ tasks:
       # execution at 60s (the launcher separately allows 240s including compile).
       # Anchored run selects only this external-package contract, not the suite.
       - env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null node e2e/forge-fake/operation-contracts.test.mjs -- go test -buildvcs=false -count=1 -v -timeout=60s -run='^TestForgeFakeOperationContracts$' ./internal/forge
+
+  test:issue-tracker-forge-fake-contract:
+    desc: shared issue tracker contract against the real GitLab, GitHub and Forgejo drivers over the Node HTTPS fake
+    preconditions:
+      - sh: command -v node
+        msg: the issue tracker forge fake contract requires Node
+    cmds:
+      # Same shape as test:forge-fake-contract: the launcher starts the fake with
+      # FORGE_FAKE_ISSUE_CONTRACT=1 and a self-signed cert, then runs this exact Go
+      # argv from api. It allows only the moved-issue subtest to skip (the forge subjects supply no MoveIssue seam).
+      - env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null node e2e/forge-fake/issue-tracker-contracts.test.mjs -- go test -buildvcs=false -count=1 -v -timeout=60s -run='^TestIssueTrackerForgeFakeContracts$' ./internal/issuetracker
 
   test:create-gitlab-bot:
     desc: hermetic bot-provisioning contract for create-gitlab-bot.sh (fake glab, no network), tally-guarded
