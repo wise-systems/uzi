@@ -315,7 +315,7 @@ func (s *Server) listIssues(w http.ResponseWriter, r *http.Request) {
 }
 
 // hasAllTags matches tag names case-insensitively, as YouTrack's query does;
-// the driver filters again on the exact name.
+// the driver filters again by resolved tag id.
 func (s *Server) hasAllTags(i *issue, names []string) bool {
 	for _, name := range names {
 		found := false
