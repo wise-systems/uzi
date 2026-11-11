@@ -156,6 +156,52 @@ func TestListTagsParsesARecordedResponse(t *testing.T) {
 	}
 }
 
+// TestListTagsParsesARecordedPrivateInstanceResponse parses
+// testdata/youtrack_tags_recorded_private.json, a response of the same request
+// recorded with a permanent token on a private YouTrack instance. Every login,
+// tag name, id and the member count in it is a placeholder; the structure, the
+// $type members and the booleans are as recorded. Unlike the public recording it
+// carries usersCount, an all-users group in the use settings, a tag only its
+// owner can apply and a tag only its owner can see.
+func TestListTagsParsesARecordedPrivateInstanceResponse(t *testing.T) {
+	raw, err := os.ReadFile("testdata/youtrack_tags_recorded_private.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	y, _ := unboundDriver(t, func(w http.ResponseWriter, _ *http.Request) { writeRaw(w, string(raw)) })
+	tags, err := y.ListTags(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tags) != 3 {
+		t.Fatalf("got %d tags, want 3", len(tags))
+	}
+	shared, ownerOnly, private := tags[0], tags[1], tags[2]
+	stranger := acct("25-9999")
+
+	allUsers := Group{ID: "579-1", Name: "All Users", AllUsers: true, UsersCount: 12}
+	if len(shared.Use.Groups) != 1 || shared.Use.Groups[0] != allUsers || len(shared.Read.Groups) != 1 || shared.Read.Groups[0] != allUsers {
+		t.Errorf("shared tag sharing = read %+v, use %+v, want the All Users group with its count in both", shared.Read, shared.Use)
+	}
+	if !AccountCanApply(shared, stranger) || !OthersCanApply(shared, shared.Owner) {
+		t.Error("a tag whose use settings cover all users must be applicable by any account and by others")
+	}
+
+	if len(ownerOnly.Read.Groups) != 1 || !ownerOnly.Read.Groups[0].AllUsers || len(ownerOnly.Use.Groups) != 0 || len(ownerOnly.Use.Users) != 0 {
+		t.Errorf("owner-only tag sharing = read %+v, use %+v, want visible to all and usable by nobody listed", ownerOnly.Read, ownerOnly.Use)
+	}
+	if AccountCanApply(ownerOnly, stranger) || !AccountCanApply(ownerOnly, ownerOnly.Owner) || OthersCanApply(ownerOnly, ownerOnly.Owner) {
+		t.Error("a tag everyone can see but only its owner can apply must not count as applicable by anyone else")
+	}
+
+	if len(private.Read.Groups) != 0 || len(private.Read.Users) != 0 || len(private.Use.Groups) != 0 || len(private.Use.Users) != 0 {
+		t.Errorf("private tag sharing = read %+v, use %+v, want empty", private.Read, private.Use)
+	}
+	if AccountCanApply(private, stranger) || OthersCanApply(private, private.Owner) {
+		t.Error("a private tag must not count as applicable by anyone but its owner")
+	}
+}
+
 func TestListTagsNeedsNoProject(t *testing.T) {
 	srv := youtracktest.NewServer(t)
 	own := srv.SeedOwnTag("mine")
