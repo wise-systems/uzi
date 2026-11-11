@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	gotoken "go/token"
 	"strings"
 	"testing"
 
@@ -227,5 +230,59 @@ func TestValidateToken(t *testing.T) {
 	short := strings.Repeat("q", minTokenLen-1)
 	if strings.Contains(validateToken(short).Error(), short) {
 		t.Fatal("error leaks token")
+	}
+}
+
+// TestRedactorScrubsMixedCaseEscapes covers a percent-escaped token whose hex
+// digits are upper case in one escape and lower case in another.
+func TestRedactorScrubsMixedCaseEscapes(t *testing.T) {
+	cred := strings.Join([]string{"perm", ":", "a/b/c", "Zq9xLm2VnB7wKp"}, "")
+	r := newRedactor(cred)
+	scrubsTo(t, r, "perm%3Aa%2fb%2Fc"+"Zq9xLm2VnB7wKp")
+	scrubsTo(t, r, "perm%3aa%2Fb%2fc"+"Zq9xLm2VnB7wKp")
+}
+
+// TestRedactorSecondScrubAfterSanitize pins the scrub that follows sanitize: a
+// dotless token holding a space is split by a TAB in the message, which only
+// sanitize turns back into the token.
+func TestRedactorSecondScrubAfterSanitize(t *testing.T) {
+	cred := strings.Join([]string{"ab cd", "-efghijklmnop"}, "")
+	r := newRedactor(cred)
+	got := r.error(errors.New("x ab\tcd-efghijklmnop y")).Error()
+	if got != "x [REDACTED] y" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+// TestPackageSentinelsMatchErrorsFile fails when errors.go declares an Err
+// variable that packageSentinels omits, which would stop errors.Is matching it
+// through redactor.sentinel.
+func TestPackageSentinelsMatchErrorsFile(t *testing.T) {
+	file, err := parser.ParseFile(gotoken.NewFileSet(), "errors.go", nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	declared := 0
+	for _, d := range file.Decls {
+		gd, ok := d.(*ast.GenDecl)
+		if !ok || gd.Tok != gotoken.VAR {
+			continue
+		}
+		for _, spec := range gd.Specs {
+			for _, n := range spec.(*ast.ValueSpec).Names {
+				if strings.HasPrefix(n.Name, "Err") {
+					declared++
+				}
+			}
+		}
+	}
+	if declared != len(packageSentinels) {
+		t.Fatalf("errors.go declares %d Err variables, packageSentinels lists %d", declared, len(packageSentinels))
+	}
+	r := newRedactor(fixtureCredential())
+	for _, s := range packageSentinels {
+		if !errors.Is(r.sentinel(s, 0, "x"), s) {
+			t.Errorf("sentinel %v lost through redactor.sentinel", s)
+		}
 	}
 }

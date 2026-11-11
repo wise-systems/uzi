@@ -89,6 +89,26 @@ func lowerPercent(s string) string {
 	return string(b)
 }
 
+// upperPercent upper-cases the hex digits of every %XX escape in s.
+func upperPercent(s string) string {
+	b := []byte(s)
+	for i := 0; i+2 < len(b); i++ {
+		if b[i] == '%' {
+			b[i+1] = upperHex(b[i+1])
+			b[i+2] = upperHex(b[i+2])
+			i += 2
+		}
+	}
+	return string(b)
+}
+
+func upperHex(c byte) byte {
+	if c >= 'a' && c <= 'f' {
+		return c - ('a' - 'A')
+	}
+	return c
+}
+
 func lowerHex(c byte) byte {
 	if c >= 'A' && c <= 'F' {
 		return c + ('a' - 'A')
@@ -96,8 +116,19 @@ func lowerHex(c byte) byte {
 	return c
 }
 
-// scrub replaces every listed secret form in s.
+// scrub replaces every listed secret form in s. A second pass runs over a copy
+// whose %XX escapes are upper-cased, so a mixed-case escape such as one that
+// reads "%2f...%2F" is caught too; the copy is used only when it matched.
 func (r redactor) scrub(s string) string {
+	out := r.scrubForms(s)
+	canon := upperPercent(out)
+	if c := r.scrubForms(canon); c != canon {
+		return c
+	}
+	return out
+}
+
+func (r redactor) scrubForms(s string) string {
 	for _, secret := range r.secrets {
 		s = strings.ReplaceAll(s, secret, redactPlaceholder)
 	}
@@ -168,7 +199,7 @@ func (r redactor) errorStatus(err error, status int) error {
 	var large *forge.ResponseTooLargeError
 	if errors.As(err, &large) {
 		outcome := large.Class()
-		if outcome == forge.ErrorClassOther && status != 0 {
+		if outcome == forge.ErrorClassOther {
 			outcome = classifyStatus(status)
 		}
 		return &forge.ResponseTooLargeError{Provenance: large.Provenance, Outcome: outcome}
@@ -202,7 +233,7 @@ func detailSuffix(detail string) string {
 // isPackageSentinel reports whether err is one of this package's fixed
 // sentinels; only those may stay in an error chain.
 func isPackageSentinel(err error) bool {
-	for _, s := range []error{ErrUnsupportedKind, ErrProjectNotBound, ErrStateMappingUnset, ErrInvalidLabelName, ErrRedirectRefused} {
+	for _, s := range packageSentinels {
 		if err == s {
 			return true
 		}

@@ -13,7 +13,7 @@ const defaultTimeout = 15 * time.Second
 // newHTTPClient builds the client a driver uses: a finite timeout and no
 // redirect following, so a Location header cannot carry the token to another
 // host. A nil base means an independent httptransport.New(http.DefaultTransport);
-// a driver sets base only through a test-only constructor helper.
+// only the test-only constructor in export_test.go sets base.
 func newHTTPClient(timeout time.Duration, base http.RoundTripper) *http.Client {
 	if timeout <= 0 {
 		timeout = defaultTimeout

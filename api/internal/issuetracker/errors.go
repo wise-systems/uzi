@@ -17,3 +17,7 @@ var (
 	// The client never follows one, so the token cannot be forwarded.
 	ErrRedirectRefused = errors.New("issuetracker: redirect refused")
 )
+
+// packageSentinels lists every sentinel above. redactor.sentinel keeps only
+// these in an error chain, so a new sentinel must be added here too.
+var packageSentinels = []error{ErrUnsupportedKind, ErrProjectNotBound, ErrStateMappingUnset, ErrInvalidLabelName, ErrRedirectRefused}
