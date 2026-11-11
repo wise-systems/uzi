@@ -15,7 +15,10 @@
 # case that fails for a different reason than the one asserted, is a BROKEN INSTRUMENT
 # (exit 2), never a pass.
 #
-# EXIT CODES (the assert-db-capacity-render.sh convention):
+# EXIT CODES (this script deliberately diverges from assert-db-capacity-render.sh: a
+# failing-render case that fails with the WRONG message is exit 2 here, not 1, because it
+# means the guard under test was not the thing that fired, so the instrument cannot
+# vouch for it; a property that simply does not hold is exit 1):
 #     2 = the instrument is broken (helm/yq/chart missing, a render that must succeed
 #         failed, an expected key absent, or a render failed for an unrelated reason)
 #     1 = a property does not hold
@@ -106,10 +109,14 @@ else
 fi
 
 # --- (c) invalid entries and the duplicate key fail the render ------------------------------
-expect_fail "(c) http:// entry" "issueTracker.allowedBaseURLs" \
+expect_fail "(c) http:// entry" "must be an absolute https URL with a host" \
   --set 'issueTracker.allowedBaseURLs[0]=http://tracker.example.org'
-expect_fail "(c) hostless https:// entry" "issueTracker.allowedBaseURLs" \
+expect_fail "(c) hostless https:// entry" "must be an absolute https URL with a host" \
   --set 'issueTracker.allowedBaseURLs[0]=https://'
+expect_fail "(c) entry containing a comma" "must not contain a comma or whitespace" \
+  --set 'issueTracker.allowedBaseURLs[0]=https://a.example.com\,http://b.example.com'
+expect_fail "(c) entry containing whitespace" "must not contain a comma or whitespace" \
+  --set 'issueTracker.allowedBaseURLs[0]=https://a.example.com b.example.com'
 expect_fail "(c) value + api.config.ISSUE_TRACKER_ALLOWED_BASE_URLS" "EITHER issueTracker.allowedBaseURLs OR api.config.ISSUE_TRACKER_ALLOWED_BASE_URLS" \
   --set 'issueTracker.allowedBaseURLs[0]=https://tracker.example.org' \
   --set-string api.config.ISSUE_TRACKER_ALLOWED_BASE_URLS=https://other.example.org

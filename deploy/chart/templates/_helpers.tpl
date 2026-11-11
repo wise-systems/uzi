@@ -407,6 +407,10 @@ true
 {{- define "uzi.issueTrackerAllowedBaseURLs" -}}
 {{- $out := list }}
 {{- range (.Values.issueTracker).allowedBaseURLs }}
+{{- /* Checked before urlParse: the list is joined with "," and the api splits on ",", so an entry holding one would smuggle in a second URL past the https check. */}}
+{{- if regexMatch "[,\\s]" (toString .) }}
+{{- fail (printf "issueTracker.allowedBaseURLs entry %q must not contain a comma or whitespace (the entries are joined with \",\" into ISSUE_TRACKER_ALLOWED_BASE_URLS; list each URL as its own entry)." .) }}
+{{- end }}
 {{- $u := urlParse . }}
 {{- if or (not $u.hostname) (ne $u.scheme "https") }}
 {{- fail (printf "issueTracker.allowedBaseURLs entry %q must be an absolute https URL with a host, e.g. https://tracker.example.com (it feeds ISSUE_TRACKER_ALLOWED_BASE_URLS; the api rejects the same input at boot)." .) }}
