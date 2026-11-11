@@ -7,6 +7,7 @@ import (
 	"unicode"
 
 	"github.com/vtmocanu/uzi/api/internal/config"
+	"github.com/vtmocanu/uzi/api/internal/issuetracker"
 )
 
 // strictBaseURL validates raw as an https scheme-and-host base URL and returns
@@ -46,11 +47,15 @@ func strictBaseURL(raw string) (string, error) {
 	if err != nil || nu.Hostname() == "" {
 		return "", errors.New("invalid base URL: it must be an https URL with a host")
 	}
-	// A control or format character in the host (a zero-width or bidi
+	// A control, format or non-ASCII character in the host (a zero-width or bidi
 	// character) would look like another host once it is shown.
 	for _, r := range nu.Host {
-		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) || r == '\u2028' || r == '\u2029' {
+		if issuetracker.InvisibleRune(r) {
 			return "", errors.New("invalid base URL: the host holds a control or invisible character")
+		}
+		// An internationalised name arrives as "xn--" punycode.
+		if r > unicode.MaxASCII {
+			return "", errors.New("invalid base URL: the host must be ASCII; use the xn-- form of an internationalised name")
 		}
 	}
 	return norm, nil

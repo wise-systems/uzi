@@ -10,6 +10,10 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/forge"
 )
 
+// The allocation tests below read the process-wide runtime.MemStats
+// TotalAlloc, so they must not run in parallel with each other or with any
+// other test: do not add t.Parallel to them.
+
 // allocBound is the most a decode test lets the process allocate while it
 // serves and decodes one oversized response. The response itself is read into a
 // buffer of at most 8 MiB (grown by append, so several times that is allocated
@@ -90,6 +94,52 @@ func TestTagBombAllocatesLittle(t *testing.T) {
 	}
 }
 
+// TestDuplicateTagsKeysAllocateLittle pins that encoding/json calling
+// ytTags.UnmarshalJSON once per repeated "tags" key costs no per-call Decoder:
+// the unfixed decoder allocated about 380 MiB for the page fixture. The fixed
+// decoder allocates about 30 MiB without -race and about 100 MiB with it (the
+// race build makes sync.Pool drop entries, so encoding/json's own pooled state
+// is reallocated), so the bound sits between the two.
+func TestDuplicateTagsKeysAllocateLittle(t *testing.T) {
+	const bound = 192 << 20
+	t.Run("page", func(t *testing.T) {
+		issue := strings.TrimSuffix(rawIssue("2-1", "UZI-1", 1, "0-1", ""), `"tags":[]}`)
+		dup := `"tags":[{}],`
+		body := "[" + issue + strings.Repeat(dup, int(listPageBytes-int64(len(issue))-64)/len(dup)) + `"tags":[]}]`
+		if int64(len(body)) > listPageBytes {
+			t.Fatalf("fixture is %d bytes, over the page cap", len(body))
+		}
+		y, _ := loggedDriver(t, func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Query().Get("$skip") != "0" {
+				writeRaw(w, "[]")
+				return
+			}
+			_, _ = w.Write([]byte(body))
+		})
+		var err error
+		got := totalAlloc(func() { _, err = y.ListIssues(context.Background(), 1, forge.ListIssuesOptions{}) })
+		if err != nil {
+			t.Logf("ListIssues: %v", err)
+		}
+		if got > bound {
+			t.Errorf("allocated %d MiB for a %d MiB page, want under %d MiB", got>>20, len(body)>>20, bound>>20)
+		}
+	})
+	t.Run("issue", func(t *testing.T) {
+		issue := strings.TrimSuffix(rawIssue("2-1", "UZI-1", 1, "0-1", ""), `"tags":[]}`)
+		dup := `"tags":[{}],`
+		body := []byte(issue + strings.Repeat(dup, int(objectBytes-int64(len(issue))-64)/len(dup)) + `"tags":[]}`)
+		if int64(len(body)) > objectBytes {
+			t.Fatalf("fixture is %d bytes, over the object cap", len(body))
+		}
+		y, _ := loggedDriver(t, func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(body) })
+		got := totalAlloc(func() { _, _ = y.GetIssue(context.Background(), 1, 1) })
+		if got > bound {
+			t.Errorf("allocated %d MiB for a %d MiB issue, want under %d MiB", got>>20, len(body)>>20, bound>>20)
+		}
+	})
+}
+
 func TestListDecodeShapes(t *testing.T) {
 	for name, tc := range map[string]struct {
 		body    string
@@ -163,5 +213,24 @@ func TestTopLevelItemsAndNestedTagsShareOneBudget(t *testing.T) {
 	y, _ = loggedDriver(t, rawListHandler(one, one, one, one))
 	if _, err := y.ListIssues(context.Background(), 1, forge.ListIssuesOptions{}); err != nil {
 		t.Errorf("4 items + 4 tags = 8 refused under a ceiling of 10: %v", err)
+	}
+}
+
+func TestTopLevelCountIgnoresBracketsInStrings(t *testing.T) {
+	for name, tc := range map[string]struct {
+		in    string
+		count int
+	}{
+		"empty":             {`[]`, 0},
+		"spaced empty":      {` [ ] `, 0},
+		"scalars":           {`[1, 2,3]`, 3},
+		"nested":            {`[[1,2],{"a":[3,4]},5]`, 3},
+		"string with ,]":    {`["a,]","b\"],"]`, 2},
+		"escaped backslash": {`["\\",1]`, 2},
+		"not an array":      {`{"a":[1,2]}`, 0},
+	} {
+		if got, _ := topLevelCount([]byte(tc.in)); got != tc.count {
+			t.Errorf("%s: count %d, want %d", name, got, tc.count)
+		}
 	}
 }

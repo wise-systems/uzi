@@ -181,8 +181,6 @@ func TestConnectRefusesBadInput(t *testing.T) {
 		{"bare hash", "youtrack", testHost + "#", validToken},
 		{"escaped percent in host", "youtrack", "https://x%25y.example.com", validToken},
 		{"empty hostname with port", "youtrack", "https://:443", validToken},
-		{"zero-width character in host", "youtrack", "https://issues.exam\u200bple.com", validToken},
-		{"bidi override in host", "youtrack", "https://issues.example.com\u202e", validToken},
 		{"no host", "youtrack", "https://", validToken},
 		{"not allowlisted", "youtrack", "https://evil.example.com", validToken},
 		{"explicit default port is a different origin string", "youtrack", testHost + ":443", validToken},
@@ -215,8 +213,15 @@ func TestConnectRefusesBadToken(t *testing.T) {
 			h := newHarness(t)
 			_, err := h.svc.Connect(context.Background(), uuid.New(), "youtrack", testHost, tok)
 			e := wantKind(t, err, KindBadRequest)
-			if e.Message != "invalid token" {
-				t.Errorf("message = %q, want the fixed invalid token message", e.Message)
+			if !strings.HasPrefix(e.Message, "invalid token: ") {
+				t.Errorf("message = %q, want the validator's reason after \"invalid token: \"", e.Message)
+			}
+			// The reason must never echo the token: no 8-byte window of it appears.
+			for i := 0; i+8 <= len(tok) && i < 64; i++ {
+				if strings.Contains(e.Message, tok[i:i+8]) {
+					t.Errorf("message %q contains the token window %q", e.Message, tok[i:i+8])
+					break
+				}
 			}
 			if len(h.built) != 0 || len(h.q.rows) != 0 {
 				t.Error("driver built or row stored for a refused token")
@@ -569,9 +574,11 @@ func TestNewDefaultsToRegistry(t *testing.T) {
 // allowlist that accepts anything, so only the base URL check can refuse.
 func TestConnectRefusesAnInvisibleHostCharacterBeforeTheAllowlist(t *testing.T) {
 	for name, u := range map[string]string{
-		"zero width":     "https://issues.exam​ple.com",
-		"bidi override":  "https://issues.example.com‮",
-		"line separator": "https://issues.exam ple.com",
+		"zero width":     "https://issues.exam\u200bple.com",
+		"bidi override":  "https://issues.example.com\u202e",
+		"line separator": "https://issues.exam\u2028ple.com",
+		"hangul filler":  "https://issues.exam\u3164ple.com",
+		"unicode idn":    "https://issues.exampl\u00e9.com",
 	} {
 		t.Run(name, func(t *testing.T) {
 			h := newHarness(t)

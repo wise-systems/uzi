@@ -20,63 +20,108 @@ var errNotArray = errors.New("issuetracker: response is not a JSON array")
 // errTrailingData is returned when a list response has data after its array.
 var errTrailingData = errors.New("issuetracker: response has data after the JSON array")
 
-// ytTags is a nested tag array. Its UnmarshalJSON streams the elements and
-// refuses once more than maxNestedItems have been read, so one object cannot
-// make the decoder allocate a slice as large as the response.
+// ytTags is a nested tag array. Its UnmarshalJSON counts the elements with a
+// byte scan and refuses above maxNestedItems before anything is decoded, so one
+// object cannot make the decoder allocate a slice as large as the response. It
+// builds no json.Decoder: encoding/json calls it once per repeated "tags" key,
+// and a per-call Decoder would multiply across a response of repeated keys.
 type ytTags []ytTag
 
-// UnmarshalJSON implements json.Unmarshaler.
+// UnmarshalJSON implements json.Unmarshaler. b is already-validated JSON.
 func (t *ytTags) UnmarshalJSON(b []byte) error {
-	items, err := decodeArray[ytTag](b, maxNestedItems, errNestedCeiling)
-	if err != nil {
-		return err
+	if n, _ := topLevelCount(b); n > maxNestedItems {
+		return errNestedCeiling
 	}
-	*t = items
-	return nil
+	return json.Unmarshal(b, (*[]ytTag)(t))
 }
 
-// decodeArray decodes a JSON array element by element and returns refuse as
-// soon as it meets element number limit+1, before that element is decoded, so at
-// most limit elements are ever allocated. A JSON null is an empty array.
-func decodeArray[T any](b []byte, limit int, refuse error) ([]T, error) {
-	dec := json.NewDecoder(bytes.NewReader(b))
-	tok, err := dec.Token()
-	if err != nil {
-		return nil, err
+// topLevelCount scans b, a JSON value, and returns the number of elements of
+// the array it starts with (0 when it does not start with an array) and the
+// offset just past that array (0 when it does not start with one, or never
+// closes). It tracks bracket depth and string state only, so it neither
+// validates nor allocates; a caller that needs validity gets it from
+// json.Unmarshal afterwards.
+func topLevelCount(b []byte) (count, end int) {
+	i := 0
+	for i < len(b) && isJSONSpace(b[i]) {
+		i++
 	}
-	if tok == nil {
-		return nil, endOfInput(dec)
+	if i >= len(b) || b[i] != '[' {
+		return 0, 0
 	}
-	if d, ok := tok.(json.Delim); !ok || d != '[' {
-		return nil, errNotArray
-	}
-	var items []T
-	for dec.More() {
-		if len(items) >= limit {
-			return nil, refuse
+	depth, seen, inStr, esc := 0, false, false, false
+	for ; i < len(b); i++ {
+		c := b[i]
+		if inStr {
+			switch {
+			case esc:
+				esc = false
+			case c == '\\':
+				esc = true
+			case c == '"':
+				inStr = false
+			}
+			continue
 		}
-		var it T
-		if err := dec.Decode(&it); err != nil {
-			return nil, err
+		switch c {
+		case '[', '{':
+			if depth == 1 {
+				seen = true
+			}
+			depth++
+		case ']', '}':
+			depth--
+			if depth == 0 {
+				if seen {
+					count++
+				}
+				return count, i + 1
+			}
+		case ',':
+			if depth == 1 {
+				count++
+			}
+		case '"':
+			if depth == 1 {
+				seen = true
+			}
+			inStr = true
+		default:
+			if depth == 1 && !isJSONSpace(c) {
+				seen = true
+			}
 		}
-		items = append(items, it)
 	}
-	if _, err := dec.Token(); err != nil {
-		return nil, err
-	}
-	return items, endOfInput(dec)
+	return count, 0
 }
 
-// endOfInput reports errTrailingData unless dec has nothing left.
-func endOfInput(dec *json.Decoder) error {
-	if _, err := dec.Token(); err != io.EOF {
-		return errTrailingData
-	}
-	return nil
-}
+func isJSONSpace(c byte) bool { return c == ' ' || c == '\t' || c == '\n' || c == '\r' }
 
 // decodePage decodes one list page. The driver asked for pageSize items, so a
-// longer array is a protocol violation and is refused while decoding.
+// longer array is a protocol violation: the elements are counted before any is
+// decoded, so an oversized page allocates nothing for its items. A JSON null is
+// an empty page.
 func decodePage[T any](body []byte) ([]T, error) {
-	return decodeArray[T](body, pageSize, errItemCeiling)
+	trimmed := bytes.TrimSpace(body)
+	if string(trimmed) == "null" {
+		return nil, nil
+	}
+	n, end := topLevelCount(body)
+	if end == 0 {
+		if len(trimmed) > 0 && trimmed[0] == '[' {
+			return nil, io.ErrUnexpectedEOF
+		}
+		return nil, errNotArray
+	}
+	if n > pageSize {
+		return nil, errItemCeiling
+	}
+	if len(bytes.TrimSpace(body[end:])) > 0 {
+		return nil, errTrailingData
+	}
+	var items []T
+	if err := json.Unmarshal(body, &items); err != nil {
+		return nil, err
+	}
+	return items, nil
 }

@@ -16,7 +16,7 @@ const maxLabelNameLen = 200
 func (y *youTrack) checkLabelName(name string) error {
 	bad := strings.TrimSpace(name) == "" || len(name) > maxLabelNameLen
 	for _, c := range name {
-		if c == '{' || c == '}' || invisible(c) {
+		if c == '{' || c == '}' || InvisibleRune(c) {
 			bad = true
 		}
 	}

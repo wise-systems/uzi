@@ -17,17 +17,17 @@ func ValidateToken(token string) error {
 		return errors.New("issuetracker: token longer than the maximum length")
 	}
 	for _, c := range token {
-		if invisible(c) {
+		if InvisibleRune(c) {
 			return errors.New("issuetracker: token contains a control or format character")
 		}
 	}
 	return nil
 }
 
-// invisible reports whether c is a control character, a Unicode format
+// InvisibleRune reports whether c is a control character, a Unicode format
 // character (bidi controls, zero-width characters, BOM) or the line or
 // paragraph separator.
-func invisible(c rune) bool {
+func InvisibleRune(c rune) bool {
 	return unicode.IsControl(c) || unicode.Is(unicode.Cf, c) || c == '\u2028' || c == '\u2029'
 }
 

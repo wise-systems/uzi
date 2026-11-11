@@ -13,8 +13,8 @@ import (
 // Connect verifies a token against the issue tracker and stores it sealed for
 // the user, creating the connection or rotating the existing one for the same
 // (user, kind, base URL). The order is fixed: kind, token presence, token shape
-// (issuetracker.ValidateToken), strict base URL, allowlist, driver build, token verification, account check, seal,
-// upsert. A refused base URL never reaches the driver factory, so no outbound
+// (issuetracker.ValidateToken), strict base URL, allowlist, driver build, token
+// verification, account check, seal, upsert. A refused base URL never reaches the driver factory, so no outbound
 // request or token use happens for it. The token is trimmed of surrounding
 // whitespace, and it appears in no returned error or log line.
 func (s *Service) Connect(ctx context.Context, userID uuid.UUID, kind, baseURL, token string) (Connection, error) {
@@ -27,8 +27,9 @@ func (s *Service) Connect(ctx context.Context, userID uuid.UUID, kind, baseURL, 
 		return Connection{}, &Error{Kind: KindBadRequest, Message: "a token is required"}
 	}
 	if err := issuetracker.ValidateToken(token); err != nil {
-		// The driver's message names the rule, never the token; the client gets a fixed one.
-		return Connection{}, &Error{Kind: KindBadRequest, Message: "invalid token"}
+		// ValidateToken's message names the rule that failed and never
+		// includes the token, so it is passed through.
+		return Connection{}, &Error{Kind: KindBadRequest, Message: "invalid token: " + err.Error()}
 	}
 	norm, err := strictBaseURL(baseURL)
 	if err != nil {

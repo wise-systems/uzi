@@ -52,7 +52,7 @@ func TestListIssuesRefusesMalformedIDs(t *testing.T) {
 	}
 }
 
-func TestListIssuesLimitStopsAcrossPages(t *testing.T) {
+func TestListIssuesLimitWithinOnePageStopsAfterOneRequest(t *testing.T) {
 	y, srv := newFakeDriver(t)
 	for range 250 {
 		srv.SeedIssue("t", "")

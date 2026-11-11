@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"unicode"
 )
 
 // defaultStateField is the YouTrack custom field that holds the issue state.
@@ -93,6 +94,13 @@ func strictBaseURL(raw string) (string, error) {
 		return bad("must not carry credentials")
 	case u.Path != "" && u.Path != "/":
 		return bad("must not carry a path")
+	}
+	// An invisible or non-ASCII host character would look like another host
+	// once shown; an internationalised name arrives as "xn--" punycode.
+	for _, c := range u.Host {
+		if InvisibleRune(c) || c > unicode.MaxASCII {
+			return bad("host must be plain ASCII with no control or invisible character")
+		}
 	}
 	return "https://" + u.Host, nil
 }

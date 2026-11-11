@@ -138,7 +138,7 @@ func (r redactor) string(s string) string {
 // with a space. It uses the predicate of issueinput.AuthorName.
 func sanitize(s string) string {
 	return strings.Map(func(c rune) rune {
-		if invisible(c) {
+		if InvisibleRune(c) {
 			return ' '
 		}
 		return c
