@@ -18,7 +18,7 @@ import (
 // Recorded-call test (PRD 4173 M4): for a repo with no issue-tracker link,
 // pin every forge call the repo-scoped handlers make: the first board open
 // (default-column seed plus initial import), the Refresh sync, a board card
-// move, a new board issue, and a repo enable (live guard, column seed, import
+// move, a new board issue, promote, the issue page, column configuration, and a repo enable (live guard, column seed, import
 // after enable). The forge is reached
 // through the real forgesvc builder seam and the real privcheck guard, so the
 // calls are the production ones. The golden was captured before the
@@ -29,7 +29,17 @@ import (
 type rcRepoForge struct{ forgetest.BaseFake }
 
 func (*rcRepoForge) ListIssues(_ context.Context, _ int64, opts forge.ListIssuesOptions) ([]forge.Issue, error) {
-	return []forge.Issue{{IID: 5, Title: "t", State: "opened", Labels: opts.Labels, UpdatedAt: time.Date(2026, 5, 6, 7, 8, 9, 0, time.UTC)}}, nil
+	at := time.Date(2026, 5, 6, 7, 8, 9, 0, time.UTC)
+	issues := []forge.Issue{{IID: 5, Title: "t", State: "opened", Labels: opts.Labels, UpdatedAt: at}}
+	if len(opts.Labels) == 0 {
+		// The additive open fetch also returns an issue without the uzi label,
+		// the card the Promote step labels.
+		issues = append(issues, forge.Issue{IID: 9, Title: "unlabelled", State: "opened", UpdatedAt: at})
+	}
+	return issues, nil
+}
+func (*rcRepoForge) GetIssue(_ context.Context, _, iid int64) (forge.Issue, error) {
+	return forge.Issue{IID: iid, Title: "t", State: "opened", Description: "body", Labels: []string{"uzi"}, UpdatedAt: time.Date(2026, 5, 6, 7, 8, 9, 0, time.UTC)}, nil
 }
 func (*rcRepoForge) UpdateIssueLabels(context.Context, int64, int64, []string, []string) error {
 	return nil
@@ -99,6 +109,9 @@ func TestRecordedCallsRepoHandlersLiveDB(t *testing.T) {
 	// Issue 5 was cached by the import above; drag it into a column.
 	step("MoveIssue (board card move)", http.MethodPost, fmt.Sprintf("/api/repos/%s/issues/5/move", tracked), `{"to_column":"In Progress"}`, http.StatusOK)
 	step("CreateIssue (board new issue)", http.MethodPost, fmt.Sprintf("/api/repos/%s/issues", tracked), `{"title":"new card","description":"body"}`, http.StatusCreated)
+	step("PromoteIssue (board promote, SetIssueLabel)", http.MethodPost, fmt.Sprintf("/api/repos/%s/issues/9/promote", tracked), "", http.StatusOK)
+	step("GetIssueDetail (issue page)", http.MethodGet, fmt.Sprintf("/api/repos/%s/issues/5", tracked), "", http.StatusOK)
+	step("ConfigureColumns", http.MethodPut, fmt.Sprintf("/api/repos/%s/board/columns", tracked), `{"columns":[{"label_name":"In Progress"},{"label_name":"Later"}]}`, http.StatusOK)
 	step("SetRepoEnabled true (guard, column seed, importAfterEnable)", http.MethodPut, fmt.Sprintf("/api/repos/%s", toEnable), `{"enabled":true}`, http.StatusOK)
 
 	forgetest.AssertGolden(t, "recorded_calls_handler_repo_handlers.golden", lines)

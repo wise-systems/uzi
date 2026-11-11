@@ -46,7 +46,9 @@ var recordedPollAt = time.Date(2026, 5, 6, 7, 8, 9, 0, time.UTC)
 
 func (*recordedPollForge) ListIssues(_ context.Context, _ int64, opts forge.ListIssuesOptions) ([]forge.Issue, error) {
 	if len(opts.Labels) == 1 && opts.Labels[0] == "agent-found" {
-		return nil, nil
+		// One agent-found issue so the finding mark is non-zero and tick 2's
+		// incremental finding fetch carries its UpdatedAfter bound.
+		return []forge.Issue{{IID: 11, Title: "finding", State: "opened", Labels: []string{"agent-found"}, UpdatedAt: recordedPollAt}}, nil
 	}
 	return []forge.Issue{
 		{IID: 5, Title: "autopilot", State: "opened", Labels: []string{"uzi", "autopilot"}, UpdatedAt: recordedPollAt},
@@ -132,7 +134,8 @@ func TestRecordedCallsPollerTickLiveDB(t *testing.T) {
 	// incremental.
 	engine := New(svc, mergedRepoStore{q, repo}, time.Minute, 3)
 	engine.SetPipelineWatch(time.Hour, 5)
-	engine.SetAutopilot(NewAutopilot(q, &apRuns{}, nil))
+	starter := &apRuns{}
+	engine.SetAutopilot(NewAutopilot(q, starter, nil))
 
 	var lines []string
 	for i, label := range []string{"tick 1 (full reconcile)", "tick 2 (incremental)"} {
@@ -144,6 +147,9 @@ func TestRecordedCallsPollerTickLiveDB(t *testing.T) {
 		}
 		lines = append(lines, "# "+label)
 		lines = append(lines, calls...)
+	}
+	if len(starter.calls) != 1 || starter.calls[0].iid != 5 {
+		t.Fatalf("autopilot run starter calls = %+v, want exactly one, for issue 5", starter.calls)
 	}
 	forgetest.AssertGolden(t, "recorded_calls_poller_tick.golden", lines)
 }
