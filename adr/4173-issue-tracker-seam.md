@@ -2,7 +2,7 @@
 
 **Status**: Accepted (PRD #4173, M3 landed; M4–M6 pending)
 **Date**: 2026-11-11
-**Deciders**: Vlad + agent team
+**Deciders**: the maintainer + agent team
 **PRD**: [prds/4173-external-issue-trackers.md](../prds/4173-external-issue-trackers.md) — the PRD carries the milestones and the Decision Log; this ADR carries the durable shape of what M3 built and the invariants a later change must keep.
 
 ## Decision (summary)
@@ -21,7 +21,7 @@ Not shipped yet: the repo link, `IssueTrackerForRepo` returning an issue tracker
 
 - `Driver` is `forge.IssueTracker` plus `VerifyToken`, `ListProjects`, `ListTags` and `ListStates(project)`. It never embeds `forge.CodeHost`, so passing a driver where a code host is required is a compile error (S1).
 - A new tracker is one `Kind` constant, one entry in the `constructors` map in `registry.go` and one driver. There is no init-time registration.
-- Each driver ships a fake: `issuetrackertest.BaseFake` (an in-memory base with loud not-stubbed defaults, for the tests of callers) and `youtracktest` (an in-process HTTPS fake server).
+- The package ships one shared in-memory fake, `issuetrackertest.BaseFake` (loud not-stubbed defaults, for the tests of callers), and each driver ships its HTTP fake (YouTrack: `youtracktest`, an in-process HTTPS server).
 - `issuetrackertest.RunContract` is the one contract suite. It runs on the real YouTrack driver against its HTTPS fake, and on the three real forge drivers against `e2e/forge-fake` in contract mode. Passing it on an in-memory fake is not evidence of parity.
 
 ### D8. Separate connections
@@ -47,7 +47,7 @@ Not shipped yet: the repo link, `IssueTrackerForRepo` returning an issue tracker
 - The eligibility tag is chosen by id. Its name resolves to the stored id whoever owns the tag, for reads and for writes.
 - Any other name resolves only to a tag owned by the connection's account, which the driver learns from `users/me`. A missing one is created, owned by that account, with the eligibility tag's sharing settings. The eligibility tag is never created, and a drifted name never resolves to the eligibility id.
 - Reads drop a tag that only shares the eligibility name.
-- `ListTags` returns the tags the token can see, with owner and read/use sharing settings. `AccountCanApply` and `OthersCanApply` judge the use settings, and the owner counts as covered. A named group counts for others only with `UsersCount >= 2`; real YouTrack omitted `usersCount` in the recorded response (`testdata/youtrack_tags_recorded.json`), so in practice it counts only the All Users group. This fails closed. Using these to refuse a link is M4.
+- `ListTags` returns the tags the token can see, with owner and read/use sharing settings. `AccountCanApply` and `OthersCanApply` judge the use settings, and the owner counts as covered. A named group counts for others only with `UsersCount >= 2`; the anonymous response recorded from a real YouTrack (`testdata/youtrack_tags_recorded.json`) omits `usersCount`, so on such a response only the All Users group counts. This fails closed. Using these to refuse a link is M4.
 
 ## Invariants a future change must keep
 
@@ -60,6 +60,7 @@ Not shipped yet: the repo link, `IssueTrackerForRepo` returning an issue tracker
 ## Open questions for M6's live pass
 
 - Whether YouTrack accepts `readSharingSettings` and `tagSharingSettings` in the tag-create body. The fake accepts them; no real server has been asked.
+- Whether an authenticated token receives `usersCount` on a tag's sharing groups (the anonymous recording has none).
 - Whether the server query `tag: {name}` resolves every tag of that name, including ones owned by others. The client side filters by id, so a wrong answer here would drop issues, not mis-tag them.
 
 ## Consequences
