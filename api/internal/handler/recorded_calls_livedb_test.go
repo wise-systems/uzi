@@ -17,8 +17,9 @@ import (
 
 // Recorded-call test (PRD 4173 M4): for a repo with no issue-tracker link,
 // pin every forge call the repo-scoped handlers make: the first board open
-// (default-column seed plus initial import), the Refresh sync, and a repo
-// enable (live guard, column seed, import after enable). The forge is reached
+// (default-column seed plus initial import), the Refresh sync, a board card
+// move, a new board issue, and a repo enable (live guard, column seed, import
+// after enable). The forge is reached
 // through the real forgesvc builder seam and the real privcheck guard, so the
 // calls are the production ones. The golden was captured before the
 // tracker-link rerouting; regenerate only deliberately, with
@@ -29,6 +30,12 @@ type rcRepoForge struct{ forgetest.BaseFake }
 
 func (*rcRepoForge) ListIssues(_ context.Context, _ int64, opts forge.ListIssuesOptions) ([]forge.Issue, error) {
 	return []forge.Issue{{IID: 5, Title: "t", State: "opened", Labels: opts.Labels, UpdatedAt: time.Date(2026, 5, 6, 7, 8, 9, 0, time.UTC)}}, nil
+}
+func (*rcRepoForge) UpdateIssueLabels(context.Context, int64, int64, []string, []string) error {
+	return nil
+}
+func (*rcRepoForge) CreateIssue(_ context.Context, _ int64, title, _ string, labels []string) (forge.Issue, error) {
+	return forge.Issue{IID: 6, Title: title, State: "opened", Labels: labels, UpdatedAt: time.Date(2026, 5, 6, 7, 8, 9, 0, time.UTC)}, nil
 }
 func (*rcRepoForge) EnsureLabels(context.Context, int64, []forge.Label) error { return nil }
 func (*rcRepoForge) VerifyToken(context.Context) (forge.BotIdentity, error) {
@@ -89,6 +96,9 @@ func TestRecordedCallsRepoHandlersLiveDB(t *testing.T) {
 	}
 	step("GetBoard, repo with no columns (board seed)", http.MethodGet, fmt.Sprintf("/api/repos/%s/board", tracked), "", http.StatusOK)
 	step("SyncRepo (Refresh)", http.MethodPost, fmt.Sprintf("/api/repos/%s/sync", tracked), "", http.StatusOK)
+	// Issue 5 was cached by the import above; drag it into a column.
+	step("MoveIssue (board card move)", http.MethodPost, fmt.Sprintf("/api/repos/%s/issues/5/move", tracked), `{"to_column":"In Progress"}`, http.StatusOK)
+	step("CreateIssue (board new issue)", http.MethodPost, fmt.Sprintf("/api/repos/%s/issues", tracked), `{"title":"new card","description":"body"}`, http.StatusCreated)
 	step("SetRepoEnabled true (guard, column seed, importAfterEnable)", http.MethodPut, fmt.Sprintf("/api/repos/%s", toEnable), `{"enabled":true}`, http.StatusOK)
 
 	forgetest.AssertGolden(t, "recorded_calls_handler_repo_handlers.golden", lines)

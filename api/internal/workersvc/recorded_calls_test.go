@@ -12,9 +12,9 @@ import (
 )
 
 // Recorded-call tests (PRD 4173 M4): for a repo with no issue-tracker link, a
-// manual issue run captures its input (GetIssue, ListIssueComments, one
-// RepositoryAuthorEligibility per distinct comment author) and makes no other
-// forge call. The goldens were captured before the tracker-link rerouting;
+// manual issue run captures its input (GetIssue, ListIssueComments, and one
+// RepositoryAuthorEligibility check per distinct author, the issue author
+// included) and makes no other forge call. The goldens were captured before the tracker-link rerouting;
 // regenerate only deliberately, with UZI_UPDATE_GOLDEN=1.
 
 func recordedRunFixture(t *testing.T) (*Service, *forgetest.Recorder, *fakeStore) {

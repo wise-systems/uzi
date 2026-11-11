@@ -18,8 +18,12 @@ import (
 // record, see AssertGolden) and notice when a later refactor changes it.
 // Only calls are recorded, never results; the wrapped Forge supplies those.
 //
-// Safe for concurrent use. Calls() keeps call order; SortedCalls() is the
-// order-insensitive form for paths that fan out across goroutines.
+// Safe for concurrent use. Calls() keeps call order.
+//
+// Recorder implements only forge.Forge. It hides any optional interface the
+// wrapped value also implements (for example ProjectBoardSyncer), so code that
+// type-asserts for one sees the Recorder as lacking it; a path that does so
+// cannot be recorded through this wrapper.
 type Recorder struct {
 	inner forge.Forge
 
@@ -40,14 +44,6 @@ func (r *Recorder) Calls() []string {
 	return append([]string(nil), r.calls...)
 }
 
-// SortedCalls returns the recorded lines sorted lexically, for paths whose
-// call order depends on goroutine scheduling.
-func (r *Recorder) SortedCalls() []string {
-	out := r.Calls()
-	sort.Strings(out)
-	return out
-}
-
 func (r *Recorder) record(method string, args ...any) {
 	parts := make([]string, len(args))
 	for i, a := range args {
@@ -63,10 +59,17 @@ var timeType = reflect.TypeOf(time.Time{})
 
 // formatArg renders v deterministically: times as RFC3339 UTC (zero time as
 // "<zero>"), pointers dereferenced, structs as {Field:value ...} in field
-// order, slices as [a b], maps with sorted keys, strings quoted.
+// order, slices as [a b] (a nil slice or map as "nil", so it differs from an
+// empty one), maps with sorted keys, strings quoted. A value it cannot render
+// stably (unexported field, func, chan) becomes "<unformattable T>" rather
+// than panicking.
 func formatArg(v reflect.Value) string {
 	if !v.IsValid() {
 		return "<nil>"
+	}
+	if !v.CanInterface() {
+		// Unexported struct field: reflect refuses Interface() on it.
+		return "<unformattable " + v.Type().String() + ">"
 	}
 	if v.Type() == timeType {
 		t := v.Interface().(time.Time)
@@ -95,12 +98,18 @@ func formatArg(v reflect.Value) string {
 		b.WriteString("}")
 		return b.String()
 	case reflect.Slice, reflect.Array:
+		if v.Kind() == reflect.Slice && v.IsNil() {
+			return "nil"
+		}
 		parts := make([]string, v.Len())
 		for i := range parts {
 			parts[i] = formatArg(v.Index(i))
 		}
 		return "[" + strings.Join(parts, " ") + "]"
 	case reflect.Map:
+		if v.IsNil() {
+			return "nil"
+		}
 		type kv struct{ k, v string }
 		var kvs []kv
 		for it := v.MapRange(); it.Next(); {
@@ -112,6 +121,9 @@ func formatArg(v reflect.Value) string {
 			parts[i] = e.k + ":" + e.v
 		}
 		return "map[" + strings.Join(parts, " ") + "]"
+	case reflect.Func, reflect.Chan, reflect.UnsafePointer, reflect.Uintptr:
+		// Printing these would expose an address.
+		return "<unformattable " + v.Type().String() + ">"
 	default:
 		return fmt.Sprint(v.Interface())
 	}
