@@ -42,8 +42,8 @@ async function stop(child) {
   try { await closed; } finally { clearTimeout(timer); }
 }
 
-// The only subtests that may skip: YouTrack-only behaviours the forge dialects
-// do not have (an issue that moves project, a deletable comment).
+// The only subtest that may skip: the forge subjects supply no MoveIssue seam,
+// so the moved-issue case runs on YouTrack only.
 const ALLOWED_SKIPS = new Set(["MovedIssueIsRefused"]);
 const CASES = [
   "EnsureLabelsIsIdempotent", "CreateIssueRoundTrips", "ListIssuesFilters", "UpdateLabelsAndDescription",

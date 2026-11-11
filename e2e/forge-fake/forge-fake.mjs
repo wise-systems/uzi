@@ -94,7 +94,7 @@ const EXPECT_USER = process.env.FORGE_FAKE_EXPECT_USER || "";
 const EXPECT_PAT = process.env.FORGE_FAKE_EXPECT_PAT || "";
 
 // FORGE_FAKE_ISSUE_CONTRACT=1 turns on the issue-tracker contract fidelity the
-// default e2e fake deliberately lacks: a persisted label catalog on GitLab and
+// default e2e fake deliberately lacks: an in-memory label catalog on GitLab and
 // GitHub, issue state/description writes on all three dialects, GitHub's per-label
 // add/remove routes, and the /_e2e/issues/{iid}/comments mutator. Unset, every
 // answer is byte-identical to before (e2e/phases/60-schedules-sweep.sh relies on
