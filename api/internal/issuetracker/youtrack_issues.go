@@ -68,8 +68,9 @@ func (y *youTrack) GetIssue(ctx context.Context, projectID, issueIID int64) (for
 	return y.toIssue(w)
 }
 
-// CreateIssue implements forge.IssueTracker. The issue is created first, then
-// each label is attached as a tag (see resolveTagIDs; created when missing), and the result is
+// CreateIssue implements forge.IssueTracker. The labels resolve to tag ids first
+// (see resolveTagIDs; created when missing), so a failure there leaves no issue
+// behind. Then the issue is created, each tag is attached, and the result is
 // read back, so it has the shape GetIssue returns. There is no rollback: when
 // attaching a tag or the read-back fails, the error is returned (redacted) but
 // the issue stays created.
@@ -80,6 +81,12 @@ func (y *youTrack) CreateIssue(ctx context.Context, projectID int64, title, desc
 	}
 	if err := y.checkLabelNames(labels); err != nil {
 		return forge.Issue{}, err
+	}
+	var ids map[string]string
+	if len(labels) > 0 {
+		if ids, err = y.resolveTagIDs(ctx, labels, true); err != nil {
+			return forge.Issue{}, err
+		}
 	}
 	var created ytIssue
 	_, _, err = y.do(ctx, ytCall{
@@ -100,20 +107,14 @@ func (y *youTrack) CreateIssue(ctx context.Context, projectID int64, title, desc
 	if !entityIDRE.MatchString(created.ID) {
 		return forge.Issue{}, y.fail("youtrack: issue with a malformed id in the response")
 	}
-	if len(labels) > 0 {
-		ids, err := y.resolveTagIDs(ctx, labels, true)
-		if err != nil {
-			return forge.Issue{}, err
+	attached := map[string]bool{}
+	for _, n := range labels {
+		if attached[n] {
+			continue
 		}
-		attached := map[string]bool{}
-		for _, n := range labels {
-			if attached[n] {
-				continue
-			}
-			attached[n] = true
-			if err := y.attachTag(ctx, created.ID, ids[n]); err != nil {
-				return forge.Issue{}, err
-			}
+		attached[n] = true
+		if err := y.attachTag(ctx, created.ID, ids[n]); err != nil {
+			return forge.Issue{}, err
 		}
 	}
 	w, err := y.issueByEntity(ctx, created.ID)

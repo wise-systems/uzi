@@ -114,6 +114,10 @@ func (y *youTrack) createTag(ctx context.Context, name string, share sharingCopy
 //     set, a missing one is created with the eligibility tag's sharing settings;
 //     without it, the name is left out of the result.
 //
+// The eligibility tag is never a candidate for another name, even when its
+// YouTrack name drifted to one: the stored name is display only, so such a name
+// gets an account-owned tag of its own.
+//
 // A tag of the same name that someone else owns is never used for such a name,
 // because its owner may change what it means or who can see it. It makes no
 // request when every name is the eligibility name.
@@ -144,7 +148,7 @@ func (y *youTrack) resolveTagIDs(ctx context.Context, names []string, create boo
 	}
 	owned := make(map[string]string, len(tags))
 	for _, t := range tags {
-		if t.Owner == nil || t.Owner.ID != account.ID {
+		if t.ID == y.eligibility.ID || t.Owner == nil || t.Owner.ID != account.ID {
 			continue
 		}
 		if _, dup := owned[t.Name]; !dup {

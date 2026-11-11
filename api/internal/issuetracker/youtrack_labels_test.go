@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/vtmocanu/uzi/api/internal/forge"
+	"github.com/vtmocanu/uzi/api/internal/issuetracker/youtracktest"
 )
 
 // TestLabelGuardOnEveryGuardedMethod sends a brace, and a name one byte over
@@ -153,6 +154,62 @@ func TestMalformedTagIDsNeverReachAPath(t *testing.T) {
 			if strings.Contains(w, "/issues/") {
 				t.Errorf("sent %v", w)
 			}
+		}
+	})
+}
+
+// driftedEligibilityDriver builds a driver whose stored eligibility tag is an
+// account-owned tag that YouTrack now calls "uzi-finding", while the stored
+// name (display only) is still "uzi-ready".
+func driftedEligibilityDriver(t *testing.T) (*youTrack, *youtracktest.Server, string) {
+	t.Helper()
+	srv := youtracktest.NewServer(t)
+	eligID := srv.SeedOwnTag("uzi-finding")
+	opts := fakeOptions(srv)
+	opts.EligibilityTag = TagRef{ID: eligID, Name: "uzi-ready"}
+	y, err := newYouTrackOver(opts, srv.Client().Transport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return y, srv, eligID
+}
+
+// TestDriftedEligibilityTagNameNeverResolvesToTheEligibilityTag pins that a
+// uzi write of a label equal to the eligibility tag's current YouTrack name
+// does not attach the eligibility tag: a finding issue must not become
+// eligible. YouTrack refuses a second tag of that name for the same owner, so
+// the write fails (409) rather than succeeding with the wrong tag.
+func TestDriftedEligibilityTagNameNeverResolvesToTheEligibilityTag(t *testing.T) {
+	ctx := context.Background()
+	t.Run("UpdateIssueLabels", func(t *testing.T) {
+		y, srv, eligID := driftedEligibilityDriver(t)
+		n := srv.SeedIssue("t", "")
+		if err := y.UpdateIssueLabels(ctx, 1, n, []string{"uzi-finding"}, nil); err == nil {
+			t.Error("UpdateIssueLabels succeeded; want the tag creation to fail")
+		}
+		if got := srv.IssueTagIDs(n); slices.Contains(got, eligID) {
+			t.Errorf("issue tags = %v, include the eligibility tag %s", got, eligID)
+		}
+	})
+	t.Run("CreateIssue", func(t *testing.T) {
+		y, srv, eligID := driftedEligibilityDriver(t)
+		srv.ResetRequests()
+		if _, err := y.CreateIssue(ctx, 1, "t", "d", []string{"uzi-finding"}); err == nil {
+			t.Error("CreateIssue succeeded; want the tag creation to fail")
+		}
+		for _, r := range srv.Requests() {
+			if r.Method == http.MethodPost && strings.HasSuffix(r.Path, "/api/issues") {
+				t.Errorf("an issue was created although its label could not be resolved (eligibility tag %s)", eligID)
+			}
+		}
+	})
+	t.Run("EnsureLabels", func(t *testing.T) {
+		y, srv, _ := driftedEligibilityDriver(t)
+		if err := y.EnsureLabels(ctx, 1, []forge.Label{{Name: "uzi-finding"}}); err == nil {
+			t.Error("EnsureLabels succeeded; want the tag creation to fail")
+		}
+		if got := srv.TagsNamed("uzi-finding"); len(got) != 1 {
+			t.Errorf("tags named uzi-finding = %d, want 1 (the eligibility tag alone)", len(got))
 		}
 	})
 }

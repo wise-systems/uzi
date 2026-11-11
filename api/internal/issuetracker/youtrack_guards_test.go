@@ -98,9 +98,11 @@ func TestCreateIssueRefusesAMalformedCreatedID(t *testing.T) {
 		}
 		writeRaw(w, rawIssue("2-1", "UZI-1", 1, "0-1", ""))
 	})
-	if _, err := y.CreateIssue(context.Background(), 1, "t", "d", []string{"a"}); err == nil {
+	if _, err := y.CreateIssue(context.Background(), 1, "t", "d", []string{fakeEligibility.Name}); err == nil {
 		t.Fatal("CreateIssue accepted a malformed created id")
 	}
+	// The eligibility label needs no lookup, so the POST is the only request:
+	// the malformed id stops the attach and the read-back.
 	if got := log.all(); len(got) != 1 {
 		t.Errorf("requests = %v, want only the POST", got)
 	}
