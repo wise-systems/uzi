@@ -1,8 +1,9 @@
 -- +goose Up
 
--- Lock-cheap: this migration takes ACCESS EXCLUSIVE on repos (new columns, CHECK, trigger)
--- and SHARE ROW EXCLUSIVE on nine other tables (CREATE TRIGGER); fail fast instead of
--- queueing behind a long transaction and stalling every reader behind us (the 00402 pattern).
+-- This migration takes ACCESS EXCLUSIVE on repos and issues (new columns and CHECKs, which
+-- scan every row while the lock is held) and SHARE ROW EXCLUSIVE on the other guarded tables
+-- (CREATE TRIGGER). lock_timeout bounds only the wait for a lock, not how long it is held: fail
+-- fast instead of queueing behind a long transaction and stalling every reader (the 00402 pattern).
 SET LOCAL lock_timeout = '5s';
 
 -- PRD #4173 M4: link a repo to an external issue tracker project, and keep that
