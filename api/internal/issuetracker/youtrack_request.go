@@ -71,7 +71,7 @@ func (y *youTrack) do(ctx context.Context, c ytCall, out any) (status, n int, er
 	if err != nil {
 		return 0, 0, y.red.error(err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	status = resp.StatusCode
 	if isRedirect(resp) {
 		return status, 0, y.red.sentinel(ErrRedirectRefused, status, fmt.Sprintf("%s %s answered HTTP %d", c.method, path, status))

@@ -170,7 +170,7 @@ func TestConnectRefusesRedirect(t *testing.T) {
 	t.Cleanup(other.Close)
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		primary.Add(1)
-		http.Redirect(w, r, other.URL+r.URL.Path, http.StatusFound)
+		http.Redirect(w, r, other.URL+r.URL.Path, http.StatusFound) //nolint:gosec // G710: test redirect to a second httptest server, the redirect-refusal behaviour under test
 	}))
 	t.Cleanup(srv.Close)
 	h := newSvcHarness(t, srv.Client().Transport, allowOnly(srv.URL))

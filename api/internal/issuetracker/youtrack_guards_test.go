@@ -228,7 +228,7 @@ func TestResponseFailuresAreClassifiedAndRedacted(t *testing.T) {
 	t.Run("read error on success", func(t *testing.T) {
 		y, _ := loggedDriver(t, truncated(http.StatusOK))
 		_, err := y.GetIssue(context.Background(), 1, 1)
-		classified(t, err)
+		_ = classified(t, err)
 	})
 	t.Run("read error on a server error", func(t *testing.T) {
 		y, _ := loggedDriver(t, truncated(http.StatusInternalServerError))

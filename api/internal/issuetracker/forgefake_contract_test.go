@@ -70,12 +70,12 @@ func postFake(t *testing.T, endpoint, path string, body any) {
 	}
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint+path, bytes.NewReader(raw))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint+path, bytes.NewReader(raw)) //nolint:gosec // G704: endpoint is the local httptest fake's URL, never user input
 	if err != nil {
 		t.Fatal(err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := http.DefaultClient.Do(req) //nolint:gosec // G704: request targets the local httptest fake only
 	if err != nil {
 		t.Fatalf("POST %s: %v", path, err)
 	}

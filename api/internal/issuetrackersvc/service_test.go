@@ -156,7 +156,7 @@ func TestConnectRefusesWhenAllowlistEmpty(t *testing.T) {
 	h := newHarness(t)
 	h.allow = map[string]bool{}
 	_, err := h.svc.Connect(context.Background(), uuid.New(), "youtrack", testHost, testToken("a", "b"))
-	wantKind(t, err, KindBadRequest)
+	_ = wantKind(t, err, KindBadRequest)
 	if len(h.built) != 0 {
 		t.Fatalf("driver factory called %d times for a refused host", len(h.built))
 	}
@@ -189,7 +189,7 @@ func TestConnectRefusesBadInput(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			h := newHarness(t)
 			_, err := h.svc.Connect(context.Background(), uuid.New(), tc.kind, tc.url, tc.token)
-			wantKind(t, err, KindBadRequest)
+			_ = wantKind(t, err, KindBadRequest)
 			if len(h.built) != 0 {
 				t.Error("driver built for refused input")
 			}
@@ -307,7 +307,7 @@ func TestConnectRefusesBadAccount(t *testing.T) {
 			h := newHarness(t)
 			h.template.account = acct
 			_, err := h.svc.Connect(context.Background(), uuid.New(), "youtrack", testHost, testToken("t"))
-			wantKind(t, err, KindBadGateway)
+			_ = wantKind(t, err, KindBadGateway)
 			if len(h.q.rows) != 0 {
 				t.Error("row stored for a bad account")
 			}
@@ -393,21 +393,21 @@ func TestReadsAreOwnerScoped(t *testing.T) {
 		t.Fatalf("owner get = %v, %v", got, err)
 	}
 	_, err = h.svc.Get(ctx, other, c.ID)
-	wantKind(t, err, KindNotFound)
+	_ = wantKind(t, err, KindNotFound)
 	if list, err := h.svc.List(ctx, other); err != nil || len(list) != 0 {
 		t.Errorf("foreign list = %v, %v", list, err)
 	}
 	if list, err := h.svc.List(ctx, owner); err != nil || len(list) != 1 {
 		t.Errorf("owner list = %v, %v", list, err)
 	}
-	wantKind(t, h.svc.Delete(ctx, other, c.ID), KindNotFound)
+	_ = wantKind(t, h.svc.Delete(ctx, other, c.ID), KindNotFound)
 	if _, err := h.svc.Get(ctx, owner, c.ID); err != nil {
 		t.Fatalf("foreign delete removed the row: %v", err)
 	}
 	if err := h.svc.Delete(ctx, owner, c.ID); err != nil {
 		t.Fatal(err)
 	}
-	wantKind(t, h.svc.Delete(ctx, owner, c.ID), KindNotFound)
+	_ = wantKind(t, h.svc.Delete(ctx, owner, c.ID), KindNotFound)
 }
 
 func TestDriverForOpensTokenAndPassesOptions(t *testing.T) {
@@ -429,7 +429,7 @@ func TestDriverForOpensTokenAndPassesOptions(t *testing.T) {
 		t.Errorf("built = %+v, want %+v", h.built, want)
 	}
 	_, err = h.svc.DriverFor(ctx, uuid.New(), c.ID, ref, "", "", "")
-	wantKind(t, err, KindNotFound)
+	_ = wantKind(t, err, KindNotFound)
 }
 
 func TestDriverForFailsClosedWhenAllowlistEmptied(t *testing.T) {
@@ -443,13 +443,13 @@ func TestDriverForFailsClosedWhenAllowlistEmptied(t *testing.T) {
 	h.built = nil
 	h.allow = map[string]bool{}
 	_, err = h.svc.DriverFor(ctx, user, c.ID, issuetracker.ProjectRef{}, "", "", "")
-	wantKind(t, err, KindBadRequest)
+	_ = wantKind(t, err, KindBadRequest)
 	if len(h.built) != 0 {
 		t.Error("driver built after the allowlist was emptied")
 	}
 	// Discovery goes through the same gate.
 	_, err = h.svc.ListProjects(ctx, user, c.ID)
-	wantKind(t, err, KindBadRequest)
+	_ = wantKind(t, err, KindBadRequest)
 }
 
 func TestDriverForRefusesTamperedRow(t *testing.T) {
@@ -473,7 +473,7 @@ func TestDriverForRefusesTamperedRow(t *testing.T) {
 	h.allow["https://evil.example.com/x"] = true
 	h.q.rows[0].BaseUrl = "https://evil.example.com/x"
 	_, err = h.svc.DriverFor(ctx, user, c.ID, issuetracker.ProjectRef{}, "", "", "")
-	wantKind(t, err, KindBadRequest)
+	_ = wantKind(t, err, KindBadRequest)
 }
 
 func TestDriverForRefusesNonCanonicalStoredURL(t *testing.T) {
@@ -489,7 +489,7 @@ func TestDriverForRefusesNonCanonicalStoredURL(t *testing.T) {
 	h.allow["https://ISSUES.example.com"] = true
 	h.q.rows[0].BaseUrl = "https://ISSUES.example.com"
 	_, err = h.svc.DriverFor(ctx, user, c.ID, issuetracker.ProjectRef{}, "", "", "")
-	wantKind(t, err, KindBadRequest)
+	_ = wantKind(t, err, KindBadRequest)
 	if len(h.built) != 0 {
 		t.Error("driver built for a non-canonical stored URL")
 	}
@@ -506,7 +506,7 @@ func TestDriverForRefusesMalformedProjectRef(t *testing.T) {
 	h.built = nil
 	for _, ref := range []issuetracker.ProjectRef{{ID: "0-1"}, {ShortName: "UZI"}, {ID: "x", ShortName: "UZI"}, {ID: "0-1", ShortName: "1bad"}} {
 		_, err = h.svc.DriverFor(ctx, user, c.ID, ref, "", "", "")
-		wantKind(t, err, KindBadRequest)
+		_ = wantKind(t, err, KindBadRequest)
 	}
 	if len(h.built) != 0 {
 		t.Error("driver built for a malformed project reference")
@@ -530,7 +530,7 @@ func TestListStatesUsesEmptyProjectRefAndValidatesID(t *testing.T) {
 	h.built = nil
 	for _, bad := range []string{"", "abc", "0-1/../x", "1-", "0-1\n"} {
 		_, err = h.svc.ListStates(ctx, user, c.ID, bad)
-		wantKind(t, err, KindBadRequest)
+		_ = wantKind(t, err, KindBadRequest)
 	}
 	if len(h.built) != 0 {
 		t.Error("driver built for a bad project id")
@@ -552,12 +552,12 @@ func TestListProjectsAndStates(t *testing.T) {
 	}
 	h.template.projectErr = errors.New("boom")
 	_, err = h.svc.ListProjects(ctx, user, c.ID)
-	wantKind(t, err, KindBadGateway)
+	_ = wantKind(t, err, KindBadGateway)
 	// ListStates is not stubbed on the double: its error surfaces as a bad gateway, not a panic.
 	_, err = h.svc.ListStates(ctx, user, c.ID, "0-1")
-	wantKind(t, err, KindBadGateway)
+	_ = wantKind(t, err, KindBadGateway)
 	_, err = h.svc.ListStates(ctx, uuid.New(), c.ID, "0-1")
-	wantKind(t, err, KindNotFound)
+	_ = wantKind(t, err, KindNotFound)
 }
 
 func TestNewDefaultsToRegistry(t *testing.T) {
@@ -585,7 +585,7 @@ func TestConnectRefusesAnInvisibleHostCharacterBeforeTheAllowlist(t *testing.T) 
 			asked := 0
 			h.svc.allowed = func(string) bool { asked++; return true }
 			_, err := h.svc.Connect(context.Background(), uuid.New(), "youtrack", u, testToken("v"))
-			wantKind(t, err, KindBadRequest)
+			_ = wantKind(t, err, KindBadRequest)
 			if asked != 0 || len(h.built) != 0 {
 				t.Errorf("allowlist asked %d times, driver built %d times", asked, len(h.built))
 			}

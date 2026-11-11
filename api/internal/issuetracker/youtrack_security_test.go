@@ -74,7 +74,7 @@ func TestRedirectsAreRefused(t *testing.T) {
 			other := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { hits.Add(1) }))
 			t.Cleanup(other.Close)
 			y, _ := tlsDriver(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				http.Redirect(w, r, other.URL+r.URL.Path, code)
+				http.Redirect(w, r, other.URL+r.URL.Path, code) //nolint:gosec // G710: test redirect to a second httptest server, the redirect-refusal behaviour under test
 			}))
 			ctx := context.Background()
 			calls := map[string]func() error{

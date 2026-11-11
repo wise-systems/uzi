@@ -16,7 +16,7 @@ func (y *youTrack) ListProjects(ctx context.Context) ([]Project, error) {
 		if !entityIDRE.MatchString(p.ID) || !shortNameRE.MatchString(p.ShortName) {
 			return nil, y.fail("youtrack: project with a malformed id in the response")
 		}
-		out = append(out, Project{ID: p.ID, ShortName: p.ShortName, Name: p.Name})
+		out = append(out, Project(p))
 	}
 	return out, nil
 }

@@ -50,7 +50,7 @@ func NewServer(t testing.TB) *Server {
 	s.mux = s.routes()
 	s.Server = httptest.NewTLSServer(http.HandlerFunc(s.serve))
 	t.Cleanup(func() {
-		s.Server.Close()
+		s.Close()
 		s.mu.Lock()
 		defer s.mu.Unlock()
 		if len(s.unmodelled) > 0 {

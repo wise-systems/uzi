@@ -23,7 +23,7 @@ func TestClientDoesNotFollowRedirect(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if !isRedirect(resp) {
 		t.Fatalf("status %d not detected as redirect", resp.StatusCode)
 	}
@@ -53,7 +53,7 @@ func TestClientNotModifiedWithoutLocation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if !isRedirect(resp) {
 		t.Fatal("304 not detected")
 	}

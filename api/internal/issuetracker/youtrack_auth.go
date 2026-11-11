@@ -21,5 +21,5 @@ func (y *youTrack) VerifyToken(ctx context.Context) (Account, error) {
 	if err != nil {
 		return Account{}, err
 	}
-	return Account{ID: u.ID, Login: u.Login}, nil
+	return Account(u), nil
 }
