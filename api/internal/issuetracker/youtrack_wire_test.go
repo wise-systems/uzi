@@ -7,8 +7,8 @@ import (
 
 func TestIssueMapping(t *testing.T) {
 	y, srv := newFakeDriver(t)
-	n := srv.SeedIssue("title", "body", "x", "y")
-	got, err := y.GetIssue(context.Background(), 99, n)
+	n := srv.SeedIssue("title", "body", srv.SeedOwnTag("x"), srv.SeedOwnTag("y"))
+	got, err := y.GetIssue(context.Background(), testProjectID, n)
 	if err != nil {
 		t.Fatal(err)
 	}

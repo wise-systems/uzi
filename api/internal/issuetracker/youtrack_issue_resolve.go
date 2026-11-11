@@ -9,7 +9,8 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/forge"
 )
 
-// resolveIssue is the one step every per-issue method starts with. issueIID is
+// resolveIssue is the one step every per-issue method starts with. It checks
+// projectID against the bound project before any request. issueIID is
 // YouTrack's numberInProject. The issue is read as SHORT-n and must sit in the
 // bound project with that number; otherwise it is reported as
 // *forge.IssueNotFoundError. YouTrack keeps answering an old SHORT-n after the
@@ -17,8 +18,8 @@ import (
 // read as gone. Follow-up calls address the issue by the returned entity id.
 // The check is a read: YouTrack has no conditional write, so an issue moved
 // after resolveIssue returns can still be written by the follow-up call.
-func (y *youTrack) resolveIssue(ctx context.Context, issueIID int64) (ytIssue, error) {
-	p, err := y.requireProject()
+func (y *youTrack) resolveIssue(ctx context.Context, projectID, issueIID int64) (ytIssue, error) {
+	p, err := y.requireProject(projectID)
 	if err != nil {
 		return ytIssue{}, err
 	}

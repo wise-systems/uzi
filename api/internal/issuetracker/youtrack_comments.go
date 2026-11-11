@@ -13,8 +13,8 @@ import (
 // ListIssueComments implements forge.IssueTracker: deleted comments are
 // dropped and the rest come back oldest first. Author ids are 0 (unresolved),
 // because YouTrack account ids are strings.
-func (y *youTrack) ListIssueComments(ctx context.Context, _, issueIID int64) ([]forge.IssueComment, error) {
-	w, err := y.resolveIssue(ctx, issueIID)
+func (y *youTrack) ListIssueComments(ctx context.Context, projectID, issueIID int64) ([]forge.IssueComment, error) {
+	w, err := y.resolveIssue(ctx, projectID, issueIID)
 	if err != nil {
 		return nil, err
 	}
@@ -45,10 +45,11 @@ func (y *youTrack) ListIssueComments(ctx context.Context, _, issueIID int64) ([]
 	return out, nil
 }
 
-// CreateIssueNote implements forge.IssueTracker. ID is the numeric suffix of
-// the comment's entity id.
-func (y *youTrack) CreateIssueNote(ctx context.Context, _, issueIID int64, body string) (forge.IssueNote, error) {
-	w, err := y.resolveIssue(ctx, issueIID)
+// CreateIssueNote implements forge.IssueTracker. ID is always 0: a YouTrack
+// comment id is a string such as "4-17" and has no numeric form that is unique
+// across issues, so none is invented (PRD #4173 D10).
+func (y *youTrack) CreateIssueNote(ctx context.Context, projectID, issueIID int64, body string) (forge.IssueNote, error) {
+	w, err := y.resolveIssue(ctx, projectID, issueIID)
 	if err != nil {
 		return forge.IssueNote{}, err
 	}
@@ -64,9 +65,5 @@ func (y *youTrack) CreateIssueNote(ctx context.Context, _, issueIID int64, body 
 	if err != nil {
 		return forge.IssueNote{}, err
 	}
-	id, err := noteID(c.ID)
-	if err != nil {
-		return forge.IssueNote{}, y.red.error(err)
-	}
-	return forge.IssueNote{ID: id, Body: c.Text}, nil
+	return forge.IssueNote{Body: c.Text}, nil
 }

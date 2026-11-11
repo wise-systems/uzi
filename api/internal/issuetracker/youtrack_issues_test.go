@@ -83,7 +83,17 @@ func TestListIssuesClientSideFilters(t *testing.T) {
 		resolved,
 		old,
 	}
-	y, _ := loggedDriver(t, rawListHandler(issues...))
+	// "bug" is a tag the account owns; the other tags exist only on the issues.
+	y, _ := loggedDriver(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/users/me":
+			writeRaw(w, rawMe)
+		case "/api/tags":
+			writeRaw(w, `[`+strings.Replace(bug, `}`, `,"owner":{"id":"`+rawMeID+`"}}`, 1)+`]`)
+		default:
+			rawListHandler(issues...)(w, r)
+		}
+	})
 	ctx := context.Background()
 	iids := func(opts forge.ListIssuesOptions) []int64 {
 		t.Helper()

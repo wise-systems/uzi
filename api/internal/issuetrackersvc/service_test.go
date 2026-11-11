@@ -92,6 +92,12 @@ type fakeDriver struct {
 	verifyErr  error
 	projects   []issuetracker.Project
 	projectErr error
+	tags       []issuetracker.Tag
+	tagErr     error
+}
+
+func (d *fakeDriver) ListTags(context.Context) ([]issuetracker.Tag, error) {
+	return d.tags, d.tagErr
 }
 
 func (d *fakeDriver) VerifyToken(context.Context) (issuetracker.Account, error) {
@@ -420,15 +426,22 @@ func TestDriverForOpensTokenAndPassesOptions(t *testing.T) {
 		t.Fatal(err)
 	}
 	h.built = nil
-	ref := issuetracker.ProjectRef{ID: "0-1", ShortName: "UZI"}
-	if _, err := h.svc.DriverFor(ctx, user, c.ID, ref, "State", "Open", "Done"); err != nil {
+	binding := issuetracker.Binding{
+		Project:        issuetracker.ProjectRef{ID: "0-1", ShortName: "UZI"},
+		ProjectID:      4173,
+		EligibilityTag: issuetracker.TagRef{ID: "5-3", Name: "uzi"},
+	}
+	if _, err := h.svc.DriverFor(ctx, user, c.ID, binding, "State", "Open", "Done"); err != nil {
 		t.Fatal(err)
 	}
-	want := issuetracker.Options{BaseURL: testHost, Token: tok, Project: ref, StateField: "State", OpenState: "Open", ClosedState: "Done"}
+	want := issuetracker.Options{
+		BaseURL: testHost, Token: tok, Project: binding.Project, ProjectID: 4173, EligibilityTag: binding.EligibilityTag,
+		StateField: "State", OpenState: "Open", ClosedState: "Done",
+	}
 	if len(h.built) != 1 || h.built[0] != want {
 		t.Errorf("built = %+v, want %+v", h.built, want)
 	}
-	_, err = h.svc.DriverFor(ctx, uuid.New(), c.ID, ref, "", "", "")
+	_, err = h.svc.DriverFor(ctx, uuid.New(), c.ID, binding, "", "", "")
 	_ = wantKind(t, err, KindNotFound)
 }
 
@@ -442,7 +455,7 @@ func TestDriverForFailsClosedWhenAllowlistEmptied(t *testing.T) {
 	}
 	h.built = nil
 	h.allow = map[string]bool{}
-	_, err = h.svc.DriverFor(ctx, user, c.ID, issuetracker.ProjectRef{}, "", "", "")
+	_, err = h.svc.DriverFor(ctx, user, c.ID, issuetracker.Binding{}, "", "", "")
 	_ = wantKind(t, err, KindBadRequest)
 	if len(h.built) != 0 {
 		t.Error("driver built after the allowlist was emptied")
@@ -464,7 +477,7 @@ func TestDriverForRefusesTamperedRow(t *testing.T) {
 	// A row whose base URL was rewritten no longer opens: the AAD differs.
 	h.allow["https://evil.example.com"] = true
 	h.q.rows[0].BaseUrl = "https://evil.example.com"
-	_, err = h.svc.DriverFor(ctx, user, c.ID, issuetracker.ProjectRef{}, "", "", "")
+	_, err = h.svc.DriverFor(ctx, user, c.ID, issuetracker.Binding{}, "", "", "")
 	e := wantKind(t, err, KindInternal)
 	if e.Message != "internal error" || len(h.built) != 0 {
 		t.Errorf("message = %q, built = %d", e.Message, len(h.built))
@@ -472,7 +485,7 @@ func TestDriverForRefusesTamperedRow(t *testing.T) {
 	// A row with a non-strict URL is refused before opening.
 	h.allow["https://evil.example.com/x"] = true
 	h.q.rows[0].BaseUrl = "https://evil.example.com/x"
-	_, err = h.svc.DriverFor(ctx, user, c.ID, issuetracker.ProjectRef{}, "", "", "")
+	_, err = h.svc.DriverFor(ctx, user, c.ID, issuetracker.Binding{}, "", "", "")
 	_ = wantKind(t, err, KindBadRequest)
 }
 
@@ -488,14 +501,14 @@ func TestDriverForRefusesNonCanonicalStoredURL(t *testing.T) {
 	// Strict-valid and allowlisted, but not the canonical stored form.
 	h.allow["https://ISSUES.example.com"] = true
 	h.q.rows[0].BaseUrl = "https://ISSUES.example.com"
-	_, err = h.svc.DriverFor(ctx, user, c.ID, issuetracker.ProjectRef{}, "", "", "")
+	_, err = h.svc.DriverFor(ctx, user, c.ID, issuetracker.Binding{}, "", "", "")
 	_ = wantKind(t, err, KindBadRequest)
 	if len(h.built) != 0 {
 		t.Error("driver built for a non-canonical stored URL")
 	}
 }
 
-func TestDriverForRefusesMalformedProjectRef(t *testing.T) {
+func TestDriverForRefusesPartialOrMalformedBinding(t *testing.T) {
 	h := newHarness(t)
 	ctx := context.Background()
 	user := uuid.New()
@@ -504,12 +517,33 @@ func TestDriverForRefusesMalformedProjectRef(t *testing.T) {
 		t.Fatal(err)
 	}
 	h.built = nil
-	for _, ref := range []issuetracker.ProjectRef{{ID: "0-1"}, {ShortName: "UZI"}, {ID: "x", ShortName: "UZI"}, {ID: "0-1", ShortName: "1bad"}} {
-		_, err = h.svc.DriverFor(ctx, user, c.ID, ref, "", "", "")
-		_ = wantKind(t, err, KindBadRequest)
+	good := issuetracker.Binding{
+		Project:        issuetracker.ProjectRef{ID: "0-1", ShortName: "UZI"},
+		ProjectID:      7,
+		EligibilityTag: issuetracker.TagRef{ID: "5-3", Name: "uzi"},
+	}
+	mutate := func(f func(*issuetracker.Binding)) issuetracker.Binding { b := good; f(&b); return b }
+	for name, b := range map[string]issuetracker.Binding{
+		"project id only":     {ProjectID: 7},
+		"eligibility only":    {EligibilityTag: good.EligibilityTag},
+		"project only":        {Project: good.Project},
+		"no project id":       mutate(func(b *issuetracker.Binding) { b.ProjectID = 0 }),
+		"no eligibility":      mutate(func(b *issuetracker.Binding) { b.EligibilityTag = issuetracker.TagRef{} }),
+		"no project":          mutate(func(b *issuetracker.Binding) { b.Project = issuetracker.ProjectRef{} }),
+		"negative project id": mutate(func(b *issuetracker.Binding) { b.ProjectID = -1 }),
+		"half project":        mutate(func(b *issuetracker.Binding) { b.Project.ID = "" }),
+		"bad project id":      mutate(func(b *issuetracker.Binding) { b.Project.ID = "x" }),
+		"bad short name":      mutate(func(b *issuetracker.Binding) { b.Project.ShortName = "1bad" }),
+		"bad tag id":          mutate(func(b *issuetracker.Binding) { b.EligibilityTag.ID = "x" }),
+		"bad tag name":        mutate(func(b *issuetracker.Binding) { b.EligibilityTag.Name = "a}b" }),
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := h.svc.DriverFor(ctx, user, c.ID, b, "", "", "")
+			_ = wantKind(t, err, KindBadRequest)
+		})
 	}
 	if len(h.built) != 0 {
-		t.Error("driver built for a malformed project reference")
+		t.Error("driver built for a partial or malformed binding")
 	}
 }
 
@@ -557,6 +591,30 @@ func TestListProjectsAndStates(t *testing.T) {
 	_, err = h.svc.ListStates(ctx, user, c.ID, "0-1")
 	_ = wantKind(t, err, KindBadGateway)
 	_, err = h.svc.ListStates(ctx, uuid.New(), c.ID, "0-1")
+	_ = wantKind(t, err, KindNotFound)
+}
+
+func TestListTags(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	user := uuid.New()
+	c, err := h.svc.Connect(ctx, user, "youtrack", testHost, testToken("t"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.built = nil
+	h.template.tags = []issuetracker.Tag{{ID: "5-1", Name: "uzi", Owner: issuetracker.Account{ID: "1-1", Login: "bot"}}}
+	got, err := h.svc.ListTags(ctx, user, c.ID)
+	if err != nil || len(got) != 1 || got[0].Name != "uzi" {
+		t.Fatalf("ListTags = %v, %v", got, err)
+	}
+	if len(h.built) != 1 || h.built[0].Project != (issuetracker.ProjectRef{}) || h.built[0].ProjectID != 0 || h.built[0].EligibilityTag != (issuetracker.TagRef{}) {
+		t.Errorf("ListTags built %+v, want one unbound driver", h.built)
+	}
+	h.template.tagErr = errors.New("boom")
+	_, err = h.svc.ListTags(ctx, user, c.ID)
+	_ = wantKind(t, err, KindBadGateway)
+	_, err = h.svc.ListTags(ctx, uuid.New(), c.ID)
 	_ = wantKind(t, err, KindNotFound)
 }
 

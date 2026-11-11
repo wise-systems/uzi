@@ -30,11 +30,13 @@ func tlsDriverToken(t *testing.T, h http.Handler, token string) (*youTrack, *htt
 	srv := httptest.NewTLSServer(h)
 	t.Cleanup(srv.Close)
 	y, err := newYouTrackOver(Options{
-		BaseURL:     srv.URL,
-		Token:       token,
-		Project:     ProjectRef{ID: "0-1", ShortName: "UZI"},
-		OpenState:   "Open",
-		ClosedState: "Fixed",
+		BaseURL:        srv.URL,
+		Token:          token,
+		Project:        ProjectRef{ID: "0-1", ShortName: "UZI"},
+		ProjectID:      testProjectID,
+		EligibilityTag: fakeEligibility,
+		OpenState:      "Open",
+		ClosedState:    "Fixed",
 	}, srv.Client().Transport)
 	if err != nil {
 		t.Fatal(err)

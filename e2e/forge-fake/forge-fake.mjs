@@ -96,10 +96,21 @@ const EXPECT_PAT = process.env.FORGE_FAKE_EXPECT_PAT || "";
 // FORGE_FAKE_ISSUE_CONTRACT=1 turns on the issue-tracker contract fidelity the
 // default e2e fake deliberately lacks: an in-memory label catalog on GitLab and
 // GitHub, issue state/description writes on all three dialects, GitHub's per-label
-// add/remove routes, and the /_e2e/issues/{iid}/comments mutator. Unset, every
+// add/remove routes, the /_e2e/issues/{iid}/comments mutator, and a 404 for a
+// project id the fake does not serve (see missingContractProject). Unset, every
 // answer is byte-identical to before (e2e/phases/60-schedules-sweep.sh relies on
 // GitLab GET /labels answering [] and POST not persisting).
 const ISSUE_CONTRACT = process.env.FORGE_FAKE_ISSUE_CONTRACT === "1";
+// missingContractProject is true under ISSUE_CONTRACT for a project id the fake
+// does not serve, so the issue tracker contract's ProjectGuard case sees a
+// driver that names another project fail instead of landing on PROJECTS[0], the
+// way resolveProject() maps an unknown id for every other caller. Without the
+// flag it is always false, so the default behavior is unchanged.
+function missingContractProject(idParam) {
+  if (!ISSUE_CONTRACT) return false;
+  const raw = decodeURIComponent(String(idParam || ""));
+  return !PROJECTS.some((p) => String(p.id) === raw || p.path_with_namespace === raw);
+}
 // name -> {id, name, color}; only read or written when ISSUE_CONTRACT is on.
 const labelCatalog = /** @type {Record<string, any>} */ ({});
 let nextCatalogLabelId = 300;
@@ -1169,6 +1180,7 @@ const server = https.createServer(
     const fjRepoById = path.match(/^\/api\/v1\/repositories\/(\d+)$/);
     if (method === "GET" && fjRepoById) {
       // GetRepoByID (the driver resolves a numeric project id -> owner/repo slug).
+      if (missingContractProject(fjRepoById[1])) return send(res, 404, { message: "The target couldn't be found." });
       const project = resolveProject(fjRepoById[1]);
       const [owner, ...rest] = project.path_with_namespace.split("/");
       return send(res, 200, {
@@ -1520,6 +1532,7 @@ const server = https.createServer(
       // member=true (compliant, least-privilege).
       const ghRepoById = g.match(/^\/repositories\/(\d+)$/);
       if (method === "GET" && ghRepoById) {
+        if (missingContractProject(ghRepoById[1])) return send(res, 404, { message: "Not Found" });
         const project = resolveProject(ghRepoById[1]);
         const [owner, ...rest] = project.path_with_namespace.split("/");
         return send(res, 200, {
@@ -1876,6 +1889,7 @@ const server = https.createServer(
     // the single-project behavior otherwise.
     const proj = path.match(/^\/api\/v4\/projects\/([^/]+)(\/.*)?$/);
     if (proj) {
+      if (missingContractProject(proj[1])) return send(res, 404, { message: "404 Project Not Found" });
       const project = resolveProject(proj[1]);
       const rest = proj[2] || "";
 

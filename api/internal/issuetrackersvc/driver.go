@@ -12,10 +12,13 @@ import (
 // base URL form and the allowlist against the stored row BEFORE opening the
 // token, so removing a host from the allowlist stops use of existing rows
 // (fail closed). The token is opened with the row's user, kind and base URL as
-// AAD, used only to build the driver, and never returned or logged.
-func (s *Service) DriverFor(ctx context.Context, userID, connID uuid.UUID, project issuetracker.ProjectRef, stateField, open, closed string) (issuetracker.Driver, error) {
-	if issuetracker.ValidProjectRef(project) != nil {
-		return nil, &Error{Kind: KindBadRequest, Message: "invalid project reference"}
+// AAD, used only to build the driver, and never returned or logged. binding is
+// the empty issuetracker.Binding for a connection-level driver, or all of the
+// project, the repository's forge project id and the eligibility tag; a partial
+// or malformed one is refused before anything is read.
+func (s *Service) DriverFor(ctx context.Context, userID, connID uuid.UUID, binding issuetracker.Binding, stateField, open, closed string) (issuetracker.Driver, error) {
+	if issuetracker.ValidBinding(binding) != nil {
+		return nil, &Error{Kind: KindBadRequest, Message: "invalid project binding"}
 	}
 	row, err := s.getRow(ctx, userID, connID)
 	if err != nil {
@@ -39,12 +42,14 @@ func (s *Service) DriverFor(ctx context.Context, userID, connID uuid.UUID, proje
 		return nil, internal()
 	}
 	d, err := s.newDriver(kind, issuetracker.Options{
-		BaseURL:     norm,
-		Token:       token,
-		Project:     project,
-		StateField:  stateField,
-		OpenState:   open,
-		ClosedState: closed,
+		BaseURL:        norm,
+		Token:          token,
+		Project:        binding.Project,
+		ProjectID:      binding.ProjectID,
+		EligibilityTag: binding.EligibilityTag,
+		StateField:     stateField,
+		OpenState:      open,
+		ClosedState:    closed,
 	})
 	if err != nil {
 		s.log.Error("build issue tracker driver", "kind", row.Kind, "error", err)
@@ -55,7 +60,7 @@ func (s *Service) DriverFor(ctx context.Context, userID, connID uuid.UUID, proje
 
 // ListProjects lists the projects the connection's token can see.
 func (s *Service) ListProjects(ctx context.Context, userID, connID uuid.UUID) ([]issuetracker.Project, error) {
-	d, err := s.DriverFor(ctx, userID, connID, issuetracker.ProjectRef{}, "", "", "")
+	d, err := s.DriverFor(ctx, userID, connID, issuetracker.Binding{}, "", "", "")
 	if err != nil {
 		return nil, err
 	}
@@ -71,7 +76,7 @@ func (s *Service) ListStates(ctx context.Context, userID, connID uuid.UUID, proj
 	if !issuetracker.ValidProjectID(projectID) {
 		return nil, &Error{Kind: KindBadRequest, Message: "invalid project id"}
 	}
-	d, err := s.DriverFor(ctx, userID, connID, issuetracker.ProjectRef{}, "", "", "")
+	d, err := s.DriverFor(ctx, userID, connID, issuetracker.Binding{}, "", "", "")
 	if err != nil {
 		return nil, err
 	}
@@ -80,4 +85,18 @@ func (s *Service) ListStates(ctx context.Context, userID, connID uuid.UUID, proj
 		return nil, &Error{Kind: KindBadGateway, Message: "could not list states: " + err.Error()}
 	}
 	return states, nil
+}
+
+// ListTags lists the tags the connection's token can see, with their owners and
+// sharing settings.
+func (s *Service) ListTags(ctx context.Context, userID, connID uuid.UUID) ([]issuetracker.Tag, error) {
+	d, err := s.DriverFor(ctx, userID, connID, issuetracker.Binding{}, "", "", "")
+	if err != nil {
+		return nil, err
+	}
+	tags, err := d.ListTags(ctx)
+	if err != nil {
+		return nil, &Error{Kind: KindBadGateway, Message: "could not list tags: " + err.Error()}
+	}
+	return tags, nil
 }

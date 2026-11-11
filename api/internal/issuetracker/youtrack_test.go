@@ -15,15 +15,25 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/issuetracker/youtracktest"
 )
 
+// testProjectID is the forge project id the test drivers are bound to; the
+// tests pass it as the projectID argument.
+const testProjectID = 1
+
+// fakeEligibility is the eligibility tag the fake seeds: owned by another user
+// and shared with All Users.
+var fakeEligibility = TagRef{ID: youtracktest.EligibilityTagID, Name: youtracktest.EligibilityTagName}
+
 // fakeOptions are the Options that bind a driver to the fake's main project
-// with the state mapping its State bundle supports.
+// and eligibility tag with the state mapping its State bundle supports.
 func fakeOptions(srv *youtracktest.Server) Options {
 	return Options{
-		BaseURL:     srv.URL,
-		Token:       srv.Token,
-		Project:     ProjectRef{ID: youtracktest.ProjectID, ShortName: youtracktest.ProjectShortName},
-		OpenState:   "Open",
-		ClosedState: "Fixed",
+		BaseURL:        srv.URL,
+		Token:          srv.Token,
+		Project:        ProjectRef{ID: youtracktest.ProjectID, ShortName: youtracktest.ProjectShortName},
+		ProjectID:      testProjectID,
+		EligibilityTag: fakeEligibility,
+		OpenState:      "Open",
+		ClosedState:    "Fixed",
 	}
 }
 
@@ -63,12 +73,15 @@ func newFakeDriverWithField(t *testing.T, field string) (*youtracktest.Server, *
 }
 
 func TestConstructorValidation(t *testing.T) {
-	good := Options{BaseURL: "https://yt.example.com", Token: credential(), Project: ProjectRef{ID: "0-1", ShortName: "UZI"}}
+	good := Options{
+		BaseURL: "https://yt.example.com", Token: credential(), Project: ProjectRef{ID: "0-1", ShortName: "UZI"},
+		ProjectID: 7, EligibilityTag: TagRef{ID: "5-3", Name: "uzi"},
+	}
 	mutate := func(f func(*Options)) Options { o := good; f(&o); return o }
 	if _, err := New(KindYouTrack, good); err != nil {
 		t.Fatalf("good options: %v", err)
 	}
-	if _, err := New(KindYouTrack, mutate(func(o *Options) { o.Project = ProjectRef{} })); err != nil {
+	if _, err := New(KindYouTrack, mutate(func(o *Options) { o.Project, o.ProjectID, o.EligibilityTag = ProjectRef{}, 0, TagRef{} })); err != nil {
 		t.Fatalf("unbound options: %v", err)
 	}
 	bad := map[string]Options{
@@ -87,6 +100,15 @@ func TestConstructorValidation(t *testing.T) {
 		"bad short":   mutate(func(o *Options) { o.Project.ShortName = "1X" }),
 		"bad id":      mutate(func(o *Options) { o.Project.ID = "abc" }),
 		"half bound":  mutate(func(o *Options) { o.Project.ID = "" }),
+		// A binding is all or nothing (PRD #4173 D10, D14).
+		"no project id":       mutate(func(o *Options) { o.ProjectID = 0 }),
+		"negative project id": mutate(func(o *Options) { o.ProjectID = -3 }),
+		"no eligibility":      mutate(func(o *Options) { o.EligibilityTag = TagRef{} }),
+		"project id only":     mutate(func(o *Options) { o.Project, o.EligibilityTag = ProjectRef{}, TagRef{} }),
+		"eligibility only":    mutate(func(o *Options) { o.Project, o.ProjectID = ProjectRef{}, 0 }),
+		"bad tag id":          mutate(func(o *Options) { o.EligibilityTag.ID = "../x" }),
+		"bad tag name":        mutate(func(o *Options) { o.EligibilityTag.Name = "a}b" }),
+		"empty tag name":      mutate(func(o *Options) { o.EligibilityTag.Name = "" }),
 	}
 	for name, o := range bad {
 		if _, err := New(KindYouTrack, o); err == nil {
@@ -144,26 +166,37 @@ func rawIssue(id, readable string, number int64, projectID, tags string) string 
 		`"project":{"id":%q,"shortName":"UZI"},"tags":[%s]}`, id, readable, number, projectID, tags)
 }
 
+// rawMe is the users/me answer of the account that raw handlers' tags belong to.
+const (
+	rawMeID      = "1-1"
+	rawMe        = `{"id":"` + rawMeID + `","login":"u"}`
+	rawNoSharing = `{"readSharingSettings":{"permittedGroups":[],"permittedUsers":[]},"tagSharingSettings":{"permittedGroups":[],"permittedUsers":[]}}`
+)
+
 func writeRaw(w http.ResponseWriter, body string) {
 	w.Header().Set("Content-Type", "application/json")
 	_, _ = w.Write([]byte(body))
 }
 
-// everyMethod lists the eleven forge.IssueTracker methods as closures over y.
-func everyMethod(y *youTrack) map[string]func() error {
+// everyMethod lists the eleven forge.IssueTracker methods as closures over y,
+// each called with the project id the test drivers are bound to.
+func everyMethod(y *youTrack) map[string]func() error { return everyMethodWith(y, testProjectID) }
+
+// everyMethodWith is everyMethod with a chosen projectID argument.
+func everyMethodWith(y *youTrack, pid int64) map[string]func() error {
 	ctx := context.Background()
 	return map[string]func() error{
-		"ListLabels":             func() error { _, err := y.ListLabels(ctx, 1); return err },
-		"EnsureLabels":           func() error { return y.EnsureLabels(ctx, 1, []forge.Label{{Name: "a"}}) },
-		"ListIssues":             func() error { _, err := y.ListIssues(ctx, 1, forge.ListIssuesOptions{}); return err },
-		"GetIssue":               func() error { _, err := y.GetIssue(ctx, 1, 1); return err },
-		"CreateIssue":            func() error { _, err := y.CreateIssue(ctx, 1, "t", "d", []string{"a"}); return err },
-		"UpdateIssueLabels":      func() error { return y.UpdateIssueLabels(ctx, 1, 1, []string{"a"}, []string{"b"}) },
-		"UpdateIssueDescription": func() error { return y.UpdateIssueDescription(ctx, 1, 1, "d") },
-		"SetIssueState":          func() error { return y.SetIssueState(ctx, 1, 1, forge.StateClosed) },
-		"ListIssueLabelEvents":   func() error { _, err := y.ListIssueLabelEvents(ctx, 1, 1); return err },
-		"ListIssueComments":      func() error { _, err := y.ListIssueComments(ctx, 1, 1); return err },
-		"CreateIssueNote":        func() error { _, err := y.CreateIssueNote(ctx, 1, 1, "n"); return err },
+		"ListLabels":             func() error { _, err := y.ListLabels(ctx, pid); return err },
+		"EnsureLabels":           func() error { return y.EnsureLabels(ctx, pid, []forge.Label{{Name: "a"}}) },
+		"ListIssues":             func() error { _, err := y.ListIssues(ctx, pid, forge.ListIssuesOptions{}); return err },
+		"GetIssue":               func() error { _, err := y.GetIssue(ctx, pid, 1); return err },
+		"CreateIssue":            func() error { _, err := y.CreateIssue(ctx, pid, "t", "d", []string{"a"}); return err },
+		"UpdateIssueLabels":      func() error { return y.UpdateIssueLabels(ctx, pid, 1, []string{"a"}, []string{"b"}) },
+		"UpdateIssueDescription": func() error { return y.UpdateIssueDescription(ctx, pid, 1, "d") },
+		"SetIssueState":          func() error { return y.SetIssueState(ctx, pid, 1, forge.StateClosed) },
+		"ListIssueLabelEvents":   func() error { _, err := y.ListIssueLabelEvents(ctx, pid, 1); return err },
+		"ListIssueComments":      func() error { _, err := y.ListIssueComments(ctx, pid, 1); return err },
+		"CreateIssueNote":        func() error { _, err := y.CreateIssueNote(ctx, pid, 1, "n"); return err },
 	}
 }
 

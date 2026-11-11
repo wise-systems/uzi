@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"sync"
 	"unicode"
 )
 
@@ -20,18 +21,27 @@ var (
 )
 
 // youTrack is the JetBrains YouTrack driver. It is bound to one project when
-// built (see ProjectRef): the projectID argument of every forge.IssueTracker
-// method is ignored, and a driver with no project bound refuses them with
-// ErrProjectNotBound. VerifyToken, ListProjects and ListStates need no binding.
+// built (see Binding). Every forge.IssueTracker method checks its projectID
+// argument against the bound id before any request: a driver with no project
+// bound refuses them with ErrProjectNotBound, and a different id gets
+// ErrProjectMismatch. VerifyToken, ListProjects, ListTags and ListStates need
+// no binding.
 type youTrack struct {
 	baseURL     string // scheme and host, no trailing slash
 	token       string
 	project     ProjectRef
+	projectID   int64  // the forge project id the driver answers to
+	eligibility TagRef // the eligibility tag; its name always resolves to its id
 	stateField  string
 	openState   string
 	closedState string
 	client      *http.Client
 	red         redactor
+
+	// accountMu guards account, the token's own account. It is read from
+	// users/me the first time tag ownership matters, then kept (see connAccount).
+	accountMu sync.Mutex
+	account   *Account
 }
 
 var _ Driver = (*youTrack)(nil)
@@ -51,7 +61,7 @@ func buildYouTrack(opts Options, base http.RoundTripper) (*youTrack, error) {
 	if err := ValidateToken(opts.Token); err != nil {
 		return nil, err
 	}
-	if err := ValidProjectRef(opts.Project); err != nil {
+	if err := ValidBinding(Binding{Project: opts.Project, ProjectID: opts.ProjectID, EligibilityTag: opts.EligibilityTag}); err != nil {
 		return nil, err
 	}
 	stateField := opts.StateField
@@ -62,6 +72,8 @@ func buildYouTrack(opts Options, base http.RoundTripper) (*youTrack, error) {
 		baseURL:     baseURL,
 		token:       opts.Token,
 		project:     opts.Project,
+		projectID:   opts.ProjectID,
+		eligibility: opts.EligibilityTag,
 		stateField:  stateField,
 		openState:   opts.OpenState,
 		closedState: opts.ClosedState,
@@ -105,10 +117,15 @@ func strictBaseURL(raw string) (string, error) {
 	return "https://" + u.Host, nil
 }
 
-// requireProject returns the bound project or the ErrProjectNotBound sentinel.
-func (y *youTrack) requireProject() (ProjectRef, error) {
+// requireProject is the guard every forge.IssueTracker method starts with,
+// before any request: it returns the bound project, ErrProjectNotBound for an
+// unbound driver, or ErrProjectMismatch when projectID is not the bound one.
+func (y *youTrack) requireProject(projectID int64) (ProjectRef, error) {
 	if y.project == (ProjectRef{}) {
 		return ProjectRef{}, y.red.sentinel(ErrProjectNotBound, 0, "")
+	}
+	if projectID != y.projectID {
+		return ProjectRef{}, y.red.sentinel(ErrProjectMismatch, 0, "")
 	}
 	return y.project, nil
 }

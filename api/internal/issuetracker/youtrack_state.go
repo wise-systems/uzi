@@ -11,8 +11,8 @@ import (
 // SetIssueState implements forge.IssueTracker. It writes the explicit state
 // value Options names for the requested state and never guesses one; with that
 // value unset it returns ErrStateMappingUnset.
-func (y *youTrack) SetIssueState(ctx context.Context, _, issueIID int64, state forge.IssueState) error {
-	if _, err := y.requireProject(); err != nil {
+func (y *youTrack) SetIssueState(ctx context.Context, projectID, issueIID int64, state forge.IssueState) error {
+	if _, err := y.requireProject(projectID); err != nil {
 		return err
 	}
 	var value string
@@ -27,7 +27,7 @@ func (y *youTrack) SetIssueState(ctx context.Context, _, issueIID int64, state f
 	if value == "" {
 		return y.red.sentinel(ErrStateMappingUnset, 0, "no value configured for "+string(state))
 	}
-	w, err := y.resolveIssue(ctx, issueIID)
+	w, err := y.resolveIssue(ctx, projectID, issueIID)
 	if err != nil {
 		return err
 	}

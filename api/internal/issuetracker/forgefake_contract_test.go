@@ -17,6 +17,11 @@ import (
 // forgeFakeProjectID is the project id of the Node fake's first project.
 const forgeFakeProjectID = 1
 
+// forgeFakeOtherProjectID is a project id the Node fake does not have. Under
+// FORGE_FAKE_ISSUE_CONTRACT=1 the fake answers 404 for it instead of falling
+// back to its first project, which is what the ProjectGuard case relies on.
+const forgeFakeOtherProjectID = 4242
+
 // TestIssueTrackerForgeFakeContracts runs the shared issue tracker contract
 // against the real GitLab, GitHub and Forgejo drivers over the Node HTTPS fake
 // (e2e/forge-fake/forge-fake.mjs). The launcher
@@ -44,8 +49,9 @@ func TestIssueTrackerForgeFakeContracts(t *testing.T) {
 					t.Fatalf("forge.New(%s): %v", dialect, err)
 				}
 				return issuetrackertest.Subject{
-					IssueTracker: driver,
-					ProjectID:    forgeFakeProjectID,
+					IssueTracker:   driver,
+					ProjectID:      forgeFakeProjectID,
+					OtherProjectID: forgeFakeOtherProjectID,
 					SeedHumanComment: func(t *testing.T, iid int64, username, body string) {
 						postFake(t, endpoint, fmt.Sprintf("/_e2e/issues/%d/comments", iid),
 							map[string]any{"username": username, "body": body})

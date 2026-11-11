@@ -10,8 +10,9 @@ import (
 func TestLabelEventsOrdinalAndExpansion(t *testing.T) {
 	y, srv := newFakeDriver(t)
 	n := srv.SeedIssue("t", "")
-	srv.SeedTagActivity(n, "alice", []string{"a", "b"}, []string{"c"})
-	srv.SeedTagActivity(n, "bob", []string{"d"}, nil)
+	a, b, c, d := srv.SeedOwnTag("a"), srv.SeedOwnTag("b"), srv.SeedOwnTag("c"), srv.SeedOwnTag("d")
+	srv.SeedTagActivity(n, "alice", []string{a, b}, []string{c})
+	srv.SeedTagActivity(n, "bob", []string{d}, nil)
 	got, err := y.ListIssueLabelEvents(context.Background(), 1, n)
 	if err != nil {
 		t.Fatal(err)

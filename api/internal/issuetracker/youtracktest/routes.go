@@ -31,6 +31,7 @@ func (s *Server) routes() *http.ServeMux {
 	route("/api/admin/projects/{pid}/customFields", map[string]http.HandlerFunc{http.MethodGet: s.listProjectFields})
 	route("/api/admin/projects/{pid}/customFields/{cf}/bundle/values", map[string]http.HandlerFunc{http.MethodGet: s.listBundleValues})
 	route("/api/tags", map[string]http.HandlerFunc{http.MethodGet: s.listTags, http.MethodPost: s.createTag})
+	route("/api/tags/{id}", map[string]http.HandlerFunc{http.MethodGet: s.getTag})
 	route("/api/issues", map[string]http.HandlerFunc{http.MethodGet: s.listIssues, http.MethodPost: s.createIssue})
 	route("/api/issues/{id}", map[string]http.HandlerFunc{http.MethodGet: s.getIssue, http.MethodPost: s.updateIssue})
 	route("/api/issues/{id}/tags", map[string]http.HandlerFunc{http.MethodPost: s.addIssueTag})
@@ -163,24 +164,71 @@ func (s *Server) listTags(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	writePage(w, r, spec, s.m.tagsJSON(tagIDs(s.m.tags)))
-}
-
-func tagIDs(tags []*tag) []string {
-	ids := make([]string, 0, len(tags))
-	for _, t := range tags {
-		ids = append(ids, t.id)
+	items := []map[string]any{}
+	for _, t := range s.m.visibleTags() {
+		items = append(items, s.m.tagJSON(t))
 	}
-	return ids
+	writePage(w, r, spec, items)
 }
 
+// getTag answers 404 for a tag the bot cannot see, as for one that is not there.
+func (s *Server) getTag(w http.ResponseWriter, r *http.Request) {
+	spec, ok := fields(w, r)
+	if !ok {
+		return
+	}
+	t := s.m.tagByID(r.PathValue("id"))
+	if t == nil || !t.visibleTo(BotID) {
+		notFound(w, r.PathValue("id"))
+		return
+	}
+	writeJSON(w, http.StatusOK, spec.project(s.m.tagJSON(t)))
+}
+
+// sharingBody is the sharing settings member of a create-tag body: ids only.
+type sharingBody struct {
+	Groups []struct {
+		ID string `json:"id"`
+	} `json:"permittedGroups"`
+	Users []struct {
+		ID string `json:"id"`
+	} `json:"permittedUsers"`
+}
+
+// toSharing resolves a body's ids against the fake's groups and users; it
+// reports false for an id the fake does not know.
+func (b *sharingBody) toSharing() (sharing, bool) {
+	var out sharing
+	if b == nil {
+		return out, true
+	}
+	for _, g := range b.Groups {
+		if !slices.ContainsFunc(fakeGroups, func(k group) bool { return k.id == g.ID }) {
+			return sharing{}, false
+		}
+		out.groups = append(out.groups, g.ID)
+	}
+	for _, u := range b.Users {
+		if !slices.ContainsFunc(fakeUsers, func(k user) bool { return k.id == u.ID }) {
+			return sharing{}, false
+		}
+		out.users = append(out.users, u.ID)
+	}
+	return out, true
+}
+
+// createTag makes a tag owned by the bot, with the sharing settings of the
+// body. Only a duplicate of a tag the bot already owns is a conflict: another
+// user's tag of the same name does not block it.
 func (s *Server) createTag(w http.ResponseWriter, r *http.Request) {
 	spec, ok := fields(w, r)
 	if !ok {
 		return
 	}
 	var body struct {
-		Name string `json:"name"`
+		Name string       `json:"name"`
+		Read *sharingBody `json:"readSharingSettings"`
+		Use  *sharingBody `json:"tagSharingSettings"`
 	}
 	if !decodeBody(w, r, &body) {
 		return
@@ -189,14 +237,21 @@ func (s *Server) createTag(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "Bad Request", "tag name is required")
 		return
 	}
+	read, readOK := body.Read.toSharing()
+	use, useOK := body.Use.toSharing()
+	if !readOK || !useOK {
+		writeError(w, http.StatusBadRequest, "Bad Request", "unknown group or user in the sharing settings")
+		return
+	}
 	for _, t := range s.m.tags {
-		if t.name == body.Name {
+		if t.owner == BotID && t.name == body.Name {
 			writeError(w, http.StatusConflict, "Conflict", "tag already exists")
 			return
 		}
 	}
-	t := s.m.ensureTag(body.Name)
-	writeJSON(w, http.StatusOK, spec.project(s.m.tagsJSON([]string{t.id})[0]))
+	t := &tag{id: s.m.nextID(5), name: body.Name, owner: BotID, read: read, use: use}
+	s.m.tags = append(s.m.tags, t)
+	writeJSON(w, http.StatusOK, spec.project(s.m.tagJSON(t)))
 }
 
 var (
@@ -260,7 +315,7 @@ func (s *Server) listIssues(w http.ResponseWriter, r *http.Request) {
 }
 
 // hasAllTags matches tag names case-insensitively, as YouTrack's query does;
-// the driver filters again on the exact name.
+// the driver filters again by resolved tag id.
 func (s *Server) hasAllTags(i *issue, names []string) bool {
 	for _, name := range names {
 		found := false
@@ -382,8 +437,12 @@ func (s *Server) addIssueTag(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	t := s.m.tagByID(body.ID)
-	if t == nil {
+	if t == nil || !t.visibleTo(BotID) {
 		writeError(w, http.StatusBadRequest, "Bad Request", "unknown tag")
+		return
+	}
+	if !t.usableBy(BotID) {
+		writeError(w, http.StatusForbidden, "Forbidden", "the tag is not shared with you for use")
 		return
 	}
 	if i.hasTag(t.id) {
@@ -391,7 +450,7 @@ func (s *Server) addIssueTag(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.m.addTag(i, t, BotLogin)
-	writeJSON(w, http.StatusOK, spec.project(s.m.tagsJSON([]string{t.id})[0]))
+	writeJSON(w, http.StatusOK, spec.project(s.m.tagJSON(t)))
 }
 
 func (s *Server) removeIssueTag(w http.ResponseWriter, r *http.Request) {

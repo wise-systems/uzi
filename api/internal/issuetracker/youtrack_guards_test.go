@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/vtmocanu/uzi/api/internal/forge"
+	"github.com/vtmocanu/uzi/api/internal/issuetracker/youtracktest"
 )
 
 func TestSetIssueStateRefusesAStateThatIsNeitherOpenedNorClosed(t *testing.T) {
@@ -97,9 +98,11 @@ func TestCreateIssueRefusesAMalformedCreatedID(t *testing.T) {
 		}
 		writeRaw(w, rawIssue("2-1", "UZI-1", 1, "0-1", ""))
 	})
-	if _, err := y.CreateIssue(context.Background(), 1, "t", "d", []string{"a"}); err == nil {
+	if _, err := y.CreateIssue(context.Background(), 1, "t", "d", []string{fakeEligibility.Name}); err == nil {
 		t.Fatal("CreateIssue accepted a malformed created id")
 	}
+	// The eligibility label needs no lookup, so the POST is the only request:
+	// the malformed id stops the attach and the read-back.
 	if got := log.all(); len(got) != 1 {
 		t.Errorf("requests = %v, want only the POST", got)
 	}
@@ -140,17 +143,38 @@ func TestUpdateIssueLabelsDeduplicates(t *testing.T) {
 	}
 }
 
-func TestUpdateIssueLabelsSkipsTheTagListingForAPresentLabel(t *testing.T) {
-	y, srv := newFakeDriver(t)
-	n := srv.SeedIssue("t", "", "x")
-	srv.ResetRequests()
-	if err := y.UpdateIssueLabels(context.Background(), 1, n, []string{"x"}, nil); err != nil {
-		t.Fatal(err)
-	}
-	for _, r := range srv.Requests() {
-		if strings.HasPrefix(r.Path, "/api/tags") || r.Method != http.MethodGet {
-			t.Errorf("unexpected request for an already-present label: %v", r)
-		}
+// TestUpdateIssueLabelsAddOfAPresentTagWritesNothing: "already on the issue" is
+// decided by tag id. The eligibility name resolves to its stored id with no
+// request at all; another name needs the account and its tags, and then still
+// writes nothing.
+func TestUpdateIssueLabelsAddOfAPresentTagWritesNothing(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		seed     func(*youtracktest.Server) string // returns the tag id put on the issue
+		label    string
+		wantRead bool // the tag list and users/me are read
+	}{
+		{"eligibility tag", func(*youtracktest.Server) string { return youtracktest.EligibilityTagID }, youtracktest.EligibilityTagName, false},
+		{"account tag", func(s *youtracktest.Server) string { return s.SeedOwnTag("x") }, "x", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			y, srv := newFakeDriver(t)
+			n := srv.SeedIssue("t", "", tc.seed(srv))
+			srv.ResetRequests()
+			if err := y.UpdateIssueLabels(context.Background(), testProjectID, n, []string{tc.label}, nil); err != nil {
+				t.Fatal(err)
+			}
+			readsTags := false
+			for _, r := range srv.Requests() {
+				if r.Method != http.MethodGet {
+					t.Errorf("wrote for an already-present label: %v", r)
+				}
+				readsTags = readsTags || strings.HasPrefix(r.Path, "/api/tags") || r.Path == "/api/users/me"
+			}
+			if readsTags != tc.wantRead {
+				t.Errorf("read tags or the account = %v, want %v", readsTags, tc.wantRead)
+			}
+		})
 	}
 }
 

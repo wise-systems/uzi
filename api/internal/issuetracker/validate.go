@@ -2,6 +2,7 @@ package issuetracker
 
 import (
 	"errors"
+	"slices"
 	"unicode"
 )
 
@@ -34,6 +35,38 @@ func InvisibleRune(c rune) bool {
 // ValidProjectID reports whether id is a well-formed project entity id such as
 // "0-1".
 func ValidProjectID(id string) bool { return entityIDRE.MatchString(id) }
+
+// ValidTagRef requires a well-formed tag id and a name a label may carry.
+func ValidTagRef(ref TagRef) error {
+	if !entityIDRE.MatchString(ref.ID) {
+		return errors.New("issuetracker: invalid eligibility tag id")
+	}
+	if labelNameProblem(ref.Name) {
+		return errors.New("issuetracker: invalid eligibility tag name")
+	}
+	return nil
+}
+
+// ValidBinding accepts the empty Binding (a connection-level driver) and a
+// Binding with all of its parts set and well formed; a partial one is refused,
+// so a driver can never answer for a project without knowing its eligibility
+// tag. The message never includes the input.
+func ValidBinding(b Binding) error {
+	set := []bool{b.Project != (ProjectRef{}), b.ProjectID != 0, b.EligibilityTag != (TagRef{})}
+	if !slices.Contains(set, true) {
+		return nil
+	}
+	if slices.Contains(set, false) {
+		return errors.New("issuetracker: project, project id and eligibility tag must all be set or all be empty")
+	}
+	if b.ProjectID < 0 {
+		return errors.New("issuetracker: invalid project id")
+	}
+	if err := ValidProjectRef(b.Project); err != nil {
+		return err
+	}
+	return ValidTagRef(b.EligibilityTag)
+}
 
 // ValidProjectRef accepts the empty ProjectRef (no project bound) and
 // otherwise requires a well-formed id and short name. The message never

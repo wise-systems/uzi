@@ -1,10 +1,7 @@
 package issuetracker
 
 import (
-	"fmt"
 	"regexp"
-	"strconv"
-	"strings"
 	"time"
 
 	"github.com/vtmocanu/uzi/api/internal/forge"
@@ -12,10 +9,13 @@ import (
 
 // fields parameters. YouTrack returns only what is asked for.
 const (
-	issueFields    = "id,idReadable,numberInProject,summary,description,created,updated,resolved,reporter(id,login),tags(id,name),project(id,shortName)"
-	tagFields      = "id,name"
-	commentFields  = "id,text,created,deleted,author(id,login)"
-	activityFields = "id,timestamp,author(id,login),added(id,name),removed(id,name)"
+	issueFields     = "id,idReadable,numberInProject,summary,description,created,updated,resolved,reporter(id,login),tags(id,name),project(id,shortName)"
+	tagFields       = "id,name"
+	ownedTagFields  = "id,name,owner(id)"
+	sharingFields   = "permittedGroups(id,name,allUsersGroup,usersCount),permittedUsers(id,login)"
+	sharedTagFields = "id,name,owner(id,login),readSharingSettings(" + sharingFields + "),tagSharingSettings(" + sharingFields + ")"
+	commentFields   = "id,text,created,deleted,author(id,login)"
+	activityFields  = "id,timestamp,author(id,login),added(id,name),removed(id,name)"
 )
 
 // idReadableRE matches an id-readable such as "UZI-15"; it ends up in WebURL.
@@ -26,9 +26,39 @@ type ytUser struct {
 	Login string `json:"login"`
 }
 
+// ytTag is a wire tag. Owner and the sharing settings are present only where
+// the request asked for them (see ownedTagFields and sharedTagFields).
 type ytTag struct {
-	ID   string `json:"id"`
-	Name string `json:"name"`
+	ID    string     `json:"id"`
+	Name  string     `json:"name"`
+	Owner *ytUser    `json:"owner"`
+	Read  *ytSharing `json:"readSharingSettings"`
+	Use   *ytSharing `json:"tagSharingSettings"`
+}
+
+// ytSharing is YouTrack's TagSharingSettings (and the read settings, which have
+// the same members).
+type ytSharing struct {
+	Groups []ytGroup `json:"permittedGroups"`
+	Users  []ytUser  `json:"permittedUsers"`
+}
+
+type ytGroup struct {
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	AllUsers   bool   `json:"allUsersGroup"`
+	UsersCount int    `json:"usersCount"`
+}
+
+// nestedCount is the number of users and groups in the tag's sharing settings.
+func (t ytTag) nestedCount() int {
+	n := 0
+	for _, s := range []*ytSharing{t.Read, t.Use} {
+		if s != nil {
+			n += len(s.Groups) + len(s.Users)
+		}
+	}
+	return n
 }
 
 type ytProject struct {
@@ -109,26 +139,24 @@ func (y *youTrack) toIssue(w ytIssue) (forge.Issue, error) {
 		issue.Author = w.Reporter.Login
 	}
 	for _, t := range w.Tags {
+		if y.foreignEligibility(t) {
+			continue
+		}
 		issue.Labels = append(issue.Labels, t.Name)
 	}
 	return issue, nil
 }
 
+// foreignEligibility reports whether t carries the eligibility name without
+// being the eligibility tag. Reads leave it out, so the eligibility name in a
+// result always means the stored tag.
+func (y *youTrack) foreignEligibility(t ytTag) bool {
+	return y.eligibility.Name != "" && t.Name == y.eligibility.Name && t.ID != y.eligibility.ID
+}
+
 // inBoundProject reports whether the issue sits in the bound project.
 func (y *youTrack) inBoundProject(w ytIssue) bool {
 	return w.Project != nil && w.Project.ID == y.project.ID && w.NumberInProject > 0
-}
-
-// noteID is the numeric suffix of a comment entity id such as "4-17".
-func noteID(id string) (int64, error) {
-	if !entityIDRE.MatchString(id) {
-		return 0, fmt.Errorf("youtrack: comment with a malformed id in the response")
-	}
-	n, err := strconv.ParseInt(id[strings.IndexByte(id, '-')+1:], 10, 64)
-	if err != nil {
-		return 0, fmt.Errorf("youtrack: comment with a malformed id in the response")
-	}
-	return n, nil
 }
 
 func login(u *ytUser) string {
