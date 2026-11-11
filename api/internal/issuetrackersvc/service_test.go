@@ -171,6 +171,9 @@ func TestConnectRefusesBadInput(t *testing.T) {
 		{"query", "youtrack", testHost + "?a=b", "tok"},
 		{"bare question mark", "youtrack", testHost + "?", "tok"},
 		{"fragment", "youtrack", testHost + "#x", "tok"},
+		{"bare hash", "youtrack", testHost + "#", "tok"},
+		{"escaped percent in host", "youtrack", "https://x%25y.example.com", "tok"},
+		{"empty hostname with port", "youtrack", "https://:443", "tok"},
 		{"no host", "youtrack", "https://", "tok"},
 		{"not allowlisted", "youtrack", "https://evil.example.com", "tok"},
 		{"explicit default port is a different origin string", "youtrack", testHost + ":443", "tok"},
@@ -184,6 +187,57 @@ func TestConnectRefusesBadInput(t *testing.T) {
 				t.Error("driver built for refused input")
 			}
 		})
+	}
+}
+
+func TestConnectRefusesBadToken(t *testing.T) {
+	cases := map[string]string{
+		"8 MiB":         strings.Repeat("a", 8<<20),
+		"just too long": strings.Repeat("a", maxTokenLen+1),
+		"embedded CRLF": strings.Join([]string{"perm", "abc\r\nX-Evil: 1", "def"}, "-"),
+		"zero width":    strings.Join([]string{"perm", "abc\u200bdef", "ghi"}, "-"),
+		"bidi override": strings.Join([]string{"perm", "abc\u202edef", "ghi"}, "-"),
+		"embedded NUL":  strings.Join([]string{"perm", "abc\x00def", "ghi"}, "-"),
+	}
+	for name, tok := range cases {
+		t.Run(name, func(t *testing.T) {
+			h := newHarness(t)
+			_, err := h.svc.Connect(context.Background(), uuid.New(), "youtrack", testHost, tok)
+			wantKind(t, err, KindBadRequest)
+			if len(h.built) != 0 || len(h.q.rows) != 0 {
+				t.Error("driver built or row stored for a refused token")
+			}
+		})
+	}
+	h := newHarness(t)
+	if _, err := h.svc.Connect(context.Background(), uuid.New(), "youtrack", testHost, strings.Repeat("a", maxTokenLen)); err != nil {
+		t.Errorf("a token of exactly the limit must pass: %v", err)
+	}
+}
+
+func TestConnectNilAllowlistRefusesAll(t *testing.T) {
+	built := 0
+	s := New(&fakeQuerier{}, nil, nil, func(issuetracker.Kind, issuetracker.Options) (issuetracker.Driver, error) {
+		built++
+		return &fakeDriver{}, nil
+	})
+	_, err := s.Connect(context.Background(), uuid.New(), "youtrack", testHost, strings.Repeat("a", 32))
+	e := wantKind(t, err, KindBadRequest)
+	if !strings.Contains(e.Message, "allowed") || built != 0 {
+		t.Errorf("message = %q, built = %d", e.Message, built)
+	}
+}
+
+func TestConnectDriverBuildFailureIsBadRequest(t *testing.T) {
+	h := newHarness(t)
+	h.svc.newDriver = func(issuetracker.Kind, issuetracker.Options) (issuetracker.Driver, error) {
+		return nil, errors.New("issuetracker: token shorter than the minimum length")
+	}
+	tok := testToken("s")
+	_, err := h.svc.Connect(context.Background(), uuid.New(), "youtrack", testHost, tok)
+	e := wantKind(t, err, KindBadRequest)
+	if !strings.Contains(e.Message, "invalid token") || strings.Contains(e.Message, tok) {
+		t.Errorf("message = %q", e.Message)
 	}
 }
 
@@ -401,6 +455,67 @@ func TestDriverForRefusesTamperedRow(t *testing.T) {
 	h.q.rows[0].BaseUrl = "https://evil.example.com/x"
 	_, err = h.svc.DriverFor(ctx, user, c.ID, issuetracker.ProjectRef{}, "", "", "")
 	wantKind(t, err, KindBadRequest)
+}
+
+func TestDriverForRefusesNonCanonicalStoredURL(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	user := uuid.New()
+	c, err := h.svc.Connect(ctx, user, "youtrack", testHost, testToken("t"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.built = nil
+	// Strict-valid and allowlisted, but not the canonical stored form.
+	h.allow["https://ISSUES.example.com"] = true
+	h.q.rows[0].BaseUrl = "https://ISSUES.example.com"
+	_, err = h.svc.DriverFor(ctx, user, c.ID, issuetracker.ProjectRef{}, "", "", "")
+	wantKind(t, err, KindBadRequest)
+	if len(h.built) != 0 {
+		t.Error("driver built for a non-canonical stored URL")
+	}
+}
+
+func TestDriverForRefusesMalformedProjectRef(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	user := uuid.New()
+	c, err := h.svc.Connect(ctx, user, "youtrack", testHost, testToken("t"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.built = nil
+	for _, ref := range []issuetracker.ProjectRef{{ID: "0-1"}, {ShortName: "UZI"}, {ID: "x", ShortName: "UZI"}, {ID: "0-1", ShortName: "1bad"}} {
+		_, err = h.svc.DriverFor(ctx, user, c.ID, ref, "", "", "")
+		wantKind(t, err, KindBadRequest)
+	}
+	if len(h.built) != 0 {
+		t.Error("driver built for a malformed project reference")
+	}
+}
+
+func TestListStatesUsesEmptyProjectRefAndValidatesID(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	user := uuid.New()
+	c, err := h.svc.Connect(ctx, user, "youtrack", testHost, testToken("t"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.built = nil
+	// The double's ListStates is unstubbed and errors; only the build matters here.
+	_, _ = h.svc.ListStates(ctx, user, c.ID, "0-1")
+	if len(h.built) != 1 || h.built[0].Project != (issuetracker.ProjectRef{}) {
+		t.Errorf("built = %+v, want one build with an empty Project", h.built)
+	}
+	h.built = nil
+	for _, bad := range []string{"", "abc", "0-1/../x", "1-", "0-1\n"} {
+		_, err = h.svc.ListStates(ctx, user, c.ID, bad)
+		wantKind(t, err, KindBadRequest)
+	}
+	if len(h.built) != 0 {
+		t.Error("driver built for a bad project id")
+	}
 }
 
 func TestListProjectsAndStates(t *testing.T) {

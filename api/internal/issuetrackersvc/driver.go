@@ -2,11 +2,22 @@ package issuetrackersvc
 
 import (
 	"context"
+	"regexp"
 
 	"github.com/google/uuid"
 
 	"github.com/vtmocanu/uzi/api/internal/issuetracker"
 )
+
+var (
+	entityIDRE  = regexp.MustCompile(`^\d+-\d+$`)
+	shortNameRE = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_]*$`)
+)
+
+// validProjectRef reports whether p is empty or has a well-formed id and short name.
+func validProjectRef(p issuetracker.ProjectRef) bool {
+	return p == (issuetracker.ProjectRef{}) || (entityIDRE.MatchString(p.ID) && shortNameRE.MatchString(p.ShortName))
+}
 
 // DriverFor builds a driver for a stored connection. It re-checks the strict
 // base URL form and the allowlist against the stored row BEFORE opening the
@@ -14,6 +25,9 @@ import (
 // (fail closed). The token is opened with the row's user, kind and base URL as
 // AAD, used only to build the driver, and never returned or logged.
 func (s *Service) DriverFor(ctx context.Context, userID, connID uuid.UUID, project issuetracker.ProjectRef, stateField, open, closed string) (issuetracker.Driver, error) {
+	if !validProjectRef(project) {
+		return nil, &Error{Kind: KindBadRequest, Message: "invalid project reference"}
+	}
 	row, err := s.getRow(ctx, userID, connID)
 	if err != nil {
 		return nil, err
@@ -65,7 +79,10 @@ func (s *Service) ListProjects(ctx context.Context, userID, connID uuid.UUID) ([
 
 // ListStates lists the issue states of one project of the connection.
 func (s *Service) ListStates(ctx context.Context, userID, connID uuid.UUID, projectID string) ([]issuetracker.State, error) {
-	d, err := s.DriverFor(ctx, userID, connID, issuetracker.ProjectRef{ID: projectID}, "", "", "")
+	if !entityIDRE.MatchString(projectID) {
+		return nil, &Error{Kind: KindBadRequest, Message: "invalid project id"}
+	}
+	d, err := s.DriverFor(ctx, userID, connID, issuetracker.ProjectRef{}, "", "", "")
 	if err != nil {
 		return nil, err
 	}

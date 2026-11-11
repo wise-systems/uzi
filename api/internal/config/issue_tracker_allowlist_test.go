@@ -1,6 +1,7 @@
 package config
 
 import (
+	"os"
 	"strings"
 	"testing"
 )
@@ -18,6 +19,19 @@ func TestLoadReadsIssueTrackerAllowlist(t *testing.T) {
 	}
 	if cfg.IssueTrackerAllowedBaseURLs != nil {
 		t.Errorf("empty variable gave %v, want nil", cfg.IssueTrackerAllowedBaseURLs)
+	}
+
+	// Truly unset, not just empty: t.Setenv registers the restore, then Unsetenv removes it.
+	t.Setenv(env, "x")
+	if err := os.Unsetenv(env); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = Load()
+	if err != nil {
+		t.Fatalf("Load with the variable unset: %v", err)
+	}
+	if cfg.IssueTrackerAllowedBaseURLs != nil {
+		t.Errorf("unset variable gave %v, want nil", cfg.IssueTrackerAllowedBaseURLs)
 	}
 
 	t.Setenv(env, "https://Issues.Example.com/, https://issues.example.com")

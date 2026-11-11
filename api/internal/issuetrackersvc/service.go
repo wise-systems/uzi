@@ -2,8 +2,9 @@ package issuetrackersvc
 
 import (
 	"context"
-	"github.com/google/uuid"
 	"log/slog"
+
+	"github.com/google/uuid"
 
 	"github.com/vtmocanu/uzi/api/internal/issuetracker"
 	"github.com/vtmocanu/uzi/api/internal/secretbox"

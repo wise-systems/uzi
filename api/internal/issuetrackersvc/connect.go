@@ -2,7 +2,9 @@ package issuetrackersvc
 
 import (
 	"context"
+	"errors"
 	"strings"
+	"unicode"
 
 	"github.com/google/uuid"
 
@@ -26,6 +28,9 @@ func (s *Service) Connect(ctx context.Context, userID uuid.UUID, kind, baseURL, 
 	if token == "" {
 		return Connection{}, &Error{Kind: KindBadRequest, Message: "a token is required"}
 	}
+	if err := validateTokenShape(token); err != nil {
+		return Connection{}, &Error{Kind: KindBadRequest, Message: err.Error()}
+	}
 	norm, err := strictBaseURL(baseURL)
 	if err != nil {
 		return Connection{}, &Error{Kind: KindBadRequest, Message: err.Error()}
@@ -37,7 +42,8 @@ func (s *Service) Connect(ctx context.Context, userID uuid.UUID, kind, baseURL, 
 	d, err := s.newDriver(parsedKind, issuetracker.Options{BaseURL: norm, Token: token})
 	if err != nil {
 		s.log.Error("build issue tracker driver", "kind", string(parsedKind), "error", err)
-		return Connection{}, &Error{Kind: KindBadRequest, Message: "could not initialize issue tracker client"}
+		// The driver's build errors never carry the token.
+		return Connection{}, &Error{Kind: KindBadRequest, Message: "invalid token or connection settings: " + err.Error()}
 	}
 	account, err := d.VerifyToken(ctx)
 	if err != nil {
@@ -66,4 +72,21 @@ func (s *Service) Connect(ctx context.Context, userID uuid.UUID, kind, baseURL, 
 		return Connection{}, internal()
 	}
 	return toConnection(row), nil
+}
+
+// maxTokenLen bounds a token in bytes, before it is sealed or handed to a driver.
+const maxTokenLen = 4096
+
+// validateTokenShape refuses a token that is too long or holds a control or
+// format (Cf) character. The message never includes the token.
+func validateTokenShape(token string) error {
+	if len(token) > maxTokenLen {
+		return errors.New("token is too long")
+	}
+	for _, r := range token {
+		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
+			return errors.New("token holds a control or invisible character")
+		}
+	}
+	return nil
 }
