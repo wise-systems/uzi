@@ -2,6 +2,7 @@ package issuetracker
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -342,6 +343,45 @@ func TestNullTagsKeepsEmptyListSemantics(t *testing.T) {
 	tags := ytTags{{}, {}}
 	if err := tags.UnmarshalJSON([]byte(" null ")); err != nil || len(tags) != 0 {
 		t.Errorf("null: %d tags, %v; want an empty list", len(tags), err)
+	}
+}
+
+// TestRepeatedTagsKeysLeaveNoStaleFields pins that a later "tags" key never
+// inherits a field an earlier key set: the reused elements are cleared.
+func TestRepeatedTagsKeysLeaveNoStaleFields(t *testing.T) {
+	for name, in := range map[string]string{
+		"null between": `{"tags":[{"id":"6-1","name":"a"},{"id":"6-2","name":"b"}],"tags":null,"tags":[{"name":"c"}]}`,
+		"no null":      `{"tags":[{"id":"6-1","name":"a"},{"id":"6-2","name":"b"}],"tags":[{"name":"c"}]}`,
+	} {
+		var w ytIssue
+		if err := json.Unmarshal([]byte(in), &w); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if len(w.Tags) != 1 || w.Tags[0].ID != "" || w.Tags[0].Name != "c" {
+			t.Errorf("%s: tags = %+v, want one tag named c with no id", name, w.Tags)
+		}
+	}
+}
+
+// TestNullBetweenRepeatedTagsAllocatesLittle pins that a null between repeated
+// "tags" keys keeps the backing array. Measured under 2 MiB (22 MiB with
+// -race), against about 7.5 MiB (49 MiB with -race) when null is handed to
+// json.Unmarshal and the slice is rebuilt per key.
+func TestNullBetweenRepeatedTagsAllocatesLittle(t *testing.T) {
+	bound := uint64(4 << 20)
+	if raceEnabled {
+		bound = 36 << 20
+	}
+	issue := strings.TrimSuffix(rawIssue("2-1", "UZI-1", 1, "0-1", ""), `"tags":[]}`)
+	elem := issue + strings.Repeat(`"tags":[{}],"tags":null,`, 2400) + `"tags":[]}`
+	body := []byte("[" + strings.TrimSuffix(strings.Repeat(elem+",", pageSize), ",") + "]")
+	var err error
+	got := totalAlloc(func() { _, err = decodePage[ytIssue](body) })
+	if err != nil {
+		t.Fatalf("decodePage: %v", err)
+	}
+	if got > bound {
+		t.Errorf("allocated %d KiB, want under %d KiB", got>>10, bound>>10)
 	}
 }
 

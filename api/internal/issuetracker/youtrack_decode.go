@@ -60,9 +60,13 @@ type ytTags []ytTag
 
 // UnmarshalJSON implements json.Unmarshaler. b is already-validated JSON.
 func (t *ytTags) UnmarshalJSON(b []byte) error {
+	// A repeated "tags" key reuses the backing array, so a later key never
+	// forces a reallocation per call. encoding/json does not zero reused
+	// elements, so clear them first: a field a later key omits must not keep
+	// the value an earlier key gave it.
+	clear((*t)[:cap(*t)])
 	if trimmed := trimJSONSpace(b); string(trimmed) == "null" {
-		// null is an empty list; keep the backing array so a repeated key does
-		// not force a reallocation per call.
+		// null is an empty list.
 		*t = (*t)[:0]
 		return nil
 	}
