@@ -160,7 +160,8 @@ func TestMalformedTagIDsNeverReachAPath(t *testing.T) {
 
 // driftedEligibilityDriver builds a driver whose stored eligibility tag is an
 // account-owned tag that YouTrack now calls "uzi-finding", while the stored
-// name, which the driver uses instead of the live one, is still "uzi-ready".
+// name, which resolves the eligibility label on writes and queries, is still
+// "uzi-ready".
 func driftedEligibilityDriver(t *testing.T) (*youTrack, *youtracktest.Server, string) {
 	t.Helper()
 	srv := youtracktest.NewServer(t)

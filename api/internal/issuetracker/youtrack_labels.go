@@ -115,8 +115,8 @@ func (y *youTrack) createTag(ctx context.Context, name string, share sharingCopy
 //     without it, the name is left out of the result.
 //
 // The eligibility tag is never a candidate for another name, even when its
-// YouTrack name drifted to one: the driver never reads the tag's live name, so
-// such a name gets an account-owned tag of its own.
+// YouTrack name drifted to one: name matching skips the eligibility tag's id,
+// so such a name gets an account-owned tag of its own.
 //
 // A tag of the same name that someone else owns is never used for such a name,
 // because its owner may change what it means or who can see it. It makes no
