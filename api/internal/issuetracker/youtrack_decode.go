@@ -15,18 +15,25 @@ var errNestedCeiling = errors.New("issuetracker: an item carries more nested ent
 
 // Structural budgets, applied by a byte scan before any response is handed to
 // json.Unmarshal. A value is counted as one comma or one opening bracket
-// outside a string, an upper bound on the number of JSON values. A tag with an
-// id and a name costs 3 (its brace, the comma between its members and the comma
-// after it), and an activity carries up to maxNestedItems tags in each of
-// "added" and "removed", so one item is allowed 6*maxNestedItems+64 and a
-// single object (an issue holds one tags array) 4*maxNestedItems+256. The
-// budget exists because encoding/json keeps decoding after a type error and
-// builds an error per bad value, so a response of many bad values would
-// otherwise allocate in proportion to its bytes, not to what it legitimately
-// holds.
+// outside a string, an upper bound on the number of JSON values. Real YouTrack
+// adds a "$type" member to every entity, so a tag with $type, id and name costs
+// 4 (its brace, the commas between its three members and the comma after it).
+// An activity carries up to maxNestedItems such tags in each of "added" and
+// "removed" (8*maxNestedItems values), so one item is allowed
+// 10*maxNestedItems+256, which leaves headroom for one more member per tag; a single object (an
+// issue holds one tags array, plus a few members of its own) is allowed
+// 6*maxNestedItems+256, which leaves headroom for $type and one more member per
+// tag. Three totals are enforced: pageValueBudget for a whole list page,
+// itemValueBudget for each element of it and objectValueBudget for one
+// single-object response. The budgets bound the structure, not the cost of a
+// type error: 13 bytes of bad scalar fit many times inside a page budget, and
+// encoding/json keeps decoding after a type error, building one error (about
+// 150 bytes) per bad value. So decodePage also decodes element by element and
+// stops at the first error, which leaves one element, at most itemValueBudget
+// values, to amplify.
 const (
-	itemValueBudget   = 6*maxNestedItems + 64
-	objectValueBudget = 4*maxNestedItems + 256
+	itemValueBudget   = 10*maxNestedItems + 256
+	objectValueBudget = 6*maxNestedItems + 256
 	pageValueBudget   = pageSize * itemValueBudget
 )
 
@@ -221,7 +228,11 @@ func isJSONSpace(c byte) bool { return c == ' ' || c == '\t' || c == '\n' || c =
 // longer array is a protocol violation: the elements and the structural values
 // are counted by byte scans before any element is decoded, so an oversized page
 // allocates nothing for its items. A JSON null is an empty page. Whitespace is
-// JSON's own, so a form feed is a syntax error rather than padding.
+// JSON's own, so a form feed is refused (errNotArray, or errTrailingData after
+// the array) rather than skipped as padding. The whole page is validated first,
+// then each element is decoded on its own and the first error ends the decode:
+// encoding/json would otherwise go on past a type error and build an error per
+// bad value, allocating in proportion to the page's bytes.
 func decodePage[T any](body []byte) ([]T, error) {
 	trimmed := trimJSONSpace(body)
 	if len(trimmed) >= 4 && string(trimmed[:4]) == "null" {
@@ -248,9 +259,81 @@ func decodePage[T any](body []byte) ([]T, error) {
 	if valueCount(body) > pageValueBudget {
 		return nil, errValueCeiling
 	}
+	if !json.Valid(body) {
+		// Unmarshal reports the syntax error; it decodes nothing on invalid input.
+		var discard []T
+		return nil, json.Unmarshal(body, &discard)
+	}
 	var items []T
-	if err := json.Unmarshal(body, &items); err != nil {
-		return nil, err
+	var elemErr error
+	forEachElement(body, func(elem []byte) bool {
+		if valueCount(elem) > itemValueBudget {
+			elemErr = errValueCeiling
+			return false
+		}
+		var item T
+		if elemErr = json.Unmarshal(elem, &item); elemErr != nil {
+			return false
+		}
+		items = append(items, item)
+		return true
+	})
+	if elemErr != nil {
+		return nil, elemErr
 	}
 	return items, nil
+}
+
+// forEachElement calls f with each top-level element of b, a valid JSON array
+// (possibly padded with JSON space), stopping when f returns false. It tracks
+// bracket depth and string state only and allocates nothing.
+func forEachElement(b []byte, f func(elem []byte) bool) {
+	depth, start, inStr, esc := 0, -1, false, false
+	emit := func(end int) bool {
+		if start < 0 {
+			return true
+		}
+		elem := trimJSONSpace(b[start:end])
+		start = -1
+		return len(elem) == 0 || f(elem)
+	}
+	for i, c := range b {
+		if inStr {
+			switch {
+			case esc:
+				esc = false
+			case c == '\\':
+				esc = true
+			case c == '"':
+				inStr = false
+			}
+			continue
+		}
+		switch c {
+		case '[', '{':
+			depth++
+			if depth == 2 && start < 0 {
+				start = i
+			}
+		case ']', '}':
+			depth--
+			if depth == 0 {
+				emit(i)
+				return
+			}
+		case ',':
+			if depth == 1 && !emit(i) {
+				return
+			}
+		case '"':
+			inStr = true
+			if depth == 1 && start < 0 {
+				start = i
+			}
+		default:
+			if depth == 1 && start < 0 && !isJSONSpace(c) {
+				start = i
+			}
+		}
+	}
 }
