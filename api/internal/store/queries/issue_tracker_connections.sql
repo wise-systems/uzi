@@ -22,3 +22,19 @@ SELECT * FROM issue_tracker_connections WHERE id = $1 AND user_id = $2;
 
 -- name: DeleteIssueTrackerConnectionForUser :execrows
 DELETE FROM issue_tracker_connections WHERE id = $1 AND user_id = $2;
+
+-- name: LockIssueTrackerConnectionByIdentityForUpdate :one
+-- Reconnect step 1 (PRD #4173 M4 owner guidance): read the existing row of the
+-- (user, kind, base_url) identity and hold FOR UPDATE, so a link (which holds the
+-- row FOR SHARE) and a reconnect that changes the account cannot interleave. No row
+-- means a first connect, which no repo can link to yet.
+SELECT * FROM issue_tracker_connections
+WHERE user_id = $1 AND kind = $2 AND base_url = $3
+FOR UPDATE;
+
+-- name: LockIssueTrackerConnectionForShareForUser :one
+-- The link's re-read of the connection inside its transaction. FOR SHARE conflicts
+-- with the reconnect's FOR UPDATE, which the repos foreign key's own key-share lock
+-- does not when the upsert changes only non-key columns.
+SELECT * FROM issue_tracker_connections WHERE id = $1 AND user_id = $2
+FOR SHARE;

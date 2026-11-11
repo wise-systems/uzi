@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -34,6 +35,8 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/healthsvc"
 	"github.com/vtmocanu/uzi/api/internal/hostedsvc"
 	"github.com/vtmocanu/uzi/api/internal/hub"
+	"github.com/vtmocanu/uzi/api/internal/issuetracker"
+	"github.com/vtmocanu/uzi/api/internal/issuetrackersvc"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/notifysvc"
 	"github.com/vtmocanu/uzi/api/internal/oidc"
@@ -1001,6 +1004,11 @@ func run() error {
 	wsvc.SetRepoGuard(pcheck)
 
 	h := handler.New(pool, q, cfg, box, svc, wsvc, pcheck, liveHub, settingsCache)
+	// External issue tracker connections and the repo link (PRD #4173 M4). The link and
+	// the reconnect rule run in transactions on the pool. An empty allowlist
+	// (UZI_ISSUE_TRACKER_ALLOWED_BASE_URLS) still boots: Connect then refuses every URL.
+	h.SetIssueTrackerService(issuetrackersvc.New(q, box, cfg.IssueTrackerBaseURLAllowed, issuetracker.New).
+		UseTransactions(pool, func(tx pgx.Tx) issuetrackersvc.Querier { return q.WithTx(tx) }))
 	svc.SetMergedPredecessorRecovery(q, h.RecoveryService())
 
 	var bgWG sync.WaitGroup

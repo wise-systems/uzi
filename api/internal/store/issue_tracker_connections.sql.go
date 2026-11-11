@@ -88,6 +88,69 @@ func (q *Queries) ListIssueTrackerConnectionsByUser(ctx context.Context, userID 
 	return items, nil
 }
 
+const lockIssueTrackerConnectionByIdentityForUpdate = `-- name: LockIssueTrackerConnectionByIdentityForUpdate :one
+SELECT id, user_id, kind, base_url, account_id, account_login, token_ciphertext, created_at, last_verified_at FROM issue_tracker_connections
+WHERE user_id = $1 AND kind = $2 AND base_url = $3
+FOR UPDATE
+`
+
+type LockIssueTrackerConnectionByIdentityForUpdateParams struct {
+	UserID  uuid.UUID `json:"user_id"`
+	Kind    string    `json:"kind"`
+	BaseUrl string    `json:"base_url"`
+}
+
+// Reconnect step 1 (PRD #4173 M4 owner guidance): read the existing row of the
+// (user, kind, base_url) identity and hold FOR UPDATE, so a link (which holds the
+// row FOR SHARE) and a reconnect that changes the account cannot interleave. No row
+// means a first connect, which no repo can link to yet.
+func (q *Queries) LockIssueTrackerConnectionByIdentityForUpdate(ctx context.Context, arg LockIssueTrackerConnectionByIdentityForUpdateParams) (IssueTrackerConnection, error) {
+	row := q.db.QueryRow(ctx, lockIssueTrackerConnectionByIdentityForUpdate, arg.UserID, arg.Kind, arg.BaseUrl)
+	var i IssueTrackerConnection
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.Kind,
+		&i.BaseUrl,
+		&i.AccountID,
+		&i.AccountLogin,
+		&i.TokenCiphertext,
+		&i.CreatedAt,
+		&i.LastVerifiedAt,
+	)
+	return i, err
+}
+
+const lockIssueTrackerConnectionForShareForUser = `-- name: LockIssueTrackerConnectionForShareForUser :one
+SELECT id, user_id, kind, base_url, account_id, account_login, token_ciphertext, created_at, last_verified_at FROM issue_tracker_connections WHERE id = $1 AND user_id = $2
+FOR SHARE
+`
+
+type LockIssueTrackerConnectionForShareForUserParams struct {
+	ID     uuid.UUID `json:"id"`
+	UserID uuid.UUID `json:"user_id"`
+}
+
+// The link's re-read of the connection inside its transaction. FOR SHARE conflicts
+// with the reconnect's FOR UPDATE, which the repos foreign key's own key-share lock
+// does not when the upsert changes only non-key columns.
+func (q *Queries) LockIssueTrackerConnectionForShareForUser(ctx context.Context, arg LockIssueTrackerConnectionForShareForUserParams) (IssueTrackerConnection, error) {
+	row := q.db.QueryRow(ctx, lockIssueTrackerConnectionForShareForUser, arg.ID, arg.UserID)
+	var i IssueTrackerConnection
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.Kind,
+		&i.BaseUrl,
+		&i.AccountID,
+		&i.AccountLogin,
+		&i.TokenCiphertext,
+		&i.CreatedAt,
+		&i.LastVerifiedAt,
+	)
+	return i, err
+}
+
 const upsertIssueTrackerConnection = `-- name: UpsertIssueTrackerConnection :one
 
 INSERT INTO issue_tracker_connections (

@@ -2,9 +2,11 @@ package issuetrackersvc
 
 import (
 	"context"
+	"errors"
 	"strings"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/vtmocanu/uzi/api/internal/issuetracker"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -59,17 +61,44 @@ func (s *Service) Connect(ctx context.Context, userID uuid.UUID, kind, baseURL, 
 		s.log.Error("seal issue tracker token", "error", err)
 		return Connection{}, internal()
 	}
-	row, err := s.q.UpsertIssueTrackerConnection(ctx, store.UpsertIssueTrackerConnectionParams{
-		UserID:          userID,
-		Kind:            string(parsedKind),
-		BaseUrl:         norm,
-		AccountID:       account.ID,
-		AccountLogin:    account.Login,
-		TokenCiphertext: sealed,
+	var row store.IssueTrackerConnection
+	err = s.inTx(ctx, func(q Querier) error {
+		// The existing row is locked FOR UPDATE first, so a link (which holds the
+		// row FOR SHARE) and this reconnect cannot interleave: the link either
+		// commits before the count below and is seen by it, or waits and then
+		// finds the new account.
+		existing, err := q.LockIssueTrackerConnectionByIdentityForUpdate(ctx, store.LockIssueTrackerConnectionByIdentityForUpdateParams{
+			UserID: userID, Kind: string(parsedKind), BaseUrl: norm,
+		})
+		switch {
+		case errors.Is(err, pgx.ErrNoRows):
+			// A first connect: no repo can be linked to a row that does not exist.
+		case err != nil:
+			return err
+		case existing.AccountID != account.ID:
+			// A separate statement after the lock, so READ COMMITTED sees every link
+			// committed before the lock was granted.
+			n, err := q.CountReposLinkedToIssueTrackerConnection(ctx, existing.ID)
+			if err != nil {
+				return err
+			}
+			if n > 0 {
+				return conflict("this connection is linked to a repo and the new token belongs to a different account; " +
+					"use a token of the account the connection already stands for, or connect to a different base URL")
+			}
+		}
+		row, err = q.UpsertIssueTrackerConnection(ctx, store.UpsertIssueTrackerConnectionParams{
+			UserID:          userID,
+			Kind:            string(parsedKind),
+			BaseUrl:         norm,
+			AccountID:       account.ID,
+			AccountLogin:    account.Login,
+			TokenCiphertext: sealed,
+		})
+		return err
 	})
 	if err != nil {
-		s.log.Error("upsert issue tracker connection", "error", err)
-		return Connection{}, internal()
+		return Connection{}, s.txError("connect issue tracker", err)
 	}
 	return toConnection(row), nil
 }

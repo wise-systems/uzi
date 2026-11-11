@@ -30,6 +30,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/hostedsvc"
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	"github.com/vtmocanu/uzi/api/internal/hub"
+	"github.com/vtmocanu/uzi/api/internal/issuetrackersvc"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/notifysvc"
 	"github.com/vtmocanu/uzi/api/internal/oidc"
@@ -187,6 +188,9 @@ type Handler struct {
 	// — which is mounted only when WORKER_HOSTING_ENABLED is true, so it stays nil
 	// on a compose stack and in every test that does not exercise hosting.
 	hsvc *hostedsvc.Service
+	// issueTrackers serves the issue tracker connection routes and the repo link
+	// (PRD #4173 M4); set by SetIssueTrackerService. Left unset, those routes answer 503.
+	issueTrackers *issuetrackersvc.Service
 	// usagePoker pokes the rate-limit poller when a user saves/replaces their
 	// Anthropic token (PRD #53 D3b), so their meters appear within seconds instead
 	// of up to a full poll interval. Wired via SetUsagePoker; nil-safe (the poller
@@ -342,6 +346,10 @@ type ProjectSyncer interface {
 // repo's pattern for optional post-New dependencies. Safe to leave unset — the
 // github-project-sync routes then return a clean 500 rather than panic.
 func (h *Handler) SetProjectSync(p ProjectSyncer) { h.projectSync = p }
+
+// SetIssueTrackerService wires the issue tracker connection and link service (PRD #4173 M4)
+// after construction. Safe to leave unset: its routes then answer 503 rather than panic.
+func (h *Handler) SetIssueTrackerService(s *issuetrackersvc.Service) { h.issueTrackers = s }
 
 // SetAgentSourceReconciler wires the agent-source reconciler (PRD #602 M4) after
 // construction. Safe to leave unset — the admin agent-source endpoints then return a
@@ -961,6 +969,7 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 		h.mountAgentRoutes(r)
 		h.mountAdminRoutes(r, forgeLimiter, authLimiter)
 		h.mountForgeRoutes(r, forgeLimiter)
+		h.mountIssueTrackerRoutes(r, forgeLimiter)
 		h.mountRepoRoutes(r, forgeLimiter, boardOrderLimiter)
 		h.mountWorkersRoutes(r, hostedLimiter)
 		// The stable external API (PRD #1907): its own auth (RequireV1Caller, Bearer
