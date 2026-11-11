@@ -61,6 +61,9 @@ const (
 var (
 	// ErrProjectSyncDisabled is the instance kill-switch being off (settings default).
 	ErrProjectSyncDisabled = errors.New("github project sync is disabled instance-wide")
+	// ErrProjectSyncLinkedRepo is an adopt, provision or resync on a repo linked to an
+	// external issue tracker (PRD #4173 M4): a project's items are forge issue numbers.
+	ErrProjectSyncLinkedRepo = errors.New("github project sync is not available on a repo linked to an issue tracker")
 	// ErrProjectSyncNotGitHub is an adopt against a non-GitHub repo.
 	ErrProjectSyncNotGitHub = errors.New("project sync is only supported on github repos")
 	// ErrProjectSyncUnsupported is a forge whose driver does not implement
@@ -276,6 +279,9 @@ func (s *ProjectSyncService) projectSyncSeedPreamble(ctx context.Context, repoID
 	}
 	if err := store.RefuseNeverEnabled(repo.AwaitingFirstEnable); err != nil {
 		return store.GetRepoByIDRow{}, nil, err
+	}
+	if repo.IssueTrackerConnectionID.Valid {
+		return store.GetRepoByIDRow{}, nil, ErrProjectSyncLinkedRepo
 	}
 	if err := ensureProjectScope(ctx, f); err != nil {
 		return store.GetRepoByIDRow{}, nil, err

@@ -845,12 +845,12 @@ func (h *Handler) importAfterEnable(ctx context.Context, userID, repoID uuid.UUI
 		slog.Warn("import after enable: read repo", "error", err)
 		return
 	}
-	tr, err := h.issueTrackerForRepo(ctx, row.ID, row.ForgeType, row.BaseUrl, row.TokenCiphertext)
+	tr, err := h.issueTrackerForRepo(ctx, row.UserID, row.ID, row.IssueTrackerConnectionID, row.ForgeType, row.BaseUrl, row.TokenCiphertext)
 	if err != nil {
 		slog.Warn("import after enable: build forge", "error", err)
 		return
 	}
-	if _, err := h.svc.FullSync(ctx, row.ID, row.ForgeProjectID, tr); err != nil {
+	if _, err := h.svc.SyncIssues(ctx, row.ID, row.ForgeProjectID, row.IssueTrackerConnectionID.Valid, tr); err != nil {
 		slog.Warn("import after enable failed; the poller retries", "repo", row.PathWithNamespace, "error", err)
 	}
 }

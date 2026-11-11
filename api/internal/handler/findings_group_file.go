@@ -193,7 +193,7 @@ func (h *Handler) FileFindingGroup(w http.ResponseWriter, r *http.Request) {
 		writeNeverEnabled(w)
 		return
 	}
-	tr, err := h.issueTrackerForRepo(ctx, repo.ID, repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
+	tr, err := h.issueTrackerForRepo(ctx, repo.UserID, repo.ID, repo.IssueTrackerConnectionID, repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
 	if err != nil {
 		if !releaseFindingGroupOrReport(w, op.ID, dispositionIDs, release) {
 			return
@@ -217,6 +217,9 @@ func (h *Handler) FileFindingGroup(w http.ResponseWriter, r *http.Request) {
 		if !releaseFindingGroupOrReport(w, op.ID, dispositionIDs, release) {
 			return
 		}
+		if writeIssueWriteNotOffered(w, err) {
+			return
+		}
 		httpx.Error(w, http.StatusBadGateway, "could not ensure the finding label on the forge: "+err.Error())
 		return
 	}
@@ -238,6 +241,9 @@ func (h *Handler) FileFindingGroup(w http.ResponseWriter, r *http.Request) {
 		if forge.IsCreateIssueDefinitiveRejection(err) {
 			if !h.releaseDefinitiveFindingGroup(user.ID, op.ID) {
 				writeStoppedFindingGroup(w, op.ID, dispositionIDs, "in_flight")
+				return
+			}
+			if writeIssueWriteNotOffered(w, err) {
 				return
 			}
 			httpx.Error(w, http.StatusBadGateway, "could not create the issue on the forge: "+err.Error())

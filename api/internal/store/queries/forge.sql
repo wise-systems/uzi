@@ -798,6 +798,11 @@ FROM latest l
 JOIN issues i ON i.repo_id = @repo_id AND i.forge_issue_iid = l.issue_iid
 WHERE l.status = 'completed'
   AND l.mr_iid IS NOT NULL
+  -- A repo linked to an external issue tracker (PRD #4173 M4) is owned by
+  -- ListBoardFreeMRStateWatchCandidates entirely: uzi moves no card there (writes arrive
+  -- in M5), so its MR state must not depend on the issue cache or a column label. Excluding
+  -- the repo here keeps the two lanes disjoint.
+  AND NOT EXISTS (SELECT 1 FROM repos lr WHERE lr.id = @repo_id AND lr.issue_tracker_connection_id IS NOT NULL)
   AND (
     -- Lane A (UNCHANGED): open-issue board-move watch — card in Human Review
     -- (close-edge) or run already recorded closed (reopen-edge, Decision 10).
@@ -837,12 +842,16 @@ LIMIT 100;
 -- gate, the mr_rework ledger eviction, and stop-on-close cancellation all work for these runs.
 -- Self-bounding like Lane B: poll a run only until its mr_state reaches a terminal value
 -- (merged/closed), then it drops out of this set. LIMIT 100 is a hardcoded burst bound (mirrors
--- ListMRWatchCandidates), not a sqlc param, so zero Go signature change. Keep this rationale
+-- ListMRWatchCandidates), not a sqlc param, so zero Go signature change. A repo linked to an
+-- external issue tracker (PRD #4173 M4) is widened IN whole: every issue-lane run of such a repo
+-- belongs here (the board lane excludes the repo), so linked runs record mr_state and cancel
+-- rework with no board card; an unlinked repo matches exactly as before. Keep this rationale
 -- ABOVE the statement — a comment trailing after the `;` is grabbed by sqlc as the NEXT query's doc.
 SELECT id, branch, mr_iid, mr_state
 FROM runs
 WHERE repo_id = @repo_id::uuid
-  AND (issue_iid IS NULL OR kind IN ('prompt', 'self_improve'))
+  AND (issue_iid IS NULL OR kind IN ('prompt', 'self_improve')
+       OR EXISTS (SELECT 1 FROM repos lr WHERE lr.id = @repo_id::uuid AND lr.issue_tracker_connection_id IS NOT NULL))
   AND status = 'completed'
   AND mr_iid IS NOT NULL
   AND (mr_state IS NULL OR mr_state IN ('opened', 'locked'))

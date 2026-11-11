@@ -153,7 +153,7 @@ func (h *Handler) FileIssue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tr, err := h.issueTrackerForRepo(ctx, repo.ID, repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
+	tr, err := h.issueTrackerForRepo(ctx, repo.UserID, repo.ID, repo.IssueTrackerConnectionID, repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
 	if err != nil {
 		h.revertFiledClaim(ctx, claimID)
 		slog.Error("file issue: build forge for connection", "error", err)
@@ -165,6 +165,9 @@ func (h *Handler) FileIssue(w http.ResponseWriter, r *http.Request) {
 		// Forge rejected the write (mock state E): the claim reverts, nothing is
 		// persisted, the draft stays open. err is already PAT-redacted by the driver.
 		h.revertFiledClaim(ctx, claimID)
+		if writeIssueWriteNotOffered(w, err) {
+			return
+		}
 		httpx.Error(w, http.StatusBadGateway, "could not create the issue on the forge: "+err.Error())
 		return
 	}

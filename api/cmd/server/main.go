@@ -1007,8 +1007,12 @@ func run() error {
 	// External issue tracker connections and the repo link (PRD #4173 M4). The link and
 	// the reconnect rule run in transactions on the pool. An empty allowlist
 	// (UZI_ISSUE_TRACKER_ALLOWED_BASE_URLS) still boots: Connect then refuses every URL.
-	h.SetIssueTrackerService(issuetrackersvc.New(q, box, cfg.IssueTrackerBaseURLAllowed, issuetracker.New).
-		UseTransactions(pool, func(tx pgx.Tx) issuetrackersvc.Querier { return q.WithTx(tx) }))
+	itSvc := issuetrackersvc.New(q, box, cfg.IssueTrackerBaseURLAllowed, issuetracker.New).
+		UseTransactions(pool, func(tx pgx.Tx) issuetrackersvc.Querier { return q.WithTx(tx) })
+	h.SetIssueTrackerService(itSvc)
+	// The same service is forgesvc's driver source for a linked repo's issue side (DL-5);
+	// without it a linked repo fails closed.
+	svc.SetIssueTrackerDrivers(itSvc)
 	svc.SetMergedPredecessorRecovery(q, h.RecoveryService())
 
 	var bgWG sync.WaitGroup

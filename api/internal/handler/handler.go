@@ -484,24 +484,30 @@ func (h *Handler) templateWriteStore() agentTemplateWriteStore {
 	return h.q
 }
 
-// issueTrackerForRepo builds the issue-tracker half of a repo's forge, going through
-// the injected forgeFactory when one is set and otherwise through
-// forgesvc.Service.IssueTrackerForRepo. It returns a nil issue tracker whenever err != nil,
-// on both paths. nil-safe only when a factory is injected; in production h.svc is
-// always wired.
-func (h *Handler) issueTrackerForRepo(ctx context.Context, repoID uuid.UUID, forgeType, baseURL string, tokenCiphertext []byte) (forge.IssueTracker, error) {
+// issueTrackerForRepo builds the issue-tracker half of a repo's forge for the repo's
+// owner (PRD #4173 DL-5). link is the repo row's issue_tracker_connection_id: the
+// injected forgeFactory test seam is taken only for an unlinked row (a linked row
+// through it is an error, so no test or wiring gap can reach the forge for a linked
+// repo); otherwise forgesvc.Service.IssueTrackerForRepo resolves the row itself. It
+// returns a nil issue tracker whenever err != nil. nil-safe only when a factory is
+// injected; in production h.svc is always wired.
+func (h *Handler) issueTrackerForRepo(ctx context.Context, userID, repoID uuid.UUID, link pgtype.UUID, forgeType, baseURL string, tokenCiphertext []byte) (forge.IssueTracker, error) {
 	if h.forgeFactory != nil {
+		if link.Valid {
+			return nil, forgesvc.ErrLinkedRepoUnresolvable
+		}
 		f, err := h.forgeFactory(forgeType, baseURL, tokenCiphertext)
 		if err != nil {
 			return nil, err
 		}
 		return f, nil
 	}
-	return h.svc.IssueTrackerForRepo(ctx, repoID, forgeType, baseURL, tokenCiphertext)
+	return h.svc.IssueTrackerForRepo(ctx, userID, repoID)
 }
 
-// codeHostForRepo is issueTrackerForRepo for the code-host half.
-func (h *Handler) codeHostForRepo(ctx context.Context, repoID uuid.UUID, forgeType, baseURL string, tokenCiphertext []byte) (forge.CodeHost, error) {
+// codeHostForRepo is issueTrackerForRepo for the code-host half; the link never
+// changes it (S2), so the factory seam is taken for linked rows too.
+func (h *Handler) codeHostForRepo(ctx context.Context, userID, repoID uuid.UUID, _ pgtype.UUID, forgeType, baseURL string, tokenCiphertext []byte) (forge.CodeHost, error) {
 	if h.forgeFactory != nil {
 		f, err := h.forgeFactory(forgeType, baseURL, tokenCiphertext)
 		if err != nil {
@@ -509,7 +515,7 @@ func (h *Handler) codeHostForRepo(ctx context.Context, repoID uuid.UUID, forgeTy
 		}
 		return f, nil
 	}
-	return h.svc.CodeHostForRepo(ctx, repoID, forgeType, baseURL, tokenCiphertext)
+	return h.svc.CodeHostForRepo(ctx, userID, repoID)
 }
 
 // memo returns the process-wide forge-view read memo (PRD #1255 M2b), constructing

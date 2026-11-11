@@ -11,6 +11,7 @@ package poller
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"runtime/debug"
 	"sync"
@@ -127,6 +128,8 @@ type Engine struct {
 type repoState struct {
 	marks     forgesvc.Marks
 	pollCount int
+	// autopilotSkipLogged: the linked-repo autopilot skip is logged once per repo.
+	autopilotSkipLogged bool
 }
 
 // New constructs an Engine. reconcileEvery < 1 is clamped to 1 (every poll is a
@@ -406,38 +409,65 @@ func (e *Engine) syncRepo(ctx context.Context, r store.ListEnabledReposWithConne
 		return
 	}
 
-	st.pollCount++
-
-	if reconcileDue(st.pollCount, e.reconcileEvery) {
-		observed, err := e.svc.FullSync(ctx, r.ID, r.ForgeProjectID, f)
-		if err != nil {
-			slog.Error("poller: full sync", "repo", r.PathWithNamespace, "error", err)
-			report(false, forge.Class(err))
-			return
-		}
-		// FullSync is unbounded and reports what it observed, not an advance; the
-		// clamp is the caller's. Field-wise, so a fetch that legitimately came back
-		// empty leaves its own mark alone rather than dragging the other's down.
-		st.marks = st.marks.Advance(observed)
-	} else {
-		next, err := e.svc.IncrementalSync(ctx, r.ID, r.ForgeProjectID, f, st.marks)
-		if err != nil {
-			slog.Error("poller: incremental sync", "repo", r.PathWithNamespace, "error", err)
-			report(false, forge.Class(err))
-			return
-		}
-		// Already clamped inside, and held at the caller's pair on any fetch error.
-		st.marks = next
+	// The issue side. An unlinked repo's issue side IS the forge driver (the same value
+	// as the code-host side, so every forge call stays byte-identical). A linked repo
+	// (PRD #4173 M4) goes through the resolver, which binds repo, owner and connection
+	// and wraps the driver in the write guard.
+	linked := r.IssueTrackerConnectionID.Valid
+	var tr forge.IssueTracker = f
+	var trErr error
+	if linked {
+		tr, trErr = e.svc.IssueTrackerForRepo(ctx, r.UserID, r.ID)
 	}
 
-	report(true, forge.ErrorClassOther)
+	st.pollCount++
+
+	if linked {
+		// A linked repo's issue sync failing (tracker unreachable, link unresolvable, or
+		// the linked sync not built yet) must never skip the code-host steps below: its
+		// MRs, pipelines and CI do not depend on the tracker. It also says nothing about
+		// the forge connection, whose client was built above, so the attempt reports ok.
+		report(true, forge.ErrorClassOther)
+		if trErr != nil {
+			slog.Error("poller: build linked issue tracker", "repo", r.PathWithNamespace, "error", trErr)
+		} else if err := e.syncLinkedIssues(ctx, r, tr, st); err != nil {
+			if errors.Is(err, forgesvc.ErrLinkedSyncNotReady) {
+				slog.Debug("poller: linked issue sync not available yet", "repo", r.PathWithNamespace)
+			} else {
+				slog.Error("poller: linked issue sync", "repo", r.PathWithNamespace, "error", err)
+			}
+		}
+	} else {
+		if reconcileDue(st.pollCount, e.reconcileEvery) {
+			observed, err := e.svc.FullSync(ctx, r.ID, r.ForgeProjectID, f)
+			if err != nil {
+				slog.Error("poller: full sync", "repo", r.PathWithNamespace, "error", err)
+				report(false, forge.Class(err))
+				return
+			}
+			// FullSync is unbounded and reports what it observed, not an advance; the
+			// clamp is the caller's. Field-wise, so a fetch that legitimately came back
+			// empty leaves its own mark alone rather than dragging the other's down.
+			st.marks = st.marks.Advance(observed)
+		} else {
+			next, err := e.svc.IncrementalSync(ctx, r.ID, r.ForgeProjectID, f, st.marks)
+			if err != nil {
+				slog.Error("poller: incremental sync", "repo", r.PathWithNamespace, "error", err)
+				report(false, forge.Class(err))
+				return
+			}
+			// Already clamped inside, and held at the caller's pair on any fetch error.
+			st.marks = next
+		}
+		report(true, forge.ErrorClassOther)
+	}
 
 	// MR-close watcher (PRD #24): after the issue cache is fresh, check each
 	// watched card's MR for an opened↔closed edge and move the card accordingly.
 	// Runs only after a successful issue sync (an early return above skips it when
 	// the forge is unreachable). Per-candidate errors are log-and-skipped inside;
 	// only a candidate-enumeration failure surfaces here.
-	if err := e.svc.SyncMRStates(ctx, r.ID, r.ForgeProjectID, f, f); err != nil {
+	if err := e.svc.SyncMRStates(ctx, r.ID, r.ForgeProjectID, f, tr); err != nil {
 		slog.Error("poller: sync MR states", "repo", r.PathWithNamespace, "error", err)
 	}
 
@@ -459,7 +489,7 @@ func (e *Engine) syncRepo(ctx context.Context, r store.ListEnabledReposWithConne
 	// above already guarantee. It makes NO use of the issue cache (it reads the
 	// description live via GetIssue, since the cache has no description column), so
 	// unlike SyncFiledIssueCloses it does not depend on the sync ordering.
-	if err := e.svc.SyncPRDLinkPatches(ctx, r.ID, r.ForgeProjectID, f, f); err != nil {
+	if err := e.svc.SyncPRDLinkPatches(ctx, r.ID, r.ForgeProjectID, f, tr); err != nil {
 		slog.Error("poller: sync PRD link patches", "repo", r.PathWithNamespace, "error", err)
 	}
 
@@ -506,8 +536,16 @@ func (e *Engine) syncRepo(ctx context.Context, r store.ListEnabledReposWithConne
 	// application on a PRD issue into an auto_approve run for the mapped consenting
 	// user (or one explanatory issue comment). All per-issue errors are handled
 	// inside; nothing surfaces here.
+	// Skipped on a linked repo (PRD #4173 D12): the autopilot label is a forge label.
 	if e.autopilot != nil {
-		e.autopilot.detect(ctx, r, f, f)
+		if linked {
+			if !st.autopilotSkipLogged {
+				st.autopilotSkipLogged = true
+				slog.Info("poller: autopilot detection skipped for a repo linked to an issue tracker", "repo", r.PathWithNamespace)
+			}
+		} else {
+			e.autopilot.detect(ctx, r, f, f)
+		}
 	}
 
 	// CI-autofix detection (PRD #71 M6): also post-sync, a sibling of the autopilot
@@ -518,7 +556,7 @@ func (e *Engine) syncRepo(ctx context.Context, r store.ListEnabledReposWithConne
 	// MR branch into an automatic ci_fix run (or one halt comment). All per-candidate
 	// errors are handled inside; nothing surfaces here.
 	if e.pipelineMaxRefs > 0 && e.ciAutoFix != nil {
-		e.ciAutoFix.detect(ctx, r, f, f)
+		e.ciAutoFix.detect(ctx, r, f, tr)
 	}
 
 	// MR-review-rework detection (PRD #700 M3): also post-sync, a sibling of the
@@ -530,7 +568,7 @@ func (e *Engine) syncRepo(ctx context.Context, r store.ListEnabledReposWithConne
 	// being wired (the instance kill-switch); the admin kill-switch + per-user opt-in +
 	// per-MR cap gate activation inside it. All per-candidate errors are handled inside.
 	if e.pipelineMaxRefs > 0 && e.mrReviewWatch != nil {
-		e.mrReviewWatch.detect(ctx, r, f, f)
+		e.mrReviewWatch.detect(ctx, r, f, tr)
 	}
 
 	// Reverse Status→label sync (PRD #364 M6): a genuine per-tick sibling (NOT gated
@@ -541,11 +579,32 @@ func (e *Engine) syncRepo(ctx context.Context, r store.ListEnabledReposWithConne
 	// overlap (tick does wg.Wait()), but the forward path in the HTTP handler CAN
 	// interleave with this read — the stored-marker no-op tolerates it (worst case a
 	// redundant same-value label write).
-	if e.reverseSyncEligible(r.ForgeType) {
+	// Skipped on a linked repo: a project's items are forge issue numbers (PRD #4173 M4).
+	if e.reverseSyncEligible(r.ForgeType) && !linked {
 		if err := e.projectReverse.ReverseSync(ctx, r.ID); err != nil {
 			slog.Error("poller: reverse project sync", "repo", r.PathWithNamespace, "error", err)
 		}
 	}
+}
+
+// syncLinkedIssues runs the linked repo's issue sync through the forgesvc
+// dispatchers on the same full/incremental cadence as an unlinked repo, folding the
+// marks only on success.
+func (e *Engine) syncLinkedIssues(ctx context.Context, r store.ListEnabledReposWithConnectionsRow, tr forge.IssueTracker, st *repoState) error {
+	if reconcileDue(st.pollCount, e.reconcileEvery) {
+		observed, err := e.svc.SyncIssues(ctx, r.ID, r.ForgeProjectID, true, tr)
+		if err != nil {
+			return err
+		}
+		st.marks = st.marks.Advance(observed)
+		return nil
+	}
+	next, err := e.svc.SyncIssuesIncremental(ctx, r.ID, r.ForgeProjectID, true, tr, st.marks)
+	if err != nil {
+		return err
+	}
+	st.marks = next
+	return nil
 }
 
 // reverseSyncEligible reports whether the per-tick reverse (Status → label) sibling
