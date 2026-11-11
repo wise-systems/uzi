@@ -10728,6 +10728,7 @@ ORDER BY id DESC;
 SELECT r.status, r.issue_iid, r.repo_id, r.origin_column, r.board_column, r.move_pending_since,
        r.auto_approve, r.mr_iid,
        rp.forge_project_id, rp.web_url AS repo_web_url,
+       rp.issue_tracker_connection_id, rp.awaiting_first_enable,
        c.forge_type, c.base_url, c.token_ciphertext
 FROM runs r
 JOIN repos rp ON rp.id = r.repo_id
@@ -10743,8 +10744,11 @@ WHERE r.id = @run_id;
 -- not currently hold return no row, so a cross-tenant read is a 404, not a leak. A
 -- repo-less run has no repos row and returns no row too; the service checks repo_id
 -- off the owned run FIRST so it can tell that apart and answer 409.
-SELECT rp.forge_project_id,
-       c.forge_type, c.base_url, c.token_ciphertext, c.bot_forge_user_id
+-- PRD #4173 M4 adds repo_id, the connection owner's user_id and the repo's issue
+-- tracker link, so the worker proxy can resolve the issue source per repo and owner.
+SELECT rp.id AS repo_id, rp.forge_project_id,
+       rp.issue_tracker_connection_id,
+       c.user_id, c.forge_type, c.base_url, c.token_ciphertext, c.bot_forge_user_id
 FROM runs r
 JOIN repos rp ON rp.id = r.repo_id
 JOIN forge_connections c ON c.id = rp.connection_id AND c.user_id = r.user_id -- #1688: owner-scoped token

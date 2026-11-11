@@ -107,9 +107,11 @@ WHERE id = $1;
 
 -- name: UpsertRepo :one
 -- Upserted whenever the membership list is fetched. Never touches `enabled`, so
--- a re-listing does not un-enable a repo the user already turned on.
-INSERT INTO repos (connection_id, forge_project_id, path_with_namespace, web_url, default_branch)
-VALUES ($1, $2, $3, $4, $5)
+-- a re-listing does not un-enable a repo the user already turned on. The insert
+-- branch marks a newly discovered repo awaiting_first_enable (PRD #4173 D13); the
+-- conflict branch never touches it, and the repos trigger clears it on first enable.
+INSERT INTO repos (connection_id, forge_project_id, path_with_namespace, web_url, default_branch, awaiting_first_enable)
+VALUES ($1, $2, $3, $4, $5, true)
 ON CONFLICT (connection_id, forge_project_id) DO UPDATE
 SET path_with_namespace = EXCLUDED.path_with_namespace,
     web_url             = EXCLUDED.web_url,
@@ -139,6 +141,8 @@ ORDER BY r.path_with_namespace ASC;
 SELECT r.id, r.connection_id, r.forge_project_id, r.path_with_namespace, r.web_url,
        r.default_branch, r.enabled, r.fold_improve_uzi_backlog,
        r.guardrail_override_reason, r.guardrail_override_by, r.guardrail_override_at,
+       r.issue_tracker_connection_id, r.issue_tracker_project_id, r.issue_tracker_project_short,
+       r.eligibility_tag_id, r.eligibility_tag_name, r.issue_tracker_linked_at, r.awaiting_first_enable,
        c.forge_type, c.base_url, c.token_ciphertext, c.user_id, c.bot_forge_user_id
 FROM repos r
 JOIN forge_connections c ON c.id = r.connection_id
@@ -159,6 +163,8 @@ WHERE r.id = $1 AND c.user_id = $2;
 -- plus forge_project_id for slug/issue resolution.
 SELECT r.id, r.connection_id, r.forge_project_id, r.path_with_namespace, r.web_url,
        r.default_branch, r.enabled,
+       r.issue_tracker_connection_id, r.issue_tracker_project_id, r.issue_tracker_project_short,
+       r.eligibility_tag_id, r.eligibility_tag_name, r.issue_tracker_linked_at, r.awaiting_first_enable,
        c.forge_type, c.base_url, c.token_ciphertext, c.user_id
 FROM repos r
 JOIN forge_connections c ON c.id = r.connection_id
@@ -386,6 +392,8 @@ RETURNING *;
 -- engine's poller set.
 SELECT r.id, r.connection_id, r.forge_project_id, r.path_with_namespace, r.web_url,
        r.default_branch, r.enabled,
+       r.issue_tracker_connection_id, r.issue_tracker_project_id, r.issue_tracker_project_short,
+       r.eligibility_tag_id, r.eligibility_tag_name, r.issue_tracker_linked_at, r.awaiting_first_enable,
        c.forge_type, c.base_url, c.token_ciphertext, c.user_id
 FROM repos r
 JOIN forge_connections c ON c.id = r.connection_id

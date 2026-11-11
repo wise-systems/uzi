@@ -583,6 +583,7 @@ type Issue struct {
 	SyncedAt       pgtype.Timestamptz `json:"synced_at"`
 	BoardPosition  pgtype.Int8        `json:"board_position"`
 	AssigneeIds    []byte             `json:"assignee_ids"`
+	IssueKey       pgtype.Text        `json:"issue_key"`
 }
 
 type IssueProposal struct {
@@ -1055,6 +1056,13 @@ type Repo struct {
 	CrossCheckRepoInstructionsEnabled bool               `json:"cross_check_repo_instructions_enabled"`
 	IgnoredInferredCapabilities       []string           `json:"ignored_inferred_capabilities"`
 	AgentSourceDefault                pgtype.Text        `json:"agent_source_default"`
+	AwaitingFirstEnable               bool               `json:"awaiting_first_enable"`
+	IssueTrackerConnectionID          pgtype.UUID        `json:"issue_tracker_connection_id"`
+	IssueTrackerProjectID             pgtype.Text        `json:"issue_tracker_project_id"`
+	IssueTrackerProjectShort          pgtype.Text        `json:"issue_tracker_project_short"`
+	EligibilityTagID                  pgtype.Text        `json:"eligibility_tag_id"`
+	EligibilityTagName                pgtype.Text        `json:"eligibility_tag_name"`
+	IssueTrackerLinkedAt              pgtype.Timestamptz `json:"issue_tracker_linked_at"`
 }
 
 type RepoToolProfile struct {

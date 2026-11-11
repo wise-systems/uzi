@@ -7659,8 +7659,9 @@ func (q *Queries) GetRunForWorkerUser(ctx context.Context, arg GetRunForWorkerUs
 }
 
 const getRunForgeConnForWorker = `-- name: GetRunForgeConnForWorker :one
-SELECT rp.forge_project_id,
-       c.forge_type, c.base_url, c.token_ciphertext, c.bot_forge_user_id
+SELECT rp.id AS repo_id, rp.forge_project_id,
+       rp.issue_tracker_connection_id,
+       c.user_id, c.forge_type, c.base_url, c.token_ciphertext, c.bot_forge_user_id
 FROM runs r
 JOIN repos rp ON rp.id = r.repo_id
 JOIN forge_connections c ON c.id = rp.connection_id AND c.user_id = r.user_id -- #1688: owner-scoped token
@@ -7673,11 +7674,14 @@ type GetRunForgeConnForWorkerParams struct {
 }
 
 type GetRunForgeConnForWorkerRow struct {
-	ForgeProjectID  int64  `json:"forge_project_id"`
-	ForgeType       string `json:"forge_type"`
-	BaseUrl         string `json:"base_url"`
-	TokenCiphertext []byte `json:"token_ciphertext"`
-	BotForgeUserID  int64  `json:"bot_forge_user_id"`
+	RepoID                   uuid.UUID   `json:"repo_id"`
+	ForgeProjectID           int64       `json:"forge_project_id"`
+	IssueTrackerConnectionID pgtype.UUID `json:"issue_tracker_connection_id"`
+	UserID                   uuid.UUID   `json:"user_id"`
+	ForgeType                string      `json:"forge_type"`
+	BaseUrl                  string      `json:"base_url"`
+	TokenCiphertext          []byte      `json:"token_ciphertext"`
+	BotForgeUserID           int64       `json:"bot_forge_user_id"`
 }
 
 // The forge connection facts a WORKER-authenticated run needs to build a driver and
@@ -7688,11 +7692,16 @@ type GetRunForgeConnForWorkerRow struct {
 // not currently hold return no row, so a cross-tenant read is a 404, not a leak. A
 // repo-less run has no repos row and returns no row too; the service checks repo_id
 // off the owned run FIRST so it can tell that apart and answer 409.
+// PRD #4173 M4 adds repo_id, the connection owner's user_id and the repo's issue
+// tracker link, so the worker proxy can resolve the issue source per repo and owner.
 func (q *Queries) GetRunForgeConnForWorker(ctx context.Context, arg GetRunForgeConnForWorkerParams) (GetRunForgeConnForWorkerRow, error) {
 	row := q.db.QueryRow(ctx, getRunForgeConnForWorker, arg.RunID, arg.WorkerID)
 	var i GetRunForgeConnForWorkerRow
 	err := row.Scan(
+		&i.RepoID,
 		&i.ForgeProjectID,
+		&i.IssueTrackerConnectionID,
+		&i.UserID,
 		&i.ForgeType,
 		&i.BaseUrl,
 		&i.TokenCiphertext,
@@ -7735,6 +7744,7 @@ const getRunMoveContext = `-- name: GetRunMoveContext :one
 SELECT r.status, r.issue_iid, r.repo_id, r.origin_column, r.board_column, r.move_pending_since,
        r.auto_approve, r.mr_iid,
        rp.forge_project_id, rp.web_url AS repo_web_url,
+       rp.issue_tracker_connection_id, rp.awaiting_first_enable,
        c.forge_type, c.base_url, c.token_ciphertext
 FROM runs r
 JOIN repos rp ON rp.id = r.repo_id
@@ -7743,19 +7753,21 @@ WHERE r.id = $1
 `
 
 type GetRunMoveContextRow struct {
-	Status           string             `json:"status"`
-	IssueIid         pgtype.Int8        `json:"issue_iid"`
-	RepoID           pgtype.UUID        `json:"repo_id"`
-	OriginColumn     pgtype.Text        `json:"origin_column"`
-	BoardColumn      pgtype.Text        `json:"board_column"`
-	MovePendingSince pgtype.Timestamptz `json:"move_pending_since"`
-	AutoApprove      bool               `json:"auto_approve"`
-	MrIid            pgtype.Int8        `json:"mr_iid"`
-	ForgeProjectID   int64              `json:"forge_project_id"`
-	RepoWebUrl       string             `json:"repo_web_url"`
-	ForgeType        string             `json:"forge_type"`
-	BaseUrl          string             `json:"base_url"`
-	TokenCiphertext  []byte             `json:"token_ciphertext"`
+	Status                   string             `json:"status"`
+	IssueIid                 pgtype.Int8        `json:"issue_iid"`
+	RepoID                   pgtype.UUID        `json:"repo_id"`
+	OriginColumn             pgtype.Text        `json:"origin_column"`
+	BoardColumn              pgtype.Text        `json:"board_column"`
+	MovePendingSince         pgtype.Timestamptz `json:"move_pending_since"`
+	AutoApprove              bool               `json:"auto_approve"`
+	MrIid                    pgtype.Int8        `json:"mr_iid"`
+	ForgeProjectID           int64              `json:"forge_project_id"`
+	RepoWebUrl               string             `json:"repo_web_url"`
+	IssueTrackerConnectionID pgtype.UUID        `json:"issue_tracker_connection_id"`
+	AwaitingFirstEnable      bool               `json:"awaiting_first_enable"`
+	ForgeType                string             `json:"forge_type"`
+	BaseUrl                  string             `json:"base_url"`
+	TokenCiphertext          []byte             `json:"token_ciphertext"`
 }
 
 // Column automation (PRD #12 M1) ------------------------------------------
@@ -7785,6 +7797,8 @@ func (q *Queries) GetRunMoveContext(ctx context.Context, runID uuid.UUID) (GetRu
 		&i.MrIid,
 		&i.ForgeProjectID,
 		&i.RepoWebUrl,
+		&i.IssueTrackerConnectionID,
+		&i.AwaitingFirstEnable,
 		&i.ForgeType,
 		&i.BaseUrl,
 		&i.TokenCiphertext,
