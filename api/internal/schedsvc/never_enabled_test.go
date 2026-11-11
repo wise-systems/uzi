@@ -11,7 +11,8 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
-// PRD 4173 D13: a schedule on a repo that has never been enabled fires nothing. The
+// PRD 4173 D13: a schedule on a repo that has never been enabled fires nothing (issue, sweep,
+// prompt and self_improve targets). The
 // refusal comes before any forge driver is built: the builder fails the build with a
 // different error, so a build would show as the wrong error, and the forge fake's call
 // counters stay at zero. advance treats the error as transient (retried, never parked).
@@ -22,6 +23,13 @@ func TestFireOnNeverEnabledRepoMakesNoForgeCall(t *testing.T) {
 	}{
 		{"issue", func(h *harness) store.RunSchedule { return h.issueSchedule() }},
 		{"sweep", func(h *harness) store.RunSchedule { return h.sweepSchedule(pgtype.Int4{}) }},
+		{"prompt", func(h *harness) store.RunSchedule {
+			s := h.issueSchedule()
+			s.Target = "prompt"
+			s.IssueIid = pgtype.Int8{}
+			s.Prompt = pgtype.Text{String: "do a thing", Valid: true}
+			return s
+		}},
 		{"self_improve", func(h *harness) store.RunSchedule { return h.selfImproveSchedule() }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

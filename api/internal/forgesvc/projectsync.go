@@ -245,8 +245,10 @@ func (s *ProjectSyncService) projectSyncResolve(ctx context.Context, repoID uuid
 	return repo, syncer, f, nil
 }
 
-// projectSyncPreamble runs the preconditions the write paths (Adopt, Provision,
-// SetVisibility, ShareWithUser, Unshare) and the RepoOwnerType read share: everything
+// projectSyncPreamble runs the preconditions the share and visibility paths
+// (SetVisibility, ShareWithUser, Unshare) and the RepoOwnerType read share (the paths
+// that project issue numbers, Adopt, Provision, Resync and AutoCreateColumns, use
+// projectSyncSeedPreamble instead): everything
 // projectSyncResolve checks, plus the live scope preflight (ensureProjectScope, which
 // adds MissingScope to the sentinel set). The check order is exactly what the admin
 // handler maps to a 4xx — keeping the entry points DRY without changing any observable

@@ -81,16 +81,15 @@ func (s *Service) CreateTaskRun(ctx context.Context, userID, repoID uuid.UUID, i
 		}
 		return store.Run{}, err
 	}
+	// PRD 4173 D13: no run of any kind on a never-enabled repo; refused before any forge call.
+	if err := store.RefuseNeverEnabled(row.AwaitingFirstEnable); err != nil {
+		return store.Run{}, err
+	}
 
 	// Linked handoffs validate directly against the owner's forge project. They do not
 	// depend on cached board membership, labels, issue state, or a PRD link.
 	var continued pgtype.Int8
 	if continuedIssueIID != nil {
-		// PRD 4173 D13: a continued issue number may not be stored on a never-enabled
-		// repo. Refused before the forge read below.
-		if err := store.RefuseNeverEnabled(row.AwaitingFirstEnable); err != nil {
-			return store.Run{}, err
-		}
 		if *continuedIssueIID <= 0 {
 			return store.Run{}, ErrContinuedIssueInvalid
 		}

@@ -8,6 +8,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgconn"
 
+	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -76,6 +77,71 @@ func TestNeverEnabledRepoRefusedBeforeForge(t *testing.T) {
 		}
 		if fb.buildCalls != 0 || fs.selfImproveParams != nil {
 			t.Errorf("forge builds = %d, run created = %v; want none", fb.buildCalls, fs.selfImproveParams != nil)
+		}
+	})
+
+	t.Run("CreateTaskRun without an issue", func(t *testing.T) {
+		row := aValidRepoRow()
+		row.AwaitingFirstEnable = true
+		fs := &fakeStore{repoRow: row}
+		fb := &fakeForges{f: &fakeForge{}}
+		svc := New(fs, newBox(t), testParams())
+		svc.SetForges(fb)
+		_, err := svc.CreateTaskRun(ctx, user, repo, "task", "", false, false, false, false, nil)
+		if !errors.Is(err, ErrRepoNeverEnabled) {
+			t.Fatalf("err = %v, want ErrRepoNeverEnabled", err)
+		}
+		if fb.buildCalls != 0 || fs.taskRunParams != nil {
+			t.Errorf("forge builds = %d, run created = %v; want none", fb.buildCalls, fs.taskRunParams != nil)
+		}
+	})
+
+	t.Run("CreatePromptRun", func(t *testing.T) {
+		fs := &fakeStore{repoRow: store.GetRepoForUserRow{ID: repo, AwaitingFirstEnable: true}}
+		fb := &fakeForges{f: &fakeForge{}}
+		svc := New(fs, newBox(t), testParams())
+		svc.SetForges(fb)
+		_, err := svc.CreatePromptRun(ctx, user, repo, uuid.New(), "t", "p", false, false, nil, nil, false, nil, nil)
+		if !errors.Is(err, ErrRepoNeverEnabled) {
+			t.Fatalf("err = %v, want ErrRepoNeverEnabled", err)
+		}
+		if fb.buildCalls != 0 {
+			t.Errorf("forge builds = %d, want 0", fb.buildCalls)
+		}
+	})
+
+	t.Run("CreateCIFixRun", func(t *testing.T) {
+		fs := &fakeStore{repoRow: store.GetRepoForUserRow{ID: repo, AwaitingFirstEnable: true}}
+		fb := &fakeForges{f: &fakeForge{}}
+		svc := New(fs, newBox(t), testParams())
+		svc.SetForges(fb)
+		_, err := svc.CreateCIFixRun(ctx, user, repo, "main", "t", "d", FailureSnapshot{}, nil)
+		if !errors.Is(err, ErrRepoNeverEnabled) {
+			t.Fatalf("err = %v, want ErrRepoNeverEnabled", err)
+		}
+		if fb.buildCalls != 0 {
+			t.Errorf("forge builds = %d, want 0", fb.buildCalls)
+		}
+	})
+
+	t.Run("createMRReworkRun", func(t *testing.T) {
+		fs := &fakeStore{repoRow: store.GetRepoForUserRow{ID: repo, AwaitingFirstEnable: true}}
+		svc := New(fs, newBox(t), testParams())
+		_, err := svc.createMRReworkRun(ctx, user, repo, "ref", 1, uuid.New(), "t", "d", nil, "", nil, nil, nil)
+		if !errors.Is(err, ErrRepoNeverEnabled) {
+			t.Fatalf("err = %v, want ErrRepoNeverEnabled", err)
+		}
+	})
+
+	t.Run("CreateProposal", func(t *testing.T) {
+		fs := &fakeStore{repoRow: store.GetRepoForUserRow{ID: repo, AwaitingFirstEnable: true}, runByID: store.Run{Kind: runkind.Chat, Status: "running"}}
+		svc := New(fs, newBox(t), testParams())
+		_, err := svc.CreateProposal(ctx, store.Worker{UserID: user}, uuid.New(), repo, "t", "d", []byte(`[]`))
+		if !errors.Is(err, ErrRepoNeverEnabled) {
+			t.Fatalf("err = %v, want ErrRepoNeverEnabled", err)
+		}
+		if fs.createdProposal != nil {
+			t.Error("a proposal was stored for a never-enabled repo")
 		}
 	})
 

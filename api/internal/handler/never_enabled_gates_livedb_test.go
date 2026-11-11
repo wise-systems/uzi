@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -17,6 +18,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
+	"github.com/vtmocanu/uzi/api/internal/schedsvc"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -228,5 +230,96 @@ func TestNeverEnabledGuardErrorMapsTo409LiveDB(t *testing.T) {
 	f.wantRefused(t, rr)
 	if writeIfNeverEnabled(httptest.NewRecorder(), errors.New("boom")) {
 		t.Error("an unrelated error was mapped to the never-enabled refusal")
+	}
+}
+
+// insertSchedule seeds a recurring schedule of the given target on repo for the fixture user.
+func (f *neverEnabledFixture) insertSchedule(t *testing.T, repo uuid.UUID, target string) uuid.UUID {
+	t.Helper()
+	id := uuid.New()
+	if target == "issue" {
+		mustExecT(context.Background(), t, f.pool,
+			`INSERT INTO run_schedules (id, user_id, repo_id, target, issue_iid, timing, cron_expr, timezone, next_fire_at, auto_approve, status, enabled)
+			 VALUES ($1, $2, $3, 'issue', 7, 'recurring', '0 3 * * *', 'UTC', now() + interval '1 day', true, 'active', true)`, id, f.admin.ID, repo)
+		return id
+	}
+	mustExecT(context.Background(), t, f.pool,
+		`INSERT INTO run_schedules (id, user_id, repo_id, target, prompt, timing, cron_expr, timezone, next_fire_at, auto_approve, status, enabled)
+		 VALUES ($1, $2, $3, 'prompt', 'do a thing', 'recurring', '0 3 * * *', 'UTC', now() + interval '1 day', true, 'active', true)`, id, f.admin.ID, repo)
+	return id
+}
+
+// The run and schedule entry points that reach the service or the scheduler answer 409 for
+// an awaiting repo, with no forge call.
+func TestNeverEnabledRunsAndSchedulesRefusedLiveDB(t *testing.T) {
+	f := seedNeverEnabledFixture(t)
+	ctx := context.Background()
+	f.h.wsvc.SetForges(f.h.svc)
+	f.h.scheduler = schedsvc.New(f.h.q, f.h.wsvc, f.h.svc, f.h.settings, nil, nil, 0, slog.Default())
+	repoParam := map[string]string{"id": f.repoID.String()}
+
+	// A prompt schedule can sit on an awaiting repo at the database level (no issue number),
+	// which is what RunScheduleNow must still refuse.
+	awaitingPrompt := f.insertSchedule(t, f.repoID, "prompt")
+	goodIssue := f.insertSchedule(t, f.goodRepo, "issue")
+	goodPrompt := f.insertSchedule(t, f.goodRepo, "prompt")
+
+	chat, err := f.h.wsvc.CreateChatRun(ctx, f.admin.ID, "hello")
+	if err != nil {
+		t.Fatalf("CreateChatRun: %v", err)
+	}
+	prop, err := f.h.q.CreateIssueProposal(ctx, store.CreateIssueProposalParams{
+		RunID: chat.ID, RepoID: f.repoID, Title: "t", Description: "d", Labels: []byte(`[]`),
+	})
+	if err != nil {
+		t.Fatalf("CreateIssueProposal: %v", err)
+	}
+
+	cases := []struct {
+		name string
+		call func(w http.ResponseWriter)
+	}{
+		{"RunScheduleNow", func(w http.ResponseWriter) {
+			f.h.RunScheduleNow(w, f.request(http.MethodPost, nil, map[string]string{"id": awaitingPrompt.String()}))
+		}},
+		{"CreateRun", func(w http.ResponseWriter) {
+			f.h.CreateRun(w, f.request(http.MethodPost, map[string]any{"issue_iid": 7}, repoParam))
+		}},
+		{"CreateTaskRun", func(w http.ResponseWriter) {
+			f.h.CreateTaskRun(w, f.request(http.MethodPost, map[string]any{"context": "do it"}, repoParam))
+		}},
+		{"CreateCIFixRun", func(w http.ResponseWriter) {
+			f.h.CreateCIFixRun(w, f.request(http.MethodPost, map[string]any{"ref": "main"}, repoParam))
+		}},
+		{"ConfigureColumns", func(w http.ResponseWriter) {
+			f.h.ConfigureColumns(w, f.request(http.MethodPut, map[string]any{"columns": []string{"a"}}, repoParam))
+		}},
+		{"ConfirmProposal", func(w http.ResponseWriter) {
+			f.h.ConfirmProposal(w, f.request(http.MethodPost, nil, map[string]string{"id": chat.ID.String(), "pid": prop.ID.String()}))
+		}},
+		{"CloneSchedule prompt", func(w http.ResponseWriter) {
+			f.h.CloneSchedule(w, f.request(http.MethodPost, map[string]any{"repo_id": f.repoID.String()}, map[string]string{"id": goodPrompt.String()}))
+		}},
+		{"CloneSchedule issue", func(w http.ResponseWriter) {
+			f.h.CloneSchedule(w, f.request(http.MethodPost, map[string]any{"repo_id": f.repoID.String()}, map[string]string{"id": goodIssue.String()}))
+		}},
+		{"AddScheduleRepo prompt", func(w http.ResponseWriter) {
+			f.h.AddScheduleRepo(w, f.request(http.MethodPost, map[string]any{"repo_id": f.repoID.String()}, map[string]string{"id": goodPrompt.String()}))
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rr := httptest.NewRecorder()
+			tc.call(rr)
+			f.wantRefused(t, rr)
+		})
+	}
+	var n int
+	if err := f.pool.QueryRow(ctx, `SELECT count(*) FROM run_schedules WHERE repo_id = $1`, f.repoID).Scan(&n); err != nil || n != 1 {
+		t.Errorf("schedules on the awaiting repo = %d (%v), want only the seeded one", n, err)
+	}
+	var status string
+	if err := f.pool.QueryRow(ctx, `SELECT status FROM issue_proposals WHERE id = $1`, prop.ID).Scan(&status); err != nil || status != "pending" {
+		t.Errorf("proposal status = %q (%v), want pending after the refused confirm", status, err)
 	}
 }

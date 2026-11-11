@@ -32,6 +32,10 @@ func (h *Handler) CreateCIFixRun(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	// PRD 4173 D13: no run on a never-enabled repo, refused before any pipeline read.
+	if refuseNeverEnabled(w, repo.AwaitingFirstEnable) {
+		return
+	}
 	user, _ := mw.UserFromContext(r.Context())
 	var req struct {
 		Ref string `json:"ref"`
@@ -122,6 +126,8 @@ func (h *Handler) CreateCIFixRun(w http.ResponseWriter, r *http.Request) {
 			// GetMergeRequestSummary (PAT-redacted by the driver); database and forge
 			// construction errors are logged in workersvc and never reach this body.
 			httpx.Error(w, http.StatusBadGateway, err.Error())
+		case errors.Is(err, workersvc.ErrRepoNeverEnabled):
+			writeNeverEnabled(w)
 		case errors.Is(err, workersvc.ErrRepoNotFound):
 			httpx.Error(w, http.StatusNotFound, "repo not found")
 		case errors.Is(err, workersvc.ErrActiveFixExists):

@@ -1896,6 +1896,8 @@ func (g gateSubmitter) ConfirmProposalForUser(ctx context.Context, userID, runID
 		return slacksvc.CreatedIssue{}, slacksvc.ErrChatProposalHandled
 	case errors.Is(err, workersvc.ErrProposalNotFound):
 		return slacksvc.CreatedIssue{}, slacksvc.ErrChatProposalGone
+	case errors.Is(err, workersvc.ErrRepoNeverEnabled):
+		return slacksvc.CreatedIssue{}, slacksvc.ErrChatProposalRepoNeverEnabled
 	case errors.Is(err, workersvc.ErrProposalRepoGone),
 		errors.Is(err, workersvc.ErrForgeBuild),
 		errors.Is(err, workersvc.ErrForgeIssueWrite),

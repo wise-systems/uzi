@@ -908,6 +908,14 @@ func (e *Scheduler) firePrompt(ctx context.Context, sched store.RunSchedule) (Fi
 	// column) — the resolver engages ONLY for origin='default', so existing schedules are
 	// byte-for-byte unchanged. Resolution runs BEFORE deriving the title so the run-view
 	// header labels the resolved prompt, not the (NULL) column.
+	// PRD 4173 D13: no run starts on a never-enabled repo. Checked first, before the
+	// active-run lookup and any forge read; transient to advance, like resolveRepoForge.
+	// A repo read that fails is left to the create seam below, which reports it.
+	if repo, rerr := e.store.GetRepoForUser(ctx, store.GetRepoForUserParams{ID: sched.RepoID, UserID: sched.UserID}); rerr == nil {
+		if err := store.RefuseNeverEnabled(repo.AwaitingFirstEnable); err != nil {
+			return FireOutcome{}, err
+		}
+	}
 	prompt := sched.Prompt.String
 	if sched.Origin == "default" {
 		job, ok := e.catalog(sched.CatalogSlug.String)
@@ -1158,9 +1166,11 @@ func (e *Scheduler) resolveRepoForge(ctx context.Context, sched store.RunSchedul
 		}
 		return store.GetRepoForUserRow{}, nil, err
 	}
-	// PRD 4173 D13: a never-enabled repo fires nothing. The error is transient to advance
+	// PRD 4173 D13: a never-enabled repo is refused here, before any forge driver is built,
+	// for every fire that resolves its forge through this function. firePrompt checks the
+	// marker itself (it may need no forge at all). The error is transient to advance
 	// (logged, retried next tick, never parked), so the schedule fires once the repo is
-	// enabled. Refused before any forge driver is built.
+	// enabled.
 	if err := store.RefuseNeverEnabled(repo.AwaitingFirstEnable); err != nil {
 		return store.GetRepoForUserRow{}, nil, err
 	}
