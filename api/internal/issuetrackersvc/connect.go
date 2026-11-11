@@ -102,7 +102,11 @@ func (s *Service) Connect(ctx context.Context, userID uuid.UUID, kind, baseURL, 
 					}
 					return err
 				}
-				// Still no row to lock after the re-entry: fall through to the upsert.
+				// Still no row to lock after the re-entry: the row the insert lost to was
+				// deleted meanwhile. Fall through to the upsert, which inserts a row with a
+				// new id that no link can reference yet. Accepted boundary: if a third
+				// connect re-inserts the row and a link commits on it while this upsert
+				// waits, only the upsert's weaker WHERE stands in the way (see the query).
 			case err != nil:
 				return err
 			case existing.AccountID != account.ID:
