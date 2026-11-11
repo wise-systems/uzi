@@ -82,10 +82,8 @@ type Handler struct {
 	adminProductTokenRowsOverride int32
 	// forgeFactory, when non-nil, replaces forgesvc's IssueTrackerForRepo and
 	// CodeHostForRepo behind the repo-side wrappers issueTrackerForRepo and
-	// codeHostForRepo, for every handler that resolves its forge through them (PRD
-	// #1255 M2a introduced it for the forge-view read routes). The connection-scoped
-	// handlers and the run-scoped worker forge proxy call h.svc.ForgeForConnection
-	// directly and are not covered. It lets the covered handlers be
+	// codeHostForRepo, for every repo-scoped handler on either half (PRD #1255 M2a
+	// introduced it for the forge-view read routes). It lets those handlers be
 	// exercised against a forgetest.BaseFake without a live forge or a wired
 	// forgesvc.Service (the forge-view and ci-fix live-DB suites inject one). nil in
 	// production — New leaves it unset and the wrappers fall back to h.svc. Mirrors
@@ -480,7 +478,7 @@ func (h *Handler) templateWriteStore() agentTemplateWriteStore {
 
 // issueTrackerForRepo builds the issue-tracker half of a repo's forge, going through
 // the injected forgeFactory when one is set and otherwise through
-// forgesvc.Service.IssueTrackerForRepo. It returns a nil tracker whenever err != nil,
+// forgesvc.Service.IssueTrackerForRepo. It returns a nil issue tracker whenever err != nil,
 // on both paths. nil-safe only when a factory is injected; in production h.svc is
 // always wired.
 func (h *Handler) issueTrackerForRepo(ctx context.Context, repoID uuid.UUID, forgeType, baseURL string, tokenCiphertext []byte) (forge.IssueTracker, error) {

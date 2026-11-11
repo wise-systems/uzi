@@ -8,9 +8,9 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/forge"
 )
 
-// IssueTrackerForRepo returns the issue side of a repo (D8 of the IssueTracker /
-// CodeHost split). Phase 1: the repo's own forge driver, built exactly as
-// ForgeForConnection builds it. Phase 2 will map repoID to an external tracker.
+// IssueTrackerForRepo returns the issue side of a repo (D5 of PRD #4173, the IssueTracker /
+// CodeHost split). Through M3: the repo's own forge driver, built exactly as
+// ForgeForConnection builds it. From PRD #4173 M4 it maps repoID to a linked external issue tracker.
 // The caller has already resolved the connection through its own owner-scoped
 // lookup, so forgeType, baseURL and tokenCiphertext come from that row.
 func (s *Service) IssueTrackerForRepo(ctx context.Context, repoID uuid.UUID, forgeType, baseURL string, tokenCiphertext []byte) (forge.IssueTracker, error) {

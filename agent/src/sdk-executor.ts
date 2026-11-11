@@ -537,6 +537,9 @@ export interface SdkExecutorOptions {
   /** Root for per-run tool-provisioning dirs (PRD #18 M3), OUTSIDE any clone.
    *  Default: a `provision/` sibling of the provisioning HOME on the data volume. */
   provisionRoot?: string;
+  /** issue #3644: the per-attempt provision directory name under `provisionRoot` (`<runId>.g<N>` for a restore's successor);
+   *  absent = `<runId>`. */
+  dirKey?: string;
   /**
    * SHARED (worker-lifetime) HOME for the tool-provisioning subprocess — the nix
    * single-user profile + devbox state that warm-start relies on (PRD #18; PRD #42
@@ -932,6 +935,7 @@ export class SdkExecutor implements Executor {
   private runWorktree: string | undefined;
   private readonly secretPaths: readonly string[];
   private readonly provisionRoot: string;
+  private readonly dirKey: string | undefined;
   private readonly provisionHomeDir: string;
   private readonly provision: typeof provisionTools;
   private readonly installDeps: typeof installJsDeps;
@@ -1077,6 +1081,7 @@ export class SdkExecutor implements Executor {
       opts.provisionRoot ??
       path.join(path.dirname(this.provisionHomeDir), "provision");
     this.provision = opts.provision ?? provisionTools;
+    this.dirKey = opts.dirKey;
     this.installDeps = opts.installDeps ?? installJsDeps;
     // Docker wiring (PRD #83 M1): derive the two consumer facts ONCE. `dockerHost` set
     // ⇒ a sidecar daemon is reachable, so the guardrail allows docker and DOCKER_HOST is
@@ -1586,6 +1591,7 @@ export class SdkExecutor implements Executor {
       homeDir: this.provisionHomeDir,
       log: this.log,
       provision: this.provision,
+      ...(this.dirKey === undefined ? {} : { dirKey: this.dirKey }),
     });
 
     // issue #1783 (R2): the runner's attempt marker rides the CLI env, so every process the
@@ -1999,9 +2005,11 @@ export class SdkExecutor implements Executor {
     //   frozen at construction, so it must be the same list the `agents` map holds, or
     //   the guard admits an Agent call the SDK cannot resolve. The implement turns
     //   rebuild this with the selected roster (PRD #37). The adapter also injects the
-    //   run-wide disallowedTools (ASYNC_DEFERRAL_TOOLS): block the deferral tools so the
-    //   lead can't background work to a future turn the per-turn reap would only wake to
-    //   a killed subagent (#34); delegation is forced synchronous by the Agent guard hook.
+    //   run-wide disallowedTools (ASYNC_DEFERRAL_TOOLS plus native AskUserQuestion, #4149):
+    //   block the deferral tools so the lead can't background work to a future turn the
+    //   per-turn reap would only wake to a killed subagent (#34); delegation is forced
+    //   synchronous by the Agent guard hook. Native AskUserQuestion is denied because
+    //   clarification goes through uzi's MCP ask_user (PRD #88).
     //
     // `leadModel` is computed above (before the plan-turn copy) so the PRD #305 own-roster
     // override can use it; here it only drives the top-level lead model. PRD #617 effort

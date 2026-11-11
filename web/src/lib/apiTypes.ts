@@ -4028,7 +4028,10 @@ export interface Run {
    *  "provider_outage" is a counted provider interruption with a scheduled retry;
    *  "retained_recovery_exhausted" can be timed or owner-held (see recovery_retry_not_before);
    *  "retained_recovery_adoption_failed" is an integrity hold: retained adoption or a predecessor
-   *  remediation record refused source use (the agent did not start): always owner-held with local work and custody preserved, no automatic retry.
+   *  remediation record refused source use, or independent restore refused an unsupported
+   *  predecessor before source effects (canonical, hosted or no boundary record, when earlier
+   *  checks pass). The agent did not start; always owner-held with local work and custody
+   *  preserved, no automatic retry. An unsupported predecessor proves no adoption or quiescence.
    *  Only the owner can Resume or Cancel, through the existing owner authorization.
    *  "retained_continuation_unwitnessed" (issue #3859) means a retained-custody continuation's
    *  claimed worker flight was never witnessed starting or departing within a bounded window;
@@ -4664,6 +4667,17 @@ export interface AdminUsageUser {
   /** Issue #3686: this user's lifetime and seven-day PR counts. Absent on older APIs. */
   pr_count?: number;
   last7_pr_count?: number;
+  /** Issue #3876: this user's lifetime and seven-day runs split by harness. The same runs as
+   *  run_count / last7_run_count, so each split sums to its window's count; a cross-check run
+   *  counts under the harness it ran on. Absent on older APIs. */
+  harness_runs?: HarnessRuns;
+  last7_harness_runs?: HarnessRuns;
+}
+
+// HarnessRuns counts runs per harness (issue #3876).
+export interface HarnessRuns {
+  claude: number;
+  codex: number;
 }
 
 // AdminUsage is the factory-wide view (GET /api/admin/usage, admin-only): the
