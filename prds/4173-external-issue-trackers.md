@@ -2,7 +2,7 @@
 
 **Issue:** #4173  
 **Priority:** Medium  
-**Status:** In progress, r3 2026-11-11. M1 delivered. r3 follows the maintainer's scope review: one real tracker instead of abstract identity work, and the comment, command and withdrawal behaviours leave this PRD.  
+**Status:** In progress, r3 2026-11-11. M1 and M2 delivered. r3 follows the maintainer's scope review: one real tracker instead of abstract identity work, and the comment, command and withdrawal behaviours leave this PRD.  
 **Delivery:** one PR per milestone, each merged before the next starts. No implementation or validation step touches `.github/workflows/**`.  
 **Builds on:**
 
@@ -22,7 +22,7 @@ A tracker does only the second job. Adding one as a fourth forge would force it 
 ## Goal
 
 1. `Forge` splits into `IssueTracker` (issues, labels, comments, state) and `CodeHost` (everything else), and stays as their union. Done in M1.
-2. Every caller receives only the half it needs. M2.
+2. Every caller receives only the half it needs. Done in M2.
 3. A repo can take its issues from a YouTrack project while its code, merge requests and CI stay on its forge.
 4. Feature parity: every issue-side feature that works today on GitLab, GitHub and Forgejo works on YouTrack, or is listed below as not offered on a tracker yet.
 5. Backwards compatible: a repo with no tracker link behaves exactly as today. No backfill, no setting to change.
@@ -97,7 +97,7 @@ These hold in every milestone. A change that weakens one is out of scope for thi
 Progress (one PR per milestone, each merged before the next starts):
 
 - [x] **M1:** the `IssueTracker` and `CodeHost` interfaces
-- [ ] **M2:** every caller on its half
+- [x] **M2:** every caller on its half. Verified in the run: the type-checked inventory shows 0 issue-side calls through `forge.Forge` and 45 through `IssueTracker` (plus `GetIssueBounded` and `EnsureBoardColumns`), and handing `privcheck` an `IssueTracker`-only value fails to compile. `task gate:api` slots green except `deadcode:api` (not run).
 - [ ] **M3:** tracker connections and the YouTrack driver
 - [ ] **M4:** issue identity, the repo link and issue intake from YouTrack
 - [ ] **M5:** the board and issue writes on YouTrack
@@ -159,7 +159,7 @@ Settings → Issue trackers, the CLI commands, a setup page under `docs/`, an AD
 
 ## Risks
 
-- **Size of M2.** About 57 production and 31 test files, mechanical. A type-checked inventory of forge calls is the guard.
+- **Size of M2.** 57 production and 31 test files, mechanical. A type-checked inventory of forge calls was the guard.
 - **Drift from `main` between milestones.** Each milestone's branch is rebased on `main` before its PR.
 - **YouTrack specifics leak into the seam.** The contract suite runs on all four implementations, and the second tracker (Asana) is the real test of the seam.
 
@@ -169,4 +169,7 @@ Settings → Issue trackers, the CLI commands, a setup page under `docs/`, an AD
 - **2026-11-10: one file per interface.** `issuetracker.go` and `codehost.go`; r1 had both interfaces in `forge.go`.
 - **2026-11-10: no reflection test.** The interface declarations enforce the split (D4).
 - **2026-11-10: M2 test edits.** Fakes may change a parameter type, and mixed callers' test call sites pass the same fake twice. Nothing else in a test changes.
+- **2026-11-10: M2 wires `IssueTrackerForRepo`/`CodeHostForRepo` (D5) where a repo is in hand without new test fakes.** They are `forgesvc.(*Service)` methods in `forgesvc/repo_sides.go` taking `(ctx, repoID, forgeType, baseURL, tokenCiphertext)` (the caller's own owner-scoped lookup, never the unscoped `GetRepoByID`), used by the repo-scoped handlers and the merged-predecessor check. `workersvc`, `schedsvc`, `runlifecycle`, `privcheck`, `provisionsvc` and `seed` keep their own `ForgeForConnection` factory interfaces (adding the resolvers there would add methods to about 30 test fakes) and narrow at the first use; M4 routes them through the resolvers. Connection-scoped handlers, the run-scoped worker forge proxy (`resolveForgeRun`), `ProjectSyncService`'s own factory and the poll loop build one driver and narrow it at each use or pass it as both halves.
+- **2026-11-10: the PRD link patch takes both halves.** D3 placed it on `IssueTracker`, but it also reads the merge request (`GetMergeRequest`), so `SyncPRDLinkPatches` takes `(ch forge.CodeHost, tr forge.IssueTracker)`. Comment intake (`issueinput.Fetch`), the autopilot, CI-autofix and MR-rework detectors, the MR state watcher, self-improve and the worker get-issue route are mixed the same way.
+- **2026-11-10: "`privcheck` compiles against `CodeHost` only" means every privcheck parameter, local and forge call is `CodeHost`.** Its `ForgeBuilder` factory interface still returns `forge.Forge`, converted to `CodeHost` straight after the build; handing privcheck an `IssueTracker`-only value is a compile error.
 - **2026-11-10: scope after the maintainer's review.** YouTrack becomes part of this PRD and drives the identity design. The living comment, the outbox, withdrawal, comments to the agent and `/uzi` commands move out. Asana follows in its own PRD.
