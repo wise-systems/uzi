@@ -2014,6 +2014,7 @@ func steerRunCardMessage(err error) string {
 func isInternalStartRunErr(err error) bool {
 	switch {
 	case errors.Is(err, workersvc.ErrRepoNotFound), errors.Is(err, workersvc.ErrIssueNotFound),
+		errors.Is(err, workersvc.ErrRepoNeverEnabled),
 		errors.Is(err, workersvc.ErrNotPRDIssue),
 		errors.Is(err, workersvc.ErrActiveRunExists), errors.Is(err, workersvc.ErrBranchInUse),
 		errors.Is(err, workersvc.ErrDescriptionTooLarge), errors.Is(err, workersvc.ErrForgeIssueRead):
@@ -2030,6 +2031,8 @@ func startRunCardMessage(err error) string {
 	switch {
 	case errors.Is(err, workersvc.ErrRepoNotFound):
 		return "That repo isn't yours, or it no longer exists."
+	case errors.Is(err, workersvc.ErrRepoNeverEnabled):
+		return "That repo has never been enabled; enable it in uzi first."
 	case errors.Is(err, workersvc.ErrIssueNotFound):
 		return "That issue isn't on this repo's board."
 	case errors.Is(err, workersvc.ErrNotPRDIssue):

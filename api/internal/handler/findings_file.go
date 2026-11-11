@@ -91,6 +91,10 @@ func (h *Handler) FileFinding(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
+	// PRD 4173 D13: before the claim and the forge write.
+	if refuseNeverEnabled(w, repo.AwaitingFirstEnable) {
+		return
+	}
 
 	// (3) Resolve the filed title/description (D4). The default is the deterministic template
 	// over the STORED row (agent text never rides in raw — RenderFinding routes each field

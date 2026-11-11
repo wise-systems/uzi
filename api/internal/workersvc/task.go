@@ -86,6 +86,11 @@ func (s *Service) CreateTaskRun(ctx context.Context, userID, repoID uuid.UUID, i
 	// depend on cached board membership, labels, issue state, or a PRD link.
 	var continued pgtype.Int8
 	if continuedIssueIID != nil {
+		// PRD 4173 D13: a continued issue number may not be stored on a never-enabled
+		// repo. Refused before the forge read below.
+		if err := store.RefuseNeverEnabled(row.AwaitingFirstEnable); err != nil {
+			return store.Run{}, err
+		}
 		if *continuedIssueIID <= 0 {
 			return store.Run{}, ErrContinuedIssueInvalid
 		}

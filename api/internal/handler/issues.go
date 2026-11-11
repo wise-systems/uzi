@@ -37,6 +37,11 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	// PRD 4173 D13: refused before the forge write, so nothing is created that the
+	// issue-number guard would then strand.
+	if refuseNeverEnabled(w, repo.AwaitingFirstEnable) {
+		return
+	}
 	var req createIssueRequest
 	if err := httpx.DecodeJSON(r, &req); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")

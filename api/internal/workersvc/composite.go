@@ -133,6 +133,12 @@ func (s *Service) ConfirmProposalForUser(ctx context.Context, userID, runID, pro
 		}
 		return CreatedIssue{}, err
 	}
+	// PRD 4173 D13: no issue is created on a never-enabled repo. The claim reverts so the
+	// proposal stays pending; nothing has touched the forge.
+	if err := store.RefuseNeverEnabled(repo.AwaitingFirstEnable); err != nil {
+		s.revertProposal(ctx, propID)
+		return CreatedIssue{}, err
+	}
 
 	f, err := s.forges.ForgeForConnection(repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
 	if err != nil {
@@ -204,6 +210,10 @@ func (s *Service) StartRunForUser(ctx context.Context, userID, repoID uuid.UUID,
 		if errors.Is(err, pgx.ErrNoRows) {
 			return store.Run{}, ErrRepoNotFound
 		}
+		return store.Run{}, err
+	}
+	// PRD 4173 D13: refused before the forge read below; CreateRun repeats the gate.
+	if err := store.RefuseNeverEnabled(repo.AwaitingFirstEnable); err != nil {
 		return store.Run{}, err
 	}
 	f, err := s.forges.ForgeForConnection(repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)

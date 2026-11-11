@@ -262,6 +262,25 @@ func (s *ProjectSyncService) projectSyncPreamble(ctx context.Context, repoID uui
 	return repo, syncer, nil
 }
 
+// projectSyncSeedPreamble is projectSyncPreamble for the paths that project cached
+// issue numbers onto a board (Adopt, Provision, Resync, AutoCreateColumns): it refuses
+// a never-enabled repo (PRD 4173 D13) after the pure resolve and BEFORE the live scope
+// preflight or any other forge call. The share and visibility paths keep
+// projectSyncPreamble; they store no issue number.
+func (s *ProjectSyncService) projectSyncSeedPreamble(ctx context.Context, repoID uuid.UUID) (store.GetRepoByIDRow, forge.ProjectBoardSyncer, error) {
+	repo, syncer, f, err := s.projectSyncResolve(ctx, repoID)
+	if err != nil {
+		return store.GetRepoByIDRow{}, nil, err
+	}
+	if err := store.RefuseNeverEnabled(repo.AwaitingFirstEnable); err != nil {
+		return store.GetRepoByIDRow{}, nil, err
+	}
+	if err := ensureProjectScope(ctx, f); err != nil {
+		return store.GetRepoByIDRow{}, nil, err
+	}
+	return repo, syncer, nil
+}
+
 // ProjectSyncStatus is the health/observability snapshot of a repo's project sync
 // link (PRD #364 M7), returned by ProjectSyncStatus for the admin health endpoint.
 // It carries no secret and no forge coordinate the UI cannot already see — just the

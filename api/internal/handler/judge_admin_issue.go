@@ -235,6 +235,10 @@ func (h *Handler) AdminFileJudgeIssue(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
+	// PRD 4173 D13: before the claim and the forge write.
+	if refuseNeverEnabled(w, repo.AwaitingFirstEnable) {
+		return
+	}
 
 	// Labels are assembled server-side (Decision 3/6): the single uzi run-eligibility label
 	// (PRD #764), never from the request body.

@@ -1158,6 +1158,12 @@ func (e *Scheduler) resolveRepoForge(ctx context.Context, sched store.RunSchedul
 		}
 		return store.GetRepoForUserRow{}, nil, err
 	}
+	// PRD 4173 D13: a never-enabled repo fires nothing. The error is transient to advance
+	// (logged, retried next tick, never parked), so the schedule fires once the repo is
+	// enabled. Refused before any forge driver is built.
+	if err := store.RefuseNeverEnabled(repo.AwaitingFirstEnable); err != nil {
+		return store.GetRepoForUserRow{}, nil, err
+	}
 	f, err := e.forge.ForgeForConnection(repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
 	if err != nil {
 		return store.GetRepoForUserRow{}, nil, fmt.Errorf("build forge driver: %w", err) // transient

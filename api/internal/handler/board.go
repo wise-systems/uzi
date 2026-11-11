@@ -313,6 +313,11 @@ func (h *Handler) GetBoard(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	// PRD 4173 D13: a never-enabled repo is neither seeded nor synced; the board opens
+	// only after the first enable.
+	if refuseNeverEnabled(w, repo.AwaitingFirstEnable) {
+		return
+	}
 
 	count, err := h.q.CountBoardColumns(r.Context(), repo.ID)
 	if err != nil {
@@ -1219,6 +1224,9 @@ func issueToCard(is store.Issue, position map[string]int, forgeType string) card
 func (h *Handler) SyncRepo(w http.ResponseWriter, r *http.Request) {
 	repo, ok := h.repoForRequest(w, r)
 	if !ok {
+		return
+	}
+	if refuseNeverEnabled(w, repo.AwaitingFirstEnable) {
 		return
 	}
 	tr, err := h.issueTrackerForRepo(r.Context(), repo.ID, repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)

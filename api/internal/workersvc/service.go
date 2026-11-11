@@ -94,7 +94,11 @@ var (
 	// ErrRunWallExpired refuses an ordinary pause or guarded question at the run deadline.
 	ErrRunWallExpired = errors.New("run wall deadline expired")
 	ErrRepoNotFound   = errors.New("repo not found")
-	ErrIssueNotFound  = errors.New("issue not found")
+	// ErrRepoNeverEnabled refuses a run, issue filing or sync on a repo that has never been
+	// enabled (PRD 4173 D13). It is store.ErrRepoNeverEnabled, so the store guard's UZ413
+	// (store.MapNeverEnabled) and the service gates answer with one error.
+	ErrRepoNeverEnabled = store.ErrRepoNeverEnabled
+	ErrIssueNotFound    = errors.New("issue not found")
 	// ErrNotPRDIssue rejects a run on an issue that does not carry the configured
 	// run-eligibility label (PRD #764 M1: the uzi_label) → 422. This is now the SINGLE
 	// eligibility gate — an issue without the uzi_label is not uzi's to run, PRD link
@@ -7964,6 +7968,11 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 		if errors.Is(err, pgx.ErrNoRows) {
 			return store.Run{}, ErrRepoNotFound
 		}
+		return store.Run{}, err
+	}
+	// PRD 4173 D13: a never-enabled repo starts no run, whoever asks (manual, schedule,
+	// autopilot, composite). Before guardDefaultBranch, which may call the forge.
+	if err := store.RefuseNeverEnabled(row.AwaitingFirstEnable); err != nil {
 		return store.Run{}, err
 	}
 	// #66 D1 layer 2: the service-layer guardrail, shared across the PAT-bearing

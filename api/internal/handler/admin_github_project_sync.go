@@ -460,6 +460,8 @@ func writeProjectSyncError(w http.ResponseWriter, op string, err error) {
 		httpx.Error(w, http.StatusNotFound, "repo not found")
 	case errors.Is(err, forgesvc.ErrProjectSyncNotLinked):
 		httpx.Error(w, http.StatusNotFound, err.Error())
+	case errors.Is(store.MapNeverEnabled(err), store.ErrRepoNeverEnabled):
+		writeNeverEnabled(w)
 	case errors.Is(err, forgesvc.ErrProjectSyncDisabled),
 		errors.Is(err, forgesvc.ErrProjectSyncAlreadyLinked):
 		httpx.Error(w, http.StatusConflict, err.Error())

@@ -85,6 +85,11 @@ func (e *Scheduler) fireSelfImprove(ctx context.Context, sched store.RunSchedule
 		}
 		return FireOutcome{}, err // transient DB error: retry next tick
 	}
+	// PRD 4173 D13: a never-enabled repo is skipped (transient to advance: logged, retried
+	// next tick, never parked) before any forge call or tracking-issue write.
+	if err := store.RefuseNeverEnabled(repo.AwaitingFirstEnable); err != nil {
+		return FireOutcome{}, err
+	}
 
 	// 2. Active-run pre-check, per repo. On a DB error retry next tick (transient). If a run
 	// is already active for this repo, benign skip — no notification (mirrors firePrompt's

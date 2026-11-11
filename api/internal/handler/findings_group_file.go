@@ -184,6 +184,15 @@ func (h *Handler) FileFindingGroup(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
+	// PRD 4173 D13: the group is already claimed, so release it before refusing; nothing
+	// has touched the forge.
+	if store.RefuseNeverEnabled(repo.AwaitingFirstEnable) != nil {
+		if !releaseFindingGroupOrReport(w, op.ID, dispositionIDs, release) {
+			return
+		}
+		writeNeverEnabled(w)
+		return
+	}
 	tr, err := h.issueTrackerForRepo(ctx, repo.ID, repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
 	if err != nil {
 		if !releaseFindingGroupOrReport(w, op.ID, dispositionIDs, release) {

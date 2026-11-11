@@ -346,6 +346,8 @@ func (h *Handler) ConfirmProposal(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case errors.Is(err, workersvc.ErrProposalRepoGone):
 			httpx.Error(w, http.StatusNotFound, "the proposal's target repo is no longer available")
+		case errors.Is(err, workersvc.ErrRepoNeverEnabled):
+			writeNeverEnabled(w)
 		case errors.Is(err, workersvc.ErrForgeIssueWrite):
 			// err wraps the driver's already-redacted message.
 			httpx.Error(w, http.StatusBadGateway, err.Error())
