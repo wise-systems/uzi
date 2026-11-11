@@ -2,7 +2,6 @@ package issuetrackersvc
 
 import (
 	"errors"
-	"unicode"
 
 	"github.com/vtmocanu/uzi/api/internal/issuetracker"
 )
@@ -29,7 +28,7 @@ func validateAccountField(s string) error {
 		return errors.New("empty or too long")
 	}
 	for _, r := range s {
-		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) || r == '\u2028' || r == '\u2029' {
+		if issuetracker.InvisibleRune(r) {
 			return errors.New("forbidden character")
 		}
 	}

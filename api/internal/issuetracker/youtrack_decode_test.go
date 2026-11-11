@@ -2,6 +2,8 @@ package issuetracker
 
 import (
 	"context"
+	"errors"
+	"io"
 	"net/http"
 	"runtime"
 	"strings"
@@ -102,6 +104,9 @@ func TestTagBombAllocatesLittle(t *testing.T) {
 // is reallocated), so the bound sits between the two.
 func TestDuplicateTagsKeysAllocateLittle(t *testing.T) {
 	const bound = 192 << 20
+	// The fixed single-issue decode allocates about 4 MiB (25 MiB with -race);
+	// the unfixed one allocated about 99 MiB (120 MiB with -race).
+	const issueBound = 48 << 20
 	t.Run("page", func(t *testing.T) {
 		issue := strings.TrimSuffix(rawIssue("2-1", "UZI-1", 1, "0-1", ""), `"tags":[]}`)
 		dup := `"tags":[{}],`
@@ -134,8 +139,8 @@ func TestDuplicateTagsKeysAllocateLittle(t *testing.T) {
 		}
 		y, _ := loggedDriver(t, func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(body) })
 		got := totalAlloc(func() { _, _ = y.GetIssue(context.Background(), 1, 1) })
-		if got > bound {
-			t.Errorf("allocated %d MiB for a %d MiB issue, want under %d MiB", got>>20, len(body)>>20, bound>>20)
+		if got > issueBound {
+			t.Errorf("allocated %d MiB for a %d MiB issue, want under %d MiB", got>>20, len(body)>>20, issueBound>>20)
 		}
 	})
 }
@@ -143,20 +148,116 @@ func TestDuplicateTagsKeysAllocateLittle(t *testing.T) {
 func TestListDecodeShapes(t *testing.T) {
 	for name, tc := range map[string]struct {
 		body    string
-		wantErr bool
+		want    error
+		wantLen int
 	}{
-		"null is an empty list": {`null`, false},
-		"object":                {`{}`, true},
-		"trailing data":         {`[] []`, true},
-		"truncated":             {`[{"id":"0-1"`, true},
+		"null is an empty list":       {`null`, nil, 0},
+		"null padded with JSON space": {" \t\r\nnull\n ", nil, 0},
+		"form feed is not JSON space": {"\fnull", errNotArray, 0},
+		"data after null":             {`null x`, errTrailingData, 0},
+		"object":                      {`{}`, errNotArray, 0},
+		"trailing data":               {`[] []`, errTrailingData, 0},
+		"truncated":                   {`[{"id":"0-1"`, io.ErrUnexpectedEOF, 0},
+		"over the item ceiling":       {emptyObjects(pageSize + 1), errItemCeiling, 0},
+		"exactly the item ceiling":    {emptyObjects(pageSize), nil, pageSize},
+		"repeated bad values":         {`[{` + strings.Repeat(`"a":"",`, pageValueBudget) + `"a":""}]`, errValueCeiling, 0},
+		"form feed after the array":   {"[]\f", errTrailingData, 0},
+		"JSON space after the array":  {"[] \n", nil, 0},
 	} {
 		t.Run(name, func(t *testing.T) {
-			y, _ := loggedDriver(t, func(w http.ResponseWriter, _ *http.Request) { writeRaw(w, tc.body) })
-			got, err := y.ListProjects(context.Background())
-			if (err != nil) != tc.wantErr || (err == nil && len(got) != 0) {
-				t.Errorf("got %v, %v; wantErr %v", got, err, tc.wantErr)
+			got, err := decodePage[map[string]any]([]byte(tc.body))
+			if !errors.Is(err, tc.want) || len(got) != tc.wantLen {
+				t.Errorf("got %d items, %v; want %d items, %v", len(got), err, tc.wantLen, tc.want)
 			}
 		})
+	}
+}
+
+// TestRepeatedBadValuesAllocateLittle pins that a response of many values that
+// fail to decode is refused by the structural budget before encoding/json
+// builds an error per value (the unfixed decoder allocated about 510 MiB for the
+// repeated-tags page; the fixed one allocates the response buffer only).
+func TestRepeatedBadValuesAllocateLittle(t *testing.T) {
+	issue := strings.TrimSuffix(rawIssue("2-1", "UZI-1", 1, "0-1", ""), `"tags":[]}`)
+	fill := func(dup string, limit int64, head string) string {
+		return head + strings.Repeat(dup, int(limit-int64(len(head))-64)/len(dup))
+	}
+	badTags := `"tags":[` + strings.Repeat("1,", 999) + `1],`
+	for name, tc := range map[string]struct {
+		dup  string
+		page bool
+	}{
+		"page of bad tags":     {badTags, true},
+		"issue of bad tags":    {badTags, false},
+		"page of bad created":  {`"created":"",`, true},
+		"issue of bad created": {`"created":"",`, false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var body string
+			if tc.page {
+				body = "[" + fill(tc.dup, listPageBytes-2, issue) + `"tags":[]}]`
+			} else {
+				body = fill(tc.dup, objectBytes, issue) + `"tags":[]}`
+			}
+			y, _ := loggedDriver(t, func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Query().Get("$skip") != "0" && tc.page {
+					writeRaw(w, "[]")
+					return
+				}
+				_, _ = w.Write([]byte(body))
+			})
+			var err error
+			got := totalAlloc(func() {
+				if tc.page {
+					_, err = y.ListIssues(context.Background(), 1, forge.ListIssuesOptions{})
+				} else {
+					_, err = y.GetIssue(context.Background(), 1, 1)
+				}
+			})
+			if err == nil {
+				t.Error("a response of repeated bad values was accepted")
+			}
+			bound := uint64(repeatedIssueBound)
+			if tc.page {
+				bound = repeatedPageBound
+			}
+			if got > bound {
+				t.Errorf("allocated %d MiB for a %d MiB response, want under %d MiB", got>>20, len(body)>>20, bound>>20)
+			}
+		})
+	}
+}
+
+// Bounds for TestRepeatedBadValuesAllocateLittle, in bytes allocated. Measured
+// without and with -race: fixed page 24 and 41 MiB (the response buffer), fixed
+// issue 6 and 11 MiB; unbudgeted page 118 to 615 MiB, unbudgeted issue of bad
+// tags 134 and 155 MiB (the unbudgeted issue of bad created values allocates
+// 26 and 33 MiB, so that case is a plain regression check, not a discriminator).
+const (
+	repeatedPageBound  = 64 << 20
+	repeatedIssueBound = 20 << 20
+)
+
+func TestTagElementsMustBeObjects(t *testing.T) {
+	for name, tc := range map[string]struct {
+		in string
+		ok bool
+	}{
+		"empty":         {`[]`, true},
+		"objects":       {`[{"id":"a"} , {}]`, true},
+		"null":          {`null`, true},
+		"null element":  {`[null]`, true},
+		"number":        {`[1]`, false},
+		"later number":  {`[{},1]`, false},
+		"string":        {`["{"]`, false},
+		"nested array":  {`[[{}]]`, false},
+		"brace in text": {`[{"a":"1,2"},{"b":[1,2]}]`, true},
+	} {
+		var tags ytTags
+		err := tags.UnmarshalJSON([]byte(tc.in))
+		if (err == nil) != tc.ok {
+			t.Errorf("%s: err = %v, want ok=%v", name, err, tc.ok)
+		}
 	}
 }
 

@@ -92,7 +92,11 @@ func (y *youTrack) do(ctx context.Context, c ytCall, out any) (status, n int, er
 	case c.decode != nil:
 		decodeErr = c.decode(body)
 	case out != nil:
-		decodeErr = json.Unmarshal(body, out)
+		if valueCount(body) > objectValueBudget {
+			decodeErr = errValueCeiling
+		} else {
+			decodeErr = json.Unmarshal(body, out)
+		}
 	}
 	if decodeErr != nil {
 		return status, len(body), y.red.errorStatus(fmt.Errorf("youtrack: %s %s: decode response: %w", c.method, path, decodeErr), status)
@@ -132,8 +136,8 @@ type nester interface {
 // ytPages walks every page of a list endpoint under paginate's ceilings and
 // calls visit with each page. visit returns true to stop early. Items that
 // implement nester count their nested entries toward maxItems. A page is
-// decoded as a stream and refused as soon as it holds more than pageSize
-// items. Errors come back redacted.
+// counted by a byte scan and refused above pageSize items or the structural
+// value budget before any element is decoded. Errors come back redacted.
 func ytPages[T any](ctx context.Context, y *youTrack, path []string, query url.Values, visit func([]T) bool) error {
 	var fetchErr error
 	seen := 0
