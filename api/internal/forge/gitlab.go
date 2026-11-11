@@ -56,7 +56,7 @@ type gitLab struct {
 	logClient *http.Client
 }
 
-// The driver implements both halves of the Forge contract (PRD #8).
+// The driver implements both halves of the Forge contract (PRD #4173).
 var (
 	_ IssueTracker = (*gitLab)(nil)
 	_ CodeHost     = (*gitLab)(nil)

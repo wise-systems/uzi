@@ -65,7 +65,7 @@ type forgejo struct {
 	slugs map[int64]repoSlug
 }
 
-// The driver implements both halves of the Forge contract (PRD #8).
+// The driver implements both halves of the Forge contract (PRD #4173).
 var (
 	_ IssueTracker = (*forgejo)(nil)
 	_ CodeHost     = (*forgejo)(nil)
