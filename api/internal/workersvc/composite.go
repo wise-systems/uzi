@@ -166,7 +166,7 @@ func (s *Service) ConfirmProposalForUser(ctx context.Context, userID, runID, pro
 	if err != nil {
 		s.revertProposal(ctx, propID)
 		// err is already PAT-redacted by the driver.
-		return CreatedIssue{}, fmt.Errorf("%w: %v", ErrForgeIssueWrite, err)
+		return CreatedIssue{}, fmt.Errorf("%w: %w", ErrForgeIssueWrite, err)
 	}
 
 	// Settle confirming -> confirmed with the created iid. This row is ours (we hold

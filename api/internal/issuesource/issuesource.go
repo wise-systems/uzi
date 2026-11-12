@@ -24,6 +24,12 @@ type Sources interface {
 // is deliberately no fallback to the forge, whose issue numbers mean nothing there.
 var ErrNotWired = errors.New("repo is linked to an issue tracker but no issue tracker source is wired")
 
+// ErrIssueWriteNotOffered is returned for every write to a linked external issue
+// tracker (YouTrack writes arrive in PRD #4173 M5). forgesvc.ErrIssueWriteNotOffered
+// is this same value; it lives here so a package that cannot import forgesvc can
+// wrap and match it.
+var ErrIssueWriteNotOffered = errors.New("issue writes on a repo linked to an issue tracker are not offered yet")
+
 // For returns the issue side a caller should use for one repo row. linked is
 // whether the row's issue_tracker_connection_id is set. An unlinked row gets
 // unlinked untouched (the caller's own forge driver, byte-identical to before M4);

@@ -6,12 +6,16 @@ import (
 	"fmt"
 
 	"github.com/vtmocanu/uzi/api/internal/forge"
+	"github.com/vtmocanu/uzi/api/internal/issuesource"
 )
 
 // ErrIssueWriteNotOffered is returned by the write guard for every write to a
 // linked external issue tracker: YouTrack writes arrive in PRD #4173 M5, so until
 // then no request is sent (S1: uzi stays read-only against the tracker).
-var ErrIssueWriteNotOffered = errors.New("issue writes on a repo linked to an issue tracker are not offered yet")
+//
+// It is the issuesource sentinel itself, so a package that cannot import forgesvc
+// (workersvc) can wrap and match the same value.
+var ErrIssueWriteNotOffered = issuesource.ErrIssueWriteNotOffered
 
 // linkedIssueError marks an *forge.IssueNotFoundError returned by a linked
 // repo's issue reads. A forge not-found is never marked, so IssueWriteSkippable
@@ -147,10 +151,15 @@ func (u unavailableIssueTracker) CreateIssueNote(context.Context, int64, int64, 
 	return forge.IssueNote{}, u.cause
 }
 
+// linkedIssueSource marks the guard (and so UnavailableIssueTracker) as a linked
+// repo's issue side. A wrapper placed around a resolver's result must forward it,
+// or SyncIssues will treat the wrapped tracker as a forge driver.
+func (*issueWriteGuard) linkedIssueSource() {}
+
 // isLinkedTracker reports whether tr is a linked repo's issue side, the only thing
 // SyncIssues dispatches on: the choice comes from the resolver's own output, never
 // from a separate caller flag that could disagree with it.
 func isLinkedTracker(tr forge.IssueTracker) bool {
-	_, ok := tr.(*issueWriteGuard)
+	_, ok := tr.(interface{ linkedIssueSource() })
 	return ok
 }
