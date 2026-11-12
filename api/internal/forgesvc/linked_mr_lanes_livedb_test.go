@@ -199,4 +199,21 @@ func TestMRWatchLanesForLinkedAndUnlinkedReposLiveDB(t *testing.T) {
 			t.Errorf("order = %v, want the older live (NULL mr_state) run before the newer closed run", rows)
 		}
 	})
+
+	t.Run("live rows keep the created_at order on an unlinked repo", func(t *testing.T) {
+		// A never-recorded (NULL mr_state) run does not outrank a newer opened one: among
+		// live rows the order is created_at DESC exactly as before the linked reopen watch.
+		older := uuid.New()
+		exec(`INSERT INTO runs (id, user_id, repo_id, kind, issue_iid, issue_title, issue_description, branch, mr_iid, mr_state, status, created_at)
+		      VALUES ($1, $2, $3, 'prompt', NULL, 't', 'd', $4, 22, NULL, 'completed', now() - interval '1 hour')`,
+			older, user, plainRepo, "uzi/prompt-older-"+plainRepo.String())
+		exec(`UPDATE runs SET created_at = now() WHERE id = $1`, runs[plainRepo]["prompt"])
+		rows, err := q.ListBoardFreeMRStateWatchCandidates(ctx, plainRepo)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(rows) != 2 || rows[0].ID != runs[plainRepo]["prompt"] || rows[1].ID != older {
+			t.Errorf("order = %v, want the newer opened run before the older NULL one", rows)
+		}
+	})
 }
