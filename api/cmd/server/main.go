@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -34,6 +35,8 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/healthsvc"
 	"github.com/vtmocanu/uzi/api/internal/hostedsvc"
 	"github.com/vtmocanu/uzi/api/internal/hub"
+	"github.com/vtmocanu/uzi/api/internal/issuetracker"
+	"github.com/vtmocanu/uzi/api/internal/issuetrackersvc"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/notifysvc"
 	"github.com/vtmocanu/uzi/api/internal/oidc"
@@ -1001,6 +1004,20 @@ func run() error {
 	wsvc.SetRepoGuard(pcheck)
 
 	h := handler.New(pool, q, cfg, box, svc, wsvc, pcheck, liveHub, settingsCache)
+	// External issue tracker connections and the repo link (PRD #4173 M4). The link and
+	// the reconnect rule run in transactions on the pool. An empty allowlist
+	// (UZI_ISSUE_TRACKER_ALLOWED_BASE_URLS) still boots: Connect then refuses every URL.
+	itSvc := issuetrackersvc.New(q, box, cfg.IssueTrackerBaseURLAllowed, issuetracker.New).
+		UseTransactions(pool, func(tx pgx.Tx) issuetrackersvc.Querier { return q.WithTx(tx) })
+	h.SetIssueTrackerService(itSvc)
+	// The same service is forgesvc's driver source for a linked repo's issue side (DL-5);
+	// without it a linked repo fails closed.
+	svc.SetIssueTrackerDrivers(itSvc)
+	// DL-5: the services M2 left on their own forge factories resolve a linked repo's
+	// issue side through forgesvc too; each fails closed for a linked repo without it.
+	// provisionsvc needs none: enabling a linked repo only records column rows.
+	wsvc.SetIssueSources(svc)
+	lifecycle.SetIssueSources(svc)
 	svc.SetMergedPredecessorRecovery(q, h.RecoveryService())
 
 	var bgWG sync.WaitGroup
@@ -1055,6 +1072,7 @@ func run() error {
 	// schedule that came due while the api was down fire promptly after a restart.
 	if cfg.SchedulerCheckInterval > 0 {
 		scheduler := schedsvc.New(q, wsvc, svc, settingsCache, notifier, vlt, cfg.SchedulerCheckInterval, slog.Default())
+		scheduler.SetIssueSources(svc)
 		scheduler.SetCIRepair(schedsvc.CIRepairConfig{MaxJobs: cfg.CIFixMaxJobs, LogTailBytes: cfg.CIFixLogTailBytes, MaxAttempts: cfg.CIAutofixMaxAttempts, ConfigPaths: cfg.CIAutofixConfigPaths, ArtifactMaxFiles: cfg.CIArtifactMaxFiles, ArtifactMaxBytes: cfg.CIArtifactMaxBytes})
 		// Admin-health loop-beat: the scheduler is one of the four loops (PRD #1484 M2, D15).
 		// Registered ONLY inside this started-block, so a not-started scheduler
@@ -1888,6 +1906,8 @@ func (g gateSubmitter) ConfirmProposalForUser(ctx context.Context, userID, runID
 		return slacksvc.CreatedIssue{}, slacksvc.ErrChatProposalHandled
 	case errors.Is(err, workersvc.ErrProposalNotFound):
 		return slacksvc.CreatedIssue{}, slacksvc.ErrChatProposalGone
+	case errors.Is(err, workersvc.ErrRepoNeverEnabled):
+		return slacksvc.CreatedIssue{}, slacksvc.ErrChatProposalRepoNeverEnabled
 	case errors.Is(err, workersvc.ErrProposalRepoGone),
 		errors.Is(err, workersvc.ErrForgeBuild),
 		errors.Is(err, workersvc.ErrForgeIssueWrite),
@@ -2006,6 +2026,7 @@ func steerRunCardMessage(err error) string {
 func isInternalStartRunErr(err error) bool {
 	switch {
 	case errors.Is(err, workersvc.ErrRepoNotFound), errors.Is(err, workersvc.ErrIssueNotFound),
+		errors.Is(err, workersvc.ErrRepoNeverEnabled),
 		errors.Is(err, workersvc.ErrNotPRDIssue),
 		errors.Is(err, workersvc.ErrActiveRunExists), errors.Is(err, workersvc.ErrBranchInUse),
 		errors.Is(err, workersvc.ErrDescriptionTooLarge), errors.Is(err, workersvc.ErrForgeIssueRead):
@@ -2022,6 +2043,8 @@ func startRunCardMessage(err error) string {
 	switch {
 	case errors.Is(err, workersvc.ErrRepoNotFound):
 		return "That repo isn't yours, or it no longer exists."
+	case errors.Is(err, workersvc.ErrRepoNeverEnabled):
+		return "That repo has never been enabled; enable it in uzi first."
 	case errors.Is(err, workersvc.ErrIssueNotFound):
 		return "That issue isn't on this repo's board."
 	case errors.Is(err, workersvc.ErrNotPRDIssue):

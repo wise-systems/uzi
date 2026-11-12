@@ -15,6 +15,7 @@ import (
 	"unicode"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/vtmocanu/uzi/api/internal/config"
 	"github.com/vtmocanu/uzi/api/internal/issuetracker"
@@ -27,8 +28,17 @@ import (
 // memQuerier is a minimal in-memory issuetrackersvc.Querier: only the upsert
 // Connect uses is real, the rest are unreachable from these tests.
 type memQuerier struct {
+	// Querier is left nil: the link queries are never reached by these tests,
+	// so calling one panics loudly instead of answering.
+	issuetrackersvc.Querier
 	mu   sync.Mutex
 	rows []store.IssueTrackerConnection
+}
+
+// LockIssueTrackerConnectionByIdentityForUpdate reports no existing row, so
+// Connect takes its first-connect path (these tests never reconnect).
+func (m *memQuerier) LockIssueTrackerConnectionByIdentityForUpdate(context.Context, store.LockIssueTrackerConnectionByIdentityForUpdateParams) (store.IssueTrackerConnection, error) {
+	return store.IssueTrackerConnection{}, pgx.ErrNoRows
 }
 
 func (m *memQuerier) UpsertIssueTrackerConnection(_ context.Context, a store.UpsertIssueTrackerConnectionParams) (store.IssueTrackerConnection, error) {

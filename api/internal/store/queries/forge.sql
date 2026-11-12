@@ -107,9 +107,11 @@ WHERE id = $1;
 
 -- name: UpsertRepo :one
 -- Upserted whenever the membership list is fetched. Never touches `enabled`, so
--- a re-listing does not un-enable a repo the user already turned on.
-INSERT INTO repos (connection_id, forge_project_id, path_with_namespace, web_url, default_branch)
-VALUES ($1, $2, $3, $4, $5)
+-- a re-listing does not un-enable a repo the user already turned on. The insert
+-- branch marks a newly discovered repo awaiting_first_enable (PRD #4173 D13); the
+-- conflict branch never touches it, and the repos trigger clears it on first enable.
+INSERT INTO repos (connection_id, forge_project_id, path_with_namespace, web_url, default_branch, awaiting_first_enable)
+VALUES ($1, $2, $3, $4, $5, true)
 ON CONFLICT (connection_id, forge_project_id) DO UPDATE
 SET path_with_namespace = EXCLUDED.path_with_namespace,
     web_url             = EXCLUDED.web_url,
@@ -139,6 +141,8 @@ ORDER BY r.path_with_namespace ASC;
 SELECT r.id, r.connection_id, r.forge_project_id, r.path_with_namespace, r.web_url,
        r.default_branch, r.enabled, r.fold_improve_uzi_backlog,
        r.guardrail_override_reason, r.guardrail_override_by, r.guardrail_override_at,
+       r.issue_tracker_connection_id, r.issue_tracker_project_id, r.issue_tracker_project_short,
+       r.eligibility_tag_id, r.eligibility_tag_name, r.issue_tracker_linked_at, r.awaiting_first_enable,
        c.forge_type, c.base_url, c.token_ciphertext, c.user_id, c.bot_forge_user_id
 FROM repos r
 JOIN forge_connections c ON c.id = r.connection_id
@@ -159,6 +163,8 @@ WHERE r.id = $1 AND c.user_id = $2;
 -- plus forge_project_id for slug/issue resolution.
 SELECT r.id, r.connection_id, r.forge_project_id, r.path_with_namespace, r.web_url,
        r.default_branch, r.enabled,
+       r.issue_tracker_connection_id, r.issue_tracker_project_id, r.issue_tracker_project_short,
+       r.eligibility_tag_id, r.eligibility_tag_name, r.issue_tracker_linked_at, r.awaiting_first_enable,
        c.forge_type, c.base_url, c.token_ciphertext, c.user_id
 FROM repos r
 JOIN forge_connections c ON c.id = r.connection_id
@@ -386,6 +392,8 @@ RETURNING *;
 -- engine's poller set.
 SELECT r.id, r.connection_id, r.forge_project_id, r.path_with_namespace, r.web_url,
        r.default_branch, r.enabled,
+       r.issue_tracker_connection_id, r.issue_tracker_project_id, r.issue_tracker_project_short,
+       r.eligibility_tag_id, r.eligibility_tag_name, r.issue_tracker_linked_at, r.awaiting_first_enable,
        c.forge_type, c.base_url, c.token_ciphertext, c.user_id
 FROM repos r
 JOIN forge_connections c ON c.id = r.connection_id
@@ -790,6 +798,11 @@ FROM latest l
 JOIN issues i ON i.repo_id = @repo_id AND i.forge_issue_iid = l.issue_iid
 WHERE l.status = 'completed'
   AND l.mr_iid IS NOT NULL
+  -- A repo linked to an external issue tracker (PRD #4173 M4) is owned by
+  -- ListBoardFreeMRStateWatchCandidates entirely: uzi moves no card there (writes arrive
+  -- in M5), so its MR state must not depend on the issue cache or a column label. Excluding
+  -- the repo here keeps the two lanes disjoint.
+  AND NOT EXISTS (SELECT 1 FROM repos lr WHERE lr.id = @repo_id AND lr.issue_tracker_connection_id IS NOT NULL)
   AND (
     -- Lane A (UNCHANGED): open-issue board-move watch — card in Human Review
     -- (close-edge) or run already recorded closed (reopen-edge, Decision 10).
@@ -829,12 +842,16 @@ LIMIT 100;
 -- gate, the mr_rework ledger eviction, and stop-on-close cancellation all work for these runs.
 -- Self-bounding like Lane B: poll a run only until its mr_state reaches a terminal value
 -- (merged/closed), then it drops out of this set. LIMIT 100 is a hardcoded burst bound (mirrors
--- ListMRWatchCandidates), not a sqlc param, so zero Go signature change. Keep this rationale
+-- ListMRWatchCandidates), not a sqlc param, so zero Go signature change. A repo linked to an
+-- external issue tracker (PRD #4173 M4) is widened IN whole: every issue-lane run of such a repo
+-- belongs here (the board lane excludes the repo), so linked runs record mr_state and cancel
+-- rework with no board card; an unlinked repo matches exactly as before. Keep this rationale
 -- ABOVE the statement — a comment trailing after the `;` is grabbed by sqlc as the NEXT query's doc.
 SELECT id, branch, mr_iid, mr_state
 FROM runs
 WHERE repo_id = @repo_id::uuid
-  AND (issue_iid IS NULL OR kind IN ('prompt', 'self_improve'))
+  AND (issue_iid IS NULL OR kind IN ('prompt', 'self_improve')
+       OR EXISTS (SELECT 1 FROM repos lr WHERE lr.id = @repo_id::uuid AND lr.issue_tracker_connection_id IS NOT NULL))
   AND status = 'completed'
   AND mr_iid IS NOT NULL
   AND (mr_state IS NULL OR mr_state IN ('opened', 'locked'))

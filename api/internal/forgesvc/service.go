@@ -106,6 +106,9 @@ func HasPRDLink(description string) bool {
 // be unit-tested against a fake store (and a mocked Forge) without a live
 // database. *store.Queries satisfies it.
 type IssueStore interface {
+	// GetRepoIssueSourceForUser is the one owner-scoped row the per-repo resolvers
+	// (IssueTrackerForRepo, CodeHostForRepo) read.
+	GetRepoIssueSourceForUser(ctx context.Context, arg store.GetRepoIssueSourceForUserParams) (store.GetRepoIssueSourceForUserRow, error)
 	RemoveCachedIssueLabel(context.Context, store.RemoveCachedIssueLabelParams) (store.Issue, error)
 	UpsertIssue(ctx context.Context, arg store.UpsertIssueParams) (store.Issue, error)
 	// UpsertIssueLabels is the label-only cache-write variant used by AutoMove and
@@ -187,6 +190,10 @@ type Service struct {
 	groupCursorMu sync.Mutex
 	groupCursors  map[uuid.UUID]store.FindingGroupCursor
 	forgeBuilder  ForgeBuilder
+
+	// itDrivers builds a linked repo's issue tracker driver (SetIssueTrackerDrivers).
+	// nil means a linked repo fails closed.
+	itDrivers IssueTrackerDrivers
 
 	// findingGroupSince is the optional pending-warning age clock; nil uses time.Since.
 	findingGroupSince func(time.Time) time.Duration

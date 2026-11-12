@@ -174,7 +174,7 @@ SET guardrail_override_reason = NULL,
     guardrail_override_by     = NULL,
     guardrail_override_at     = NULL
 WHERE id = $1
-RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, awaiting_first_enable, issue_tracker_connection_id, issue_tracker_project_id, issue_tracker_project_short, eligibility_tag_id, eligibility_tag_name, issue_tracker_linked_at
 `
 
 // PRD #66 M8 (D8): revoke the admin per-repo override, re-arming the guardrail
@@ -204,6 +204,13 @@ func (q *Queries) ClearRepoGuardrailOverride(ctx context.Context, id uuid.UUID) 
 		&i.CrossCheckRepoInstructionsEnabled,
 		&i.IgnoredInferredCapabilities,
 		&i.AgentSourceDefault,
+		&i.AwaitingFirstEnable,
+		&i.IssueTrackerConnectionID,
+		&i.IssueTrackerProjectID,
+		&i.IssueTrackerProjectShort,
+		&i.EligibilityTagID,
+		&i.EligibilityTagName,
+		&i.IssueTrackerLinkedAt,
 	)
 	return i, err
 }
@@ -505,7 +512,7 @@ func (q *Queries) GetForgeConnectionForUser(ctx context.Context, arg GetForgeCon
 }
 
 const getIssueByIID = `-- name: GetIssueByIID :one
-SELECT id, repo_id, forge_issue_iid, title, state, labels, web_url, author, has_prd_link, forge_updated_at, synced_at, board_position, assignee_ids FROM issues WHERE repo_id = $1 AND forge_issue_iid = $2
+SELECT id, repo_id, forge_issue_iid, title, state, labels, web_url, author, has_prd_link, forge_updated_at, synced_at, board_position, assignee_ids, issue_key FROM issues WHERE repo_id = $1 AND forge_issue_iid = $2
 `
 
 type GetIssueByIIDParams struct {
@@ -530,6 +537,7 @@ func (q *Queries) GetIssueByIID(ctx context.Context, arg GetIssueByIIDParams) (I
 		&i.SyncedAt,
 		&i.BoardPosition,
 		&i.AssigneeIds,
+		&i.IssueKey,
 	)
 	return i, err
 }
@@ -672,6 +680,8 @@ func (q *Queries) GetLatestRunForIssue(ctx context.Context, arg GetLatestRunForI
 const getRepoByID = `-- name: GetRepoByID :one
 SELECT r.id, r.connection_id, r.forge_project_id, r.path_with_namespace, r.web_url,
        r.default_branch, r.enabled,
+       r.issue_tracker_connection_id, r.issue_tracker_project_id, r.issue_tracker_project_short,
+       r.eligibility_tag_id, r.eligibility_tag_name, r.issue_tracker_linked_at, r.awaiting_first_enable,
        c.forge_type, c.base_url, c.token_ciphertext, c.user_id
 FROM repos r
 JOIN forge_connections c ON c.id = r.connection_id
@@ -679,17 +689,24 @@ WHERE r.id = $1
 `
 
 type GetRepoByIDRow struct {
-	ID                uuid.UUID   `json:"id"`
-	ConnectionID      uuid.UUID   `json:"connection_id"`
-	ForgeProjectID    int64       `json:"forge_project_id"`
-	PathWithNamespace string      `json:"path_with_namespace"`
-	WebUrl            string      `json:"web_url"`
-	DefaultBranch     pgtype.Text `json:"default_branch"`
-	Enabled           bool        `json:"enabled"`
-	ForgeType         string      `json:"forge_type"`
-	BaseUrl           string      `json:"base_url"`
-	TokenCiphertext   []byte      `json:"token_ciphertext"`
-	UserID            uuid.UUID   `json:"user_id"`
+	ID                       uuid.UUID          `json:"id"`
+	ConnectionID             uuid.UUID          `json:"connection_id"`
+	ForgeProjectID           int64              `json:"forge_project_id"`
+	PathWithNamespace        string             `json:"path_with_namespace"`
+	WebUrl                   string             `json:"web_url"`
+	DefaultBranch            pgtype.Text        `json:"default_branch"`
+	Enabled                  bool               `json:"enabled"`
+	IssueTrackerConnectionID pgtype.UUID        `json:"issue_tracker_connection_id"`
+	IssueTrackerProjectID    pgtype.Text        `json:"issue_tracker_project_id"`
+	IssueTrackerProjectShort pgtype.Text        `json:"issue_tracker_project_short"`
+	EligibilityTagID         pgtype.Text        `json:"eligibility_tag_id"`
+	EligibilityTagName       pgtype.Text        `json:"eligibility_tag_name"`
+	IssueTrackerLinkedAt     pgtype.Timestamptz `json:"issue_tracker_linked_at"`
+	AwaitingFirstEnable      bool               `json:"awaiting_first_enable"`
+	ForgeType                string             `json:"forge_type"`
+	BaseUrl                  string             `json:"base_url"`
+	TokenCiphertext          []byte             `json:"token_ciphertext"`
+	UserID                   uuid.UUID          `json:"user_id"`
 }
 
 // One repo plus the connection fields needed to build a forge client, UNSCOPED by
@@ -715,6 +732,13 @@ func (q *Queries) GetRepoByID(ctx context.Context, id uuid.UUID) (GetRepoByIDRow
 		&i.WebUrl,
 		&i.DefaultBranch,
 		&i.Enabled,
+		&i.IssueTrackerConnectionID,
+		&i.IssueTrackerProjectID,
+		&i.IssueTrackerProjectShort,
+		&i.EligibilityTagID,
+		&i.EligibilityTagName,
+		&i.IssueTrackerLinkedAt,
+		&i.AwaitingFirstEnable,
 		&i.ForgeType,
 		&i.BaseUrl,
 		&i.TokenCiphertext,
@@ -727,6 +751,8 @@ const getRepoForUser = `-- name: GetRepoForUser :one
 SELECT r.id, r.connection_id, r.forge_project_id, r.path_with_namespace, r.web_url,
        r.default_branch, r.enabled, r.fold_improve_uzi_backlog,
        r.guardrail_override_reason, r.guardrail_override_by, r.guardrail_override_at,
+       r.issue_tracker_connection_id, r.issue_tracker_project_id, r.issue_tracker_project_short,
+       r.eligibility_tag_id, r.eligibility_tag_name, r.issue_tracker_linked_at, r.awaiting_first_enable,
        c.forge_type, c.base_url, c.token_ciphertext, c.user_id, c.bot_forge_user_id
 FROM repos r
 JOIN forge_connections c ON c.id = r.connection_id
@@ -739,22 +765,29 @@ type GetRepoForUserParams struct {
 }
 
 type GetRepoForUserRow struct {
-	ID                      uuid.UUID          `json:"id"`
-	ConnectionID            uuid.UUID          `json:"connection_id"`
-	ForgeProjectID          int64              `json:"forge_project_id"`
-	PathWithNamespace       string             `json:"path_with_namespace"`
-	WebUrl                  string             `json:"web_url"`
-	DefaultBranch           pgtype.Text        `json:"default_branch"`
-	Enabled                 bool               `json:"enabled"`
-	FoldImproveUziBacklog   bool               `json:"fold_improve_uzi_backlog"`
-	GuardrailOverrideReason pgtype.Text        `json:"guardrail_override_reason"`
-	GuardrailOverrideBy     pgtype.UUID        `json:"guardrail_override_by"`
-	GuardrailOverrideAt     pgtype.Timestamptz `json:"guardrail_override_at"`
-	ForgeType               string             `json:"forge_type"`
-	BaseUrl                 string             `json:"base_url"`
-	TokenCiphertext         []byte             `json:"token_ciphertext"`
-	UserID                  uuid.UUID          `json:"user_id"`
-	BotForgeUserID          int64              `json:"bot_forge_user_id"`
+	ID                       uuid.UUID          `json:"id"`
+	ConnectionID             uuid.UUID          `json:"connection_id"`
+	ForgeProjectID           int64              `json:"forge_project_id"`
+	PathWithNamespace        string             `json:"path_with_namespace"`
+	WebUrl                   string             `json:"web_url"`
+	DefaultBranch            pgtype.Text        `json:"default_branch"`
+	Enabled                  bool               `json:"enabled"`
+	FoldImproveUziBacklog    bool               `json:"fold_improve_uzi_backlog"`
+	GuardrailOverrideReason  pgtype.Text        `json:"guardrail_override_reason"`
+	GuardrailOverrideBy      pgtype.UUID        `json:"guardrail_override_by"`
+	GuardrailOverrideAt      pgtype.Timestamptz `json:"guardrail_override_at"`
+	IssueTrackerConnectionID pgtype.UUID        `json:"issue_tracker_connection_id"`
+	IssueTrackerProjectID    pgtype.Text        `json:"issue_tracker_project_id"`
+	IssueTrackerProjectShort pgtype.Text        `json:"issue_tracker_project_short"`
+	EligibilityTagID         pgtype.Text        `json:"eligibility_tag_id"`
+	EligibilityTagName       pgtype.Text        `json:"eligibility_tag_name"`
+	IssueTrackerLinkedAt     pgtype.Timestamptz `json:"issue_tracker_linked_at"`
+	AwaitingFirstEnable      bool               `json:"awaiting_first_enable"`
+	ForgeType                string             `json:"forge_type"`
+	BaseUrl                  string             `json:"base_url"`
+	TokenCiphertext          []byte             `json:"token_ciphertext"`
+	UserID                   uuid.UUID          `json:"user_id"`
+	BotForgeUserID           int64              `json:"bot_forge_user_id"`
 }
 
 // One repo plus the connection fields needed to build a forge client, scoped to
@@ -777,6 +810,13 @@ func (q *Queries) GetRepoForUser(ctx context.Context, arg GetRepoForUserParams) 
 		&i.GuardrailOverrideReason,
 		&i.GuardrailOverrideBy,
 		&i.GuardrailOverrideAt,
+		&i.IssueTrackerConnectionID,
+		&i.IssueTrackerProjectID,
+		&i.IssueTrackerProjectShort,
+		&i.EligibilityTagID,
+		&i.EligibilityTagName,
+		&i.IssueTrackerLinkedAt,
+		&i.AwaitingFirstEnable,
 		&i.ForgeType,
 		&i.BaseUrl,
 		&i.TokenCiphertext,
@@ -905,7 +945,8 @@ const listBoardFreeMRStateWatchCandidates = `-- name: ListBoardFreeMRStateWatchC
 SELECT id, branch, mr_iid, mr_state
 FROM runs
 WHERE repo_id = $1::uuid
-  AND (issue_iid IS NULL OR kind IN ('prompt', 'self_improve'))
+  AND (issue_iid IS NULL OR kind IN ('prompt', 'self_improve')
+       OR EXISTS (SELECT 1 FROM repos lr WHERE lr.id = $1::uuid AND lr.issue_tracker_connection_id IS NOT NULL))
   AND status = 'completed'
   AND mr_iid IS NOT NULL
   AND (mr_state IS NULL OR mr_state IN ('opened', 'locked'))
@@ -934,7 +975,10 @@ type ListBoardFreeMRStateWatchCandidatesRow struct {
 // gate, the mr_rework ledger eviction, and stop-on-close cancellation all work for these runs.
 // Self-bounding like Lane B: poll a run only until its mr_state reaches a terminal value
 // (merged/closed), then it drops out of this set. LIMIT 100 is a hardcoded burst bound (mirrors
-// ListMRWatchCandidates), not a sqlc param, so zero Go signature change. Keep this rationale
+// ListMRWatchCandidates), not a sqlc param, so zero Go signature change. A repo linked to an
+// external issue tracker (PRD #4173 M4) is widened IN whole: every issue-lane run of such a repo
+// belongs here (the board lane excludes the repo), so linked runs record mr_state and cancel
+// rework with no board card; an unlinked repo matches exactly as before. Keep this rationale
 // ABOVE the statement — a comment trailing after the `;` is grabbed by sqlc as the NEXT query's doc.
 func (q *Queries) ListBoardFreeMRStateWatchCandidates(ctx context.Context, repoID uuid.UUID) ([]ListBoardFreeMRStateWatchCandidatesRow, error) {
 	rows, err := q.db.Query(ctx, listBoardFreeMRStateWatchCandidates, repoID)
@@ -986,7 +1030,7 @@ func (q *Queries) ListEnabledRepoIDs(ctx context.Context) ([]uuid.UUID, error) {
 }
 
 const listEnabledReposByConnection = `-- name: ListEnabledReposByConnection :many
-SELECT id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default FROM repos WHERE connection_id = $1 AND enabled = true
+SELECT id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, awaiting_first_enable, issue_tracker_connection_id, issue_tracker_project_id, issue_tracker_project_short, eligibility_tag_id, eligibility_tag_name, issue_tracker_linked_at FROM repos WHERE connection_id = $1 AND enabled = true
 ORDER BY path_with_namespace ASC
 `
 
@@ -1022,6 +1066,13 @@ func (q *Queries) ListEnabledReposByConnection(ctx context.Context, connectionID
 			&i.CrossCheckRepoInstructionsEnabled,
 			&i.IgnoredInferredCapabilities,
 			&i.AgentSourceDefault,
+			&i.AwaitingFirstEnable,
+			&i.IssueTrackerConnectionID,
+			&i.IssueTrackerProjectID,
+			&i.IssueTrackerProjectShort,
+			&i.EligibilityTagID,
+			&i.EligibilityTagName,
+			&i.IssueTrackerLinkedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -1034,7 +1085,7 @@ func (q *Queries) ListEnabledReposByConnection(ctx context.Context, connectionID
 }
 
 const listEnabledReposForUser = `-- name: ListEnabledReposForUser :many
-SELECT r.id, r.connection_id, r.forge_project_id, r.path_with_namespace, r.web_url, r.default_branch, r.enabled, r.repo_skills_enabled, r.repo_devbox_opt_in, r.repo_claudemd_enabled, r.guardrail_override_reason, r.guardrail_override_by, r.guardrail_override_at, r.required_capabilities, r.fold_improve_uzi_backlog, r.code_cross_check_guidance, r.cross_check_repo_instructions_enabled, r.ignored_inferred_capabilities, r.agent_source_default FROM repos r
+SELECT r.id, r.connection_id, r.forge_project_id, r.path_with_namespace, r.web_url, r.default_branch, r.enabled, r.repo_skills_enabled, r.repo_devbox_opt_in, r.repo_claudemd_enabled, r.guardrail_override_reason, r.guardrail_override_by, r.guardrail_override_at, r.required_capabilities, r.fold_improve_uzi_backlog, r.code_cross_check_guidance, r.cross_check_repo_instructions_enabled, r.ignored_inferred_capabilities, r.agent_source_default, r.awaiting_first_enable, r.issue_tracker_connection_id, r.issue_tracker_project_id, r.issue_tracker_project_short, r.eligibility_tag_id, r.eligibility_tag_name, r.issue_tracker_linked_at FROM repos r
 JOIN forge_connections c ON c.id = r.connection_id
 WHERE c.user_id = $1 AND r.enabled = true
 ORDER BY r.path_with_namespace ASC
@@ -1070,6 +1121,13 @@ func (q *Queries) ListEnabledReposForUser(ctx context.Context, userID uuid.UUID)
 			&i.CrossCheckRepoInstructionsEnabled,
 			&i.IgnoredInferredCapabilities,
 			&i.AgentSourceDefault,
+			&i.AwaitingFirstEnable,
+			&i.IssueTrackerConnectionID,
+			&i.IssueTrackerProjectID,
+			&i.IssueTrackerProjectShort,
+			&i.EligibilityTagID,
+			&i.EligibilityTagName,
+			&i.IssueTrackerLinkedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -1084,6 +1142,8 @@ func (q *Queries) ListEnabledReposForUser(ctx context.Context, userID uuid.UUID)
 const listEnabledReposWithConnections = `-- name: ListEnabledReposWithConnections :many
 SELECT r.id, r.connection_id, r.forge_project_id, r.path_with_namespace, r.web_url,
        r.default_branch, r.enabled,
+       r.issue_tracker_connection_id, r.issue_tracker_project_id, r.issue_tracker_project_short,
+       r.eligibility_tag_id, r.eligibility_tag_name, r.issue_tracker_linked_at, r.awaiting_first_enable,
        c.forge_type, c.base_url, c.token_ciphertext, c.user_id
 FROM repos r
 JOIN forge_connections c ON c.id = r.connection_id
@@ -1091,17 +1151,24 @@ WHERE r.enabled = true
 `
 
 type ListEnabledReposWithConnectionsRow struct {
-	ID                uuid.UUID   `json:"id"`
-	ConnectionID      uuid.UUID   `json:"connection_id"`
-	ForgeProjectID    int64       `json:"forge_project_id"`
-	PathWithNamespace string      `json:"path_with_namespace"`
-	WebUrl            string      `json:"web_url"`
-	DefaultBranch     pgtype.Text `json:"default_branch"`
-	Enabled           bool        `json:"enabled"`
-	ForgeType         string      `json:"forge_type"`
-	BaseUrl           string      `json:"base_url"`
-	TokenCiphertext   []byte      `json:"token_ciphertext"`
-	UserID            uuid.UUID   `json:"user_id"`
+	ID                       uuid.UUID          `json:"id"`
+	ConnectionID             uuid.UUID          `json:"connection_id"`
+	ForgeProjectID           int64              `json:"forge_project_id"`
+	PathWithNamespace        string             `json:"path_with_namespace"`
+	WebUrl                   string             `json:"web_url"`
+	DefaultBranch            pgtype.Text        `json:"default_branch"`
+	Enabled                  bool               `json:"enabled"`
+	IssueTrackerConnectionID pgtype.UUID        `json:"issue_tracker_connection_id"`
+	IssueTrackerProjectID    pgtype.Text        `json:"issue_tracker_project_id"`
+	IssueTrackerProjectShort pgtype.Text        `json:"issue_tracker_project_short"`
+	EligibilityTagID         pgtype.Text        `json:"eligibility_tag_id"`
+	EligibilityTagName       pgtype.Text        `json:"eligibility_tag_name"`
+	IssueTrackerLinkedAt     pgtype.Timestamptz `json:"issue_tracker_linked_at"`
+	AwaitingFirstEnable      bool               `json:"awaiting_first_enable"`
+	ForgeType                string             `json:"forge_type"`
+	BaseUrl                  string             `json:"base_url"`
+	TokenCiphertext          []byte             `json:"token_ciphertext"`
+	UserID                   uuid.UUID          `json:"user_id"`
 }
 
 // Every enabled repo across all users, with its connection, for the sync
@@ -1123,6 +1190,13 @@ func (q *Queries) ListEnabledReposWithConnections(ctx context.Context) ([]ListEn
 			&i.WebUrl,
 			&i.DefaultBranch,
 			&i.Enabled,
+			&i.IssueTrackerConnectionID,
+			&i.IssueTrackerProjectID,
+			&i.IssueTrackerProjectShort,
+			&i.EligibilityTagID,
+			&i.EligibilityTagName,
+			&i.IssueTrackerLinkedAt,
+			&i.AwaitingFirstEnable,
 			&i.ForgeType,
 			&i.BaseUrl,
 			&i.TokenCiphertext,
@@ -1177,7 +1251,7 @@ func (q *Queries) ListForgeConnectionsByUser(ctx context.Context, userID uuid.UU
 }
 
 const listIssuesByRepo = `-- name: ListIssuesByRepo :many
-SELECT id, repo_id, forge_issue_iid, title, state, labels, web_url, author, has_prd_link, forge_updated_at, synced_at, board_position, assignee_ids FROM issues WHERE repo_id = $1
+SELECT id, repo_id, forge_issue_iid, title, state, labels, web_url, author, has_prd_link, forge_updated_at, synced_at, board_position, assignee_ids, issue_key FROM issues WHERE repo_id = $1
 ORDER BY board_position ASC NULLS LAST, forge_issue_iid ASC
 `
 
@@ -1223,6 +1297,7 @@ func (q *Queries) ListIssuesByRepo(ctx context.Context, repoID uuid.UUID) ([]Iss
 			&i.SyncedAt,
 			&i.BoardPosition,
 			&i.AssigneeIds,
+			&i.IssueKey,
 		); err != nil {
 			return nil, err
 		}
@@ -1417,6 +1492,11 @@ FROM latest l
 JOIN issues i ON i.repo_id = $1 AND i.forge_issue_iid = l.issue_iid
 WHERE l.status = 'completed'
   AND l.mr_iid IS NOT NULL
+  -- A repo linked to an external issue tracker (PRD #4173 M4) is owned by
+  -- ListBoardFreeMRStateWatchCandidates entirely: uzi moves no card there (writes arrive
+  -- in M5), so its MR state must not depend on the issue cache or a column label. Excluding
+  -- the repo here keeps the two lanes disjoint.
+  AND NOT EXISTS (SELECT 1 FROM repos lr WHERE lr.id = $1 AND lr.issue_tracker_connection_id IS NOT NULL)
   AND (
     -- Lane A (UNCHANGED): open-issue board-move watch — card in Human Review
     -- (close-edge) or run already recorded closed (reopen-edge, Decision 10).
@@ -1640,7 +1720,7 @@ func (q *Queries) ListPRDLinkPatchCandidates(ctx context.Context, arg ListPRDLin
 }
 
 const listReposByConnectionForUser = `-- name: ListReposByConnectionForUser :many
-SELECT r.id, r.connection_id, r.forge_project_id, r.path_with_namespace, r.web_url, r.default_branch, r.enabled, r.repo_skills_enabled, r.repo_devbox_opt_in, r.repo_claudemd_enabled, r.guardrail_override_reason, r.guardrail_override_by, r.guardrail_override_at, r.required_capabilities, r.fold_improve_uzi_backlog, r.code_cross_check_guidance, r.cross_check_repo_instructions_enabled, r.ignored_inferred_capabilities, r.agent_source_default FROM repos r
+SELECT r.id, r.connection_id, r.forge_project_id, r.path_with_namespace, r.web_url, r.default_branch, r.enabled, r.repo_skills_enabled, r.repo_devbox_opt_in, r.repo_claudemd_enabled, r.guardrail_override_reason, r.guardrail_override_by, r.guardrail_override_at, r.required_capabilities, r.fold_improve_uzi_backlog, r.code_cross_check_guidance, r.cross_check_repo_instructions_enabled, r.ignored_inferred_capabilities, r.agent_source_default, r.awaiting_first_enable, r.issue_tracker_connection_id, r.issue_tracker_project_id, r.issue_tracker_project_short, r.eligibility_tag_id, r.eligibility_tag_name, r.issue_tracker_linked_at FROM repos r
 JOIN forge_connections c ON c.id = r.connection_id
 WHERE r.connection_id = $1 AND c.user_id = $2
 ORDER BY r.path_with_namespace ASC
@@ -1681,6 +1761,13 @@ func (q *Queries) ListReposByConnectionForUser(ctx context.Context, arg ListRepo
 			&i.CrossCheckRepoInstructionsEnabled,
 			&i.IgnoredInferredCapabilities,
 			&i.AgentSourceDefault,
+			&i.AwaitingFirstEnable,
+			&i.IssueTrackerConnectionID,
+			&i.IssueTrackerProjectID,
+			&i.IssueTrackerProjectShort,
+			&i.EligibilityTagID,
+			&i.EligibilityTagName,
+			&i.IssueTrackerLinkedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -1698,7 +1785,7 @@ SET labels = COALESCE((SELECT jsonb_agg(value ORDER BY ordinal)
     FROM jsonb_array_elements(labels) WITH ORDINALITY AS item(value, ordinal)
     WHERE value <> to_jsonb($1::text)), '[]'::jsonb)
 WHERE repo_id = $2 AND forge_issue_iid = $3
-RETURNING id, repo_id, forge_issue_iid, title, state, labels, web_url, author, has_prd_link, forge_updated_at, synced_at, board_position, assignee_ids
+RETURNING id, repo_id, forge_issue_iid, title, state, labels, web_url, author, has_prd_link, forge_updated_at, synced_at, board_position, assignee_ids, issue_key
 `
 
 type RemoveCachedIssueLabelParams struct {
@@ -1726,6 +1813,7 @@ func (q *Queries) RemoveCachedIssueLabel(ctx context.Context, arg RemoveCachedIs
 		&i.SyncedAt,
 		&i.BoardPosition,
 		&i.AssigneeIds,
+		&i.IssueKey,
 	)
 	return i, err
 }
@@ -1734,7 +1822,7 @@ const reopenIssueState = `-- name: ReopenIssueState :one
 UPDATE issues
 SET state = 'opened', board_position = NULL, synced_at = now()
 WHERE repo_id = $1 AND forge_issue_iid = $2
-RETURNING id, repo_id, forge_issue_iid, title, state, labels, web_url, author, has_prd_link, forge_updated_at, synced_at, board_position, assignee_ids
+RETURNING id, repo_id, forge_issue_iid, title, state, labels, web_url, author, has_prd_link, forge_updated_at, synced_at, board_position, assignee_ids, issue_key
 `
 
 type ReopenIssueStateParams struct {
@@ -1767,6 +1855,7 @@ func (q *Queries) ReopenIssueState(ctx context.Context, arg ReopenIssueStatePara
 		&i.SyncedAt,
 		&i.BoardPosition,
 		&i.AssigneeIds,
+		&i.IssueKey,
 	)
 	return i, err
 }
@@ -1861,7 +1950,7 @@ const setRepoAgentSourceDefault = `-- name: SetRepoAgentSourceDefault :one
 UPDATE repos SET agent_source_default = $1::text
 WHERE repos.id = $2
   AND $1::text IS DISTINCT FROM 'repo'
-RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, awaiting_first_enable, issue_tracker_connection_id, issue_tracker_project_id, issue_tracker_project_short, eligibility_tag_id, eligibility_tag_name, issue_tracker_linked_at
 `
 
 type SetRepoAgentSourceDefaultParams struct {
@@ -1892,6 +1981,13 @@ func (q *Queries) SetRepoAgentSourceDefault(ctx context.Context, arg SetRepoAgen
 		&i.CrossCheckRepoInstructionsEnabled,
 		&i.IgnoredInferredCapabilities,
 		&i.AgentSourceDefault,
+		&i.AwaitingFirstEnable,
+		&i.IssueTrackerConnectionID,
+		&i.IssueTrackerProjectID,
+		&i.IssueTrackerProjectShort,
+		&i.EligibilityTagID,
+		&i.EligibilityTagName,
+		&i.IssueTrackerLinkedAt,
 	)
 	return i, err
 }
@@ -1900,7 +1996,7 @@ const setRepoAgentSourceDefaultForUser = `-- name: SetRepoAgentSourceDefaultForU
 UPDATE repos SET agent_source_default = $1::text
 WHERE repos.id = $2
   AND repos.connection_id IN (SELECT forge_connections.id FROM forge_connections WHERE forge_connections.user_id = $3)
-RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, awaiting_first_enable, issue_tracker_connection_id, issue_tracker_project_id, issue_tracker_project_short, eligibility_tag_id, eligibility_tag_name, issue_tracker_linked_at
 `
 
 type SetRepoAgentSourceDefaultForUserParams struct {
@@ -1932,12 +2028,19 @@ func (q *Queries) SetRepoAgentSourceDefaultForUser(ctx context.Context, arg SetR
 		&i.CrossCheckRepoInstructionsEnabled,
 		&i.IgnoredInferredCapabilities,
 		&i.AgentSourceDefault,
+		&i.AwaitingFirstEnable,
+		&i.IssueTrackerConnectionID,
+		&i.IssueTrackerProjectID,
+		&i.IssueTrackerProjectShort,
+		&i.EligibilityTagID,
+		&i.EligibilityTagName,
+		&i.IssueTrackerLinkedAt,
 	)
 	return i, err
 }
 
 const setRepoCapabilityPolicy = `-- name: SetRepoCapabilityPolicy :one
-UPDATE repos SET required_capabilities = $2, ignored_inferred_capabilities = $3 WHERE repos.id = $1 RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default
+UPDATE repos SET required_capabilities = $2, ignored_inferred_capabilities = $3 WHERE repos.id = $1 RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, awaiting_first_enable, issue_tracker_connection_id, issue_tracker_project_id, issue_tracker_project_short, eligibility_tag_id, eligibility_tag_name, issue_tracker_linked_at
 `
 
 type SetRepoCapabilityPolicyParams struct {
@@ -1969,6 +2072,13 @@ func (q *Queries) SetRepoCapabilityPolicy(ctx context.Context, arg SetRepoCapabi
 		&i.CrossCheckRepoInstructionsEnabled,
 		&i.IgnoredInferredCapabilities,
 		&i.AgentSourceDefault,
+		&i.AwaitingFirstEnable,
+		&i.IssueTrackerConnectionID,
+		&i.IssueTrackerProjectID,
+		&i.IssueTrackerProjectShort,
+		&i.EligibilityTagID,
+		&i.EligibilityTagName,
+		&i.IssueTrackerLinkedAt,
 	)
 	return i, err
 }
@@ -1977,7 +2087,7 @@ const setRepoCapabilityPolicyForUser = `-- name: SetRepoCapabilityPolicyForUser 
 UPDATE repos SET required_capabilities = $2, ignored_inferred_capabilities = $3
 WHERE repos.id = $1
   AND repos.connection_id IN (SELECT forge_connections.id FROM forge_connections WHERE forge_connections.user_id = $4)
-RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, awaiting_first_enable, issue_tracker_connection_id, issue_tracker_project_id, issue_tracker_project_short, eligibility_tag_id, eligibility_tag_name, issue_tracker_linked_at
 `
 
 type SetRepoCapabilityPolicyForUserParams struct {
@@ -2015,6 +2125,13 @@ func (q *Queries) SetRepoCapabilityPolicyForUser(ctx context.Context, arg SetRep
 		&i.CrossCheckRepoInstructionsEnabled,
 		&i.IgnoredInferredCapabilities,
 		&i.AgentSourceDefault,
+		&i.AwaitingFirstEnable,
+		&i.IssueTrackerConnectionID,
+		&i.IssueTrackerProjectID,
+		&i.IssueTrackerProjectShort,
+		&i.EligibilityTagID,
+		&i.EligibilityTagName,
+		&i.IssueTrackerLinkedAt,
 	)
 	return i, err
 }
@@ -2023,7 +2140,7 @@ const setRepoCodeCrossCheckInputs = `-- name: SetRepoCodeCrossCheckInputs :one
 UPDATE repos SET
  code_cross_check_guidance = CASE WHEN $1::boolean THEN $2::text ELSE code_cross_check_guidance END,
  cross_check_repo_instructions_enabled = COALESCE($3::boolean, cross_check_repo_instructions_enabled)
-WHERE id = $4 RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default
+WHERE id = $4 RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, awaiting_first_enable, issue_tracker_connection_id, issue_tracker_project_id, issue_tracker_project_short, eligibility_tag_id, eligibility_tag_name, issue_tracker_linked_at
 `
 
 type SetRepoCodeCrossCheckInputsParams struct {
@@ -2061,6 +2178,13 @@ func (q *Queries) SetRepoCodeCrossCheckInputs(ctx context.Context, arg SetRepoCo
 		&i.CrossCheckRepoInstructionsEnabled,
 		&i.IgnoredInferredCapabilities,
 		&i.AgentSourceDefault,
+		&i.AwaitingFirstEnable,
+		&i.IssueTrackerConnectionID,
+		&i.IssueTrackerProjectID,
+		&i.IssueTrackerProjectShort,
+		&i.EligibilityTagID,
+		&i.EligibilityTagName,
+		&i.IssueTrackerLinkedAt,
 	)
 	return i, err
 }
@@ -2070,7 +2194,7 @@ UPDATE repos SET
  code_cross_check_guidance = CASE WHEN $1::boolean THEN $2::text ELSE code_cross_check_guidance END,
  cross_check_repo_instructions_enabled = COALESCE($3::boolean, cross_check_repo_instructions_enabled)
 WHERE repos.id = $4 AND repos.connection_id IN (SELECT fc.id FROM forge_connections fc WHERE fc.user_id = $5)
-RETURNING repos.id, repos.connection_id, repos.forge_project_id, repos.path_with_namespace, repos.web_url, repos.default_branch, repos.enabled, repos.repo_skills_enabled, repos.repo_devbox_opt_in, repos.repo_claudemd_enabled, repos.guardrail_override_reason, repos.guardrail_override_by, repos.guardrail_override_at, repos.required_capabilities, repos.fold_improve_uzi_backlog, repos.code_cross_check_guidance, repos.cross_check_repo_instructions_enabled, repos.ignored_inferred_capabilities, repos.agent_source_default
+RETURNING repos.id, repos.connection_id, repos.forge_project_id, repos.path_with_namespace, repos.web_url, repos.default_branch, repos.enabled, repos.repo_skills_enabled, repos.repo_devbox_opt_in, repos.repo_claudemd_enabled, repos.guardrail_override_reason, repos.guardrail_override_by, repos.guardrail_override_at, repos.required_capabilities, repos.fold_improve_uzi_backlog, repos.code_cross_check_guidance, repos.cross_check_repo_instructions_enabled, repos.ignored_inferred_capabilities, repos.agent_source_default, repos.awaiting_first_enable, repos.issue_tracker_connection_id, repos.issue_tracker_project_id, repos.issue_tracker_project_short, repos.eligibility_tag_id, repos.eligibility_tag_name, repos.issue_tracker_linked_at
 `
 
 type SetRepoCodeCrossCheckInputsForUserParams struct {
@@ -2110,12 +2234,19 @@ func (q *Queries) SetRepoCodeCrossCheckInputsForUser(ctx context.Context, arg Se
 		&i.CrossCheckRepoInstructionsEnabled,
 		&i.IgnoredInferredCapabilities,
 		&i.AgentSourceDefault,
+		&i.AwaitingFirstEnable,
+		&i.IssueTrackerConnectionID,
+		&i.IssueTrackerProjectID,
+		&i.IssueTrackerProjectShort,
+		&i.EligibilityTagID,
+		&i.EligibilityTagName,
+		&i.IssueTrackerLinkedAt,
 	)
 	return i, err
 }
 
 const setRepoDevboxOptIn = `-- name: SetRepoDevboxOptIn :one
-UPDATE repos SET repo_devbox_opt_in = $2 WHERE repos.id = $1 RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default
+UPDATE repos SET repo_devbox_opt_in = $2 WHERE repos.id = $1 RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, awaiting_first_enable, issue_tracker_connection_id, issue_tracker_project_id, issue_tracker_project_short, eligibility_tag_id, eligibility_tag_name, issue_tracker_linked_at
 `
 
 type SetRepoDevboxOptInParams struct {
@@ -2148,6 +2279,13 @@ func (q *Queries) SetRepoDevboxOptIn(ctx context.Context, arg SetRepoDevboxOptIn
 		&i.CrossCheckRepoInstructionsEnabled,
 		&i.IgnoredInferredCapabilities,
 		&i.AgentSourceDefault,
+		&i.AwaitingFirstEnable,
+		&i.IssueTrackerConnectionID,
+		&i.IssueTrackerProjectID,
+		&i.IssueTrackerProjectShort,
+		&i.EligibilityTagID,
+		&i.EligibilityTagName,
+		&i.IssueTrackerLinkedAt,
 	)
 	return i, err
 }
@@ -2156,7 +2294,7 @@ const setRepoDevboxOptInForUser = `-- name: SetRepoDevboxOptInForUser :one
 UPDATE repos SET repo_devbox_opt_in = $2
 WHERE repos.id = $1
   AND repos.connection_id IN (SELECT forge_connections.id FROM forge_connections WHERE forge_connections.user_id = $3)
-RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, awaiting_first_enable, issue_tracker_connection_id, issue_tracker_project_id, issue_tracker_project_short, eligibility_tag_id, eligibility_tag_name, issue_tracker_linked_at
 `
 
 type SetRepoDevboxOptInForUserParams struct {
@@ -2190,6 +2328,13 @@ func (q *Queries) SetRepoDevboxOptInForUser(ctx context.Context, arg SetRepoDevb
 		&i.CrossCheckRepoInstructionsEnabled,
 		&i.IgnoredInferredCapabilities,
 		&i.AgentSourceDefault,
+		&i.AwaitingFirstEnable,
+		&i.IssueTrackerConnectionID,
+		&i.IssueTrackerProjectID,
+		&i.IssueTrackerProjectShort,
+		&i.EligibilityTagID,
+		&i.EligibilityTagName,
+		&i.IssueTrackerLinkedAt,
 	)
 	return i, err
 }
@@ -2198,7 +2343,7 @@ const setRepoEnabledForUser = `-- name: SetRepoEnabledForUser :one
 UPDATE repos SET enabled = $2
 WHERE repos.id = $1
   AND repos.connection_id IN (SELECT forge_connections.id FROM forge_connections WHERE forge_connections.user_id = $3)
-RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, awaiting_first_enable, issue_tracker_connection_id, issue_tracker_project_id, issue_tracker_project_short, eligibility_tag_id, eligibility_tag_name, issue_tracker_linked_at
 `
 
 type SetRepoEnabledForUserParams struct {
@@ -2230,12 +2375,19 @@ func (q *Queries) SetRepoEnabledForUser(ctx context.Context, arg SetRepoEnabledF
 		&i.CrossCheckRepoInstructionsEnabled,
 		&i.IgnoredInferredCapabilities,
 		&i.AgentSourceDefault,
+		&i.AwaitingFirstEnable,
+		&i.IssueTrackerConnectionID,
+		&i.IssueTrackerProjectID,
+		&i.IssueTrackerProjectShort,
+		&i.EligibilityTagID,
+		&i.EligibilityTagName,
+		&i.IssueTrackerLinkedAt,
 	)
 	return i, err
 }
 
 const setRepoFoldImproveUziBacklog = `-- name: SetRepoFoldImproveUziBacklog :one
-UPDATE repos SET fold_improve_uzi_backlog = $2 WHERE repos.id = $1 RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default
+UPDATE repos SET fold_improve_uzi_backlog = $2 WHERE repos.id = $1 RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, awaiting_first_enable, issue_tracker_connection_id, issue_tracker_project_id, issue_tracker_project_short, eligibility_tag_id, eligibility_tag_name, issue_tracker_linked_at
 `
 
 type SetRepoFoldImproveUziBacklogParams struct {
@@ -2268,6 +2420,13 @@ func (q *Queries) SetRepoFoldImproveUziBacklog(ctx context.Context, arg SetRepoF
 		&i.CrossCheckRepoInstructionsEnabled,
 		&i.IgnoredInferredCapabilities,
 		&i.AgentSourceDefault,
+		&i.AwaitingFirstEnable,
+		&i.IssueTrackerConnectionID,
+		&i.IssueTrackerProjectID,
+		&i.IssueTrackerProjectShort,
+		&i.EligibilityTagID,
+		&i.EligibilityTagName,
+		&i.IssueTrackerLinkedAt,
 	)
 	return i, err
 }
@@ -2276,7 +2435,7 @@ const setRepoFoldImproveUziBacklogForUser = `-- name: SetRepoFoldImproveUziBackl
 UPDATE repos SET fold_improve_uzi_backlog = $2
 WHERE repos.id = $1
   AND repos.connection_id IN (SELECT forge_connections.id FROM forge_connections WHERE forge_connections.user_id = $3)
-RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, awaiting_first_enable, issue_tracker_connection_id, issue_tracker_project_id, issue_tracker_project_short, eligibility_tag_id, eligibility_tag_name, issue_tracker_linked_at
 `
 
 type SetRepoFoldImproveUziBacklogForUserParams struct {
@@ -2311,6 +2470,13 @@ func (q *Queries) SetRepoFoldImproveUziBacklogForUser(ctx context.Context, arg S
 		&i.CrossCheckRepoInstructionsEnabled,
 		&i.IgnoredInferredCapabilities,
 		&i.AgentSourceDefault,
+		&i.AwaitingFirstEnable,
+		&i.IssueTrackerConnectionID,
+		&i.IssueTrackerProjectID,
+		&i.IssueTrackerProjectShort,
+		&i.EligibilityTagID,
+		&i.EligibilityTagName,
+		&i.IssueTrackerLinkedAt,
 	)
 	return i, err
 }
@@ -2321,7 +2487,7 @@ SET guardrail_override_reason = $2,
     guardrail_override_by     = $3,
     guardrail_override_at     = $4
 WHERE id = $1
-RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, awaiting_first_enable, issue_tracker_connection_id, issue_tracker_project_id, issue_tracker_project_short, eligibility_tag_id, eligibility_tag_name, issue_tracker_linked_at
 `
 
 type SetRepoGuardrailOverrideParams struct {
@@ -2365,12 +2531,19 @@ func (q *Queries) SetRepoGuardrailOverride(ctx context.Context, arg SetRepoGuard
 		&i.CrossCheckRepoInstructionsEnabled,
 		&i.IgnoredInferredCapabilities,
 		&i.AgentSourceDefault,
+		&i.AwaitingFirstEnable,
+		&i.IssueTrackerConnectionID,
+		&i.IssueTrackerProjectID,
+		&i.IssueTrackerProjectShort,
+		&i.EligibilityTagID,
+		&i.EligibilityTagName,
+		&i.IssueTrackerLinkedAt,
 	)
 	return i, err
 }
 
 const setRepoIgnoredInferredCapabilities = `-- name: SetRepoIgnoredInferredCapabilities :one
-UPDATE repos SET ignored_inferred_capabilities = $2 WHERE repos.id = $1 RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default
+UPDATE repos SET ignored_inferred_capabilities = $2 WHERE repos.id = $1 RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, awaiting_first_enable, issue_tracker_connection_id, issue_tracker_project_id, issue_tracker_project_short, eligibility_tag_id, eligibility_tag_name, issue_tracker_linked_at
 `
 
 type SetRepoIgnoredInferredCapabilitiesParams struct {
@@ -2401,6 +2574,13 @@ func (q *Queries) SetRepoIgnoredInferredCapabilities(ctx context.Context, arg Se
 		&i.CrossCheckRepoInstructionsEnabled,
 		&i.IgnoredInferredCapabilities,
 		&i.AgentSourceDefault,
+		&i.AwaitingFirstEnable,
+		&i.IssueTrackerConnectionID,
+		&i.IssueTrackerProjectID,
+		&i.IssueTrackerProjectShort,
+		&i.EligibilityTagID,
+		&i.EligibilityTagName,
+		&i.IssueTrackerLinkedAt,
 	)
 	return i, err
 }
@@ -2409,7 +2589,7 @@ const setRepoIgnoredInferredCapabilitiesForUser = `-- name: SetRepoIgnoredInferr
 UPDATE repos SET ignored_inferred_capabilities = $2
 WHERE repos.id = $1
   AND repos.connection_id IN (SELECT forge_connections.id FROM forge_connections WHERE forge_connections.user_id = $3)
-RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, awaiting_first_enable, issue_tracker_connection_id, issue_tracker_project_id, issue_tracker_project_short, eligibility_tag_id, eligibility_tag_name, issue_tracker_linked_at
 `
 
 type SetRepoIgnoredInferredCapabilitiesForUserParams struct {
@@ -2441,12 +2621,19 @@ func (q *Queries) SetRepoIgnoredInferredCapabilitiesForUser(ctx context.Context,
 		&i.CrossCheckRepoInstructionsEnabled,
 		&i.IgnoredInferredCapabilities,
 		&i.AgentSourceDefault,
+		&i.AwaitingFirstEnable,
+		&i.IssueTrackerConnectionID,
+		&i.IssueTrackerProjectID,
+		&i.IssueTrackerProjectShort,
+		&i.EligibilityTagID,
+		&i.EligibilityTagName,
+		&i.IssueTrackerLinkedAt,
 	)
 	return i, err
 }
 
 const setRepoRequiredCapabilities = `-- name: SetRepoRequiredCapabilities :one
-UPDATE repos SET required_capabilities = $2 WHERE repos.id = $1 RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default
+UPDATE repos SET required_capabilities = $2 WHERE repos.id = $1 RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, awaiting_first_enable, issue_tracker_connection_id, issue_tracker_project_id, issue_tracker_project_short, eligibility_tag_id, eligibility_tag_name, issue_tracker_linked_at
 `
 
 type SetRepoRequiredCapabilitiesParams struct {
@@ -2480,6 +2667,13 @@ func (q *Queries) SetRepoRequiredCapabilities(ctx context.Context, arg SetRepoRe
 		&i.CrossCheckRepoInstructionsEnabled,
 		&i.IgnoredInferredCapabilities,
 		&i.AgentSourceDefault,
+		&i.AwaitingFirstEnable,
+		&i.IssueTrackerConnectionID,
+		&i.IssueTrackerProjectID,
+		&i.IssueTrackerProjectShort,
+		&i.EligibilityTagID,
+		&i.EligibilityTagName,
+		&i.IssueTrackerLinkedAt,
 	)
 	return i, err
 }
@@ -2488,7 +2682,7 @@ const setRepoRequiredCapabilitiesForUser = `-- name: SetRepoRequiredCapabilities
 UPDATE repos SET required_capabilities = $2
 WHERE repos.id = $1
   AND repos.connection_id IN (SELECT forge_connections.id FROM forge_connections WHERE forge_connections.user_id = $3)
-RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, awaiting_first_enable, issue_tracker_connection_id, issue_tracker_project_id, issue_tracker_project_short, eligibility_tag_id, eligibility_tag_name, issue_tracker_linked_at
 `
 
 type SetRepoRequiredCapabilitiesForUserParams struct {
@@ -2524,6 +2718,13 @@ func (q *Queries) SetRepoRequiredCapabilitiesForUser(ctx context.Context, arg Se
 		&i.CrossCheckRepoInstructionsEnabled,
 		&i.IgnoredInferredCapabilities,
 		&i.AgentSourceDefault,
+		&i.AwaitingFirstEnable,
+		&i.IssueTrackerConnectionID,
+		&i.IssueTrackerProjectID,
+		&i.IssueTrackerProjectShort,
+		&i.EligibilityTagID,
+		&i.EligibilityTagName,
+		&i.IssueTrackerLinkedAt,
 	)
 	return i, err
 }
@@ -2533,7 +2734,7 @@ UPDATE repos SET
   repo_skills_enabled   = COALESCE($1, repo_skills_enabled),
   repo_claudemd_enabled = COALESCE($2, repo_claudemd_enabled)
 WHERE repos.id = $3
-RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, awaiting_first_enable, issue_tracker_connection_id, issue_tracker_project_id, issue_tracker_project_short, eligibility_tag_id, eligibility_tag_name, issue_tracker_linked_at
 `
 
 type SetRepoTrustFlagsParams struct {
@@ -2569,6 +2770,13 @@ func (q *Queries) SetRepoTrustFlags(ctx context.Context, arg SetRepoTrustFlagsPa
 		&i.CrossCheckRepoInstructionsEnabled,
 		&i.IgnoredInferredCapabilities,
 		&i.AgentSourceDefault,
+		&i.AwaitingFirstEnable,
+		&i.IssueTrackerConnectionID,
+		&i.IssueTrackerProjectID,
+		&i.IssueTrackerProjectShort,
+		&i.EligibilityTagID,
+		&i.EligibilityTagName,
+		&i.IssueTrackerLinkedAt,
 	)
 	return i, err
 }
@@ -2579,7 +2787,7 @@ UPDATE repos SET
   repo_claudemd_enabled = COALESCE($2, repo_claudemd_enabled)
 WHERE repos.id = $3
   AND repos.connection_id IN (SELECT forge_connections.id FROM forge_connections WHERE forge_connections.user_id = $4)
-RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, awaiting_first_enable, issue_tracker_connection_id, issue_tracker_project_id, issue_tracker_project_short, eligibility_tag_id, eligibility_tag_name, issue_tracker_linked_at
 `
 
 type SetRepoTrustFlagsForUserParams struct {
@@ -2619,6 +2827,13 @@ func (q *Queries) SetRepoTrustFlagsForUser(ctx context.Context, arg SetRepoTrust
 		&i.CrossCheckRepoInstructionsEnabled,
 		&i.IgnoredInferredCapabilities,
 		&i.AgentSourceDefault,
+		&i.AwaitingFirstEnable,
+		&i.IssueTrackerConnectionID,
+		&i.IssueTrackerProjectID,
+		&i.IssueTrackerProjectShort,
+		&i.EligibilityTagID,
+		&i.EligibilityTagName,
+		&i.IssueTrackerLinkedAt,
 	)
 	return i, err
 }
@@ -2693,7 +2908,7 @@ const updateIssueState = `-- name: UpdateIssueState :one
 UPDATE issues
 SET state = $3, synced_at = now()
 WHERE repo_id = $1 AND forge_issue_iid = $2
-RETURNING id, repo_id, forge_issue_iid, title, state, labels, web_url, author, has_prd_link, forge_updated_at, synced_at, board_position, assignee_ids
+RETURNING id, repo_id, forge_issue_iid, title, state, labels, web_url, author, has_prd_link, forge_updated_at, synced_at, board_position, assignee_ids, issue_key
 `
 
 type UpdateIssueStateParams struct {
@@ -2728,6 +2943,7 @@ func (q *Queries) UpdateIssueState(ctx context.Context, arg UpdateIssueStatePara
 		&i.SyncedAt,
 		&i.BoardPosition,
 		&i.AssigneeIds,
+		&i.IssueKey,
 	)
 	return i, err
 }
@@ -2832,7 +3048,7 @@ SET title            = EXCLUDED.title,
     has_prd_link     = EXCLUDED.has_prd_link,
     forge_updated_at = EXCLUDED.forge_updated_at,
     synced_at        = now()
-RETURNING id, repo_id, forge_issue_iid, title, state, labels, web_url, author, has_prd_link, forge_updated_at, synced_at, board_position, assignee_ids
+RETURNING id, repo_id, forge_issue_iid, title, state, labels, web_url, author, has_prd_link, forge_updated_at, synced_at, board_position, assignee_ids, issue_key
 `
 
 type UpsertIssueParams struct {
@@ -2887,6 +3103,7 @@ func (q *Queries) UpsertIssue(ctx context.Context, arg UpsertIssueParams) (Issue
 		&i.SyncedAt,
 		&i.BoardPosition,
 		&i.AssigneeIds,
+		&i.IssueKey,
 	)
 	return i, err
 }
@@ -2922,7 +3139,7 @@ SET title            = EXCLUDED.title,
     has_prd_link     = EXCLUDED.has_prd_link,
     forge_updated_at = EXCLUDED.forge_updated_at,
     synced_at        = now()
-RETURNING id, repo_id, forge_issue_iid, title, state, labels, web_url, author, has_prd_link, forge_updated_at, synced_at, board_position, assignee_ids
+RETURNING id, repo_id, forge_issue_iid, title, state, labels, web_url, author, has_prd_link, forge_updated_at, synced_at, board_position, assignee_ids, issue_key
 `
 
 type UpsertIssueLabelsParams struct {
@@ -2988,19 +3205,20 @@ func (q *Queries) UpsertIssueLabels(ctx context.Context, arg UpsertIssueLabelsPa
 		&i.SyncedAt,
 		&i.BoardPosition,
 		&i.AssigneeIds,
+		&i.IssueKey,
 	)
 	return i, err
 }
 
 const upsertRepo = `-- name: UpsertRepo :one
 
-INSERT INTO repos (connection_id, forge_project_id, path_with_namespace, web_url, default_branch)
-VALUES ($1, $2, $3, $4, $5)
+INSERT INTO repos (connection_id, forge_project_id, path_with_namespace, web_url, default_branch, awaiting_first_enable)
+VALUES ($1, $2, $3, $4, $5, true)
 ON CONFLICT (connection_id, forge_project_id) DO UPDATE
 SET path_with_namespace = EXCLUDED.path_with_namespace,
     web_url             = EXCLUDED.web_url,
     default_branch      = EXCLUDED.default_branch
-RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, awaiting_first_enable, issue_tracker_connection_id, issue_tracker_project_id, issue_tracker_project_short, eligibility_tag_id, eligibility_tag_name, issue_tracker_linked_at
 `
 
 type UpsertRepoParams struct {
@@ -3013,7 +3231,9 @@ type UpsertRepoParams struct {
 
 // Repos --------------------------------------------------------------------
 // Upserted whenever the membership list is fetched. Never touches `enabled`, so
-// a re-listing does not un-enable a repo the user already turned on.
+// a re-listing does not un-enable a repo the user already turned on. The insert
+// branch marks a newly discovered repo awaiting_first_enable (PRD #4173 D13); the
+// conflict branch never touches it, and the repos trigger clears it on first enable.
 func (q *Queries) UpsertRepo(ctx context.Context, arg UpsertRepoParams) (Repo, error) {
 	row := q.db.QueryRow(ctx, upsertRepo,
 		arg.ConnectionID,
@@ -3043,6 +3263,13 @@ func (q *Queries) UpsertRepo(ctx context.Context, arg UpsertRepoParams) (Repo, e
 		&i.CrossCheckRepoInstructionsEnabled,
 		&i.IgnoredInferredCapabilities,
 		&i.AgentSourceDefault,
+		&i.AwaitingFirstEnable,
+		&i.IssueTrackerConnectionID,
+		&i.IssueTrackerProjectID,
+		&i.IssueTrackerProjectShort,
+		&i.EligibilityTagID,
+		&i.EligibilityTagName,
+		&i.IssueTrackerLinkedAt,
 	)
 	return i, err
 }

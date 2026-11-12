@@ -30,6 +30,7 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/issueinput"
+	"github.com/vtmocanu/uzi/api/internal/issuesource"
 	"github.com/vtmocanu/uzi/api/internal/notifysvc"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/schedtmpl"
@@ -215,6 +216,10 @@ type Scheduler struct {
 	forge    ForgeBuilder
 	settings SettingsReader
 	notifier Notifier
+	// issueSources resolves the issue side of a repo linked to an external issue
+	// tracker (PRD #4173 DL-5); SetIssueSources. Nil ⇒ a linked repo fails closed
+	// (issuesource.ErrNotWired); an unlinked repo keeps using the forge driver.
+	issueSources issuesource.Sources
 	// vault gates the self_improve fire path (PRD #590 M1): a locked owner vault yields a
 	// benign skip so the run never tries to spend a token it cannot unwrap. nil ⇒ always
 	// unlocked.
@@ -255,6 +260,17 @@ func New(st Store, runs RunCreator, fb ForgeBuilder, set SettingsReader, notifie
 		store: st, runs: runs, forge: fb, settings: set, notifier: notifier, vault: vault,
 		interval: interval, now: time.Now, catalog: schedtmpl.BySlug, logger: logger,
 	}
+}
+
+// SetIssueSources wires the resolver of a linked repo's issue side (PRD #4173 DL-5).
+// Call once at startup with the *forgesvc.Service the ForgeBuilder is.
+func (e *Scheduler) SetIssueSources(is issuesource.Sources) { e.issueSources = is }
+
+// issueSide is the issue tracker for repo: the forge driver f for an unlinked repo
+// (as before M4), the resolver's for a linked one, an error for a linked repo when no
+// resolver is wired.
+func (e *Scheduler) issueSide(ctx context.Context, repo store.GetRepoForUserRow, f forge.Forge) (forge.IssueTracker, error) {
+	return issuesource.For(ctx, e.issueSources, repo.IssueTrackerConnectionID.Valid, repo.UserID, repo.ID, f)
 }
 
 // SetBeat wires the admin-health loop-beat callback (PRD #1484 M2). Call once at startup,
@@ -591,7 +607,11 @@ func (e *Scheduler) fireIssue(ctx context.Context, sched store.RunSchedule) (Fir
 		return FireOutcome{Matched: 1, Skips: []Skip{{IssueIID: &iidCopy, Reason: SkipAlreadyRunning}}}, nil
 	}
 
-	capture, err := issueinput.Fetch(ctx, f, f, repo.ForgeProjectID, iid, repo.BotForgeUserID)
+	tr, err := e.issueSide(ctx, repo, f)
+	if err != nil {
+		return FireOutcome{}, fmt.Errorf("resolve issue tracker: %w", err) // transient: retry next tick
+	}
+	capture, err := issueinput.Fetch(ctx, f, tr, repo.ForgeProjectID, iid, repo.BotForgeUserID)
 	if err != nil {
 		if forge.IsIssueResponseTooLarge(err) {
 			iidCopy := iid
@@ -711,6 +731,10 @@ func (e *Scheduler) fireSweep(ctx context.Context, sched store.RunSchedule) (Fir
 	if err != nil {
 		return FireOutcome{}, err
 	}
+	tr, err := e.issueSide(ctx, repo, f)
+	if err != nil {
+		return FireOutcome{}, fmt.Errorf("resolve issue tracker: %w", err) // transient: retry next tick
+	}
 
 	// Resolve the candidate-query selector params by kind. The assigned kind must NOT go
 	// through resolveSweepLabels — that defaults an empty selector to the uzi label (the
@@ -803,7 +827,7 @@ func (e *Scheduler) fireSweep(ctx context.Context, sched store.RunSchedule) (Fir
 			out.Skips = append(out.Skips, Skip{IssueIID: &iidCopy, Reason: SkipAlreadyRunning})
 			continue
 		}
-		capture, err := issueinput.Fetch(ctx, f, f, repo.ForgeProjectID, iid, repo.BotForgeUserID)
+		capture, err := issueinput.Fetch(ctx, f, tr, repo.ForgeProjectID, iid, repo.BotForgeUserID)
 		if err != nil {
 			e.logger.Warn("scheduler: sweep fetch issue", "schedule", sched.ID.String(), "issue", iid, "error", err)
 			reason := SkipFetchFailed
@@ -866,7 +890,7 @@ func (e *Scheduler) fireSweep(ctx context.Context, sched store.RunSchedule) (Fir
 						var cached store.Issue
 						cached, removeErr = e.store.GetIssueByIID(ctx, store.GetIssueByIIDParams{RepoID: repo.ID, ForgeIssueIid: iid})
 						if removeErr == nil {
-							_, removeErr = e.forge.SetIssueLabel(ctx, f, repo.ForgeProjectID, cached, selectorLabel, "", false)
+							_, removeErr = e.forge.SetIssueLabel(ctx, tr, repo.ForgeProjectID, cached, selectorLabel, "", false)
 						}
 					}
 					for i := range res.Started {
@@ -908,6 +932,14 @@ func (e *Scheduler) firePrompt(ctx context.Context, sched store.RunSchedule) (Fi
 	// column) — the resolver engages ONLY for origin='default', so existing schedules are
 	// byte-for-byte unchanged. Resolution runs BEFORE deriving the title so the run-view
 	// header labels the resolved prompt, not the (NULL) column.
+	// PRD 4173 D13: no run starts on a never-enabled repo. Checked first, before the
+	// active-run lookup and any forge read; transient to advance, like resolveRepoForge.
+	// A repo read that fails is left to the create seam below, which reports it.
+	if repo, rerr := e.store.GetRepoForUser(ctx, store.GetRepoForUserParams{ID: sched.RepoID, UserID: sched.UserID}); rerr == nil {
+		if err := store.RefuseNeverEnabled(repo.AwaitingFirstEnable); err != nil {
+			return FireOutcome{}, err
+		}
+	}
 	prompt := sched.Prompt.String
 	if sched.Origin == "default" {
 		job, ok := e.catalog(sched.CatalogSlug.String)
@@ -1156,6 +1188,14 @@ func (e *Scheduler) resolveRepoForge(ctx context.Context, sched store.RunSchedul
 		if isNoRows(err) {
 			return store.GetRepoForUserRow{}, nil, workersvc.ErrRepoNotFound
 		}
+		return store.GetRepoForUserRow{}, nil, err
+	}
+	// PRD 4173 D13: a never-enabled repo is refused here, before any forge driver is built,
+	// for every fire that resolves its forge through this function. firePrompt checks the
+	// marker itself (it may need no forge at all). The error is transient to advance
+	// (logged, retried next tick, never parked), so the schedule fires once the repo is
+	// enabled.
+	if err := store.RefuseNeverEnabled(repo.AwaitingFirstEnable); err != nil {
 		return store.GetRepoForUserRow{}, nil, err
 	}
 	f, err := e.forge.ForgeForConnection(repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
@@ -1419,7 +1459,11 @@ func (e *Scheduler) proposalDigestSection(ctx context.Context, sched store.RunSc
 		e.logger.Warn("scheduler: proposal digest skipped, cannot resolve repo/forge", "schedule", sched.ID.String(), "error", err)
 		return ""
 	}
-	var tr forge.IssueTracker = f // only the issue-tracker half is needed here
+	tr, err := e.issueSide(ctx, repo, f) // only the issue-tracker half is needed here
+	if err != nil {
+		e.logger.Warn("scheduler: proposal digest skipped, cannot resolve issue tracker", "schedule", sched.ID.String(), "error", err)
+		return ""
+	}
 	// The SAME label workersvc files a proposal under (single source of truth), so the
 	// digest lists exactly this job's own proposal history.
 	label := workersvc.ProposalLabel(catalogSlugOf(sched))
