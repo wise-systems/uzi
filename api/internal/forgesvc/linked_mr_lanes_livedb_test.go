@@ -173,4 +173,30 @@ func TestMRWatchLanesForLinkedAndUnlinkedReposLiveDB(t *testing.T) {
 			t.Errorf("mr_state = %q, want opened", state)
 		}
 	})
+
+	// A closed MR whose issue left the cache (moved, untagged, deleted) must not be polled
+	// forever: the reopen watch needs a cached OPEN issue, as the board lane's Lane A does.
+	t.Run("closed MR: an evicted issue is not watched", func(t *testing.T) {
+		exec(`UPDATE runs SET mr_state = 'closed' WHERE id = $1`, runs[linkedRepo]["issue"])
+		exec(`DELETE FROM issues WHERE repo_id = $1 AND forge_issue_iid = 7`, linkedRepo)
+		if f := freeLane(linkedRepo); f[runs[linkedRepo]["issue"]] {
+			t.Errorf("board-free lane = %v, want an evicted issue's closed MR dropped", f)
+		}
+	})
+
+	// Live rows (opened/locked/NULL mr_state) sort ahead of closed reopen-watch rows, so a
+	// burst of closed rows can never push a live run past the LIMIT.
+	t.Run("live rows are ordered ahead of closed rows", func(t *testing.T) {
+		exec(`INSERT INTO issues (repo_id, forge_issue_iid, title, state, labels, web_url, forge_updated_at, synced_at)
+		      VALUES ($1, 7, 't', 'opened', '[]', 'https://forge.e2e/i/7', now(), now())`, linkedRepo)
+		exec(`UPDATE runs SET mr_state = 'closed', created_at = now() + interval '1 hour' WHERE id = $1`, runs[linkedRepo]["issue"])
+		exec(`UPDATE runs SET mr_state = NULL, created_at = now() - interval '1 hour' WHERE id = $1`, runs[linkedRepo]["prompt"])
+		rows, err := q.ListBoardFreeMRStateWatchCandidates(ctx, linkedRepo)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(rows) != 2 || rows[0].ID != runs[linkedRepo]["prompt"] || rows[1].ID != runs[linkedRepo]["issue"] {
+			t.Errorf("order = %v, want the older live (NULL mr_state) run before the newer closed run", rows)
+		}
+	})
 }

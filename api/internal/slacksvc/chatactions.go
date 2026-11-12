@@ -407,7 +407,7 @@ func (c *ChatActions) createProposal(ctx context.Context, a BlockAction, userID,
 	case errors.Is(err, ErrChatProposalRepoNeverEnabled):
 		c.ephemeral(ctx, a, "That repo has never been enabled in uzi, so no issue was filed. Enable the repo first, then press Create again.")
 	case errors.Is(err, ErrChatProposalLinkedRepo):
-		c.ephemeral(ctx, a, "Issues can't be filed on a repo linked to an issue tracker yet.")
+		c.ephemeral(ctx, a, "Issues can't be filed on a repo linked to an issue tracker yet; the proposal stays pending.")
 	case errors.Is(err, ErrChatProposalForge):
 		c.ephemeral(ctx, a, "Couldn't file the issue on the forge — the proposal is back to pending, so press Create again or open it in uzi.")
 	default:
