@@ -51,11 +51,18 @@ describe("renderCompletionBlock linked arm", () => {
     assert.match(capped, /Implements part of ABC-12 \(partial delivery/);
     assert.doesNotMatch(capped, /Closes|#7\b/);
   });
-  it("the non-closing declaration and pending arms keep no Closes", () => {
+  it("the non-closing declaration arm keeps no Closes", () => {
     const decl = linkedBlock({ nonClosing: { reason: "Acceptance remains" } });
     assert.match(decl, /Related to ABC-12\./);
     assert.match(decl, /Issue remains open/);
     assert.doesNotMatch(decl, /Closes|#7\b/);
+  });
+  it("the pending arm keeps no Closes and names the key", () => {
+    const body = linkedBlock({ completionPending: { criteria: [{ criterion_id: "00000000-0000-4000-8000-0000000000a1", milestone_id: "m2",
+      kind: "maintainer", text: "Live check", reason: "Pending", conditions: ["Ready"], verification_steps: ["Observe rollout"],
+      authorization_revision: 1, status: "unverified" }] } as never });
+    assert.match(body, /Related to ABC-12\./);
+    assert.doesNotMatch(body, /Closes|#7\b/);
   });
   it("an unlinked claim is unchanged", () => {
     assert.match(renderCompletionBlock({ issueIid: 7, branch: "b", closes: true }), /Related to #7\.\n\nCloses #7/);

@@ -30165,7 +30165,8 @@ export function mrTitle(
   // #1801: NOT `Resolve issue #N` — GitLab's default merge/squash commit messages carry the title,
   // and `Resolve` + ref there closes the issue on the default branch.
   const linked = linkedIssueKey(claim);
-  return `${prefix}Work on issue ${linked.linked ? linkedIssueLabel(linked) : `#${claim.issue_iid}`}`;
+  const linkedIssue = resolveRunKind(claim.kind) === "issue" && linked.linked;
+  return `${prefix}Work on issue ${linkedIssue ? linkedIssueLabel(linked) : `#${claim.issue_iid}`}`;
 }
 
 /** PRD #1798: the options mrCompletionBlock takes after its positional parameters. All optional.
@@ -30226,14 +30227,14 @@ export function mrCompletionBlock(
   // RUN_KIND_PROFILES.completionLine. A row's undefined — ci_fix with no pipeline, and the
   // issue/chat/judge kinds that carry none — takes the issue arm (Related / Closes / partial /
   // accepted / gates) inside renderCompletionBlock.
+  const linked = linkedIssueKey(claim);
   const kindLine = RUN_KIND_PROFILES[resolveRunKind(claim.kind)].completionLine?.(claim, {
     branch,
     baseBranch: claim.base_branch?.trim() || undefined,
   });
   return renderCompletionBlock({
     issueIid: claim.issue_iid,
-    ...(resolveRunKind(claim.kind) === "issue" && linkedIssueKey(claim).linked
-      ? { linkedIssue: { label: linkedIssueKey(claim).label } } : {}),
+    ...(resolveRunKind(claim.kind) === "issue" && linked.linked ? { linkedIssue: { label: linked.label } } : {}),
     branch,
     kindLine,
     kindSections: [selfImproveSection, promptGuardSection, codeCrossCheckSummary ? [{ codeCrossCheck: codeCrossCheckSummary }] : undefined],

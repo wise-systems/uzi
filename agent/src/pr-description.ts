@@ -60,6 +60,7 @@ import { SanitizedPrDescriptionFields } from "./client.js";
 import type { ClaimConfig, PrDescriptionSource } from "./protocol.js";
 import type { CompletionPending } from "./completion-pending.js";
 import { hasDriftContradiction, type SemanticObservationRecord } from "./semantic-drift.js";
+import { linkedIssueLabel } from "./linked-issue.js";
 
 // ── Markers ─────────────────────────────────────────────────────────────────────────────────
 
@@ -1480,7 +1481,7 @@ function driftBlock(record: SemanticObservationRecord): string[] {
 function issueArm(input: CompletionBlockInput): string[] {
   const iid = input.issueIid;
   const linked = input.linkedIssue;
-  const ref = linked ? (linked.label ?? "the linked issue") : `#${iid}`;
+  const ref = linked ? linkedIssueLabel({ linked: true, label: linked.label }) : `#${iid}`;
   const deferred = input.completionScope?.deferred ?? [];
   const pending = input.completionPending && input.completionPending.criteria.length > 0 ? input.completionPending : undefined;
   const accepted = input.completionScope?.accepted ?? [];
