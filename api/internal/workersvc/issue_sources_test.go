@@ -12,6 +12,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/forge/forgetest"
 	"github.com/vtmocanu/uzi/api/internal/runkind"
+	"github.com/vtmocanu/uzi/api/internal/settings"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -27,7 +28,8 @@ type ytTracker struct {
 }
 
 func (*ytTracker) GetIssue(_ context.Context, _, iid int64) (forge.Issue, error) {
-	return forge.Issue{IID: iid, Title: "yt title", Description: "yt body", State: "opened"}, nil
+	// The fresh read carries the eligibility tag under its stored name, as the driver's does.
+	return forge.Issue{IID: iid, Title: "yt title", Description: "yt body", State: "opened", Labels: []string{linkedEligibilityName}}, nil
 }
 func (*ytTracker) ListIssueComments(context.Context, int64, int64) ([]forge.IssueComment, error) {
 	return []forge.IssueComment{{Body: "yt comment"}}, nil
@@ -47,11 +49,17 @@ func (f *fakeSources) IssueTrackerForRepo(_ context.Context, userID, repoID uuid
 	return f.tr, f.err
 }
 
+// linkedEligibilityName is the eligibility tag name of linkedRepoRow. It equals the
+// default uzi label only so the shared uziLabels() cache fixture is eligible; the
+// run gate reads the stored name on a linked repo, never the configured label.
+const linkedEligibilityName = settings.DefaultUziLabel
+
 func linkedRepoRow() store.GetRepoForUserRow {
 	return store.GetRepoForUserRow{
 		ID: uuid.New(), ForgeProjectID: 7, BotForgeUserID: 1,
 		ForgeType: "gitlab", BaseUrl: "https://gitlab.example", TokenCiphertext: []byte("sealed"),
 		IssueTrackerConnectionID: pgtype.UUID{Bytes: uuid.New(), Valid: true},
+		EligibilityTagName:       pgtype.Text{String: linkedEligibilityName, Valid: true},
 	}
 }
 

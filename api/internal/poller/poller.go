@@ -11,7 +11,6 @@ package poller
 
 import (
 	"context"
-	"errors"
 	"log/slog"
 	"runtime/debug"
 	"sync"
@@ -429,19 +428,19 @@ func (e *Engine) syncRepo(ctx context.Context, r store.ListEnabledReposWithConne
 	st.pollCount++
 
 	if linked {
-		// A linked repo's issue sync failing (tracker unreachable, link unresolvable, or
-		// the linked sync not built yet) must never skip the code-host steps below: its
-		// MRs, pipelines and CI do not depend on the tracker. It also says nothing about
-		// the forge connection, whose client was built above, so the attempt reports ok.
-		report(true, forge.ErrorClassOther)
+		// A linked repo's issue sync failing (issue tracker unreachable or its link
+		// unresolvable) must never skip the code-host steps below: its MRs, pipelines
+		// and CI do not depend on the issue tracker. The attempt reports ok only when
+		// the linked sync succeeded, as the unlinked branch does, and reports the
+		// failure's class otherwise; unlike the unlinked branch it then carries on.
 		if trErr != nil {
 			slog.Error("poller: build linked issue tracker", "repo", r.PathWithNamespace, "error", trErr)
+			report(false, forge.Class(trErr))
 		} else if err := e.syncLinkedIssues(ctx, r, tr, st); err != nil {
-			if errors.Is(err, forgesvc.ErrLinkedSyncNotReady) {
-				slog.Debug("poller: linked issue sync not available yet", "repo", r.PathWithNamespace)
-			} else {
-				slog.Error("poller: linked issue sync", "repo", r.PathWithNamespace, "error", err)
-			}
+			slog.Error("poller: linked issue sync", "repo", r.PathWithNamespace, "error", err)
+			report(false, forge.Class(err))
+		} else {
+			report(true, forge.ErrorClassOther)
 		}
 	} else {
 		if reconcileDue(st.pollCount, e.reconcileEvery) {
@@ -508,7 +507,7 @@ func (e *Engine) syncRepo(ctx context.Context, r store.ListEnabledReposWithConne
 	// cache the sync above just wrote and makes NO forge call, so it costs nothing on the
 	// wire and, like the MR watcher, is skipped entirely by the early returns when the
 	// forge is unreachable on an unlinked repo (a stale cache must not manufacture edges;
-	// a linked repo's cache is empty until the linked intake lands).
+	// a linked repo's cache holds only the eligibility tag's issues, which the linked sync wrote).
 	if err := e.svc.SyncFiledIssueCloses(ctx, r.ID); err != nil {
 		slog.Error("poller: sync filed-issue closes", "repo", r.PathWithNamespace, "error", err)
 	}
@@ -602,14 +601,14 @@ func (e *Engine) syncRepo(ctx context.Context, r store.ListEnabledReposWithConne
 // marks only on success.
 func (e *Engine) syncLinkedIssues(ctx context.Context, r store.ListEnabledReposWithConnectionsRow, tr forge.IssueTracker, st *repoState) error {
 	if reconcileDue(st.pollCount, e.reconcileEvery) {
-		observed, err := e.svc.SyncIssues(ctx, r.ID, r.ForgeProjectID, tr)
+		observed, err := e.svc.SyncIssues(ctx, r.UserID, r.ID, r.ForgeProjectID, tr)
 		if err != nil {
 			return err
 		}
 		st.marks = st.marks.Advance(observed)
 		return nil
 	}
-	next, err := e.svc.SyncIssuesIncremental(ctx, r.ID, r.ForgeProjectID, tr, st.marks)
+	next, err := e.svc.SyncIssuesIncremental(ctx, r.UserID, r.ID, r.ForgeProjectID, tr, st.marks)
 	if err != nil {
 		return err
 	}

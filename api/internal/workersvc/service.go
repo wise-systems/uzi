@@ -8020,7 +8020,22 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 	// server applies cannot disagree. Promote writes the label forge-first AND updates
 	// this cache row in the same request, so the promote-then-run sequence is not racing
 	// the poller.
-	if !isEligibleIssue(issue.Labels, []string{s.uziLabel(ctx)}) &&
+	//
+	// On a repo linked to an issue tracker (PRD #4173 D14) the eligibility label is the
+	// link's stored eligibility tag name, not the configured uzi label, and bot
+	// assignment never counts (the issue tracker reports no assignees). The cache can
+	// hold an issue that was untagged since the last full sync, so the fresh read at
+	// capture below must carry the tag as well.
+	linkedEligibility := ""
+	if row.IssueTrackerConnectionID.Valid {
+		if !row.EligibilityTagName.Valid || row.EligibilityTagName.String == "" {
+			return store.Run{}, ErrNotPRDIssue
+		}
+		linkedEligibility = row.EligibilityTagName.String
+		if !isEligibleIssue(issue.Labels, []string{linkedEligibility}) {
+			return store.Run{}, ErrNotPRDIssue
+		}
+	} else if !isEligibleIssue(issue.Labels, []string{s.uziLabel(ctx)}) &&
 		!isAssignedToBot(issue.AssigneeIds, row.BotForgeUserID) {
 		return store.Run{}, ErrNotPRDIssue
 	}
@@ -8112,6 +8127,9 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 			}
 			return store.Run{}, ErrForgeIssueRead
 		}
+	}
+	if linkedEligibility != "" && capture != nil && !slices.Contains(capture.Issue.Labels, linkedEligibility) {
+		return store.Run{}, ErrNotPRDIssue
 	}
 	savedBody, rawDigest, inputReason := pgtype.Text{}, pgtype.Text{}, pgtype.Text{}
 	blockedReasons := []string{}

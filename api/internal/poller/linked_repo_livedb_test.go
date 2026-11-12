@@ -243,3 +243,69 @@ func TestLinkedRepoWithNoDriverSourceNeverFallsBackToTheForgeLiveDB(t *testing.T
 	env.poll(t)
 	env.assertCodeHostOnly(t)
 }
+
+type syncOutcome struct {
+	ok    bool
+	class forge.ErrorClass
+}
+
+// recordOutcomes wires the engine's issue-sync health observer and returns what it saw.
+func recordOutcomes(e *linkedEnv) *[]syncOutcome {
+	var seen []syncOutcome
+	e.engine.SetSyncAttempt(func(uuid.UUID) func(bool, forge.ErrorClass) {
+		return func(ok bool, class forge.ErrorClass) { seen = append(seen, syncOutcome{ok, class}) }
+	})
+	return &seen
+}
+
+// A linked repo reports its issue sync healthy only when the linked sync succeeded, and
+// still runs every code-host step when it did not.
+func TestLinkedRepoHealthFollowsTheLinkedIssueSyncLiveDB(t *testing.T) {
+	t.Run("healthy issue tracker reports ok", func(t *testing.T) {
+		srv := youtracktest.NewServer(t)
+		trustFake(t, srv)
+		env := newLinkedEnv(t, srv, nil)
+		seen := recordOutcomes(env)
+		env.poll(t)
+		if len(*seen) != 1 || !(*seen)[0].ok {
+			t.Fatalf("outcomes = %+v, want one healthy report", *seen)
+		}
+	})
+	t.Run("an unreachable issue tracker reports unhealthy, code-host steps still run", func(t *testing.T) {
+		srv := youtracktest.NewServer(t)
+		trustFake(t, srv)
+		env := newLinkedEnv(t, srv, nil)
+		seen := recordOutcomes(env)
+		srv.Close()
+		env.poll(t)
+		if len(*seen) != 1 || (*seen)[0].ok {
+			t.Fatalf("outcomes = %+v, want one unhealthy report", *seen)
+		}
+		env.assertCodeHostOnly(t)
+	})
+	t.Run("a refused resolver reports unhealthy, code-host steps still run", func(t *testing.T) {
+		env := newLinkedEnv(t, nil, &refusingDrivers{})
+		seen := recordOutcomes(env)
+		env.poll(t)
+		if len(*seen) != 1 || (*seen)[0].ok {
+			t.Fatalf("outcomes = %+v, want one unhealthy report", *seen)
+		}
+		env.assertCodeHostOnly(t)
+	})
+}
+
+// The poller's linked tick caches the eligibility tag's issues with their keys.
+func TestLinkedRepoPollCachesTaggedIssuesLiveDB(t *testing.T) {
+	srv := youtracktest.NewServer(t)
+	trustFake(t, srv)
+	env := newLinkedEnv(t, srv, nil)
+	n := srv.SeedIssue("tagged", "body", youtracktest.EligibilityTagID)
+	env.poll(t)
+	var key *string
+	if err := env.pool.QueryRow(env.ctx, `SELECT issue_key FROM issues WHERE repo_id = $1 AND forge_issue_iid = $2`, env.repo, n).Scan(&key); err != nil {
+		t.Fatal(err)
+	}
+	if want := fmt.Sprintf("%s-%d", youtracktest.ProjectShortName, n); key == nil || *key != want {
+		t.Fatalf("issue_key = %v, want %s", key, want)
+	}
+}

@@ -384,9 +384,12 @@ type DeleteIssuesNotInParams struct {
 //
 // Since PRD #102 M6 the keep-set is the UNION of TWO fetches — the PRD-labelled set
 // and every open issue — so a caller that builds it from one of them wipes whatever
-// the other owns, on every poll. forgesvc.FullSync is the only production caller and
-// it fails closed if either fetch errors, which is what makes an empty keep-set here
-// mean "the forge really is empty" rather than "one request timed out".
+// the other owns, on every poll. forgesvc.FullSync is the production caller for a
+// forge-backed repo and it fails closed if either fetch errors, which is what makes an
+// empty keep-set here mean "the forge really is empty" rather than "one request timed
+// out". The linked issue sync's full form (forgesvc.syncLinkedIssues) is the other
+// caller: its keep-set is the eligibility tag's listing, evicted only after the
+// listing and every upsert succeeded.
 func (q *Queries) DeleteIssuesNotIn(ctx context.Context, arg DeleteIssuesNotInParams) (int64, error) {
 	result, err := q.db.Exec(ctx, deleteIssuesNotIn, arg.RepoID, arg.KeepIids)
 	if err != nil {
@@ -3053,8 +3056,8 @@ const upsertIssue = `-- name: UpsertIssue :one
 
 INSERT INTO issues (
     repo_id, forge_issue_iid, title, state, labels, assignee_ids, web_url, author,
-    has_prd_link, forge_updated_at, synced_at
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now())
+    has_prd_link, forge_updated_at, issue_key, synced_at
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, now())
 ON CONFLICT (repo_id, forge_issue_iid) DO UPDATE
 SET title            = EXCLUDED.title,
     state            = EXCLUDED.state,
@@ -3064,6 +3067,7 @@ SET title            = EXCLUDED.title,
     author           = EXCLUDED.author,
     has_prd_link     = EXCLUDED.has_prd_link,
     forge_updated_at = EXCLUDED.forge_updated_at,
+    issue_key        = EXCLUDED.issue_key,
     synced_at        = now()
 RETURNING id, repo_id, forge_issue_iid, title, state, labels, web_url, author, has_prd_link, forge_updated_at, synced_at, board_position, assignee_ids, issue_key
 `
@@ -3079,6 +3083,7 @@ type UpsertIssueParams struct {
 	Author         pgtype.Text        `json:"author"`
 	HasPrdLink     bool               `json:"has_prd_link"`
 	ForgeUpdatedAt pgtype.Timestamptz `json:"forge_updated_at"`
+	IssueKey       pgtype.Text        `json:"issue_key"`
 }
 
 // Issues cache -------------------------------------------------------------
@@ -3104,6 +3109,7 @@ func (q *Queries) UpsertIssue(ctx context.Context, arg UpsertIssueParams) (Issue
 		arg.Author,
 		arg.HasPrdLink,
 		arg.ForgeUpdatedAt,
+		arg.IssueKey,
 	)
 	var i Issue
 	err := row.Scan(

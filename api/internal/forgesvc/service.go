@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -842,13 +843,13 @@ func (s *Service) FullSync(ctx context.Context, repoID uuid.UUID, forgeProjectID
 	}
 	advanceGroups()
 
-	if err := s.upsertIssues(ctx, repoID, issues); err != nil {
+	if err := s.upsertIssues(ctx, repoID, issues, ""); err != nil {
 		return Marks{}, err
 	}
-	if err := s.upsertIssues(ctx, repoID, extra); err != nil {
+	if err := s.upsertIssues(ctx, repoID, extra, ""); err != nil {
 		return Marks{}, err
 	}
-	if err := s.upsertIssues(ctx, repoID, findingExtra); err != nil {
+	if err := s.upsertIssues(ctx, repoID, findingExtra, ""); err != nil {
 		return Marks{}, err
 	}
 	// A clean SET of fetches that legitimately returns zero issues DOES evict
@@ -942,13 +943,13 @@ func (s *Service) IncrementalSync(ctx context.Context, repoID uuid.UUID, forgePr
 	// deliberately ignored), so incremental passes cannot shift which page the
 	// next FullSync examines. Recorded-op settlement on later pages therefore
 	// happens as FullSync rotates to them.
-	if err := s.upsertIssues(ctx, repoID, issues); err != nil {
+	if err := s.upsertIssues(ctx, repoID, issues, ""); err != nil {
 		return m, err
 	}
-	if err := s.upsertIssues(ctx, repoID, withoutLabel(openIssues, uziLabel)); err != nil {
+	if err := s.upsertIssues(ctx, repoID, withoutLabel(openIssues, uziLabel), ""); err != nil {
 		return m, err
 	}
-	if err := s.upsertIssues(ctx, repoID, withoutLabel(findingIssues, uziLabel)); err != nil {
+	if err := s.upsertIssues(ctx, repoID, withoutLabel(findingIssues, uziLabel), ""); err != nil {
 		return m, err
 	}
 	return m.Advance(Marks{PRD: maxUpdatedAt(issues), Open: maxUpdatedAt(openIssues), Finding: maxUpdatedAt(findingIssues)}), nil
@@ -1004,10 +1005,12 @@ func maxUpdatedAt(issues []forge.Issue) time.Time {
 }
 
 // upsertIssues writes each forge issue into the cache, computing has_prd_link at
-// write time. It reports only an error: no high-water mark is read off this path,
+// write time. issueKeyShort is the linked repo's issue tracker project short name:
+// non-empty, every row is stored with issue_key = short + "-" + iid (D10); empty (the
+// forge sync), issue_key is written NULL. It reports only an error: no high-water mark is read off this path,
 // deliberately, because the time.Now() substitution below would put one past the
 // instant its fetch observed (see maxUpdatedAt).
-func (s *Service) upsertIssues(ctx context.Context, repoID uuid.UUID, issues []forge.Issue) error {
+func (s *Service) upsertIssues(ctx context.Context, repoID uuid.UUID, issues []forge.Issue, issueKeyShort string) error {
 	for _, is := range issues {
 		labelsJSON, err := json.Marshal(is.Labels)
 		if err != nil {
@@ -1028,6 +1031,10 @@ func (s *Service) upsertIssues(ctx context.Context, repoID uuid.UUID, issues []f
 		if updated.IsZero() {
 			updated = time.Now()
 		}
+		issueKey := pgtype.Text{}
+		if issueKeyShort != "" {
+			issueKey = pgtype.Text{String: issueKeyShort + "-" + strconv.FormatInt(is.IID, 10), Valid: true}
+		}
 		if _, err := s.q.UpsertIssue(ctx, store.UpsertIssueParams{
 			RepoID:         repoID,
 			ForgeIssueIid:  is.IID,
@@ -1039,6 +1046,7 @@ func (s *Service) upsertIssues(ctx context.Context, repoID uuid.UUID, issues []f
 			Author:         author,
 			HasPrdLink:     HasPRDLink(is.Description),
 			ForgeUpdatedAt: pgtype.Timestamptz{Time: updated, Valid: true},
+			IssueKey:       issueKey,
 		}); err != nil {
 			return err
 		}

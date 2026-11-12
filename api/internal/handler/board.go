@@ -61,6 +61,10 @@ type cardDTO struct {
 	ForgeType  string  `json:"forge_type"`
 	Author     *string `json:"author"`
 	HasPRDLink bool    `json:"has_prd_link"`
+	// IssueKey is the issue tracker key ("ABC-12") of a card cached by the linked
+	// sync (issues.issue_key, PRD #4173 D10). Empty, and so absent from the payload,
+	// for every forge-backed card, which keeps unlinked payloads byte-identical.
+	IssueKey string `json:"issue_key,omitempty"`
 	// Column is the resolved column label; "" means the implicit Open column.
 	// Ignored when Closed is true.
 	Column string `json:"column"`
@@ -456,7 +460,7 @@ func (h *Handler) seedBoard(w http.ResponseWriter, r *http.Request, repo store.G
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return false
 	}
-	if _, err := h.svc.SyncIssues(r.Context(), repo.ID, repo.ForgeProjectID, tr); err != nil {
+	if _, err := h.svc.SyncIssues(r.Context(), repo.UserID, repo.ID, repo.ForgeProjectID, tr); err != nil {
 		// Non-fatal: the board renders empty and the poller/Refresh will fill it.
 		slog.Warn("initial board import failed", "repo", repo.PathWithNamespace, "error", err)
 	}
@@ -688,6 +692,7 @@ func assembleCards(issues []store.Issue, runRows []store.ListLatestRunsForRepoRo
 			WebURL:      is.WebUrl,
 			ForgeType:   forgeType,
 			HasPRDLink:  is.HasPrdLink,
+			IssueKey:    is.IssueKey.String,
 			Column:      col,
 			Closed:      closed,
 			Conflict:    conflict,
@@ -1225,6 +1230,7 @@ func issueToCard(is store.Issue, position map[string]int, forgeType string) card
 		WebURL:      is.WebUrl,
 		ForgeType:   forgeType,
 		HasPRDLink:  is.HasPrdLink,
+		IssueKey:    is.IssueKey.String,
 		Column:      col,
 		Closed:      closed,
 		Conflict:    conflict,
@@ -1260,11 +1266,7 @@ func (h *Handler) SyncRepo(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	if _, err := h.svc.SyncIssues(r.Context(), repo.ID, repo.ForgeProjectID, tr); err != nil {
-		if errors.Is(err, forgesvc.ErrLinkedSyncNotReady) {
-			httpx.Error(w, http.StatusConflict, "issue sync for a repo linked to an issue tracker is not available yet")
-			return
-		}
+	if _, err := h.svc.SyncIssues(r.Context(), repo.UserID, repo.ID, repo.ForgeProjectID, tr); err != nil {
 		httpx.Error(w, http.StatusBadGateway, "sync failed: "+err.Error())
 		return
 	}

@@ -258,6 +258,7 @@ func (h *Handler) settleFiledIssue(ctx context.Context, claimID uuid.UUID, categ
 		Author:         pgconv.TextOrNull(created.Author),
 		HasPrdLink:     forgesvc.HasPRDLink(description),
 		ForgeUpdatedAt: pgtype.Timestamptz{Time: updated, Valid: true},
+		IssueKey:       pgtype.Text{}, // only the linked sync writes issue_key (D10)
 	}); err != nil {
 		slog.Warn("file issue: cache issue", "error", err)
 		return warnUnlinked

@@ -455,8 +455,8 @@ WHERE repo_id = @repo_id AND position >= @from_position;
 -- TestUpsertIssuePreservesBoardPositionLiveDB, because a comment cannot catch an edit.
 INSERT INTO issues (
     repo_id, forge_issue_iid, title, state, labels, assignee_ids, web_url, author,
-    has_prd_link, forge_updated_at, synced_at
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now())
+    has_prd_link, forge_updated_at, issue_key, synced_at
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, now())
 ON CONFLICT (repo_id, forge_issue_iid) DO UPDATE
 SET title            = EXCLUDED.title,
     state            = EXCLUDED.state,
@@ -466,6 +466,7 @@ SET title            = EXCLUDED.title,
     author           = EXCLUDED.author,
     has_prd_link     = EXCLUDED.has_prd_link,
     forge_updated_at = EXCLUDED.forge_updated_at,
+    issue_key        = EXCLUDED.issue_key,
     synced_at        = now()
 RETURNING *;
 
@@ -884,9 +885,12 @@ SELECT * FROM issues WHERE repo_id = $1 AND forge_issue_iid = $2;
 --
 -- Since PRD #102 M6 the keep-set is the UNION of TWO fetches — the PRD-labelled set
 -- and every open issue — so a caller that builds it from one of them wipes whatever
--- the other owns, on every poll. forgesvc.FullSync is the only production caller and
--- it fails closed if either fetch errors, which is what makes an empty keep-set here
--- mean "the forge really is empty" rather than "one request timed out".
+-- the other owns, on every poll. forgesvc.FullSync is the production caller for a
+-- forge-backed repo and it fails closed if either fetch errors, which is what makes an
+-- empty keep-set here mean "the forge really is empty" rather than "one request timed
+-- out". The linked issue sync's full form (forgesvc.syncLinkedIssues) is the other
+-- caller: its keep-set is the eligibility tag's listing, evicted only after the
+-- listing and every upsert succeeded.
 DELETE FROM issues
 WHERE repo_id = $1 AND forge_issue_iid <> ALL(@keep_iids::bigint[]);
 

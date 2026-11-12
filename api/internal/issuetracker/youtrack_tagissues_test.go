@@ -2,6 +2,7 @@ package issuetracker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -362,8 +363,7 @@ func TestListIssuesByLabelFailsClosedWhenOtherProjectsFillTheCeiling(t *testing.
 	}
 	y, _ := loggedDriver(t, tagListingHandler(issues))
 	got, err := listEligible(y)
-	// The driver redacts the cause, so the ceiling shows in the message only.
-	if err == nil || !strings.Contains(err.Error(), errItemCeiling.Error()) {
+	if !errors.Is(err, errItemCeiling) {
 		t.Fatalf("ListIssues = %+v, %v; want the item ceiling error, not a partial list", got, err)
 	}
 }

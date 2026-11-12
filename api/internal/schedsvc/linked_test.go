@@ -2,6 +2,8 @@ package schedsvc
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -28,11 +30,16 @@ func (f *fakeSources) IssueTrackerForRepo(_ context.Context, userID, repoID uuid
 	return f.tr, f.err
 }
 
+// linkedTagName is the eligibility tag name of linkedHarness's repo, deliberately not
+// the configured uzi label.
+const linkedTagName = "ready-for-uzi"
+
 // linkedHarness is newHarness with the repo linked and a resolver whose tracker is a
 // separate fake from the forge, so a read shows which side served it.
 func linkedHarness(withSources bool) (*harness, *fakeForge, *fakeSources) {
 	h := newHarness()
 	h.st.repoRow.IssueTrackerConnectionID = pgtype.UUID{Bytes: uuid.New(), Valid: true}
+	h.st.repoRow.EligibilityTagName = pgtype.Text{String: linkedTagName, Valid: true}
 	tr := &fakeForge{issue: forge.Issue{IID: 7, Description: "tracker body", Labels: []string{"PRD"}}, createdIID: 7}
 	src := &fakeSources{tr: tr}
 	if withSources {
@@ -127,5 +134,59 @@ func TestUnlinkedFireNeverConsultsResolver(t *testing.T) {
 	}
 	if len(src.users) != 0 || len(h.fb.f.getIID) != 1 {
 		t.Fatalf("resolver calls=%d forge GetIssue=%v", len(src.users), h.fb.f.getIID)
+	}
+}
+
+// PRD #4173 D14: a linked repo's sweep selects by the stored eligibility tag name,
+// for the default selector and for the SQL eligibility label of both queries.
+func TestLinkedFireSweepSelectsByTheStoredEligibilityTag(t *testing.T) {
+	h, _, _ := linkedHarness(true)
+	h.st.sweepRows = []store.ListSweepCandidateIssuesRow{{ForgeIssueIid: 1}}
+	sched := h.sweepSchedule(pgtype.Int4{})
+	sched.Labels = nil
+	if _, err := h.sched.RunNow(context.Background(), sched); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(h.st.sweepLabelParam); got != `["`+linkedTagName+`"]` {
+		t.Fatalf("empty selector resolved to %s, want the stored eligibility tag", got)
+	}
+	if h.st.sweepUziLabelParam != linkedTagName || h.st.countUziLabelParam != linkedTagName {
+		t.Fatalf("eligibility label list=%q count=%q, want %q", h.st.sweepUziLabelParam, h.st.countUziLabelParam, linkedTagName)
+	}
+}
+
+func TestLinkedFireSweepKeepsAnExplicitSelector(t *testing.T) {
+	h, _, _ := linkedHarness(true)
+	h.st.sweepRows = []store.ListSweepCandidateIssuesRow{{ForgeIssueIid: 1}}
+	sched := h.sweepSchedule(pgtype.Int4{})
+	sched.Labels = []byte(`["triage"]`)
+	if _, err := h.sched.RunNow(context.Background(), sched); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(h.st.sweepLabelParam); got != `["triage"]` || h.st.sweepUziLabelParam != linkedTagName {
+		t.Fatalf("selector = %s, eligibility = %q", got, h.st.sweepUziLabelParam)
+	}
+}
+
+func TestUnlinkedFireSweepStillUsesTheConfiguredUziLabel(t *testing.T) {
+	h := newHarness()
+	h.st.sweepRows = []store.ListSweepCandidateIssuesRow{{ForgeIssueIid: 1}}
+	sched := h.sweepSchedule(pgtype.Int4{})
+	sched.Labels = nil
+	if _, err := h.sched.RunNow(context.Background(), sched); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(h.st.sweepLabelParam); strings.Contains(got, linkedTagName) || h.st.sweepUziLabelParam == linkedTagName || h.st.sweepUziLabelParam == "" {
+		t.Fatalf("selector = %s eligibility = %q", got, h.st.sweepUziLabelParam)
+	}
+}
+
+func TestLinkedFireSweepWithNoStoredTagIsABadConfigNotAForgeLabel(t *testing.T) {
+	h, _, _ := linkedHarness(true)
+	h.st.repoRow.EligibilityTagName = pgtype.Text{}
+	sched := h.sweepSchedule(pgtype.Int4{})
+	sched.Labels = nil
+	if _, err := h.sched.fireSweep(context.Background(), sched); !errors.Is(err, errBadConfig) {
+		t.Fatalf("err = %v, want errBadConfig", err)
 	}
 }
