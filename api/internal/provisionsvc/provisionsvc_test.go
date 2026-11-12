@@ -8,6 +8,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/forge/forgetest"
@@ -379,5 +380,29 @@ func TestEnableRepoUnknownRepoIsNotFound(t *testing.T) {
 	_, err := svc.EnableRepo(context.Background(), uuid.New(), uuid.New())
 	if pe := asProvisionError(t, err); pe.Kind != KindNotFound || pe.Message != "repo not found" {
 		t.Fatalf("error = %+v", pe)
+	}
+}
+
+// PRD #4173 M4: enabling a repo linked to an external issue tracker records the default
+// column rows and creates no labels: the forge's project is not where its issues live.
+func TestEnableLinkedRepoSeedsColumnRowsWithoutForgeLabels(t *testing.T) {
+	row := repoRow()
+	row.IssueTrackerConnectionID = pgtype.UUID{Bytes: uuid.New(), Valid: true}
+	st := &fakeStore{repoRow: row}
+	ff := &fakeForge{labelsErr: errors.New("the forge must not be asked for labels")}
+	svc := New(st, fakeForges{ff}, &fakeGuard{}, allowAll)
+
+	repo, err := svc.EnableRepo(context.Background(), uuid.New(), row.ID)
+	if err != nil {
+		t.Fatalf("EnableRepo: %v", err)
+	}
+	if !repo.Enabled || !st.enabled {
+		t.Fatal("repo must be enabled")
+	}
+	if want := defaultColumnNames(); !slices.Equal(st.columns, want) {
+		t.Fatalf("board columns = %v, want %v", st.columns, want)
+	}
+	if ff.labelCall != 0 {
+		t.Fatalf("EnsureLabels calls = %d, want 0 for a linked repo", ff.labelCall)
 	}
 }

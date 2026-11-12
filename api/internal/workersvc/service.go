@@ -40,6 +40,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/config"
 	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/issueinput"
+	"github.com/vtmocanu/uzi/api/internal/issuesource"
 	"github.com/vtmocanu/uzi/api/internal/jointoken"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/planpolicy"
@@ -2125,6 +2126,10 @@ type Service struct {
 	// composite ops return ErrForgesUnavailable rather than panic (the pre-#191
 	// deployments and every test that never wires it are unaffected).
 	forges ForgeBuilder
+	// issueSources resolves the issue side of a repo linked to an external issue
+	// tracker (PRD #4173 DL-5); set via SetIssueSources. Nil ⇒ a linked repo fails
+	// closed (issuesource.ErrNotWired) and an unlinked repo keeps using forges.
+	issueSources issuesource.Sources
 	// guard is the #66 default-branch guardrail (D1 layer 2), a narrow RepoGuard
 	// interface *privcheck.Service satisfies; set via SetRepoGuard. Nil ⇒ the
 	// service-layer gate is skipped (guardDefaultBranch is a no-op) and layer 3 (the
@@ -2231,6 +2236,10 @@ func (s *Service) SetSettings(sr SettingsReader) { s.settings = sr }
 // startup, before serving; pass the same *forgesvc.Service the handlers hold. A nil
 // builder leaves the composite ops returning ErrForgesUnavailable.
 func (s *Service) SetForges(fb ForgeBuilder) { s.forges = fb }
+
+// SetIssueSources wires the resolver of a linked repo's issue side (PRD #4173 DL-5).
+// Call once at startup with the same *forgesvc.Service SetForges gets.
+func (s *Service) SetIssueSources(is issuesource.Sources) { s.issueSources = is }
 
 // SetRepoGuard wires the #66 default-branch guardrail (D1 layer 2). Late-injected
 // in main.go because the privcheck.Service is built after this Service. A nil guard
@@ -6915,9 +6924,16 @@ type ForgeConn struct {
 	// unmarshal it into a ReviewCommentsSnapshot and reject any reply/resolve id not
 	// present in it (the Decision-11 server-side scope check).
 	ReviewComments []byte
-	IssueIID       *int64
-	SavedTitle     string
-	SavedBody      string
+	// RepoID, UserID and IssueTrackerConnectionID bind the run's issue side (PRD
+	// #4173 DL-5): the issue routes resolve a linked repo's issue tracker by repo row
+	// and owner, never by the forge project id. IssueTrackerConnectionID.Valid is the
+	// repo's link.
+	RepoID                   uuid.UUID
+	UserID                   uuid.UUID
+	IssueTrackerConnectionID pgtype.UUID
+	IssueIID                 *int64
+	SavedTitle               string
+	SavedBody                string
 	// SavedBodyValid is true when the run captured a raw body (issue_saved_body not NULL); SavedBody
 	// otherwise falls back to the run's issue description.
 	SavedBodyValid bool
@@ -6973,14 +6989,17 @@ func (s *Service) ForgeConnForRun(ctx context.Context, wkr store.Worker, runID u
 		mrIID = &v
 	}
 	return ForgeConn{
-		ForgeType:       row.ForgeType,
-		BaseUrl:         row.BaseUrl,
-		TokenCiphertext: row.TokenCiphertext,
-		ForgeProjectID:  row.ForgeProjectID,
-		BotForgeUserID:  row.BotForgeUserID,
-		MRIID:           mrIID,
-		ReviewComments:  run.ReviewComments,
-		IssueIID:        issueIID, SavedTitle: run.IssueTitle, SavedBody: body, SavedBodyValid: run.IssueSavedBody.Valid, RawDigest: digest, InputReason: run.IssueInputReason.String,
+		ForgeType:                row.ForgeType,
+		BaseUrl:                  row.BaseUrl,
+		TokenCiphertext:          row.TokenCiphertext,
+		ForgeProjectID:           row.ForgeProjectID,
+		BotForgeUserID:           row.BotForgeUserID,
+		RepoID:                   row.RepoID,
+		UserID:                   row.UserID,
+		IssueTrackerConnectionID: row.IssueTrackerConnectionID,
+		MRIID:                    mrIID,
+		ReviewComments:           run.ReviewComments,
+		IssueIID:                 issueIID, SavedTitle: run.IssueTitle, SavedBody: body, SavedBodyValid: run.IssueSavedBody.Valid, RawDigest: digest, InputReason: run.IssueInputReason.String,
 	}, nil
 }
 
@@ -8080,7 +8099,13 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 		if ferr != nil {
 			return store.Run{}, ErrForgeBuild
 		}
-		capture, err = issueinput.Fetch(ctx, f, f, row.ForgeProjectID, issueIID, row.BotForgeUserID)
+		// PRD #4173 DL-5: a linked repo's issue is read through the resolver, never the
+		// forge; the code-host half of the fetch (author eligibility) stays on the forge.
+		tr, terr := issuesource.For(ctx, s.issueSources, row.IssueTrackerConnectionID.Valid, userID, repoID, f)
+		if terr != nil {
+			return store.Run{}, fmt.Errorf("%w: %v", ErrForgeBuild, terr)
+		}
+		capture, err = issueinput.Fetch(ctx, f, tr, row.ForgeProjectID, issueIID, row.BotForgeUserID)
 		if err != nil {
 			if forge.IsIssueResponseTooLarge(err) {
 				return store.Run{}, fmt.Errorf("%w: %w", ErrDescriptionTooLarge, err)

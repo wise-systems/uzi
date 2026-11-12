@@ -156,6 +156,14 @@ func (s *Service) maybeFileProposal(ctx context.Context, run store.Run, proposal
 		slog.Warn("file proposal: build forge", "run_id", run.ID, "error", err)
 		return
 	}
+	// PRD #4173 M4: filing a proposal creates an issue, which a linked repo does not
+	// offer until M5, so it is skipped before the audit row (no pending row is left
+	// behind) and never falls back to the forge, whose project number means nothing there.
+	if repo.IssueTrackerConnectionID.Valid {
+		slog.Warn("file proposal: skipped, issue creation is not offered on a repo linked to an issue tracker",
+			"run_id", run.ID, "repo_id", repo.ID)
+		return
+	}
 
 	// Audit row first (pending), then the forge write, then stamp confirmed with the
 	// iid — mirroring the issue_proposals shape ConfirmProposalForUser uses (PRD #929

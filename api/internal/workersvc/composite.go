@@ -12,6 +12,7 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/issueinput"
+	"github.com/vtmocanu/uzi/api/internal/issuesource"
 	"github.com/vtmocanu/uzi/api/internal/privcheck"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -153,7 +154,14 @@ func (s *Service) ConfirmProposalForUser(ctx context.Context, userID, runID, pro
 		}
 	}
 
-	var tr forge.IssueTracker = f
+	// PRD #4173 DL-5: a linked repo's resolver wraps the write guard, which refuses
+	// CreateIssue before any request (writes arrive in M5). The claim reverts below, so
+	// the proposal stays pending and nothing was created.
+	tr, err := issuesource.For(ctx, s.issueSources, repo.IssueTrackerConnectionID.Valid, userID, repo.ID, f)
+	if err != nil {
+		s.revertProposal(ctx, propID)
+		return CreatedIssue{}, fmt.Errorf("%w: %v", ErrForgeBuild, err)
+	}
 	created, err := tr.CreateIssue(ctx, repo.ForgeProjectID, claim.Title, claim.Description, labels)
 	if err != nil {
 		s.revertProposal(ctx, propID)
@@ -220,7 +228,11 @@ func (s *Service) StartRunForUser(ctx context.Context, userID, repoID uuid.UUID,
 	if err != nil {
 		return store.Run{}, fmt.Errorf("%w: %v", ErrForgeBuild, err)
 	}
-	capture, err := issueinput.FetchWithTimeout(ctx, f, f, repo.ForgeProjectID, issueIID, repo.BotForgeUserID, issueinput.InteractiveAssessmentTimeout)
+	tr, err := issuesource.For(ctx, s.issueSources, repo.IssueTrackerConnectionID.Valid, userID, repo.ID, f)
+	if err != nil {
+		return store.Run{}, fmt.Errorf("%w: %v", ErrForgeBuild, err)
+	}
+	capture, err := issueinput.FetchWithTimeout(ctx, f, tr, repo.ForgeProjectID, issueIID, repo.BotForgeUserID, issueinput.InteractiveAssessmentTimeout)
 	if err != nil {
 		if forge.IsIssueResponseTooLarge(err) {
 			return store.Run{}, fmt.Errorf("%w: %w", ErrDescriptionTooLarge, err)

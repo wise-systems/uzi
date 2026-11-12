@@ -310,9 +310,15 @@ func (s *Service) EnableRepo(ctx context.Context, userID, repoID uuid.UUID) (sto
 		s.logger().Error("build forge for connection", "error", err)
 		return store.Repo{}, internal()
 	}
-	// PRD #4173 D3: board columns are labels, on the issue-tracker half.
-	var tr forge.IssueTracker = f
-	if err := forgesvc.EnsureBoardColumns(ctx, s.q, tr, row.ID, row.ForgeProjectID); err != nil {
+	// PRD #4173 D3: board columns are labels, on the issue-tracker half. A repo linked to an
+	// external issue tracker records the column rows only: uzi creates no labels or tags
+	// there (writes arrive in M5), and the forge's project is not where its issues live.
+	if row.IssueTrackerConnectionID.Valid {
+		if err := forgesvc.EnsureBoardColumnRows(ctx, s.q, row.ID); err != nil {
+			s.logger().Error("ensure board column rows", "error", err)
+			return store.Repo{}, internal()
+		}
+	} else if err := forgesvc.EnsureBoardColumns(ctx, s.q, forge.IssueTracker(f), row.ID, row.ForgeProjectID); err != nil {
 		var seedErr *forgesvc.LabelSeedError
 		if errors.As(err, &seedErr) {
 			return store.Repo{}, &Error{Kind: KindBadGateway, Message: "could not seed board labels on the forge: " + seedErr.Error()}

@@ -10729,7 +10729,8 @@ SELECT r.status, r.issue_iid, r.repo_id, r.origin_column, r.board_column, r.move
        r.auto_approve, r.mr_iid,
        rp.forge_project_id, rp.web_url AS repo_web_url,
        rp.issue_tracker_connection_id, rp.awaiting_first_enable,
-       c.forge_type, c.base_url, c.token_ciphertext
+       c.forge_type, c.base_url, c.token_ciphertext,
+       r.user_id
 FROM runs r
 JOIN repos rp ON rp.id = r.repo_id
 JOIN forge_connections c ON c.id = rp.connection_id AND c.user_id = r.user_id -- #1688: owner-scoped token

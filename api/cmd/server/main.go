@@ -1013,6 +1013,11 @@ func run() error {
 	// The same service is forgesvc's driver source for a linked repo's issue side (DL-5);
 	// without it a linked repo fails closed.
 	svc.SetIssueTrackerDrivers(itSvc)
+	// DL-5: the services M2 left on their own forge factories resolve a linked repo's
+	// issue side through forgesvc too; each fails closed for a linked repo without it.
+	// provisionsvc needs none: enabling a linked repo only records column rows.
+	wsvc.SetIssueSources(svc)
+	lifecycle.SetIssueSources(svc)
 	svc.SetMergedPredecessorRecovery(q, h.RecoveryService())
 
 	var bgWG sync.WaitGroup
@@ -1067,6 +1072,7 @@ func run() error {
 	// schedule that came due while the api was down fire promptly after a restart.
 	if cfg.SchedulerCheckInterval > 0 {
 		scheduler := schedsvc.New(q, wsvc, svc, settingsCache, notifier, vlt, cfg.SchedulerCheckInterval, slog.Default())
+		scheduler.SetIssueSources(svc)
 		scheduler.SetCIRepair(schedsvc.CIRepairConfig{MaxJobs: cfg.CIFixMaxJobs, LogTailBytes: cfg.CIFixLogTailBytes, MaxAttempts: cfg.CIAutofixMaxAttempts, ConfigPaths: cfg.CIAutofixConfigPaths, ArtifactMaxFiles: cfg.CIArtifactMaxFiles, ArtifactMaxBytes: cfg.CIArtifactMaxBytes})
 		// Admin-health loop-beat: the scheduler is one of the four loops (PRD #1484 M2, D15).
 		// Registered ONLY inside this started-block, so a not-started scheduler
