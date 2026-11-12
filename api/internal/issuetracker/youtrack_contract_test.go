@@ -73,6 +73,10 @@ func TestYouTrackContract(t *testing.T) {
 					return srv.SeedIssue("seeded", "", tagIDs...)
 				},
 				IssueTagIDs: func(t *testing.T, iid int64) []string { return srv.IssueTagIDs(iid) },
+				SeedForeignTag: func(t *testing.T, name string) string {
+					everyone := youtracktest.Sharing{Groups: []string{youtracktest.AllUsersGroupID}}
+					return srv.SeedTag(name, youtracktest.OtherLogin, everyone, youtracktest.Sharing{})
+				},
 				TagsNamed: func(t *testing.T, name string) []issuetrackertest.TagView {
 					eligibility := srv.TagByID(youtracktest.EligibilityTagID)
 					var out []issuetrackertest.TagView

@@ -11,10 +11,12 @@ import (
 
 func TestIssueQuery(t *testing.T) {
 	after := time.Date(2026, 3, 1, 23, 30, 0, 0, time.UTC)
+	// Labels are given on purpose: no tag name is ever sent in a search query (a
+	// listing with labels pages the tag's issues by id), so none may appear.
 	got := issueQuery("UZI", forge.ListIssuesOptions{
 		Labels: []string{"a b", "c"}, State: forge.StateOpened, UpdatedAfter: &after,
 	})
-	want := "project: {UZI} tag: {a b} tag: {c} #Unresolved updated: 2026-02-28 .. * sort by: updated asc"
+	want := "project: {UZI} #Unresolved updated: 2026-02-28 .. * sort by: updated asc"
 	if got != want {
 		t.Fatalf("got %q, want %q", got, want)
 	}

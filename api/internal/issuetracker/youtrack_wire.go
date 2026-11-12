@@ -142,7 +142,7 @@ func (y *youTrack) toIssue(w ytIssue) (forge.Issue, error) {
 		if y.foreignEligibility(t) {
 			continue
 		}
-		issue.Labels = append(issue.Labels, t.Name)
+		issue.Labels = append(issue.Labels, y.tagName(t))
 	}
 	return issue, nil
 }
@@ -152,6 +152,15 @@ func (y *youTrack) toIssue(w ytIssue) (forge.Issue, error) {
 // result always means the stored tag.
 func (y *youTrack) foreignEligibility(t ytTag) bool {
 	return y.eligibility.Name != "" && t.Name == y.eligibility.Name && t.ID != y.eligibility.ID
+}
+
+// tagName is the label name reported for t: the eligibility tag under its
+// stored name, whatever its live name, and any other tag under its live name.
+func (y *youTrack) tagName(t ytTag) string {
+	if y.eligibility.ID != "" && t.ID == y.eligibility.ID {
+		return y.eligibility.Name
+	}
+	return t.Name
 }
 
 // inBoundProject reports whether the issue sits in the bound project.

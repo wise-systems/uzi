@@ -1,18 +1,22 @@
 package issuetracker
 
 import (
+	"cmp"
 	"context"
 	"net/http"
 	"net/url"
+	"slices"
 
 	"github.com/vtmocanu/uzi/api/internal/forge"
 )
 
-// ListIssues implements forge.IssueTracker. The query narrows by project,
-// labels, state and update date; the driver then filters again on the resolved
-// tag ids (see resolveTagIDs), the exact update instant and the bound project,
-// and honours opts.Limit after that filter. A label whose tag the token's
-// account does not own yields no issue.
+// ListIssues implements forge.IssueTracker. Without labels it queries the
+// project by state and update date. With labels it never sends a tag name in a
+// query: it pages the issues of one tag by id (listingTagID), keeps the ones
+// that sit in the bound project and carry every resolved tag id, and match the
+// state and the exact update instant, sorts them by update instant ascending
+// and only then honours opts.Limit. A label whose tag the token's account does
+// not own yields no issue.
 func (y *youTrack) ListIssues(ctx context.Context, projectID int64, opts forge.ListIssuesOptions) ([]forge.Issue, error) {
 	p, err := y.requireProject(projectID)
 	if err != nil {
@@ -30,33 +34,50 @@ func (y *youTrack) ListIssues(ctx context.Context, projectID int64, opts forge.L
 			return []forge.Issue{}, nil
 		}
 	}
-	query := url.Values{"query": {issueQuery(p.ShortName, opts)}, "fields": {issueFields}}
-	out := []forge.Issue{}
-	var mapErr error
-	err = ytPages(ctx, y, []string{"issues"}, query, func(page []ytIssue) bool {
+	byTag := len(opts.Labels) > 0
+	path, query := []string{"issues"}, url.Values{"query": {issueQuery(p.ShortName, opts)}, "fields": {issueFields}}
+	if byTag {
+		path, query = []string{"tags", y.listingTagID(opts.Labels, tagIDs), "issues"}, url.Values{"fields": {issueFields}}
+	}
+	var matched []ytIssue
+	err = ytPages(ctx, y, path, query, func(page []ytIssue) bool {
 		for _, w := range page {
-			if !y.matchesIssue(w, opts, tagIDs) {
-				continue
-			}
-			issue, err := y.toIssue(w)
-			if err != nil {
-				mapErr = err
-				return true
-			}
-			out = append(out, issue)
-			if opts.Limit > 0 && len(out) >= opts.Limit {
-				return true
+			if y.matchesIssue(w, opts, tagIDs) {
+				matched = append(matched, w)
 			}
 		}
-		return false
+		// The project query is sorted by the server, so it can stop at the limit;
+		// a tag's listing has no sort and is walked whole.
+		return !byTag && opts.Limit > 0 && len(matched) >= opts.Limit
 	})
 	if err != nil {
 		return nil, err
 	}
-	if mapErr != nil {
-		return nil, mapErr
+	if byTag {
+		slices.SortStableFunc(matched, func(a, b ytIssue) int { return cmp.Compare(a.Updated, b.Updated) })
+	}
+	if opts.Limit > 0 && len(matched) > opts.Limit {
+		matched = matched[:opts.Limit]
+	}
+	out := make([]forge.Issue, 0, len(matched))
+	for _, w := range matched {
+		issue, err := y.toIssue(w)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, issue)
 	}
 	return out, nil
+}
+
+// listingTagID picks the tag whose issues a listing walks: the eligibility tag
+// when its name is among the labels, else the tag of the first label. tagIDs is
+// the result of resolveTagIDs, which holds every label.
+func (y *youTrack) listingTagID(labels []string, tagIDs map[string]string) string {
+	if slices.Contains(labels, y.eligibility.Name) {
+		return y.eligibility.ID
+	}
+	return tagIDs[labels[0]]
 }
 
 // GetIssue implements forge.IssueTracker. issueIID is the number in the project.

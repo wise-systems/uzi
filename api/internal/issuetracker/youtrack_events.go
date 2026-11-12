@@ -41,7 +41,7 @@ func (y *youTrack) ListIssueLabelEvents(ctx context.Context, projectID, issueIID
 			out = append(out, forge.LabelEvent{
 				ID:        int64(len(out) + 1),
 				Action:    action,
-				LabelName: t.Name,
+				LabelName: y.tagName(t),
 				Username:  login(a.Author),
 				CreatedAt: time.UnixMilli(a.Timestamp).UTC(),
 			})

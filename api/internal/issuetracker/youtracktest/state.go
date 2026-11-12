@@ -203,8 +203,8 @@ func covers(s sharing, userID string) bool {
 	return false
 }
 
-// visibleTo reports whether the user can see the tag.
-func (t *tag) visibleTo(userID string) bool { return t.owner == userID || covers(t.read, userID) }
+// visibleToBot reports whether the bot can see the tag.
+func (t *tag) visibleToBot() bool { return t.owner == BotID || covers(t.read, BotID) }
 
 // usableBy reports whether the user can apply the tag to an issue.
 func (t *tag) usableBy(userID string) bool { return t.owner == userID || covers(t.use, userID) }
@@ -213,7 +213,7 @@ func (t *tag) usableBy(userID string) bool { return t.owner == userID || covers(
 func (m *model) visibleTags() []*tag {
 	var out []*tag
 	for _, t := range m.tags {
-		if t.visibleTo(BotID) {
+		if t.visibleToBot() {
 			out = append(out, t)
 		}
 	}
