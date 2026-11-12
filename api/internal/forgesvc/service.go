@@ -112,6 +112,9 @@ type IssueStore interface {
 	GetRepoIssueSourceForUser(ctx context.Context, arg store.GetRepoIssueSourceForUserParams) (store.GetRepoIssueSourceForUserRow, error)
 	RemoveCachedIssueLabel(context.Context, store.RemoveCachedIssueLabelParams) (store.Issue, error)
 	UpsertIssue(ctx context.Context, arg store.UpsertIssueParams) (store.Issue, error)
+	// UpsertIssueIfChanged is the linked issue sync's write: UpsertIssue's columns, but a
+	// row whose cached values are unchanged is not rewritten.
+	UpsertIssueIfChanged(ctx context.Context, arg store.UpsertIssueIfChangedParams) error
 	// UpsertIssueLabels is the label-only cache-write variant used by AutoMove and
 	// SetIssueLabel: it omits assignee_ids so a racing label mutation cannot clobber
 	// the forge-synced assignees with a stale in-memory snapshot (PRD #767).
@@ -1035,7 +1038,7 @@ func (s *Service) upsertIssues(ctx context.Context, repoID uuid.UUID, issues []f
 		if issueKeyShort != "" {
 			issueKey = pgtype.Text{String: issueKeyShort + "-" + strconv.FormatInt(is.IID, 10), Valid: true}
 		}
-		if _, err := s.q.UpsertIssue(ctx, store.UpsertIssueParams{
+		params := store.UpsertIssueParams{
 			RepoID:         repoID,
 			ForgeIssueIid:  is.IID,
 			Title:          is.Title,
@@ -1047,7 +1050,15 @@ func (s *Service) upsertIssues(ctx context.Context, repoID uuid.UUID, issues []f
 			HasPrdLink:     HasPRDLink(is.Description),
 			ForgeUpdatedAt: pgtype.Timestamptz{Time: updated, Valid: true},
 			IssueKey:       issueKey,
-		}); err != nil {
+		}
+		if issueKeyShort != "" {
+			// The linked sync re-reads every tagged issue each tick, so it writes only rows
+			// that changed; the forge sync keeps the unconditional write.
+			err = s.q.UpsertIssueIfChanged(ctx, store.UpsertIssueIfChangedParams(params))
+		} else {
+			_, err = s.q.UpsertIssue(ctx, params)
+		}
+		if err != nil {
 			return err
 		}
 	}

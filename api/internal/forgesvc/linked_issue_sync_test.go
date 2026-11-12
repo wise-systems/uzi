@@ -36,6 +36,13 @@ func (s *linkedSyncStore) UpsertIssue(ctx context.Context, arg store.UpsertIssue
 	return s.fakeStore.UpsertIssue(ctx, arg)
 }
 
+func (s *linkedSyncStore) UpsertIssueIfChanged(ctx context.Context, arg store.UpsertIssueIfChangedParams) error {
+	if s.upsertErr != nil {
+		return s.upsertErr
+	}
+	return s.fakeStore.UpsertIssueIfChanged(ctx, arg)
+}
+
 func newLinkedSyncStore() *linkedSyncStore {
 	return &linkedSyncStore{fakeStore: &fakeStore{}, row: store.GetRepoIssueSourceForUserRow{
 		IssueTrackerProjectShort: pgtype.Text{String: "ABC", Valid: true},
@@ -66,6 +73,9 @@ func TestSyncIssuesDispatchesOnTheLink(t *testing.T) {
 		}
 		if len(st.upserts) != 2 || st.upserts[0].IssueKey.String != "ABC-7" || !st.upserts[0].IssueKey.Valid || st.upserts[1].IssueKey.String != "ABC-12" {
 			t.Fatalf("upserts = %+v, want issue_key ABC-7 and ABC-12", st.upserts)
+		}
+		if st.changedUpserts != 2 {
+			t.Fatalf("changed-only upserts = %d, want both writes through UpsertIssueIfChanged", st.changedUpserts)
 		}
 		if len(st.deleteCalls) != 1 || len(st.deleteCalls[0].KeepIids) != 2 {
 			t.Fatalf("delete calls = %+v, want one eviction keeping both", st.deleteCalls)

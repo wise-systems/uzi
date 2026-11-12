@@ -36,6 +36,9 @@ func TestIssueTextMapped(t *testing.T) {
 		{"created by another user", func(srv *youtracktest.Server, n int64) {
 			srv.SetReporter(n, youtracktest.OtherLogin)
 		}, false},
+		{"no activities at all", func(srv *youtracktest.Server, n int64) {
+			srv.DropCreationActivity(n)
+		}, false},
 		{"a comment edit is not issue text", func(srv *youtracktest.Server, n int64) {
 			srv.SeedComment(n, youtracktest.BotLogin, "c")
 			srv.SeedCommentEdit(n, youtracktest.OtherLogin, "c", "c2")
@@ -75,7 +78,7 @@ func TestIssueTextMappedRequestPinsCategoriesAndFields(t *testing.T) {
 			t.Errorf("categories = %q, want %q", got, want)
 		}
 		f := q.Get("fields")
-		if f != "id,timestamp,author(id,login)" || strings.Contains(f, "added") || strings.Contains(f, "removed") {
+		if f != "id,timestamp,category(id),author(id,login)" || strings.Contains(f, "added") || strings.Contains(f, "removed") {
 			t.Errorf("fields = %q, want the author only and no added or removed", f)
 		}
 	}

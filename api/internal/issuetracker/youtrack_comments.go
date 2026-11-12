@@ -21,7 +21,7 @@ import (
 // comment is withheld. When the issue's comment text activities cannot be read
 // the method does not fail: it reports every comment with an empty
 // AuthorUsername (all withheld), so the run goes on without comments it cannot
-// vouch for. Only a cancelled or expired ctx is returned as an error.
+// vouch for. Of that activities read only a cancelled or expired ctx is returned as an error. No activities request is made for an issue with no comments that are not deleted.
 func (y *youTrack) ListIssueComments(ctx context.Context, projectID, issueIID int64) ([]forge.IssueComment, error) {
 	w, err := y.resolveIssue(ctx, projectID, issueIID)
 	if err != nil {
@@ -40,15 +40,16 @@ func (y *youTrack) ListIssueComments(ctx context.Context, projectID, issueIID in
 		}
 		return 0
 	})
+	live := slices.DeleteFunc(comments, func(c ytComment) bool { return c.Deleted })
+	if len(live) == 0 {
+		return []forge.IssueComment{}, nil
+	}
 	edited, readable := y.commentEditors(ctx, w.ID)
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	out := []forge.IssueComment{}
-	for _, c := range comments {
-		if c.Deleted {
-			continue
-		}
+	for _, c := range live {
 		author := login(c.Author)
 		if !readable || editedByOther(edited[c.ID], author) {
 			author = ""

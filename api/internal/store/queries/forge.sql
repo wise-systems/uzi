@@ -466,9 +466,37 @@ SET title            = EXCLUDED.title,
     author           = EXCLUDED.author,
     has_prd_link     = EXCLUDED.has_prd_link,
     forge_updated_at = EXCLUDED.forge_updated_at,
-    issue_key        = EXCLUDED.issue_key,
+    -- A forge-only writer passes NULL; it must not erase the key of a linked row.
+    issue_key        = COALESCE(EXCLUDED.issue_key, issues.issue_key),
     synced_at        = now()
 RETURNING *;
+
+-- name: UpsertIssueIfChanged :exec
+-- The linked issue sync's write (PRD #4173): the same columns as UpsertIssue (and the same
+-- board_position omission, with the same reason), but a row whose cached values are all
+-- unchanged is left untouched, so a tick that finds nothing new rewrites nothing and
+-- issues.synced_at is not refreshed by it. Nothing reads issues.synced_at. issue_key is
+-- compared as written (the linked sync always passes it).
+INSERT INTO issues (
+    repo_id, forge_issue_iid, title, state, labels, assignee_ids, web_url, author,
+    has_prd_link, forge_updated_at, issue_key, synced_at
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, now())
+ON CONFLICT (repo_id, forge_issue_iid) DO UPDATE
+SET title            = EXCLUDED.title,
+    state            = EXCLUDED.state,
+    labels           = EXCLUDED.labels,
+    assignee_ids     = EXCLUDED.assignee_ids,
+    web_url          = EXCLUDED.web_url,
+    author           = EXCLUDED.author,
+    has_prd_link     = EXCLUDED.has_prd_link,
+    forge_updated_at = EXCLUDED.forge_updated_at,
+    issue_key        = EXCLUDED.issue_key,
+    synced_at        = now()
+WHERE (issues.title, issues.state, issues.labels, issues.assignee_ids, issues.web_url, issues.author,
+       issues.has_prd_link, issues.forge_updated_at, issues.issue_key)
+      IS DISTINCT FROM
+      (EXCLUDED.title, EXCLUDED.state, EXCLUDED.labels, EXCLUDED.assignee_ids, EXCLUDED.web_url, EXCLUDED.author,
+       EXCLUDED.has_prd_link, EXCLUDED.forge_updated_at, EXCLUDED.issue_key);
 
 -- name: UpsertIssueLabels :one
 -- Labels is the INSERT seed only. On conflict, remove from CURRENT issues.labels,

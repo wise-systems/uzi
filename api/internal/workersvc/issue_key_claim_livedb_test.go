@@ -154,3 +154,60 @@ func TestIssueKeyPlacementMirrorsLiveDB(t *testing.T) {
 		t.Fatal("a capable worker is online: not a capability gap")
 	}
 }
+
+// TestIssueKeySaturationMirrorsLiveDB: ListSaturationQueuedRunsForEphemeral carries the issue_key
+// clause in both of its worker sets. A linked run is saturation demand only when a capable worker
+// exists (first set) and none of the capable workers has a free slot (second set), so a worker
+// without the capability counts as neither capable nor free.
+func TestIssueKeySaturationMirrorsLiveDB(t *testing.T) {
+	f := newCRFix(t)
+	ctx := f.env.ctx
+	f.linkFixtureRepo(t)
+	f.env.exec(`UPDATE users SET ephemeral_workers_enabled = true WHERE id = $1`, f.user)
+	run := f.startQueuedIssueRun(t, 12)
+	f.env.exec(`UPDATE runs SET status_since = now() - interval '1 hour' WHERE id = $1`, run)
+	cutoff := pgtype.Timestamptz{Time: time.Now().Add(time.Hour), Valid: true}
+	saturated := func() bool {
+		t.Helper()
+		rows, err := f.env.q.ListSaturationQueuedRunsForEphemeral(ctx, store.ListSaturationQueuedRunsForEphemeralParams{
+			CrossCheckEvaluatedAt: cutoff, CrossCheckAffinityCutoff: cutoff, BackgroundGraceCutoff: cutoff,
+			CodexCuratedModels: codexCuratedModelsSlice(), DockerRepoAllowlist: []uuid.UUID{}, EphemeralLease: pgtype.Interval{Valid: true},
+			SaturationDelay: pgtype.Interval{Valid: true}, MaxPerUser: 1000, MaxRows: 10000,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, r := range rows {
+			if r.ID == run {
+				return true
+			}
+		}
+		return false
+	}
+	fill := func(w store.Worker) {
+		f.env.exec(`INSERT INTO runs (id, user_id, repo_id, kind, issue_iid, issue_title, issue_description, status, worker_id)
+		            VALUES ($1, $2, $3, 'issue', $4, 't', 'd', 'running', $5)`, uuid.New(), f.user, f.repo, 900+int(w.ID[0]), w.ID)
+	}
+
+	// Only workers without the capability, one free and one full: nobody could ever claim the
+	// run, so it is a capability gap and not saturation demand (first worker set).
+	oldFree := f.protocolWorker(t, 2)
+	oldFull := f.protocolWorker(t, 1)
+	fill(oldFull)
+	if saturated() {
+		t.Fatal("a linked run with only incapable workers online is a gap, not saturation")
+	}
+
+	// A capable worker with a free slot will claim it: not saturated.
+	capable := f.protocolWorker(t, 1, capability.IssueKeyV1)
+	if saturated() {
+		t.Fatal("a capable worker has a free slot: not saturated")
+	}
+
+	// The capable worker is full: saturated, although an incapable worker still has a free slot
+	// (second worker set: that worker cannot claim the run, so it does not count as free room).
+	fill(capable)
+	if !saturated() {
+		t.Fatalf("every capable worker is full while incapable worker %s has room: want saturated", oldFree.ID)
+	}
+}

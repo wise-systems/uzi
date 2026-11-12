@@ -1386,7 +1386,7 @@ WITH checker_template_pins AS MATERIALIZED (
       -- PRD #4173: a run on a LINKED repo (repos.issue_tracker_connection_id) is claimable only by a
       -- worker reporting 'issue_key_v1' (it renders the run's references by issue_key and never
       -- writes Closes #<iid>). Standalone, outside fn_worker_can_claim and @capability_aware.
-      AND (NOT EXISTS (SELECT 1 FROM repos lr WHERE lr.id = r.repo_id AND lr.issue_tracker_connection_id IS NOT NULL) OR 'issue_key_v1' = ANY(@worker_protocol_caps::text[]))
+      AND ('issue_key_v1' = ANY(@worker_protocol_caps::text[]) OR NOT EXISTS (SELECT 1 FROM repos lr WHERE lr.id = r.repo_id AND lr.issue_tracker_connection_id IS NOT NULL))
       AND ((NOT r.repo_agent_source_required AND r.repo_agent_source_commit IS NULL) OR 'repo_agent_source_v1' = ANY(@worker_protocol_caps::text[]))
       AND (r.agent_source_requested IS NULL OR 'agent_source_request_v1' = ANY(@worker_protocol_caps::text[]))
       AND (NOT (r.policy_preserve_required OR r.policy_pending_fresh OR (r.policy_outcome_id IS NOT NULL AND r.policy_resolved_at IS NULL) OR r.policy_required_head IS NOT NULL) OR 'provider_policy_hold_v1' = ANY(@worker_protocol_caps::text[]))
@@ -1672,7 +1672,7 @@ WITH checker_template_pins AS MATERIALIZED (
                 -- PRD #4173: a run on a LINKED repo (repos.issue_tracker_connection_id) is claimable only by a
                 -- worker reporting 'issue_key_v1' (it renders the run's references by issue_key and never
                 -- writes Closes #<iid>). Standalone, outside fn_worker_can_claim and @capability_aware.
-                AND (NOT EXISTS (SELECT 1 FROM repos lr WHERE lr.id = r.repo_id AND lr.issue_tracker_connection_id IS NOT NULL) OR 'issue_key_v1' = ANY(p.protocol_capabilities))
+                AND ('issue_key_v1' = ANY(p.protocol_capabilities) OR NOT EXISTS (SELECT 1 FROM repos lr WHERE lr.id = r.repo_id AND lr.issue_tracker_connection_id IS NOT NULL))
                 AND ((NOT r.repo_agent_source_required AND r.repo_agent_source_commit IS NULL) OR 'repo_agent_source_v1' = ANY(p.protocol_capabilities))
                 AND (r.agent_source_requested IS NULL OR 'agent_source_request_v1' = ANY(p.protocol_capabilities))
       AND (NOT (r.policy_preserve_required OR r.policy_pending_fresh OR (r.policy_outcome_id IS NOT NULL AND r.policy_resolved_at IS NULL) OR r.policy_required_head IS NOT NULL) OR 'provider_policy_hold_v1' = ANY(p.protocol_capabilities))
@@ -10956,6 +10956,8 @@ SELECT id, runs.user_id, status, auto_approve,
        harness, codex_material_revision, codex_secret_id, worker_id, released_worker_id,
        egress_profile_id, job_protocol, ci_config_guard, repo_agent_source_commit, repo_agent_source_required, agent_source_requested,
        EXISTS (SELECT 1 FROM job_files af WHERE af.run_id = runs.id AND af.direction = 'input' AND af.state = 'attached')::boolean AS ci_artifacts_attached,
+       -- PRD #4173: true when the run's repo is linked to an external issue tracker; gates the queued-reason issue_key rung so an unlinked run makes no extra query.
+       EXISTS (SELECT 1 FROM repos lr WHERE lr.id = runs.repo_id AND lr.issue_tracker_connection_id IS NOT NULL)::boolean AS repo_linked,
        COALESCE(runs.status = 'queued' AND runs.kind <> 'cross_check'
                 AND runs.worker_id IS NOT NULL
                 AND runs.stale_requeue_generation = runs.claim_generation
@@ -11294,7 +11296,7 @@ WHERE run.id = @run_id
   -- PRD #4173: a run on a LINKED repo (repos.issue_tracker_connection_id) is claimable only by a
   -- worker reporting 'issue_key_v1' (it renders the run's references by issue_key and never
   -- writes Closes #<iid>). Standalone, outside fn_worker_can_claim and @capability_aware.
-  AND (NOT EXISTS (SELECT 1 FROM repos lr WHERE lr.id = run.repo_id AND lr.issue_tracker_connection_id IS NOT NULL) OR 'issue_key_v1' = ANY(w.protocol_capabilities))
+  AND ('issue_key_v1' = ANY(w.protocol_capabilities) OR NOT EXISTS (SELECT 1 FROM repos lr WHERE lr.id = run.repo_id AND lr.issue_tracker_connection_id IS NOT NULL))
   AND ((NOT run.repo_agent_source_required AND run.repo_agent_source_commit IS NULL) OR 'repo_agent_source_v1' = ANY(w.protocol_capabilities))
   AND (run.agent_source_requested IS NULL OR 'agent_source_request_v1' = ANY(w.protocol_capabilities))
       AND (NOT (run.policy_preserve_required OR run.policy_pending_fresh OR (run.policy_outcome_id IS NOT NULL AND run.policy_resolved_at IS NULL) OR run.policy_required_head IS NOT NULL) OR 'provider_policy_hold_v1' = ANY(w.protocol_capabilities))
@@ -11847,7 +11849,7 @@ WHERE r.status = 'queued'
         -- PRD #4173: a run on a LINKED repo (repos.issue_tracker_connection_id) is claimable only by a
         -- worker reporting 'issue_key_v1' (it renders the run's references by issue_key and never
         -- writes Closes #<iid>). Standalone, outside fn_worker_can_claim and @capability_aware.
-        AND (NOT EXISTS (SELECT 1 FROM repos lr WHERE lr.id = r.repo_id AND lr.issue_tracker_connection_id IS NOT NULL) OR 'issue_key_v1' = ANY(w.protocol_capabilities))
+        AND ('issue_key_v1' = ANY(w.protocol_capabilities) OR NOT EXISTS (SELECT 1 FROM repos lr WHERE lr.id = r.repo_id AND lr.issue_tracker_connection_id IS NOT NULL))
         AND ((NOT r.repo_agent_source_required AND r.repo_agent_source_commit IS NULL) OR 'repo_agent_source_v1' = ANY(w.protocol_capabilities))
         AND (r.agent_source_requested IS NULL OR 'agent_source_request_v1' = ANY(w.protocol_capabilities))
       AND (NOT (r.policy_preserve_required OR r.policy_pending_fresh OR (r.policy_outcome_id IS NOT NULL AND r.policy_resolved_at IS NULL) OR r.policy_required_head IS NOT NULL) OR 'provider_policy_hold_v1' = ANY(w.protocol_capabilities))
@@ -12099,7 +12101,7 @@ WHERE r.status = 'queued'
         -- PRD #4173: a run on a LINKED repo (repos.issue_tracker_connection_id) is claimable only by a
         -- worker reporting 'issue_key_v1' (it renders the run's references by issue_key and never
         -- writes Closes #<iid>). Standalone, outside fn_worker_can_claim and @capability_aware.
-        AND (NOT EXISTS (SELECT 1 FROM repos lr WHERE lr.id = r.repo_id AND lr.issue_tracker_connection_id IS NOT NULL) OR 'issue_key_v1' = ANY(w.protocol_capabilities))
+        AND ('issue_key_v1' = ANY(w.protocol_capabilities) OR NOT EXISTS (SELECT 1 FROM repos lr WHERE lr.id = r.repo_id AND lr.issue_tracker_connection_id IS NOT NULL))
         AND ((NOT r.repo_agent_source_required AND r.repo_agent_source_commit IS NULL) OR 'repo_agent_source_v1' = ANY(w.protocol_capabilities))
         AND (r.agent_source_requested IS NULL OR 'agent_source_request_v1' = ANY(w.protocol_capabilities))
       AND (NOT (r.policy_preserve_required OR r.policy_pending_fresh OR (r.policy_outcome_id IS NOT NULL AND r.policy_resolved_at IS NULL) OR r.policy_required_head IS NOT NULL) OR 'provider_policy_hold_v1' = ANY(w.protocol_capabilities))
@@ -12190,7 +12192,7 @@ WHERE r.status = 'queued'
         -- PRD #4173: a run on a LINKED repo (repos.issue_tracker_connection_id) is claimable only by a
         -- worker reporting 'issue_key_v1' (it renders the run's references by issue_key and never
         -- writes Closes #<iid>). Standalone, outside fn_worker_can_claim and @capability_aware.
-        AND (NOT EXISTS (SELECT 1 FROM repos lr WHERE lr.id = r.repo_id AND lr.issue_tracker_connection_id IS NOT NULL) OR 'issue_key_v1' = ANY(w.protocol_capabilities))
+        AND ('issue_key_v1' = ANY(w.protocol_capabilities) OR NOT EXISTS (SELECT 1 FROM repos lr WHERE lr.id = r.repo_id AND lr.issue_tracker_connection_id IS NOT NULL))
         AND ((NOT r.repo_agent_source_required AND r.repo_agent_source_commit IS NULL) OR 'repo_agent_source_v1' = ANY(w.protocol_capabilities))
         AND (r.agent_source_requested IS NULL OR 'agent_source_request_v1' = ANY(w.protocol_capabilities))
       AND (NOT (r.policy_preserve_required OR r.policy_pending_fresh OR (r.policy_outcome_id IS NOT NULL AND r.policy_resolved_at IS NULL) OR r.policy_required_head IS NOT NULL) OR 'provider_policy_hold_v1' = ANY(w.protocol_capabilities))

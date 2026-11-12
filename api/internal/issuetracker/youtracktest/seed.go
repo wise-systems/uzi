@@ -129,6 +129,25 @@ func (s *Server) SetReporter(n int64, login string) {
 	}
 }
 
+// DropCreationActivity removes the creation activity of issue number n, leaving
+// an issue whose history does not say who created it.
+func (s *Server) DropCreationActivity(n int64) {
+	s.t.Helper()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	i := s.m.byNumber(n)
+	if i == nil {
+		s.t.Fatalf("youtracktest: no issue %d", n)
+	}
+	kept := i.activities[:0]
+	for _, a := range i.activities {
+		if a.category != catIssueCreate {
+			kept = append(kept, a)
+		}
+	}
+	i.activities = kept
+}
+
 // SeedComment adds a comment by login on issue number n.
 func (s *Server) SeedComment(n int64, login, text string) {
 	s.seedComment(n, login, text, false)

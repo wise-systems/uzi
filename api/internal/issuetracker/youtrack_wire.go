@@ -108,6 +108,9 @@ type ytTextActivity struct {
 	ID        string  `json:"id"`
 	Timestamp int64   `json:"timestamp"`
 	Author    *ytUser `json:"author"`
+	Category  *struct {
+		ID string `json:"id"`
+	} `json:"category"`
 }
 
 // ytCommentActivity is a change to a comment's text: who made it and the id of
@@ -161,7 +164,9 @@ func (y *youTrack) toIssue(w ytIssue) (forge.Issue, error) {
 		if y.foreignEligibility(t) {
 			continue
 		}
-		issue.Labels = append(issue.Labels, y.tagName(t))
+		if name := y.tagName(t); !labelNameProblem(name) {
+			issue.Labels = append(issue.Labels, name)
+		}
 	}
 	return issue, nil
 }
@@ -175,6 +180,8 @@ func (y *youTrack) foreignEligibility(t ytTag) bool {
 
 // tagName is the label name reported for t: the eligibility tag under its
 // stored name, whatever its live name, and any other tag under its live name.
+// Any user can name a tag, so a caller that passes the name on drops one that
+// labelNameProblem refuses (control or invisible characters, braces, too long).
 func (y *youTrack) tagName(t ytTag) string {
 	if y.eligibility.ID != "" && t.ID == y.eligibility.ID {
 		return y.eligibility.Name

@@ -97,3 +97,53 @@ func TestCommentsFailClosedWhenTheirActivitiesCannotBeRead(t *testing.T) {
 		t.Fatalf("comments = %+v, want the one comment with an empty author", got)
 	}
 }
+
+func TestNoActivitiesRequestWithoutLiveComments(t *testing.T) {
+	activityRequests := func(srv *youtracktest.Server) int {
+		var n int
+		for _, r := range srv.Requests() {
+			if strings.HasSuffix(r.Path, "/activities") {
+				n++
+			}
+		}
+		return n
+	}
+	t.Run("no comments", func(t *testing.T) {
+		y, srv := newFakeDriver(t)
+		n := srv.SeedIssue("t", "d")
+		srv.ResetRequests()
+		got, err := y.ListIssueComments(context.Background(), testProjectID, n)
+		if err != nil || len(got) != 0 {
+			t.Fatalf("ListIssueComments = %v, %v; want none", got, err)
+		}
+		if c := activityRequests(srv); c != 0 {
+			t.Fatalf("%d activities requests, want 0", c)
+		}
+	})
+	t.Run("only deleted comments", func(t *testing.T) {
+		y, srv := newFakeDriver(t)
+		n := srv.SeedIssue("t", "d")
+		srv.SeedDeletedComment(n, youtracktest.BotLogin, "gone")
+		srv.ResetRequests()
+		got, err := y.ListIssueComments(context.Background(), testProjectID, n)
+		if err != nil || len(got) != 0 {
+			t.Fatalf("ListIssueComments = %v, %v; want none", got, err)
+		}
+		if c := activityRequests(srv); c != 0 {
+			t.Fatalf("%d activities requests, want 0", c)
+		}
+	})
+	t.Run("a live comment reads the activities once", func(t *testing.T) {
+		y, srv := newFakeDriver(t)
+		n := srv.SeedIssue("t", "d")
+		srv.SeedComment(n, youtracktest.BotLogin, "hi")
+		srv.ResetRequests()
+		got, err := y.ListIssueComments(context.Background(), testProjectID, n)
+		if err != nil || len(got) != 1 {
+			t.Fatalf("ListIssueComments = %v, %v; want one", got, err)
+		}
+		if c := activityRequests(srv); c != 1 {
+			t.Fatalf("%d activities requests, want 1", c)
+		}
+	})
+}

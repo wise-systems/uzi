@@ -1491,12 +1491,16 @@ func (s *Service) queuedReasonAfterPrerequisites(ctx context.Context, now time.T
 	}
 	// PRD #4173: a run on a LINKED repo with no online issue_key_v1 worker is unplaceable; a
 	// failed read falls through like the rungs above.
-	if r.RepoID.Valid {
-		missing, merr := s.q.IssueKeyWorkerMissingForRepo(ctx, store.IssueKeyWorkerMissingForRepoParams{RepoID: uuid.UUID(r.RepoID.Bytes), UserID: r.UserID})
-		if merr != nil {
-			slog.Error("health: check issue_key_v1 workers for linked repo", "run_id", r.ID, "error", merr)
-		} else if missing {
-			return reasonNoIssueKeyCapableWorker
+	if r.RepoLinked && r.RepoID.Valid {
+		if q, ok := s.q.(interface {
+			IssueKeyWorkerMissingForRepo(context.Context, store.IssueKeyWorkerMissingForRepoParams) (bool, error)
+		}); ok {
+			missing, merr := q.IssueKeyWorkerMissingForRepo(ctx, store.IssueKeyWorkerMissingForRepoParams{RepoID: uuid.UUID(r.RepoID.Bytes), UserID: r.UserID})
+			if merr != nil {
+				slog.Error("health: check issue_key_v1 workers for linked repo", "run_id", r.ID, "error", merr)
+			} else if missing {
+				return reasonNoIssueKeyCapableWorker
+			}
 		}
 	}
 	if r.RepoAgentSourceRequired || r.RepoAgentSourceCommit.Valid {
