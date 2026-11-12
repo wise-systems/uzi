@@ -216,6 +216,11 @@ const (
 	// NON-BYPASSABLE block: ClaimRun's standalone guard clause sits outside fn_worker_can_claim,
 	// required_capabilities and the capability-aware kill-switch, so an all-old-image fleet
 	// leaves the run queued until a worker that enforces the guard comes online.
+	// reasonNoIssueKeyCapableWorker (PRD #4173) is emitted for a queued run on a LINKED repo
+	// whose owner has no online worker self-reporting 'issue_key_v1': ClaimRun's standalone
+	// issue_key clause can never be satisfied until a worker that renders references by
+	// issue_key (and never closes #<iid>) comes online.
+	reasonNoIssueKeyCapableWorker           = "no online worker renders linked issue references (issue_key_v1); upgrade a worker"
 	reasonNoCIConfigGuardCapableWorker      = "no online worker enforces the CI-config push guard (ci_config_guard_v1); provision a capable worker"
 	reasonNoRepoAgentSourceCapableWorker    = "no online worker reads repo agents at a recorded default-branch revision (repo_agent_source_v1); upgrade a worker"
 	reasonNoAgentSourceRequestCapableWorker = "no online worker honours the run's requested agent source (agent_source_request_v1); upgrade a worker"
@@ -1482,6 +1487,16 @@ func (s *Service) queuedReasonAfterPrerequisites(ctx context.Context, now time.T
 			slog.Error("health: count online workers satisfying CI-config guard", "run_id", r.ID, "error", gerr)
 		} else if g == 0 {
 			return reasonNoCIConfigGuardCapableWorker
+		}
+	}
+	// PRD #4173: a run on a LINKED repo with no online issue_key_v1 worker is unplaceable; a
+	// failed read falls through like the rungs above.
+	if r.RepoID.Valid {
+		missing, merr := s.q.IssueKeyWorkerMissingForRepo(ctx, store.IssueKeyWorkerMissingForRepoParams{RepoID: uuid.UUID(r.RepoID.Bytes), UserID: r.UserID})
+		if merr != nil {
+			slog.Error("health: check issue_key_v1 workers for linked repo", "run_id", r.ID, "error", merr)
+		} else if missing {
+			return reasonNoIssueKeyCapableWorker
 		}
 	}
 	if r.RepoAgentSourceRequired || r.RepoAgentSourceCommit.Valid {

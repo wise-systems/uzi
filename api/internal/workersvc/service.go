@@ -1184,6 +1184,10 @@ type Store interface {
 	// queued run (runs.ci_config_guard) whose owner has NO online worker self-reporting the
 	// 'ci_config_guard_v1' protocol capability gets reasonNoCIConfigGuardCapableWorker.
 	CountOnlineWorkersSatisfyingCIConfigGuard(ctx context.Context, userID uuid.UUID) (int64, error)
+	// IssueKeyWorkerMissingForRepo backs PRD #4173's queued-reason rung: a queued run on a
+	// LINKED repo whose owner has NO online worker self-reporting 'issue_key_v1' gets
+	// reasonNoIssueKeyCapableWorker.
+	IssueKeyWorkerMissingForRepo(ctx context.Context, arg store.IssueKeyWorkerMissingForRepoParams) (bool, error)
 	// CountOnlineWorkersSatisfyingCodexHarness backs PRD #1332 M5A's (D3) queued-reason rung: a
 	// CODEX-INDICATING queued run whose owner has NO online worker advertising the 'codex_harness_v1'
 	// protocol capability gets reasonNoCodexCapableWorker — the run's non-bypassable Codex claim
