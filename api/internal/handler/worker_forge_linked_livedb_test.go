@@ -192,3 +192,39 @@ func TestWorkerForgeIssueRoutesForLinkedRunFailClosedWithoutResolverLiveDB(t *te
 		t.Fatalf("YouTrack saw %d requests", n)
 	}
 }
+
+// PRD #4173 D11 wiring: the worker's get_issue route agrees with the capture. Through the
+// real write guard over the YouTrack fake, an issue reported by an unmapped login and a
+// comment by one are withheld behind the placeholder, while the connection account's own
+// issue and comment are kept; the forge is never asked who the author is.
+func TestWorkerForgeGetIssueForLinkedRunMapsAuthorsByTheConnectionAccountLiveDB(t *testing.T) {
+	w := newLinkedWorkerRun(t, true)
+	mine := w.srv.SeedIssue("my card", "MINE_BODY", youtracktest.EligibilityTagID)
+	w.srv.SeedComment(mine, "someone", "UNMAPPED_COMMENT")
+	w.srv.SeedComment(mine, youtracktest.BotLogin, "OWN_COMMENT")
+	theirs := w.srv.SeedIssue("their card", "THEIR_BODY", youtracktest.EligibilityTagID)
+	w.srv.SetReporter(theirs, youtracktest.OtherLogin)
+
+	rr := w.get(t, fmt.Sprintf("%s/forge/issues/%d", w.linked, mine))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("own account's issue: %d %s", rr.Code, rr.Body.String())
+	}
+	body := rr.Body.String()
+	if !strings.Contains(body, "MINE_BODY") || !strings.Contains(body, "OWN_COMMENT") {
+		t.Fatalf("the connection account's own issue and comment must be kept: %s", body)
+	}
+	if strings.Contains(body, "UNMAPPED_COMMENT") || !strings.Contains(body, "Issue content withheld") {
+		t.Fatalf("an unmapped comment must be withheld behind the placeholder: %s", body)
+	}
+
+	rr = w.get(t, fmt.Sprintf("%s/forge/issues/%d", w.linked, theirs))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("unmapped author's issue: %d %s", rr.Code, rr.Body.String())
+	}
+	if strings.Contains(rr.Body.String(), "THEIR_BODY") || !strings.Contains(rr.Body.String(), "Issue content withheld") {
+		t.Fatalf("an unmapped author's issue must be withheld: %s", rr.Body.String())
+	}
+	if n := w.eligibilityCalls(); n != 0 {
+		t.Fatalf("the forge was asked about a YouTrack author %d times", n)
+	}
+}

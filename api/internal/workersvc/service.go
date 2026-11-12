@@ -8115,7 +8115,9 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 			return store.Run{}, ErrForgeBuild
 		}
 		// PRD #4173 DL-5: a linked repo's issue is read through the resolver, never the
-		// forge; the code-host half of the fetch (author eligibility) stays on the forge.
+		// forge. The code-host half of the fetch stays on the forge, but author eligibility
+		// does only for an unlinked repo: a linked repo's authors are decided by D11 mapping
+		// on the issue side (issueinput.WithIssueSide, applied by Fetch from tr).
 		tr, terr := issuesource.For(ctx, s.issueSources, row.IssueTrackerConnectionID.Valid, userID, repoID, f)
 		if terr != nil {
 			return store.Run{}, fmt.Errorf("%w: %v", ErrForgeBuild, terr)

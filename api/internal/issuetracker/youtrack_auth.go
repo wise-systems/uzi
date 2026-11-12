@@ -51,7 +51,8 @@ func (y *youTrack) fetchAccount(ctx context.Context) (Account, error) {
 // MapsAuthor reports whether an issue tracker driver can say that an author
 // login is the connection's own account, which is how D11 of the external issue
 // trackers PRD decides that an issue or comment counts as uzi's. The consumer
-// declares the interface it needs; this assertion only guards the method.
+// declares the interface it needs (issueinput.AuthorMapper, which this package
+// does not import); this assertion only guards the method.
 var _ interface {
 	MapsAuthor(ctx context.Context, author string) (bool, error)
 } = (*youTrack)(nil)

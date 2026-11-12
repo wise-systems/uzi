@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"github.com/vtmocanu/uzi/api/internal/forge"
+	"github.com/vtmocanu/uzi/api/internal/issueinput"
 	"github.com/vtmocanu/uzi/api/internal/issuesource"
 )
 
@@ -44,7 +45,11 @@ type issueWriteGuard struct {
 	inner forge.IssueTracker
 }
 
-var _ forge.IssueTracker = (*issueWriteGuard)(nil)
+var (
+	_ forge.IssueTracker         = (*issueWriteGuard)(nil)
+	_ issueinput.AuthorMapper    = (*issueWriteGuard)(nil)
+	_ issueinput.LinkedIssueSide = (*issueWriteGuard)(nil)
+)
 
 func markNotFound(err error) error {
 	var missing *forge.IssueNotFoundError
@@ -75,6 +80,16 @@ func (g *issueWriteGuard) ListIssueLabelEvents(ctx context.Context, projectID, i
 func (g *issueWriteGuard) ListIssueComments(ctx context.Context, projectID, issueIID int64) ([]forge.IssueComment, error) {
 	c, err := g.inner.ListIssueComments(ctx, projectID, issueIID)
 	return c, markNotFound(err)
+}
+
+// MapsAuthor forwards D11 author mapping to the inner driver when it can map; a
+// driver that cannot (UnavailableIssueTracker, a stub) maps nobody. It is a
+// read, so the guard does not refuse it.
+func (g *issueWriteGuard) MapsAuthor(ctx context.Context, login string) (bool, error) {
+	if m, ok := g.inner.(issueinput.AuthorMapper); ok {
+		return m.MapsAuthor(ctx, login)
+	}
+	return false, nil
 }
 
 func (g *issueWriteGuard) refuse(op string) error {
@@ -151,15 +166,15 @@ func (u unavailableIssueTracker) CreateIssueNote(context.Context, int64, int64, 
 	return forge.IssueNote{}, u.cause
 }
 
-// linkedIssueSource marks the guard (and so UnavailableIssueTracker) as a linked
+// LinkedIssueSource marks the guard (and so UnavailableIssueTracker) as a linked
 // repo's issue side. A wrapper placed around a resolver's result must forward it,
 // or SyncIssues will treat the wrapped tracker as a forge driver.
-func (*issueWriteGuard) linkedIssueSource() {}
+func (*issueWriteGuard) LinkedIssueSource() {}
 
 // isLinkedTracker reports whether tr is a linked repo's issue side, the only thing
 // SyncIssues dispatches on: the choice comes from the resolver's own output, never
 // from a separate caller flag that could disagree with it.
 func isLinkedTracker(tr forge.IssueTracker) bool {
-	_, ok := tr.(interface{ linkedIssueSource() })
+	_, ok := tr.(interface{ LinkedIssueSource() })
 	return ok
 }

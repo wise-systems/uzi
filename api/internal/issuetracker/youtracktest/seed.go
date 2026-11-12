@@ -109,6 +109,20 @@ func (s *Server) SeedIssue(summary, description string, tagIDs ...string) int64 
 	return i.number
 }
 
+// SetReporter makes login the reporter of issue number n. A seeded issue is
+// reported by BotLogin (the account the token authenticates as) until this says
+// otherwise, so a test of an author that is not the connection's account sets it.
+func (s *Server) SetReporter(n int64, login string) {
+	s.t.Helper()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	i := s.m.byNumber(n)
+	if i == nil {
+		s.t.Fatalf("youtracktest: no issue %d", n)
+	}
+	i.reporter = login
+}
+
 // SeedComment adds a comment by login on issue number n.
 func (s *Server) SeedComment(n int64, login, text string) {
 	s.seedComment(n, login, text, false)

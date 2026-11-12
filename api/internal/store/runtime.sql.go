@@ -7482,6 +7482,9 @@ SELECT r.checkpoint_tip,
        -- the shared evaluator downgrades the waivable "bot is too strong" findings —
        -- never protection_unreadable, which still refuses even an overridden repo.
        rp.guardrail_override_reason,
+       -- PRD #4173 D11 wiring: the repo's issue tracker project short name, NULL for an
+       -- unlinked repo. A linked run's claim derives issue_key from it and the run's iid.
+       rp.issue_tracker_project_short,
        c.forge_type,
        c.base_url,
        c.bot_username,
@@ -7532,6 +7535,7 @@ type GetRunClaimContextRow struct {
 	RepoDevboxOptIn            bool        `json:"repo_devbox_opt_in"`
 	FoldImproveUziBacklog      bool        `json:"fold_improve_uzi_backlog"`
 	GuardrailOverrideReason    pgtype.Text `json:"guardrail_override_reason"`
+	IssueTrackerProjectShort   pgtype.Text `json:"issue_tracker_project_short"`
 	ForgeType                  string      `json:"forge_type"`
 	BaseUrl                    string      `json:"base_url"`
 	BotUsername                string      `json:"bot_username"`
@@ -7586,6 +7590,7 @@ func (q *Queries) GetRunClaimContext(ctx context.Context, runID uuid.UUID) (GetR
 		&i.RepoDevboxOptIn,
 		&i.FoldImproveUziBacklog,
 		&i.GuardrailOverrideReason,
+		&i.IssueTrackerProjectShort,
 		&i.ForgeType,
 		&i.BaseUrl,
 		&i.BotUsername,

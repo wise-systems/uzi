@@ -7,9 +7,11 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/issuetracker/youtracktest"
 	"github.com/vtmocanu/uzi/api/internal/privcheck"
+	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -19,12 +21,13 @@ import (
 // fails closed (no payload, the run failed with origin guardrail_blocked) when the forge
 // cannot be read.
 //
-// The claim context row carries no issue tracker link today, so this test proves the
-// narrower fact that the claim path makes no issue tracker resolution
-// (fakeSources.calls stays empty) and no request (the YouTrack fake stays open, so any
-// request would be recorded) on a service wired with an issue tracker. Whether that
-// tracker is reachable is irrelevant: no request is made. The test seeds a linked claim
-// row once GetRunClaimContext carries the link (a later change in this branch).
+// The claim context row carries the repo's link (issue_tracker_project_short), and this
+// test seeds a truly linked claim: an issue run on a repo whose project short is ABC. On
+// a service wired with an issue tracker it proves the claim path makes no issue tracker
+// resolution (fakeSources.calls stays empty) and no request (the YouTrack fake stays
+// open, so any request would be recorded), and that a cleared linked claim carries the
+// issue_key the repo link derives (ABC-4) without asking the issue tracker anything.
+// Whether that issue tracker is reachable is irrelevant: no request is made.
 func TestLinkedRepoClaimGuardRunsAgainstTheForgeOnlyAndFailsClosed(t *testing.T) {
 	for name, tc := range map[string]struct {
 		verifyErr error
@@ -39,6 +42,8 @@ func TestLinkedRepoClaimGuardRunsAgainstTheForgeOnlyAndFailsClosed(t *testing.T)
 			srv.ResetRequests() // left open: any request the claim made would be recorded
 
 			f := newClaimFixture(t)
+			f.fs.claimRun.Kind = runkind.Issue
+			f.fs.claimCtx.IssueTrackerProjectShort = pgtype.Text{String: "ABC", Valid: true}
 			g := &guardForge{verifyErr: tc.verifyErr}
 			f.svc.SetRepoGuard(privcheck.NewService(nil, m2Builder{g}))
 			src := &fakeSources{tr: yt}
@@ -57,6 +62,9 @@ func TestLinkedRepoClaimGuardRunsAgainstTheForgeOnlyAndFailsClosed(t *testing.T)
 			if !tc.wantBlock {
 				if payload == nil {
 					t.Fatal("a healthy forge must clear the claim, got idle")
+				}
+				if payload.IssueKey != "ABC-4" {
+					t.Fatalf("issue_key = %q, want ABC-4 from the repo link", payload.IssueKey)
 				}
 				if f.fs.claimFailed != nil {
 					t.Fatalf("a cleared claim must not fail the run, got %+v", f.fs.claimFailed)

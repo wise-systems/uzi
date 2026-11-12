@@ -153,7 +153,7 @@ func Fetch(parent context.Context, ch forge.CodeHost, tr forge.IssueTracker, pro
 // FetchWithTimeout shares a bounded total deadline across raw capture and author
 // assessment. Successful raw capture survives child expiry, but not parent cancellation.
 func FetchWithTimeout(parent context.Context, ch forge.CodeHost, tr forge.IssueTracker, project, iid, botID int64, timeout time.Duration) (*Capture, error) {
-	a := NewAssessmentWithTimeout(parent, ch, project, timeout)
+	a := NewAssessmentWithTimeout(parent, ch, project, timeout, WithIssueSide(tr))
 	defer a.Close()
 	raw, err := tr.GetIssue(a.Context(), project, iid)
 	if err != nil {

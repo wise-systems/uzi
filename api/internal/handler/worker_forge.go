@@ -155,7 +155,7 @@ func (h *Handler) WorkerForgeGetIssue(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, forgeErrInvalid)
 		return
 	}
-	assessment := issueinput.NewAssessment(r.Context(), ch, conn.ForgeProjectID)
+	assessment := issueinput.NewAssessment(r.Context(), ch, conn.ForgeProjectID, issueinput.WithIssueSide(tr))
 	defer assessment.Close()
 	own := conn.IssueIID != nil && *conn.IssueIID == iid
 	issue, err := tr.GetIssue(assessment.Context(), conn.ForgeProjectID, iid)

@@ -21,6 +21,38 @@ type AuthorLookup interface {
 	RepositoryAuthorEligibility(context.Context, int64, int64) (forge.AuthorEligibility, error)
 }
 
+// AuthorMapper is D11 of the external issue trackers PRD: an issue tracker
+// driver that can say whether an author login is the connection's own account.
+// It is the only author evidence a linked repo has; the forge's repository
+// membership lookup says nothing about an issue tracker's people. The consumer
+// declares the interface; the YouTrack driver and the forgesvc write guard
+// around it satisfy it.
+type AuthorMapper interface {
+	MapsAuthor(ctx context.Context, login string) (bool, error)
+}
+
+// LinkedIssueSide marks a linked repo's issue side (the forgesvc write guard).
+// Its presence, not a caller flag, switches an Assessment to D11 mapping, so
+// the choice comes from the same resolver output that served the issue.
+type LinkedIssueSide interface{ LinkedIssueSource() }
+
+// Option configures an Assessment.
+type Option func(*Assessment)
+
+// WithIssueSide hands the assessment the issue side that served the issue. When
+// it is a linked repo's issue side, RepositoryAuthorEligibility is never called:
+// an author is eligible only when the side's AuthorMapper maps the login, and
+// everything else (not mapped, an error, an empty login, a side that is not an
+// AuthorMapper) is permission_unknown. An unlinked side changes nothing.
+func WithIssueSide(tr forge.IssueTracker) Option {
+	return func(a *Assessment) {
+		if _, ok := tr.(LinkedIssueSide); ok {
+			a.linked = true
+			a.mapper, _ = tr.(AuthorMapper)
+		}
+	}
+}
+
 type decision struct {
 	disposition forge.AuthorEligibility
 	err         error
@@ -38,24 +70,30 @@ type Assessment struct {
 	cancel    context.CancelFunc
 	lookup    AuthorLookup
 	project   int64
+	linked    bool         // D11: never consult lookup
+	mapper    AuthorMapper // linked only; nil maps nobody
 	mu        sync.Mutex
 	decisions map[identity]decision
 }
 
 // NewAssessment starts the child deadline immediately, before raw issue capture.
-func NewAssessment(parent context.Context, lookup AuthorLookup, projectID int64) *Assessment {
-	return NewAssessmentWithTimeout(parent, lookup, projectID, AssessmentTimeout)
+func NewAssessment(parent context.Context, lookup AuthorLookup, projectID int64, opts ...Option) *Assessment {
+	return NewAssessmentWithTimeout(parent, lookup, projectID, AssessmentTimeout, opts...)
 }
 
 // NewAssessmentWithTimeout starts one total deadline, bounded by AssessmentTimeout.
 // Nonpositive timeouts use the background default; parent deadlines still win.
-func NewAssessmentWithTimeout(parent context.Context, lookup AuthorLookup, projectID int64, timeout time.Duration) *Assessment {
+func NewAssessmentWithTimeout(parent context.Context, lookup AuthorLookup, projectID int64, timeout time.Duration, opts ...Option) *Assessment {
 	if timeout <= 0 || timeout > AssessmentTimeout {
 		timeout = AssessmentTimeout
 	}
 	ctx, cancel := context.WithTimeout(parent, timeout)
-	return &Assessment{ctx: forge.BeginAuthorAssessment(ctx), cancel: cancel,
+	a := &Assessment{ctx: forge.BeginAuthorAssessment(ctx), cancel: cancel,
 		lookup: lookup, project: projectID, decisions: make(map[identity]decision)}
+	for _, o := range opts {
+		o(a)
+	}
+	return a
 }
 
 // Context must also be used for raw issue capture so it shares the deadline.
@@ -68,7 +106,10 @@ func (a *Assessment) Author(issue forge.Issue) (forge.AuthorEligibility, error) 
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	key := identity{id: issue.AuthorForgeUserID}
-	if key.id <= 0 {
+	if a.linked {
+		// D11: a linked author is its login; the forge account id is not evidence.
+		key = identity{unresolved: issue.Author}
+	} else if key.id <= 0 {
 		key.id = 0
 		key.unresolved = issue.Author
 	}
@@ -82,7 +123,9 @@ func (a *Assessment) Author(issue forge.Issue) (forge.AuthorEligibility, error) 
 		return forge.AuthorUnknown, ErrAuthorBudget
 	}
 	v := decision{disposition: forge.AuthorUnknown, err: forge.ErrAuthorUnknown}
-	if key.id > 0 {
+	if a.linked {
+		v = a.mapLinked(issue.Author)
+	} else if key.id > 0 {
 		v.disposition, v.err = a.lookup.RepositoryAuthorEligibility(a.ctx, a.project, key.id)
 		if err := a.ctx.Err(); err != nil {
 			v = decision{forge.AuthorUnknown, err}
@@ -96,4 +139,23 @@ func (a *Assessment) Author(issue forge.Issue) (forge.AuthorEligibility, error) 
 	}
 	a.decisions[key] = v
 	return v.disposition, v.err
+}
+
+// mapLinked decides a linked repo's author by D11: eligible only on (true, nil).
+func (a *Assessment) mapLinked(login string) decision {
+	unknown := decision{forge.AuthorUnknown, forge.ErrAuthorUnknown}
+	if a.mapper == nil || login == "" {
+		return unknown
+	}
+	ok, err := a.mapper.MapsAuthor(a.ctx, login)
+	if cerr := a.ctx.Err(); cerr != nil {
+		return decision{forge.AuthorUnknown, cerr}
+	}
+	if err != nil {
+		return decision{forge.AuthorUnknown, err}
+	}
+	if !ok {
+		return unknown
+	}
+	return decision{disposition: forge.AuthorEligible}
 }

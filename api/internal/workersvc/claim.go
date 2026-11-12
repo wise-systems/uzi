@@ -55,7 +55,13 @@ type ClaimPayload struct {
 	// IssueIID is the worked issue for an issue run, null for a ci_fix run (which
 	// has no issue). IssueTitle/IssueDescription always carry a human summary (for
 	// ci_fix, a synthesized one) so the run stays displayable and self-contained.
-	IssueIID         *int64 `json:"issue_iid"`
+	IssueIID *int64 `json:"issue_iid"`
+	// IssueKey is the issue tracker's key (PRD #4173, ABC-12) of an issue run on a repo
+	// linked to an external issue tracker: the repo link's project short name and
+	// IssueIID. Omitted (not null, not "") for every other claim, which is how the
+	// worker knows a claim is non-closing by the repo link; the field is not sensitive,
+	// so an isolated claim keeps it.
+	IssueKey         string `json:"issue_key,omitempty"`
 	IssueTitle       string `json:"issue_title"`
 	IssueDescription string `json:"issue_description"`
 	// IssueComments is the structured, bot/system-filtered, bounded snapshot of the
