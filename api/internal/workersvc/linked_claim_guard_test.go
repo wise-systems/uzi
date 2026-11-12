@@ -13,14 +13,18 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// PRD #4173 M4 acceptance, claim half: for an issue run on a repo linked to an issue
-// tracker, the claim backstop (assembleClaim's privcheck.GuardRepo call, driven through
-// Service.Claim with the real privcheck service over a guardForge) still runs against
-// the forge only. It clears a healthy forge without one issue tracker request, and
-// fails closed (no payload, the run failed with the guardrail origin) when the forge
-// cannot be read, with the issue tracker unreachable in both cases. The link itself is
-// not part of the claim context row: the issue tracker is wired on the service so any
-// call into it would be recorded or fail.
+// PRD #4173 M4 acceptance, claim half: the claim backstop (assembleClaim's
+// privcheck.GuardRepo call, driven through Service.Claim with the real privcheck
+// service over a guardForge) runs against the forge only. It clears a healthy forge and
+// fails closed (no payload, the run failed with origin guardrail_blocked) when the forge
+// cannot be read.
+//
+// The claim context row carries no issue tracker link today, so this test proves the
+// narrower fact that the claim path makes no issue tracker resolution
+// (fakeSources.calls stays empty) and no request (the YouTrack fake stays open, so any
+// request would be recorded) on a service wired with an issue tracker. Whether that
+// tracker is reachable is irrelevant: no request is made. The test seeds a linked claim
+// row once GetRunClaimContext carries the link (a later change in this branch).
 func TestLinkedRepoClaimGuardRunsAgainstTheForgeOnlyAndFailsClosed(t *testing.T) {
 	for name, tc := range map[string]struct {
 		verifyErr error
@@ -32,17 +36,20 @@ func TestLinkedRepoClaimGuardRunsAgainstTheForgeOnlyAndFailsClosed(t *testing.T)
 		t.Run(name, func(t *testing.T) {
 			srv := youtracktest.NewServer(t)
 			yt := youTrackDriver(t, srv)
-			srv.Close() // the issue tracker is unreachable
-			srv.ResetRequests()
+			srv.ResetRequests() // left open: any request the claim made would be recorded
 
 			f := newClaimFixture(t)
 			g := &guardForge{verifyErr: tc.verifyErr}
 			f.svc.SetRepoGuard(privcheck.NewService(nil, m2Builder{g}))
-			f.svc.SetIssueSources(&fakeSources{tr: yt})
+			src := &fakeSources{tr: yt}
+			f.svc.SetIssueSources(src)
 
 			payload, err := f.svc.Claim(context.Background(), store.Worker{ID: uuid.New(), UserID: f.owner}, nil)
 			if err != nil {
 				t.Fatalf("Claim = %v, want a nil error (idle on a refusal, a payload otherwise)", err)
+			}
+			if len(src.calls) != 0 {
+				t.Fatalf("the claim resolved an issue tracker: %+v", src.calls)
 			}
 			if n := len(srv.Requests()); n != 0 {
 				t.Fatalf("the claim made %d issue tracker requests", n)
@@ -61,6 +68,9 @@ func TestLinkedRepoClaimGuardRunsAgainstTheForgeOnlyAndFailsClosed(t *testing.T)
 			}
 			if f.fs.claimFailed == nil || f.fs.claimFailed.ID != f.runID {
 				t.Fatalf("claimFailed = %+v, want the run failed", f.fs.claimFailed)
+			}
+			if origin := f.fs.claimFailed.FailOrigin.String; origin != "guardrail_blocked" {
+				t.Fatalf("fail origin = %q, want guardrail_blocked", origin)
 			}
 			if reason := f.fs.claimFailed.FailureReason.String; !strings.Contains(reason, "default-branch guardrail") {
 				t.Fatalf("failure reason = %q, want it to name the guardrail", reason)
