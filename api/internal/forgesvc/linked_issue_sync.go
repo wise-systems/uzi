@@ -15,13 +15,13 @@ import (
 // every code-host step, and never map it to a forge error class.
 var ErrLinkedSyncNotReady = errors.New("linked issue sync is not available yet")
 
-// SyncIssues is the one entry point for a full issue sync into the cache. An
-// unlinked repo runs the forge FullSync with tr; a linked repo runs the linked
-// sync, which this milestone leaves as ErrLinkedSyncNotReady so the intake
-// milestone replaces a single function. linked is the repo row's
-// issue_tracker_connection_id validity.
-func (s *Service) SyncIssues(ctx context.Context, repoID uuid.UUID, forgeProjectID int64, linked bool, tr forge.IssueTracker) (Marks, error) {
-	if linked {
+// SyncIssues is the one entry point for a full issue sync into the cache. tr is the
+// repo's issue side as IssueTrackerForRepo returned it: a linked repo's tracker runs
+// the linked sync, which this milestone leaves as ErrLinkedSyncNotReady so the intake
+// milestone replaces a single function; anything else is a forge driver and runs
+// FullSync. The choice is derived from tr, so it cannot disagree with it.
+func (s *Service) SyncIssues(ctx context.Context, repoID uuid.UUID, forgeProjectID int64, tr forge.IssueTracker) (Marks, error) {
+	if isLinkedTracker(tr) {
 		return Marks{}, s.syncLinkedIssues(ctx, repoID)
 	}
 	return s.FullSync(ctx, repoID, forgeProjectID, tr)
@@ -29,8 +29,8 @@ func (s *Service) SyncIssues(ctx context.Context, repoID uuid.UUID, forgeProject
 
 // SyncIssuesIncremental is SyncIssues for the poller's between-reconcile tick.
 // For a linked repo the caller's marks come back unchanged with the typed error.
-func (s *Service) SyncIssuesIncremental(ctx context.Context, repoID uuid.UUID, forgeProjectID int64, linked bool, tr forge.IssueTracker, m Marks) (Marks, error) {
-	if linked {
+func (s *Service) SyncIssuesIncremental(ctx context.Context, repoID uuid.UUID, forgeProjectID int64, tr forge.IssueTracker, m Marks) (Marks, error) {
+	if isLinkedTracker(tr) {
 		return m, s.syncLinkedIssues(ctx, repoID)
 	}
 	return s.IncrementalSync(ctx, repoID, forgeProjectID, tr, m)

@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/forge"
+	"github.com/vtmocanu/uzi/api/internal/forgesvc"
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	"github.com/vtmocanu/uzi/api/internal/issuedraft"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
@@ -238,7 +239,9 @@ func (h *Handler) FileFindingGroup(w http.ResponseWriter, r *http.Request) {
 	}
 	created, err := tr.CreateIssue(callCtx, repo.ForgeProjectID, title, description, filedLabels)
 	if err != nil {
-		if forge.IsCreateIssueDefinitiveRejection(err) {
+		// The write guard refuses before any request, so nothing was created: release the
+		// group like a definitive rejection instead of marking it uncertain.
+		if errors.Is(err, forgesvc.ErrIssueWriteNotOffered) || forge.IsCreateIssueDefinitiveRejection(err) {
 			if !h.releaseDefinitiveFindingGroup(user.ID, op.ID) {
 				writeStoppedFindingGroup(w, op.ID, dispositionIDs, "in_flight")
 				return

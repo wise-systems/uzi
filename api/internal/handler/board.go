@@ -456,7 +456,7 @@ func (h *Handler) seedBoard(w http.ResponseWriter, r *http.Request, repo store.G
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return false
 	}
-	if _, err := h.svc.SyncIssues(r.Context(), repo.ID, repo.ForgeProjectID, repo.IssueTrackerConnectionID.Valid, tr); err != nil {
+	if _, err := h.svc.SyncIssues(r.Context(), repo.ID, repo.ForgeProjectID, tr); err != nil {
 		// Non-fatal: the board renders empty and the poller/Refresh will fill it.
 		slog.Warn("initial board import failed", "repo", repo.PathWithNamespace, "error", err)
 	}
@@ -1260,7 +1260,7 @@ func (h *Handler) SyncRepo(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	if _, err := h.svc.SyncIssues(r.Context(), repo.ID, repo.ForgeProjectID, repo.IssueTrackerConnectionID.Valid, tr); err != nil {
+	if _, err := h.svc.SyncIssues(r.Context(), repo.ID, repo.ForgeProjectID, tr); err != nil {
 		if errors.Is(err, forgesvc.ErrLinkedSyncNotReady) {
 			httpx.Error(w, http.StatusConflict, "issue sync for a repo linked to an issue tracker is not available yet")
 			return

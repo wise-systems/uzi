@@ -850,7 +850,7 @@ func (h *Handler) importAfterEnable(ctx context.Context, userID, repoID uuid.UUI
 		slog.Warn("import after enable: build forge", "error", err)
 		return
 	}
-	if _, err := h.svc.SyncIssues(ctx, row.ID, row.ForgeProjectID, row.IssueTrackerConnectionID.Valid, tr); err != nil {
+	if _, err := h.svc.SyncIssues(ctx, row.ID, row.ForgeProjectID, tr); err != nil {
 		slog.Warn("import after enable failed; the poller retries", "repo", row.PathWithNamespace, "error", err)
 	}
 }

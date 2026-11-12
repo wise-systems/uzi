@@ -100,3 +100,57 @@ func (g *issueWriteGuard) SetIssueState(context.Context, int64, int64, forge.Iss
 func (g *issueWriteGuard) CreateIssueNote(context.Context, int64, int64, string) (forge.IssueNote, error) {
 	return forge.IssueNote{}, g.refuse("create issue note")
 }
+
+// UnavailableIssueTracker is the issue side handed to a linked repo whose resolver
+// failed (for example a connection removed from the allowlist): every read returns
+// cause, which is NOT skippable so no marker is settled over an outage, and every
+// write is refused by the write guard. It lets the poller's issue-side steps fail
+// or skip per candidate while the code-host steps carry on, instead of dereferencing
+// a nil tracker.
+func UnavailableIssueTracker(cause error) forge.IssueTracker {
+	return &issueWriteGuard{inner: unavailableIssueTracker{cause: cause}}
+}
+
+type unavailableIssueTracker struct{ cause error }
+
+func (u unavailableIssueTracker) ListLabels(context.Context, int64) ([]forge.Label, error) {
+	return nil, u.cause
+}
+func (u unavailableIssueTracker) EnsureLabels(context.Context, int64, []forge.Label) error {
+	return u.cause
+}
+func (u unavailableIssueTracker) ListIssues(context.Context, int64, forge.ListIssuesOptions) ([]forge.Issue, error) {
+	return nil, u.cause
+}
+func (u unavailableIssueTracker) GetIssue(context.Context, int64, int64) (forge.Issue, error) {
+	return forge.Issue{}, u.cause
+}
+func (u unavailableIssueTracker) CreateIssue(context.Context, int64, string, string, []string) (forge.Issue, error) {
+	return forge.Issue{}, u.cause
+}
+func (u unavailableIssueTracker) UpdateIssueLabels(context.Context, int64, int64, []string, []string) error {
+	return u.cause
+}
+func (u unavailableIssueTracker) UpdateIssueDescription(context.Context, int64, int64, string) error {
+	return u.cause
+}
+func (u unavailableIssueTracker) SetIssueState(context.Context, int64, int64, forge.IssueState) error {
+	return u.cause
+}
+func (u unavailableIssueTracker) ListIssueLabelEvents(context.Context, int64, int64) ([]forge.LabelEvent, error) {
+	return nil, u.cause
+}
+func (u unavailableIssueTracker) ListIssueComments(context.Context, int64, int64) ([]forge.IssueComment, error) {
+	return nil, u.cause
+}
+func (u unavailableIssueTracker) CreateIssueNote(context.Context, int64, int64, string) (forge.IssueNote, error) {
+	return forge.IssueNote{}, u.cause
+}
+
+// isLinkedTracker reports whether tr is a linked repo's issue side, the only thing
+// SyncIssues dispatches on: the choice comes from the resolver's own output, never
+// from a separate caller flag that could disagree with it.
+func isLinkedTracker(tr forge.IssueTracker) bool {
+	_, ok := tr.(*issueWriteGuard)
+	return ok
+}

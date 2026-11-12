@@ -228,3 +228,90 @@ func TestLinkedAndUnlinkedRepoWithTheSameForgeProjectIDDoNotCollideLiveDB(t *tes
 		t.Fatalf("the linked handler read made issue-side forge calls: %v", c)
 	}
 }
+
+// The same collision with ONE owner: two forge connections of the same user, forge
+// project id 77 on both, one repo linked. The binding is by repo row, so the owner
+// being the same does not blur the two.
+func TestSameOwnerLinkedAndUnlinkedRepoWithTheSameForgeProjectIDLiveDB(t *testing.T) {
+	h, pool, q, box, _ := fileIssueLiveDB(t)
+	ctx := context.Background()
+	srv := youtracktest.NewServer(t)
+	def, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		t.Fatal("http.DefaultTransport is not an *http.Transport")
+	}
+	saved := def.TLSClientConfig
+	def.TLSClientConfig = srv.Client().Transport.(*http.Transport).TLSClientConfig.Clone()
+	t.Cleanup(func() { def.TLSClientConfig = saved })
+
+	recA := forgetest.NewRecorder(&collisionForge{})
+	recB := forgetest.NewRecorder(&collisionForge{})
+	urlA := "https://" + uuid.NewString() + ".forge-a.test"
+	urlB := "https://" + uuid.NewString() + ".forge-b.test"
+	svc := forgesvc.NewWithForgeBuilder(q, box, 5*time.Second, nil, func(_ forge.Type, u, _ string, _ time.Duration) (forge.Forge, error) {
+		if u == urlA {
+			return recA, nil
+		}
+		return recB, nil
+	})
+	itSvc := issuetrackersvc.New(q, box, func(u string) bool { return u == srv.URL }, issuetracker.New)
+	svc.SetIssueTrackerDrivers(itSvc)
+	h.svc = svc
+	sealed, err := svc.EncryptToken("forge-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	user := store.User{ID: uuid.New(), Email: fmt.Sprintf("col-same-%s@e2e", uuid.NewString()[:8])}
+	connA, connB, repoL, repoP := uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	exec := func(sql string, args ...any) {
+		t.Helper()
+		if _, err := pool.Exec(ctx, sql, args...); err != nil {
+			t.Fatalf("exec: %v", err)
+		}
+	}
+	exec(`INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`, user.ID, user.Email)
+	exec(`INSERT INTO forge_connections (id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext)
+	      VALUES ($1, $2, 'gitlab', $3, 'bot-a', 1, $4), ($5, $2, 'gitlab', $6, 'bot-b', 2, $4)`, connA, user.ID, urlA, sealed, connB, urlB)
+	yt, err := itSvc.Connect(ctx, user.ID, "youtrack", srv.URL, srv.Token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const projectID = 77
+	exec(`INSERT INTO repos (id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled,
+	        issue_tracker_connection_id, issue_tracker_project_id, issue_tracker_project_short, eligibility_tag_id, eligibility_tag_name, issue_tracker_linked_at)
+	      VALUES ($1, $2, $3, $4, 'https://forge-a.test/g/l', 'main', true, $5, $6, $7, $8, $9, now())`,
+		repoL, connA, projectID, "g/linked-"+repoL.String(), yt.ID, youtracktest.ProjectID, youtracktest.ProjectShortName, youtracktest.EligibilityTagID, youtracktest.EligibilityTagName)
+	exec(`INSERT INTO repos (id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled)
+	      VALUES ($1, $2, $3, $4, 'https://forge-b.test/g/p', 'main', true)`, repoP, connB, projectID, "g/plain-"+repoP.String())
+	issueN := srv.SeedIssue("a youtrack card", "yt body", youtracktest.EligibilityTagID)
+	srv.ResetRequests()
+
+	read := func(repo uuid.UUID) *httptest.ResponseRecorder {
+		r := httptest.NewRequest(http.MethodGet, "/x", nil)
+		rctx := chi.NewRouteContext()
+		rctx.URLParams.Add("id", repo.String())
+		rctx.URLParams.Add("iid", strconv.FormatInt(issueN, 10))
+		r = r.WithContext(context.WithValue(mw.ContextWithUser(r.Context(), user), chi.RouteCtxKey, rctx))
+		rr := httptest.NewRecorder()
+		h.GetIssueDetail(rr, r)
+		return rr
+	}
+	if rr := read(repoP); rr.Code != http.StatusOK || !strings.Contains(rr.Body.String(), "forge card") {
+		t.Fatalf("plain read = %d %s", rr.Code, rr.Body.String())
+	}
+	if n := len(srv.Requests()); n != 0 {
+		t.Fatalf("the plain repo's read reached YouTrack (%d requests)", n)
+	}
+	if c := issueSideCalls(recB.Calls()); len(c) != 1 || len(issueSideCalls(recA.Calls())) != 0 {
+		t.Fatalf("plain read: forge B %v, forge A %v", c, issueSideCalls(recA.Calls()))
+	}
+	if rr := read(repoL); rr.Code != http.StatusOK || !strings.Contains(rr.Body.String(), "a youtrack card") {
+		t.Fatalf("linked read = %d %s", rr.Code, rr.Body.String())
+	}
+	if len(srv.Requests()) == 0 {
+		t.Fatal("the linked repo's read did not reach YouTrack")
+	}
+	if len(issueSideCalls(recA.Calls())) != 0 || len(issueSideCalls(recB.Calls())) != 1 {
+		t.Fatalf("the linked read touched a forge: A %v, B %v", recA.Calls(), recB.Calls())
+	}
+}

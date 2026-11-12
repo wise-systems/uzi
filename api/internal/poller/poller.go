@@ -418,6 +418,12 @@ func (e *Engine) syncRepo(ctx context.Context, r store.ListEnabledReposWithConne
 	var trErr error
 	if linked {
 		tr, trErr = e.svc.IssueTrackerForRepo(ctx, r.UserID, r.ID)
+		if trErr != nil {
+			// Never hand a nil tracker to the issue-side steps below: they read through
+			// it per candidate and would panic, and guardPanic would then skip every
+			// remaining code-host step on every tick.
+			tr = forgesvc.UnavailableIssueTracker(trErr)
+		}
 	}
 
 	st.pollCount++
@@ -464,8 +470,9 @@ func (e *Engine) syncRepo(ctx context.Context, r store.ListEnabledReposWithConne
 
 	// MR-close watcher (PRD #24): after the issue cache is fresh, check each
 	// watched card's MR for an opened↔closed edge and move the card accordingly.
-	// Runs only after a successful issue sync (an early return above skips it when
-	// the forge is unreachable). Per-candidate errors are log-and-skipped inside;
+	// Runs after the issue sync: on an unlinked repo only after a successful one (an early
+	// return above skips it when the forge is unreachable); on a linked repo regardless,
+	// since an issue-side failure says nothing about the code host. Per-candidate errors are log-and-skipped inside;
 	// only a candidate-enumeration failure surfaces here.
 	if err := e.svc.SyncMRStates(ctx, r.ID, r.ForgeProjectID, f, tr); err != nil {
 		slog.Error("poller: sync MR states", "repo", r.PathWithNamespace, "error", err)
@@ -475,7 +482,8 @@ func (e *Engine) syncRepo(ctx context.Context, r store.ListEnabledReposWithConne
 	// SyncMRStates for every issue-less MR-bearing run (prompt/self_improve plus issue-less
 	// helper runs like mr_rework/ci_fix/chat/task), so their runs.mr_state is fresh for the
 	// mr_rework detector reading candidates later this same tick. Reads live forge state
-	// (needs the forge reachable, guaranteed by the early returns above); records mr_state
+	// (needs the forge reachable: guaranteed by the early returns above on an unlinked repo,
+	// and by the forge client having been built on a linked one); records mr_state
 	// and cancels an in-flight rework on close/merge, but moves NO board card. Per-candidate
 	// errors are log-and-skipped inside; only a candidate-enumeration failure surfaces here.
 	if err := e.svc.SyncBoardFreeMRStates(ctx, r.ID, r.ForgeProjectID, f); err != nil {
@@ -486,7 +494,8 @@ func (e *Engine) syncRepo(ctx context.Context, r store.ListEnabledReposWithConne
 	// own `prds/*.md` link to the path the run moved the file to. Placed HERE — after
 	// SyncMRStates, before the filed→close sync — because it needs a live forge
 	// client and must not run when the forge is unreachable, which the early returns
-	// above already guarantee. It makes NO use of the issue cache (it reads the
+	// above guarantee for an unlinked repo (a linked repo runs it regardless of its
+	// issue side). It makes NO use of the issue cache (it reads the
 	// description live via GetIssue, since the cache has no description column), so
 	// unlike SyncFiledIssueCloses it does not depend on the sync ordering.
 	if err := e.svc.SyncPRDLinkPatches(ctx, r.ID, r.ForgeProjectID, f, tr); err != nil {
@@ -498,7 +507,8 @@ func (e *Engine) syncRepo(ctx context.Context, r store.ListEnabledReposWithConne
 	// once, on the open→closed edge, never overwriting a human's own verdict. Reads the
 	// cache the sync above just wrote and makes NO forge call, so it costs nothing on the
 	// wire and, like the MR watcher, is skipped entirely by the early returns when the
-	// forge is unreachable (a stale cache must not manufacture edges).
+	// forge is unreachable on an unlinked repo (a stale cache must not manufacture edges;
+	// a linked repo's cache is empty until the linked intake lands).
 	if err := e.svc.SyncFiledIssueCloses(ctx, r.ID); err != nil {
 		slog.Error("poller: sync filed-issue closes", "repo", r.PathWithNamespace, "error", err)
 	}
@@ -507,7 +517,7 @@ func (e *Engine) syncRepo(ctx context.Context, r store.ListEnabledReposWithConne
 	// on the SAME fresh issue cache and with no forge call of its own. A filed incidental finding
 	// whose issue was just observed CLOSED moves to Done, once, on the open→closed edge, and reopens
 	// if the bug reappears. Placed immediately after the judge sync so both consume the same tick's
-	// cache; skipped by the same early returns when the forge is unreachable.
+	// cache; skipped by the same early returns when the forge is unreachable (unlinked repos).
 	if err := e.svc.SyncFindingIssueCloses(ctx, r.ID); err != nil {
 		slog.Error("poller: sync finding-issue closes", "repo", r.PathWithNamespace, "error", err)
 	}
@@ -592,14 +602,14 @@ func (e *Engine) syncRepo(ctx context.Context, r store.ListEnabledReposWithConne
 // marks only on success.
 func (e *Engine) syncLinkedIssues(ctx context.Context, r store.ListEnabledReposWithConnectionsRow, tr forge.IssueTracker, st *repoState) error {
 	if reconcileDue(st.pollCount, e.reconcileEvery) {
-		observed, err := e.svc.SyncIssues(ctx, r.ID, r.ForgeProjectID, true, tr)
+		observed, err := e.svc.SyncIssues(ctx, r.ID, r.ForgeProjectID, tr)
 		if err != nil {
 			return err
 		}
 		st.marks = st.marks.Advance(observed)
 		return nil
 	}
-	next, err := e.svc.SyncIssuesIncremental(ctx, r.ID, r.ForgeProjectID, true, tr, st.marks)
+	next, err := e.svc.SyncIssuesIncremental(ctx, r.ID, r.ForgeProjectID, tr, st.marks)
 	if err != nil {
 		return err
 	}

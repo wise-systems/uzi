@@ -149,3 +149,26 @@ func TestPRDLinkPatchKeepsTheMarkerOnAPlainForgeNotFound(t *testing.T) {
 		t.Fatalf("an unlinked repo's not-found must not settle: %v", st.prdSettled)
 	}
 }
+
+// An unresolvable linked repo's issue side must never be nil and must not settle any
+// marker: reads fail with the cause (not skippable), writes are refused.
+func TestUnavailableIssueTrackerReadsFailAndWritesAreRefused(t *testing.T) {
+	cause := errors.New("tracker unavailable")
+	tr := UnavailableIssueTracker(cause)
+	ctx := context.Background()
+	if _, err := tr.GetIssue(ctx, 1, 2); !errors.Is(err, cause) || IssueWriteSkippable(err) {
+		t.Fatalf("GetIssue error = %v, want the cause and not skippable", err)
+	}
+	if _, err := tr.ListIssues(ctx, 1, forge.ListIssuesOptions{}); !errors.Is(err, cause) {
+		t.Fatalf("ListIssues error = %v", err)
+	}
+	if err := tr.UpdateIssueDescription(ctx, 1, 2, "d"); !IssueWriteSkippable(err) {
+		t.Fatalf("a write must be refused as not offered, got %v", err)
+	}
+	if !isLinkedTracker(tr) {
+		t.Fatal("the unavailable tracker must dispatch as linked")
+	}
+	if isLinkedTracker(&fakeForge{}) {
+		t.Fatal("a forge driver must not dispatch as linked")
+	}
+}

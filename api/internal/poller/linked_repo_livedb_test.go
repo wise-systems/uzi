@@ -1,9 +1,11 @@
 package poller
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
 	"strings"
@@ -146,11 +148,30 @@ func newLinkedEnv(t *testing.T, srv *youtracktest.Server, drivers forgesvc.Issue
 	exec("INSERT INTO runs(id,user_id,repo_id,kind,issue_iid,issue_title,issue_description,branch,mr_iid,mr_state,status,created_at) VALUES($1,$2,$3,'issue',7,'t','d',$4,13,'opened','completed','2020-01-01')",
 		env.run7, env.user, env.repo, "agent/issue-7-"+env.repo.String())
 
+	// A merged run that declared a moved PRD: SyncPRDLinkPatches has a candidate and
+	// reads the issue side for it, which would panic on a nil tracker.
+	exec("INSERT INTO runs(id,user_id,repo_id,kind,issue_iid,issue_title,issue_description,branch,mr_iid,mr_state,prd_done_path,status,created_at) VALUES($1,$2,$3,'issue',8,'t','Implements prds/72-x.md end to end.',$4,31,'merged','prds/done/72-x.md','completed','2020-01-01')",
+		uuid.New(), env.user, env.repo, "agent/issue-8-"+env.repo.String())
+
 	env.engine = New(svc, oneRepoStore{q, env.repo}, time.Minute, 3)
 	env.engine.SetPipelineWatch(time.Hour, 5)
 	env.starter = &apRuns{}
 	env.engine.SetAutopilot(NewAutopilot(q, env.starter, nil))
 	return env
+}
+
+// poll runs one tick with the default logger captured and fails if the repo's sync
+// panicked (guardPanic would then silently skip every later code-host step).
+func (e *linkedEnv) poll(t *testing.T) {
+	t.Helper()
+	var logs bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	defer slog.SetDefault(prev)
+	e.engine.PollOnce(e.ctx)
+	if strings.Contains(logs.String(), "repo sync panicked") {
+		t.Fatalf("the repo sync panicked: %s", logs.String())
+	}
 }
 
 func (e *linkedEnv) assertCodeHostOnly(t *testing.T) {
@@ -165,6 +186,11 @@ func (e *linkedEnv) assertCodeHostOnly(t *testing.T) {
 	calls := e.rec.Calls()
 	if !containsPrefix(calls, "GetMergeRequest(") {
 		t.Fatalf("the code-host steps did not run: %v", calls)
+	}
+	// The last code-host step of the pipeline watch ran: a panic in an earlier issue-side
+	// step would have skipped it.
+	if !containsPrefix(calls, "LatestPipeline(") {
+		t.Fatalf("SyncPipelines did not run after the issue-side steps: %v", calls)
 	}
 	for _, c := range calls {
 		for _, issueSide := range []string{"ListIssues(", "GetIssue(", "ListIssueLabelEvents(", "EnsureLabels(", "UpdateIssueLabels(", "ListLabels("} {
@@ -193,7 +219,7 @@ func TestLinkedRepoCodeHostStepsRunWhenTheTrackerIsUnreachableLiveDB(t *testing.
 	env := newLinkedEnv(t, srv, nil)
 	srv.Close() // the tracker is gone from here on
 
-	env.engine.PollOnce(env.ctx)
+	env.poll(t)
 	env.assertCodeHostOnly(t)
 }
 
@@ -201,7 +227,7 @@ func TestLinkedRepoCodeHostStepsRunWhenTheResolverRefusesLiveDB(t *testing.T) {
 	drivers := &refusingDrivers{}
 	env := newLinkedEnv(t, nil, drivers)
 
-	env.engine.PollOnce(env.ctx)
+	env.poll(t)
 	if drivers.calls == 0 {
 		t.Fatal("the resolver was never asked for the linked repo's issue side")
 	}
@@ -214,6 +240,6 @@ func TestLinkedRepoWithNoDriverSourceNeverFallsBackToTheForgeLiveDB(t *testing.T
 	env := newLinkedEnv(t, nil, nil)
 	env.svc.SetIssueTrackerDrivers(nil)
 
-	env.engine.PollOnce(env.ctx)
+	env.poll(t)
 	env.assertCodeHostOnly(t)
 }

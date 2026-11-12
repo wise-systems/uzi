@@ -16,11 +16,12 @@ func TestSyncIssuesDispatchesOnTheLink(t *testing.T) {
 
 	t.Run("linked: no forge call, typed error, marks kept", func(t *testing.T) {
 		f := &fakeForge{}
+		guarded := &issueWriteGuard{inner: f}
 		s := newTestService(&fakeStore{})
-		if _, err := s.SyncIssues(context.Background(), uuid.New(), testProjectID, true, f); !errors.Is(err, ErrLinkedSyncNotReady) {
+		if _, err := s.SyncIssues(context.Background(), uuid.New(), testProjectID, guarded); !errors.Is(err, ErrLinkedSyncNotReady) {
 			t.Fatalf("SyncIssues error = %v, want ErrLinkedSyncNotReady", err)
 		}
-		got, err := s.SyncIssuesIncremental(context.Background(), uuid.New(), testProjectID, true, f, marks)
+		got, err := s.SyncIssuesIncremental(context.Background(), uuid.New(), testProjectID, guarded, marks)
 		if !errors.Is(err, ErrLinkedSyncNotReady) || got != marks {
 			t.Fatalf("SyncIssuesIncremental = (%+v, %v)", got, err)
 		}
@@ -32,7 +33,7 @@ func TestSyncIssuesDispatchesOnTheLink(t *testing.T) {
 	t.Run("unlinked: the forge sync, same calls", func(t *testing.T) {
 		viaDispatcher := &fakeForge{issues: []forge.Issue{issueAt(1, recordedMarkBase)}}
 		direct := &fakeForge{issues: []forge.Issue{issueAt(1, recordedMarkBase)}}
-		if _, err := newTestService(&fakeStore{}).SyncIssues(context.Background(), uuid.New(), testProjectID, false, viaDispatcher); err != nil {
+		if _, err := newTestService(&fakeStore{}).SyncIssues(context.Background(), uuid.New(), testProjectID, viaDispatcher); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := newTestService(&fakeStore{}).FullSync(context.Background(), uuid.New(), testProjectID, direct); err != nil {
