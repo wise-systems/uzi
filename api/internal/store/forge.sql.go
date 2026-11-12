@@ -949,7 +949,17 @@ WHERE repo_id = $1::uuid
        OR EXISTS (SELECT 1 FROM repos lr WHERE lr.id = $1::uuid AND lr.issue_tracker_connection_id IS NOT NULL))
   AND status = 'completed'
   AND mr_iid IS NOT NULL
-  AND (mr_state IS NULL OR mr_state IN ('opened', 'locked'))
+  AND (mr_state IS NULL OR mr_state IN ('opened', 'locked')
+       OR (mr_state = 'closed'
+           AND issue_iid IS NOT NULL
+           AND kind NOT IN ('prompt', 'self_improve')
+           AND EXISTS (SELECT 1 FROM repos lr WHERE lr.id = $1::uuid AND lr.issue_tracker_connection_id IS NOT NULL)
+           AND NOT EXISTS (SELECT 1 FROM runs newer
+                           WHERE newer.repo_id = runs.repo_id AND newer.issue_iid = runs.issue_iid
+                             AND newer.kind NOT IN ('prompt', 'self_improve')
+                             AND newer.created_at > runs.created_at)
+           AND NOT EXISTS (SELECT 1 FROM issues i
+                           WHERE i.repo_id = runs.repo_id AND i.forge_issue_iid = runs.issue_iid AND i.state = 'closed')))
 ORDER BY created_at DESC
 LIMIT 100
 `
@@ -978,7 +988,11 @@ type ListBoardFreeMRStateWatchCandidatesRow struct {
 // ListMRWatchCandidates), not a sqlc param, so zero Go signature change. A repo linked to an
 // external issue tracker (PRD #4173 M4) is widened IN whole: every issue-lane run of such a repo
 // belongs here (the board lane excludes the repo), so linked runs record mr_state and cancel
-// rework with no board card; an unlinked repo matches exactly as before. Keep this rationale
+// rework with no board card; an unlinked repo matches exactly as before. On a linked repo the
+// lane also keeps watching an issue-lane run recorded mr_state='closed', so a reopen is recorded
+// back to 'opened' (the board lane's Lane A reopen-edge watch, Decision 10), under the same bound:
+// only the issue's LATEST run (no newer non-scheduled run of the issue, so a superseded rework
+// MR is not watched) and only while the cached issue is not closed. Keep this rationale
 // ABOVE the statement — a comment trailing after the `;` is grabbed by sqlc as the NEXT query's doc.
 func (q *Queries) ListBoardFreeMRStateWatchCandidates(ctx context.Context, repoID uuid.UUID) ([]ListBoardFreeMRStateWatchCandidatesRow, error) {
 	rows, err := q.db.Query(ctx, listBoardFreeMRStateWatchCandidates, repoID)

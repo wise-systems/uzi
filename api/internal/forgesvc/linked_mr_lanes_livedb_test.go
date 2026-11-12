@@ -8,6 +8,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -112,6 +113,64 @@ func TestMRWatchLanesForLinkedAndUnlinkedReposLiveDB(t *testing.T) {
 			if b[id] && f[id] {
 				t.Errorf("run %v is in both lanes", id)
 			}
+		}
+	})
+	// A closed MR (the reviewer closed it; it may be reopened): the board lane watches it on an
+	// unlinked repo (Lane A reopen edge); the board-free lane must do the same on a linked repo
+	// and still not watch it on an unlinked one.
+	exec(`UPDATE runs SET mr_state = 'closed' WHERE id = ANY($1)`,
+		[]uuid.UUID{runs[linkedRepo]["issue"], runs[plainRepo]["issue"]})
+
+	t.Run("closed MR: linked repo keeps the reopen watch in the board-free lane", func(t *testing.T) {
+		r := runs[linkedRepo]
+		if f := freeLane(linkedRepo); !f[r["issue"]] {
+			t.Errorf("board-free lane = %v, want the closed issue run (reopen edge)", f)
+		}
+		if b := boardLane(linkedRepo); len(b) != 0 {
+			t.Errorf("board lane = %v, want none for a linked repo", b)
+		}
+	})
+
+	t.Run("closed MR: unlinked repo's board-free set is unchanged", func(t *testing.T) {
+		r := runs[plainRepo]
+		f := freeLane(plainRepo)
+		if len(f) != 1 || !f[r["prompt"]] {
+			t.Errorf("board-free lane = %v, want the prompt run only", f)
+		}
+		if b := boardLane(plainRepo); !b[r["issue"]] {
+			t.Errorf("board lane = %v, want the closed issue run (Lane A reopen)", b)
+		}
+	})
+
+	t.Run("closed MR: a superseded run or a closed issue is not watched", func(t *testing.T) {
+		r := runs[linkedRepo]
+		newer := uuid.New()
+		exec(`INSERT INTO runs (id, user_id, repo_id, kind, issue_iid, issue_title, issue_description, branch, status)
+		      VALUES ($1, $2, $3, 'issue', 7, 't', 'd', $4, 'running')`, newer, user, linkedRepo, "agent/issue-7-rework-"+linkedRepo.String())
+		if f := freeLane(linkedRepo); f[r["issue"]] {
+			t.Errorf("board-free lane = %v, want the superseded closed run dropped", f)
+		}
+		exec(`DELETE FROM runs WHERE id = $1`, newer)
+		exec(`UPDATE issues SET state = 'closed' WHERE repo_id = $1`, linkedRepo)
+		if f := freeLane(linkedRepo); f[r["issue"]] {
+			t.Errorf("board-free lane = %v, want a closed issue's closed MR dropped", f)
+		}
+	})
+
+	// The recorder end to end: a reopen is recorded back to 'opened'.
+	t.Run("closed then reopened MR is recorded opened", func(t *testing.T) {
+		exec(`UPDATE issues SET state = 'opened' WHERE repo_id = $1`, linkedRepo)
+		svc := newTestService(q)
+		f := &fakeForge{mr: forgeMR(13, forge.MRStateOpened)}
+		if err := svc.SyncBoardFreeMRStates(ctx, linkedRepo, 1, f); err != nil {
+			t.Fatal(err)
+		}
+		var state string
+		if err := pool.QueryRow(ctx, `SELECT mr_state FROM runs WHERE id = $1`, runs[linkedRepo]["issue"]).Scan(&state); err != nil {
+			t.Fatal(err)
+		}
+		if state != "opened" {
+			t.Errorf("mr_state = %q, want opened", state)
 		}
 	})
 }
