@@ -2,6 +2,7 @@ package issuetracker
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/url"
 	"slices"
@@ -259,5 +260,110 @@ func TestMapsAuthorNeverMapsAnEmptyAccountLogin(t *testing.T) {
 	})
 	if ok, err := y.MapsAuthor(context.Background(), "x"); ok || err != nil {
 		t.Errorf("account with no login = %v, %v; want false, nil", ok, err)
+	}
+}
+
+// eligTag is the eligibility tag as an issue carries it.
+var eligTag = `{"id":"` + youtracktest.EligibilityTagID + `","name":"` + youtracktest.EligibilityTagName + `"}`
+
+// tagListingHandler serves the eligibility tag's listing with the given pages
+// of raw issues, one body per request in order, and 404 for anything else.
+func tagListingHandler(pages ...[]string) http.HandlerFunc {
+	var n atomic.Int32
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != tagListingPath(youtracktest.EligibilityTagID) {
+			http.NotFound(w, r)
+			return
+		}
+		i := int(n.Add(1)) - 1
+		if i >= len(pages) {
+			writeRaw(w, "[]")
+			return
+		}
+		writeRaw(w, "["+strings.Join(pages[i], ",")+"]")
+	}
+}
+
+func listEligible(y *youTrack) ([]forge.Issue, error) {
+	return y.ListIssues(context.Background(), testProjectID, forge.ListIssuesOptions{Labels: []string{youtracktest.EligibilityTagName}})
+}
+
+func TestListIssuesByLabelKeepsAnIssueSeenOnTwoPagesOnce(t *testing.T) {
+	filler := make([]string, 0, pageSize)
+	for i := range pageSize - 1 {
+		id := fmt.Sprintf("2-%d", 100+i)
+		filler = append(filler, rawIssue(id, "UZI-1", int64(100+i), "0-1", eligTag))
+	}
+	dup := rawIssue("2-1", "UZI-1", 1, "0-1", eligTag)
+	// The first page is full; the issue shifted across the boundary, so the
+	// second page shows it again.
+	page1 := append(slices.Clone(filler), dup)
+	y, _ := loggedDriver(t, tagListingHandler(page1, []string{dup}))
+	got, err := listEligible(y)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != pageSize {
+		t.Fatalf("listed %d issues, want %d (the repeated one kept once)", len(got), pageSize)
+	}
+	n := 0
+	for _, i := range got {
+		if i.IID == 1 {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Errorf("issue 1 listed %d times, want 1", n)
+	}
+}
+
+func TestListIssuesByLabelBreaksUpdateTiesByNumber(t *testing.T) {
+	// All three share the fixture's update instant; the server's order is 3, 1, 2.
+	y, _ := loggedDriver(t, tagListingHandler([]string{
+		rawIssue("2-3", "UZI-3", 3, "0-1", eligTag),
+		rawIssue("2-1", "UZI-1", 1, "0-1", eligTag),
+		rawIssue("2-2", "UZI-2", 2, "0-1", eligTag),
+	}))
+	got, err := listEligible(y)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var iids []int64
+	for _, i := range got {
+		iids = append(iids, i.IID)
+	}
+	if !slices.Equal(iids, []int64{1, 2, 3}) {
+		t.Errorf("listed %v, want [1 2 3]", iids)
+	}
+}
+
+func TestListIssuesByLabelErrorsWhenTheEligibilityTagIsGone(t *testing.T) {
+	y, srv := newFakeDriver(t)
+	srv.SeedIssue("eligible", "", youtracktest.EligibilityTagID)
+	// A tag deleted or no longer visible to the bot answers 404 on its listing.
+	gone, _ := loggedDriver(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"error":"Not Found","error_description":"Entity not found"}`))
+	})
+	if got, err := listEligible(gone); err == nil {
+		t.Fatalf("listed %+v with the tag gone, want an error and not an empty list", got)
+	}
+	if got, err := listEligible(y); err != nil || len(got) != 1 {
+		t.Fatalf("control listing = %+v, %v; want the one issue", got, err)
+	}
+}
+
+func TestListIssuesByLabelFailsClosedWhenOtherProjectsFillTheCeiling(t *testing.T) {
+	lowerMaxItems(t, 5)
+	issues := []string{rawIssue("2-1", "UZI-1", 1, "0-1", eligTag)}
+	for i := range 6 {
+		issues = append(issues, rawIssue(fmt.Sprintf("2-%d", 10+i), "OTH-1", int64(i+1), "0-2", eligTag))
+	}
+	y, _ := loggedDriver(t, tagListingHandler(issues))
+	got, err := listEligible(y)
+	// The driver redacts the cause, so the ceiling shows in the message only.
+	if err == nil || !strings.Contains(err.Error(), errItemCeiling.Error()) {
+		t.Fatalf("ListIssues = %+v, %v; want the item ceiling error, not a partial list", got, err)
 	}
 }

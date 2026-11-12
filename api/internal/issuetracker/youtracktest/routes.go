@@ -315,6 +315,10 @@ func (s *Server) listTagIssues(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if r.URL.Query().Has("query") {
+		writeError(w, http.StatusBadRequest, "Bad Request", "a tag's issue listing takes no query parameter")
+		return
+	}
 	id := r.PathValue("id")
 	t := s.m.tagByID(id)
 	if t == nil || !t.visibleToBot() {

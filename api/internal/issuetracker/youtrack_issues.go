@@ -15,8 +15,12 @@ import (
 // query: it pages the issues of one tag by id (listingTagID), keeps the ones
 // that sit in the bound project and carry every resolved tag id, and match the
 // state and the exact update instant, sorts them by update instant ascending
-// and only then honours opts.Limit. A label whose tag the token's account does
-// not own yields no issue.
+// and only then honours opts.Limit. Any label other than the eligibility name
+// whose tag the token's account does not own yields no issue; the eligibility
+// name resolves to its stored id whoever owns the tag. The walk counts every
+// issue of the tag, in any project and either state, against the listing
+// ceilings before the project filter, so a tag with more issues elsewhere than
+// a ceiling allows fails the listing rather than returning part of it.
 func (y *youTrack) ListIssues(ctx context.Context, projectID int64, opts forge.ListIssuesOptions) ([]forge.Issue, error) {
 	p, err := y.requireProject(projectID)
 	if err != nil {
@@ -40,21 +44,27 @@ func (y *youTrack) ListIssues(ctx context.Context, projectID int64, opts forge.L
 		path, query = []string{"tags", y.listingTagID(opts.Labels, tagIDs), "issues"}, url.Values{"fields": {issueFields}}
 	}
 	var matched []ytIssue
+	seen := map[string]bool{}
 	err = ytPages(ctx, y, path, query, func(page []ytIssue) bool {
 		for _, w := range page {
-			if y.matchesIssue(w, opts, tagIDs) {
+			// Offset paging can show one issue on two pages when an item shifts
+			// across a page boundary mid-walk; it is kept once, by entity id.
+			if y.matchesIssue(w, opts, tagIDs) && !seen[w.ID] {
+				seen[w.ID] = true
 				matched = append(matched, w)
 			}
 		}
 		// The project query is sorted by the server, so it can stop at the limit;
-		// a tag's listing has no sort and is walked whole.
+		// a tag's listing guarantees no ascending order and is walked whole.
 		return !byTag && opts.Limit > 0 && len(matched) >= opts.Limit
 	})
 	if err != nil {
 		return nil, err
 	}
 	if byTag {
-		slices.SortStableFunc(matched, func(a, b ytIssue) int { return cmp.Compare(a.Updated, b.Updated) })
+		slices.SortStableFunc(matched, func(a, b ytIssue) int {
+			return cmp.Or(cmp.Compare(a.Updated, b.Updated), cmp.Compare(a.NumberInProject, b.NumberInProject))
+		})
 	}
 	if opts.Limit > 0 && len(matched) > opts.Limit {
 		matched = matched[:opts.Limit]
