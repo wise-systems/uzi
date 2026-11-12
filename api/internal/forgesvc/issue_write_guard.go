@@ -48,6 +48,7 @@ type issueWriteGuard struct {
 var (
 	_ forge.IssueTracker         = (*issueWriteGuard)(nil)
 	_ issueinput.AuthorMapper    = (*issueWriteGuard)(nil)
+	_ issueinput.IssueTextMapper = (*issueWriteGuard)(nil)
 	_ issueinput.LinkedIssueSide = (*issueWriteGuard)(nil)
 )
 
@@ -88,6 +89,15 @@ func (g *issueWriteGuard) ListIssueComments(ctx context.Context, projectID, issu
 func (g *issueWriteGuard) MapsAuthor(ctx context.Context, login string) (bool, error) {
 	if m, ok := g.inner.(issueinput.AuthorMapper); ok {
 		return m.MapsAuthor(ctx, login)
+	}
+	return false, nil
+}
+
+// IssueTextMapped forwards D11 for the issue text to the inner driver when it
+// can say; a driver that cannot maps nothing. A read, so it is not refused.
+func (g *issueWriteGuard) IssueTextMapped(ctx context.Context, projectID, issueIID int64) (bool, error) {
+	if m, ok := g.inner.(issueinput.IssueTextMapper); ok {
+		return m.IssueTextMapped(ctx, projectID, issueIID)
 	}
 	return false, nil
 }

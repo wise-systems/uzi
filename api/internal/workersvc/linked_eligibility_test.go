@@ -78,4 +78,24 @@ func TestLinkedRunGateUsesTheStoredEligibilityTag(t *testing.T) {
 			t.Fatalf("err = %v, run created = %v", err, fs.createRunParams != nil)
 		}
 	})
+	t.Run("a linked row whose stored tag name is NULL starts nothing", func(t *testing.T) {
+		svc, fs := linkedGateService(t, "", uziLabels(), []string{"uzi"}, nil)
+		fs.repoRow.EligibilityTagName = pgtype.Text{}
+		if err := create(svc); !errors.Is(err, ErrNotPRDIssue) || fs.createRunParams != nil {
+			t.Fatalf("err = %v, run created = %v", err, fs.createRunParams != nil)
+		}
+	})
+	t.Run("a stored tag name of only blanks starts nothing", func(t *testing.T) {
+		svc, fs := linkedGateService(t, "  \t", []byte(`["  \t"]`), []string{"  \t"}, nil)
+		if err := create(svc); !errors.Is(err, ErrNotPRDIssue) || fs.createRunParams != nil {
+			t.Fatalf("err = %v, run created = %v", err, fs.createRunParams != nil)
+		}
+	})
+	t.Run("a linked repo with no capture is refused, never started on the cache alone", func(t *testing.T) {
+		svc, fs := linkedGateService(t, "ready-for-uzi", []byte(`["ready-for-uzi"]`), []string{"ready-for-uzi"}, nil)
+		svc.SetForges(nil)
+		if err := create(svc); !errors.Is(err, ErrForgeBuild) || fs.createRunParams != nil {
+			t.Fatalf("err = %v, run created = %v", err, fs.createRunParams != nil)
+		}
+	})
 }

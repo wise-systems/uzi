@@ -186,7 +186,7 @@ func (h *Handler) WorkerForgeGetIssue(w http.ResponseWriter, r *http.Request) {
 		issue.Title = conn.SavedTitle
 		issue.Description = conn.SavedBody
 	} else {
-		disposition, _ := assessment.Author(issue)
+		disposition, _ := assessment.IssueText(issue)
 		reason = issueinput.Reason(disposition)
 		if reason != "" {
 			issue.Title = issueinput.Placeholder

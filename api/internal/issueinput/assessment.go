@@ -31,6 +31,11 @@ type AuthorMapper interface {
 	MapsAuthor(ctx context.Context, login string) (bool, error)
 }
 
+// IssueTextMapper is D11 for the issue text: whether every recorded change to the issue's title and body (creation included) was made by the connection's own account.
+type IssueTextMapper interface {
+	IssueTextMapped(ctx context.Context, projectID, issueIID int64) (bool, error)
+}
+
 // LinkedIssueSide marks a linked repo's issue side (the forgesvc write guard).
 // Its presence, not a caller flag, switches an Assessment to D11 mapping, so
 // the choice comes from the same resolver output that served the issue.
@@ -49,6 +54,7 @@ func WithIssueSide(tr forge.IssueTracker) Option {
 		if _, ok := tr.(LinkedIssueSide); ok {
 			a.linked = true
 			a.mapper, _ = tr.(AuthorMapper)
+			a.textMapper, _ = tr.(IssueTextMapper)
 		}
 	}
 }
@@ -66,14 +72,16 @@ type identity struct {
 // Checks are serialized, with at most 200 distinct identities triggering lookups.
 // A failure is cached for that identity and does not block independent authors.
 type Assessment struct {
-	ctx       context.Context
-	cancel    context.CancelFunc
-	lookup    AuthorLookup
-	project   int64
-	linked    bool         // D11: never consult lookup
-	mapper    AuthorMapper // linked only; nil maps nobody
-	mu        sync.Mutex
-	decisions map[identity]decision
+	ctx     context.Context
+	cancel  context.CancelFunc
+	lookup  AuthorLookup
+	project int64
+	linked  bool         // D11: never consult lookup
+	mapper  AuthorMapper // linked only; nil maps nobody
+	// textMapper decides the issue text of a linked repo; nil means unknown.
+	textMapper IssueTextMapper
+	mu         sync.Mutex
+	decisions  map[identity]decision
 }
 
 // NewAssessment starts the child deadline immediately, before raw issue capture.
@@ -139,6 +147,39 @@ func (a *Assessment) Author(issue forge.Issue) (forge.AuthorEligibility, error) 
 	}
 	a.decisions[key] = v
 	return v.disposition, v.err
+}
+
+// IssueText assesses who wrote an issue's text. An unlinked repo's issue text is
+// its author's: exactly Author. On a linked repo the reporter must map (Author)
+// and every recorded change to the title and body must have been made by the
+// connection's own account (IssueTextMapper); a side that cannot say, an error,
+// or an expired deadline is permission_unknown. The text verdict is per issue
+// and is never cached under the author's login, which Author keys by, so an
+// issue with edited text never decides a comment by the same login.
+func (a *Assessment) IssueText(issue forge.Issue) (forge.AuthorEligibility, error) {
+	d, err := a.Author(issue)
+	if !a.linked || d != forge.AuthorEligible || err != nil {
+		return d, err
+	}
+	if a.textMapper == nil {
+		return forge.AuthorUnknown, forge.ErrAuthorUnknown
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if cerr := a.ctx.Err(); cerr != nil {
+		return forge.AuthorUnknown, cerr
+	}
+	ok, merr := a.textMapper.IssueTextMapped(a.ctx, a.project, issue.IID)
+	if cerr := a.ctx.Err(); cerr != nil {
+		return forge.AuthorUnknown, cerr
+	}
+	if merr != nil {
+		return forge.AuthorUnknown, merr
+	}
+	if !ok {
+		return forge.AuthorUnknown, forge.ErrAuthorUnknown
+	}
+	return forge.AuthorEligible, nil
 }
 
 // mapLinked decides a linked repo's author by D11: eligible only on (true, nil).

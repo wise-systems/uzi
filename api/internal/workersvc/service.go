@@ -8028,7 +8028,8 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 	// capture below must carry the tag as well.
 	linkedEligibility := ""
 	if row.IssueTrackerConnectionID.Valid {
-		if !row.EligibilityTagName.Valid || row.EligibilityTagName.String == "" {
+		// Trimmed like schedsvc's eligibilityLabel: a blank stored name is no name.
+		if strings.TrimSpace(row.EligibilityTagName.String) == "" {
 			return store.Run{}, ErrNotPRDIssue
 		}
 		linkedEligibility = row.EligibilityTagName.String
@@ -8130,8 +8131,16 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 			return store.Run{}, ErrForgeIssueRead
 		}
 	}
-	if linkedEligibility != "" && capture != nil && !slices.Contains(capture.Issue.Labels, linkedEligibility) {
-		return store.Run{}, ErrNotPRDIssue
+	if linkedEligibility != "" {
+		// The cached labels may be stale, so a linked run needs the fresh read; with no
+		// capture (no forge builder wired) there is nothing to check it against and the
+		// run is refused rather than started on the cache alone.
+		if capture == nil {
+			return store.Run{}, ErrForgeBuild
+		}
+		if !slices.Contains(capture.Issue.Labels, linkedEligibility) {
+			return store.Run{}, ErrNotPRDIssue
+		}
 	}
 	savedBody, rawDigest, inputReason := pgtype.Text{}, pgtype.Text{}, pgtype.Text{}
 	blockedReasons := []string{}

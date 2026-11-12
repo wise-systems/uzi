@@ -432,13 +432,16 @@ func (e *Engine) syncRepo(ctx context.Context, r store.ListEnabledReposWithConne
 		// unresolvable) must never skip the code-host steps below: its MRs, pipelines
 		// and CI do not depend on the issue tracker. The attempt reports ok only when
 		// the linked sync succeeded, as the unlinked branch does, and reports the
-		// failure's class otherwise; unlike the unlinked branch it then carries on.
+		// failure otherwise; unlike the unlinked branch it then carries on. The class is
+		// always Other: forge.Class would read an issue tracker's 401 as a forge auth
+		// failure, whose health action tells the user to re-check the forge connection,
+		// and it is the issue tracker connection that needs the attention.
 		if trErr != nil {
 			slog.Error("poller: build linked issue tracker", "repo", r.PathWithNamespace, "error", trErr)
-			report(false, forge.Class(trErr))
+			report(false, forge.ErrorClassOther)
 		} else if err := e.syncLinkedIssues(ctx, r, tr, st); err != nil {
 			slog.Error("poller: linked issue sync", "repo", r.PathWithNamespace, "error", err)
-			report(false, forge.Class(err))
+			report(false, forge.ErrorClassOther)
 		} else {
 			report(true, forge.ErrorClassOther)
 		}

@@ -26,13 +26,14 @@ func issueClaimPayload(t *testing.T, projectShort pgtype.Text) ClaimPayload {
 	return claimPayloadOfKind(t, runkind.Issue, projectShort)
 }
 
-// claimPayloadOfKind is issueClaimPayload for any run kind; only an issue run carries an iid.
+// claimPayloadOfKind is issueClaimPayload for any run kind. Every kind gets a valid iid, so a
+// non-issue kind is kept from reading as linked by its kind and not by a missing iid.
 func claimPayloadOfKind(t *testing.T, kind string, projectShort pgtype.Text) ClaimPayload {
 	t.Helper()
 	box := newBox(t)
 	sealedPAT, _ := box.Seal([]byte("FORGE-PAT-PLACEHOLDER"))
 	sealedTok, _ := box.Seal([]byte("ANTHROPIC-OAUTH-PLACEHOLDER"))
-	iid := pgtype.Int8{Int64: 12, Valid: kind == runkind.Issue}
+	iid := pgtype.Int8{Int64: 12, Valid: true}
 	fs := &fakeStore{
 		claimRun: store.Run{
 			ID:               uuid.MustParse("33333333-3333-3333-3333-333333333333"),

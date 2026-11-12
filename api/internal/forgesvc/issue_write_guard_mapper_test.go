@@ -15,6 +15,7 @@ import (
 // it must satisfy both halves of what issueinput asks of it.
 var (
 	_ issueinput.AuthorMapper    = (*issueWriteGuard)(nil)
+	_ issueinput.IssueTextMapper = (*issueWriteGuard)(nil)
 	_ issueinput.LinkedIssueSide = (*issueWriteGuard)(nil)
 )
 
@@ -76,6 +77,41 @@ func TestGuardOverAnInnerThatCannotMapMapsNobody(t *testing.T) {
 			}
 			if mapped, err := m.MapsAuthor(context.Background(), "anyone"); mapped || err != nil {
 				t.Fatalf("MapsAuthor = %v, %v; want false, nil", mapped, err)
+			}
+		})
+	}
+}
+
+// D11 for the issue text forwards through the guard to the real driver: the
+// account's own text maps, text edited by another user does not.
+func TestGuardOverYouTrackForwardsIssueTextMapping(t *testing.T) {
+	srv := youtracktest.NewServer(t)
+	ctx := context.Background()
+	own := srv.SeedIssue("t", "d")
+	edited := srv.SeedIssue("t", "d")
+	changed := "changed"
+	srv.SeedTextEdit(edited, youtracktest.OtherLogin, nil, &changed)
+	m := youTrackBehindTheGuard(t, srv, srv.Token).(issueinput.IssueTextMapper)
+	if ok, err := m.IssueTextMapped(ctx, 77, own); !ok || err != nil {
+		t.Fatalf("untouched text: %v, %v; want true, nil", ok, err)
+	}
+	if ok, err := m.IssueTextMapped(ctx, 77, edited); ok || err != nil {
+		t.Fatalf("text edited by another user: %v, %v; want false, nil", ok, err)
+	}
+}
+
+func TestGuardOverAnInnerWithoutTextMappingMapsNothing(t *testing.T) {
+	for name, tr := range map[string]forge.IssueTracker{
+		"unavailable": UnavailableIssueTracker(context.DeadlineExceeded),
+		"stub":        &issueWriteGuard{inner: &fakeForge{}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			m, ok := tr.(issueinput.IssueTextMapper)
+			if !ok {
+				t.Fatal("the guard must always implement IssueTextMapper")
+			}
+			if mapped, err := m.IssueTextMapped(context.Background(), 1, 1); mapped || err != nil {
+				t.Fatalf("IssueTextMapped = %v, %v; want false, nil", mapped, err)
 			}
 		})
 	}

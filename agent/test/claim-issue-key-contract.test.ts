@@ -34,16 +34,26 @@ test("linked issue claim wire contract: issue_key reaches the agent and marks th
   assert.equal(linkedIssueLabel(linked), "ABC-12");
 });
 
-test("an unlinked claim carries no issue_key at all, so the run is not linked", () => {
-  const claim = JSON.parse(readFileSync(fixture, "utf8")) as ClaimResponse;
+// claim_skills_wire.json is the server's golden of an unlinked ISSUE run: it carries an issue
+// iid, so the only thing that keeps it from reading as linked is the absence of issue_key.
+const unlinkedFixture = join(
+  import.meta.dirname,
+  "..",
+  "..",
+  "api",
+  "internal",
+  "workersvc",
+  "testdata",
+  "claim_skills_wire.json",
+);
+
+test("an unlinked issue claim golden carries no issue_key at all, so the run is not linked", () => {
+  const raw = JSON.parse(readFileSync(unlinkedFixture, "utf8")) as Record<string, unknown>;
   // The server omits the field for an unlinked claim (never null, never ""); the agent treats
   // the key's mere presence as the link, so an absent one must read as unlinked.
-  const { issue_key: _dropped, ...unlinked } = claim;
-  assert.equal("issue_key" in unlinked, false);
-  assert.deepEqual(
-    linkedIssueKey({
-      issue_key: (unlinked as { issue_key?: string }).issue_key,
-    }),
-    { linked: false, label: null },
-  );
+  assert.equal(raw.kind, "issue");
+  assert.equal(typeof raw.issue_iid, "number");
+  assert.equal("issue_key" in raw, false);
+  const claim = raw as unknown as ClaimResponse;
+  assert.deepEqual(linkedIssueKey(claim), { linked: false, label: null });
 });

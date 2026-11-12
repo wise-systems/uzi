@@ -408,6 +408,7 @@ func (s *Server) updateIssue(w http.ResponseWriter, r *http.Request) {
 	if body.Description != nil {
 		i.description = *body.Description
 		i.updated = s.m.now()
+		i.activities = append(i.activities, &activity{id: s.m.textActivityID(), category: catDescription, timestamp: i.updated, author: BotLogin})
 	}
 	for _, cf := range body.CustomFields {
 		v := s.m.stateByName(cf.Value.Name)
@@ -481,9 +482,15 @@ func (s *Server) listActivities(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if r.URL.Query().Get("categories") != "TagsCategory" {
-		writeError(w, http.StatusBadRequest, "Bad Request", "categories must be TagsCategory")
-		return
+	cats := map[string]bool{}
+	for _, c := range strings.Split(r.URL.Query().Get("categories"), ",") {
+		switch c {
+		case catTags, catIssueCreate, catSummary, catDescription, catCommentText:
+			cats[c] = true
+		default:
+			writeError(w, http.StatusBadRequest, "Bad Request", "unsupported activity category")
+			return
+		}
 	}
 	i := s.m.lookup(r.PathValue("id"))
 	if i == nil {
@@ -494,12 +501,37 @@ func (s *Server) listActivities(w http.ResponseWriter, r *http.Request) {
 	var items []map[string]any
 	for k := len(i.activities) - 1; k >= 0; k-- {
 		a := i.activities[k]
-		items = append(items, map[string]any{
-			"$type": "TagsActivityItem", "id": a.id, "timestamp": a.timestamp, "author": userJSON(a.author),
-			"added": s.m.tagsJSON(a.added), "removed": s.m.tagsJSON(a.removed),
-		})
+		if !cats[a.category] {
+			continue
+		}
+		items = append(items, s.m.activityJSON(a))
 	}
 	writePage(w, r, spec, items)
+}
+
+// activityJSON is the full wire object of an activity item. A null author is
+// the JSON null YouTrack sends for an edit it cannot attribute.
+func (m *model) activityJSON(a *activity) map[string]any {
+	var author any
+	if a.author != "" {
+		author = userJSON(a.author)
+	}
+	item := map[string]any{"id": a.id, "timestamp": a.timestamp, "author": author, "category": map[string]any{"id": a.category}}
+	switch a.category {
+	case catTags:
+		item["$type"] = "TagsActivityItem"
+		item["added"], item["removed"] = m.tagsJSON(a.added), m.tagsJSON(a.removed)
+	case catIssueCreate:
+		item["$type"] = "IssueCreatedActivityItem"
+	case catSummary:
+		item["$type"] = "SimpleValueActivityItem"
+	case catDescription:
+		item["$type"] = "TextMarkupActivityItem"
+	case catCommentText:
+		item["$type"] = "CommentActivityItem"
+		item["target"] = map[string]any{"$type": "IssueComment", "id": a.target}
+	}
+	return item
 }
 
 func commentJSON(c *comment) map[string]any {

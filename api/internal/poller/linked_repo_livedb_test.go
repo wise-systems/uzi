@@ -271,6 +271,19 @@ func TestLinkedRepoHealthFollowsTheLinkedIssueSyncLiveDB(t *testing.T) {
 			t.Fatalf("outcomes = %+v, want one healthy report", *seen)
 		}
 	})
+	t.Run("a rejected issue tracker token reports class other, not a forge auth failure", func(t *testing.T) {
+		srv := youtracktest.NewServer(t)
+		trustFake(t, srv)
+		env := newLinkedEnv(t, srv, nil)
+		seen := recordOutcomes(env)
+		// The stored token no longer matches the one the fake accepts: YouTrack answers 401.
+		srv.Token += "-rotated"
+		env.poll(t)
+		if len(*seen) != 1 || (*seen)[0].ok || (*seen)[0].class != forge.ErrorClassOther {
+			t.Fatalf("outcomes = %+v, want one unhealthy report of class %q (the forge connection is not at fault)", *seen, forge.ErrorClassOther)
+		}
+		env.assertCodeHostOnly(t)
+	})
 	t.Run("an unreachable issue tracker reports unhealthy, code-host steps still run", func(t *testing.T) {
 		srv := youtracktest.NewServer(t)
 		trustFake(t, srv)
@@ -278,8 +291,8 @@ func TestLinkedRepoHealthFollowsTheLinkedIssueSyncLiveDB(t *testing.T) {
 		seen := recordOutcomes(env)
 		srv.Close()
 		env.poll(t)
-		if len(*seen) != 1 || (*seen)[0].ok {
-			t.Fatalf("outcomes = %+v, want one unhealthy report", *seen)
+		if len(*seen) != 1 || (*seen)[0].ok || (*seen)[0].class != forge.ErrorClassOther {
+			t.Fatalf("outcomes = %+v, want one unhealthy report of class %q", *seen, forge.ErrorClassOther)
 		}
 		env.assertCodeHostOnly(t)
 	})
@@ -287,8 +300,8 @@ func TestLinkedRepoHealthFollowsTheLinkedIssueSyncLiveDB(t *testing.T) {
 		env := newLinkedEnv(t, nil, &refusingDrivers{})
 		seen := recordOutcomes(env)
 		env.poll(t)
-		if len(*seen) != 1 || (*seen)[0].ok {
-			t.Fatalf("outcomes = %+v, want one unhealthy report", *seen)
+		if len(*seen) != 1 || (*seen)[0].ok || (*seen)[0].class != forge.ErrorClassOther {
+			t.Fatalf("outcomes = %+v, want one unhealthy report of class %q", *seen, forge.ErrorClassOther)
 		}
 		env.assertCodeHostOnly(t)
 	})

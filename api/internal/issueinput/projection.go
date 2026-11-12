@@ -163,7 +163,9 @@ func FetchWithTimeout(parent context.Context, ch forge.CodeHost, tr forge.IssueT
 		return nil, err
 	}
 	c := &Capture{ProjectID: project, Issue: raw, Digest: Digest(raw.Title, raw.Description)}
-	d, _ := a.Author(raw)
+	// The issue text is read here, after GetIssue and before the activity-reading
+	// comment listing below, so the text verdict is not older than the text.
+	d, _ := a.IssueText(raw)
 	c.Reason = Reason(d)
 	c.Issue.Author = AuthorName(raw.Author)
 	comments, err := tr.ListIssueComments(a.Context(), project, iid)

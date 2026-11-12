@@ -121,6 +121,12 @@ func (s *Server) SetReporter(n int64, login string) {
 		s.t.Fatalf("youtracktest: no issue %d", n)
 	}
 	i.reporter = login
+	// The creation is recorded under the reporter, so the two never disagree.
+	for _, a := range i.activities {
+		if a.category == catIssueCreate {
+			a.author = login
+		}
+	}
 }
 
 // SeedComment adds a comment by login on issue number n.
@@ -157,7 +163,7 @@ func (s *Server) SeedTagActivity(n int64, login string, added, removed []string)
 	if i == nil {
 		s.t.Fatalf("youtracktest: no issue %d", n)
 	}
-	a := &activity{id: s.m.nextID(3), timestamp: s.m.now(), author: login}
+	a := &activity{id: s.m.nextID(3), category: catTags, timestamp: s.m.now(), author: login}
 	for _, id := range append(slices.Clone(added), removed...) {
 		if s.m.tagByID(id) == nil {
 			s.t.Fatalf("youtracktest: no tag %q", id)
@@ -197,4 +203,49 @@ func (s *Server) IssueTagIDs(n int64) []string {
 		s.t.Fatalf("youtracktest: no issue %d", n)
 	}
 	return slices.Clone(i.tags)
+}
+
+// SeedTextEdit records that login changed the summary and/or the description of
+// issue number n, as the activity log would, and sets the new text. An empty
+// login records a null author, as YouTrack does for an edit it cannot attribute.
+func (s *Server) SeedTextEdit(n int64, login string, summary, description *string) {
+	s.t.Helper()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	i := s.m.byNumber(n)
+	if i == nil {
+		s.t.Fatalf("youtracktest: no issue %d", n)
+	}
+	if summary != nil {
+		i.summary = *summary
+		i.updated = s.m.now()
+		i.activities = append(i.activities, &activity{id: s.m.textActivityID(), category: catSummary, timestamp: i.updated, author: login})
+	}
+	if description != nil {
+		i.description = *description
+		i.updated = s.m.now()
+		i.activities = append(i.activities, &activity{id: s.m.textActivityID(), category: catDescription, timestamp: i.updated, author: login})
+	}
+}
+
+// SeedCommentEdit records that login changed the text of the most recent
+// comment on issue number n whose text is text, and sets it to newText. An
+// empty login records a null author.
+func (s *Server) SeedCommentEdit(n int64, login, text, newText string) {
+	s.t.Helper()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	i := s.m.byNumber(n)
+	if i == nil {
+		s.t.Fatalf("youtracktest: no issue %d", n)
+	}
+	for k := len(i.comments) - 1; k >= 0; k-- {
+		if c := i.comments[k]; c.text == text {
+			c.text = newText
+			i.updated = s.m.now()
+			i.activities = append(i.activities, &activity{id: s.m.textActivityID(), category: catCommentText, timestamp: i.updated, author: login, target: c.id})
+			return
+		}
+	}
+	s.t.Fatalf("youtracktest: no comment %q on issue %d", text, n)
 }
