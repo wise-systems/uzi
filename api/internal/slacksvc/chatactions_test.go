@@ -271,7 +271,7 @@ func TestChatActionCreateLinkedRepoIsNotRetryable(t *testing.T) {
 
 	c.HandleBlockAction(context.Background(), chatActionPress(ActionChatProposalCreate, runID, propID))
 
-	if len(fp.ephemerals) != 1 || !strings.Contains(fp.ephemerals[0].text, "linked to an issue tracker") || strings.Contains(strings.ToLower(fp.ephemerals[0].text), "again") {
+	if len(fp.ephemerals) != 1 || !strings.Contains(fp.ephemerals[0].text, "linked to an issue tracker") || strings.Contains(strings.ToLower(fp.ephemerals[0].text), "again") || !strings.Contains(strings.ToLower(fp.ephemerals[0].text), "pending") {
 		t.Fatalf("want a non-retryable linked-repo ephemeral, got %+v", fp.ephemerals)
 	}
 }

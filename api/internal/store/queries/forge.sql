@@ -851,7 +851,8 @@ LIMIT 100;
 -- only the issue's LATEST run (no newer non-scheduled run of the issue, so a superseded rework
 -- MR is not watched) and only while the cached issue exists AND is opened (an evicted or closed
 -- issue is not polled forever). Live rows (NULL/opened/locked mr_state) sort ahead of closed
--- reopen-watch rows so the latter can never starve them under the LIMIT. Keep this rationale
+-- reopen-watch rows so the latter can never starve them under the LIMIT; among live rows the
+-- order is created_at DESC as before, so an unlinked repo's order is unchanged. Keep this rationale
 -- ABOVE the statement — a comment trailing after the `;` is grabbed by sqlc as the NEXT query's doc.
 SELECT id, branch, mr_iid, mr_state
 FROM runs
@@ -871,7 +872,7 @@ WHERE repo_id = @repo_id::uuid
                              AND newer.created_at > runs.created_at)
            AND EXISTS (SELECT 1 FROM issues i
                        WHERE i.repo_id = runs.repo_id AND i.forge_issue_iid = runs.issue_iid AND i.state = 'opened')))
-ORDER BY (mr_state = 'closed') ASC NULLS FIRST, created_at DESC
+ORDER BY (mr_state IS NOT DISTINCT FROM 'closed'), created_at DESC
 LIMIT 100;
 
 -- name: GetIssueByIID :one
