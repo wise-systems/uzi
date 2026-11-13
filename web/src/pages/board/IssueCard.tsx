@@ -426,7 +426,7 @@ export function IssueCard({
               <ExternalLinkIcon />
             </a>
           )}
-          <span className="font-mono text-xs text-faint">#{card.iid}</span>
+          <span className="font-mono text-xs text-faint">{card.issue_key || `#${card.iid}`}</span>
         </div>
       </div>
       <div className="mt-2 flex flex-wrap items-center gap-1.5">
