@@ -12,7 +12,7 @@ import (
 // ListIssueLabelEvents implements forge.IssueTracker from the issue's tag
 // activities. Events are oldest first, one per added or removed tag; ID is the
 // 1-based position in that order. A tag that has the eligibility name but is not
-// the eligibility tag is left out.
+// the eligibility tag is left out, and so is a tag whose name labelNameProblem refuses.
 func (y *youTrack) ListIssueLabelEvents(ctx context.Context, projectID, issueIID int64) ([]forge.LabelEvent, error) {
 	w, err := y.resolveIssue(ctx, projectID, issueIID)
 	if err != nil {
@@ -35,13 +35,13 @@ func (y *youTrack) ListIssueLabelEvents(ctx context.Context, projectID, issueIID
 	out := []forge.LabelEvent{}
 	emit := func(a ytActivity, action string, tags []ytTag) {
 		for _, t := range tags {
-			if y.foreignEligibility(t) {
+			if y.foreignEligibility(t) || labelNameProblem(y.tagName(t)) {
 				continue
 			}
 			out = append(out, forge.LabelEvent{
 				ID:        int64(len(out) + 1),
 				Action:    action,
-				LabelName: t.Name,
+				LabelName: y.tagName(t),
 				Username:  login(a.Author),
 				CreatedAt: time.UnixMilli(a.Timestamp).UTC(),
 			})

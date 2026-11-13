@@ -8,6 +8,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -112,6 +113,107 @@ func TestMRWatchLanesForLinkedAndUnlinkedReposLiveDB(t *testing.T) {
 			if b[id] && f[id] {
 				t.Errorf("run %v is in both lanes", id)
 			}
+		}
+	})
+	// A closed MR (the reviewer closed it; it may be reopened): the board lane watches it on an
+	// unlinked repo (Lane A reopen edge); the board-free lane must do the same on a linked repo
+	// and still not watch it on an unlinked one.
+	exec(`UPDATE runs SET mr_state = 'closed' WHERE id = ANY($1)`,
+		[]uuid.UUID{runs[linkedRepo]["issue"], runs[plainRepo]["issue"]})
+
+	t.Run("closed MR: linked repo keeps the reopen watch in the board-free lane", func(t *testing.T) {
+		r := runs[linkedRepo]
+		if f := freeLane(linkedRepo); !f[r["issue"]] {
+			t.Errorf("board-free lane = %v, want the closed issue run (reopen edge)", f)
+		}
+		if b := boardLane(linkedRepo); len(b) != 0 {
+			t.Errorf("board lane = %v, want none for a linked repo", b)
+		}
+	})
+
+	t.Run("closed MR: unlinked repo's board-free set is unchanged", func(t *testing.T) {
+		r := runs[plainRepo]
+		f := freeLane(plainRepo)
+		if len(f) != 1 || !f[r["prompt"]] {
+			t.Errorf("board-free lane = %v, want the prompt run only", f)
+		}
+		if b := boardLane(plainRepo); !b[r["issue"]] {
+			t.Errorf("board lane = %v, want the closed issue run (Lane A reopen)", b)
+		}
+	})
+
+	t.Run("closed MR: a superseded run or a closed issue is not watched", func(t *testing.T) {
+		r := runs[linkedRepo]
+		newer := uuid.New()
+		exec(`INSERT INTO runs (id, user_id, repo_id, kind, issue_iid, issue_title, issue_description, branch, status)
+		      VALUES ($1, $2, $3, 'issue', 7, 't', 'd', $4, 'running')`, newer, user, linkedRepo, "agent/issue-7-rework-"+linkedRepo.String())
+		if f := freeLane(linkedRepo); f[r["issue"]] {
+			t.Errorf("board-free lane = %v, want the superseded closed run dropped", f)
+		}
+		exec(`DELETE FROM runs WHERE id = $1`, newer)
+		exec(`UPDATE issues SET state = 'closed' WHERE repo_id = $1`, linkedRepo)
+		if f := freeLane(linkedRepo); f[r["issue"]] {
+			t.Errorf("board-free lane = %v, want a closed issue's closed MR dropped", f)
+		}
+	})
+
+	// The recorder end to end: a reopen is recorded back to 'opened'.
+	t.Run("closed then reopened MR is recorded opened", func(t *testing.T) {
+		exec(`UPDATE issues SET state = 'opened' WHERE repo_id = $1`, linkedRepo)
+		svc := newTestService(q)
+		f := &fakeForge{mr: forgeMR(13, forge.MRStateOpened)}
+		if err := svc.SyncBoardFreeMRStates(ctx, linkedRepo, 1, f); err != nil {
+			t.Fatal(err)
+		}
+		var state string
+		if err := pool.QueryRow(ctx, `SELECT mr_state FROM runs WHERE id = $1`, runs[linkedRepo]["issue"]).Scan(&state); err != nil {
+			t.Fatal(err)
+		}
+		if state != "opened" {
+			t.Errorf("mr_state = %q, want opened", state)
+		}
+	})
+
+	// A closed MR whose issue left the cache (moved, untagged, deleted) must not be polled
+	// forever: the reopen watch needs a cached OPEN issue, as the board lane's Lane A does.
+	t.Run("closed MR: an evicted issue is not watched", func(t *testing.T) {
+		exec(`UPDATE runs SET mr_state = 'closed' WHERE id = $1`, runs[linkedRepo]["issue"])
+		exec(`DELETE FROM issues WHERE repo_id = $1 AND forge_issue_iid = 7`, linkedRepo)
+		if f := freeLane(linkedRepo); f[runs[linkedRepo]["issue"]] {
+			t.Errorf("board-free lane = %v, want an evicted issue's closed MR dropped", f)
+		}
+	})
+
+	// Live rows (opened/locked/NULL mr_state) sort ahead of closed reopen-watch rows, so a
+	// burst of closed rows can never push a live run past the LIMIT.
+	t.Run("live rows are ordered ahead of closed rows", func(t *testing.T) {
+		exec(`INSERT INTO issues (repo_id, forge_issue_iid, title, state, labels, web_url, forge_updated_at, synced_at)
+		      VALUES ($1, 7, 't', 'opened', '[]', 'https://forge.e2e/i/7', now(), now())`, linkedRepo)
+		exec(`UPDATE runs SET mr_state = 'closed', created_at = now() + interval '1 hour' WHERE id = $1`, runs[linkedRepo]["issue"])
+		exec(`UPDATE runs SET mr_state = NULL, created_at = now() - interval '1 hour' WHERE id = $1`, runs[linkedRepo]["prompt"])
+		rows, err := q.ListBoardFreeMRStateWatchCandidates(ctx, linkedRepo)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(rows) != 2 || rows[0].ID != runs[linkedRepo]["prompt"] || rows[1].ID != runs[linkedRepo]["issue"] {
+			t.Errorf("order = %v, want the older live (NULL mr_state) run before the newer closed run", rows)
+		}
+	})
+
+	t.Run("live rows keep the created_at order on an unlinked repo", func(t *testing.T) {
+		// A never-recorded (NULL mr_state) run does not outrank a newer opened one: among
+		// live rows the order is created_at DESC exactly as before the linked reopen watch.
+		older := uuid.New()
+		exec(`INSERT INTO runs (id, user_id, repo_id, kind, issue_iid, issue_title, issue_description, branch, mr_iid, mr_state, status, created_at)
+		      VALUES ($1, $2, $3, 'prompt', NULL, 't', 'd', $4, 22, NULL, 'completed', now() - interval '1 hour')`,
+			older, user, plainRepo, "uzi/prompt-older-"+plainRepo.String())
+		exec(`UPDATE runs SET created_at = now() WHERE id = $1`, runs[plainRepo]["prompt"])
+		rows, err := q.ListBoardFreeMRStateWatchCandidates(ctx, plainRepo)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(rows) != 2 || rows[0].ID != runs[plainRepo]["prompt"] || rows[1].ID != older {
+			t.Errorf("order = %v, want the newer opened run before the older NULL one", rows)
 		}
 	})
 }

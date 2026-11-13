@@ -301,7 +301,13 @@ func TestEligibilityNameAloneMakesNoRequest(t *testing.T) {
 	if _, err := y.ListIssues(context.Background(), testProjectID, forge.ListIssuesOptions{Labels: []string{youtracktest.EligibilityTagName}}); err != nil {
 		t.Fatal(err)
 	}
+	// Changed on purpose: a listing with labels now pages the issues of the
+	// eligibility tag by id, so exactly that request is allowed. Any tag lookup,
+	// tag create or account read is still forbidden.
 	for _, c := range log.all() {
+		if strings.Contains(c, "/api/tags/"+youtracktest.EligibilityTagID+"/issues") {
+			continue
+		}
 		if strings.Contains(c, "/tags") || strings.Contains(c, "users/me") {
 			t.Errorf("sent %v for the eligibility name alone", c)
 		}

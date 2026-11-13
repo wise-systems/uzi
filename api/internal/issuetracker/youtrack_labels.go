@@ -181,21 +181,26 @@ func (y *youTrack) resolveTagIDs(ctx context.Context, names []string, create boo
 	return ids, nil
 }
 
-// ListLabels implements forge.IssueTracker. Labels are YouTrack tags, global
-// to the account; the result is every visible tag name, whoever owns the tag. A
-// name carried by several tags is listed once.
+// ListLabels implements forge.IssueTracker. The labels are the names a caller
+// can use: the stored eligibility name first, then every tag the token's own
+// account owns, each name once. A tag another user owns is left out, because
+// the driver never resolves a name to it (see resolveTagIDs).
 func (y *youTrack) ListLabels(ctx context.Context, projectID int64) ([]forge.Label, error) {
 	if _, err := y.requireProject(projectID); err != nil {
 		return nil, err
 	}
-	tags, err := y.listTags(ctx, tagFields)
+	account, err := y.connAccount(ctx)
 	if err != nil {
 		return nil, err
 	}
-	out := make([]forge.Label, 0, len(tags))
-	seen := make(map[string]bool, len(tags))
+	tags, err := y.listTags(ctx, ownedTagFields)
+	if err != nil {
+		return nil, err
+	}
+	out := []forge.Label{{Name: y.eligibility.Name}}
+	seen := map[string]bool{y.eligibility.Name: true}
 	for _, t := range tags {
-		if seen[t.Name] {
+		if t.ID == y.eligibility.ID || t.Owner == nil || t.Owner.ID != account.ID || seen[t.Name] {
 			continue
 		}
 		seen[t.Name] = true

@@ -52,6 +52,12 @@ func (m *memQuerier) UpsertIssueTrackerConnection(_ context.Context, a store.Ups
 	return r, nil
 }
 
+// InsertIssueTrackerConnectionIfAbsent is Connect's first-connect insert: the
+// tests never reconnect, so it inserts like the upsert.
+func (m *memQuerier) InsertIssueTrackerConnectionIfAbsent(ctx context.Context, a store.InsertIssueTrackerConnectionIfAbsentParams) (store.IssueTrackerConnection, error) {
+	return m.UpsertIssueTrackerConnection(ctx, store.UpsertIssueTrackerConnectionParams(a))
+}
+
 func (m *memQuerier) ListIssueTrackerConnectionsByUser(context.Context, uuid.UUID) ([]store.IssueTrackerConnection, error) {
 	return nil, errors.New("not used")
 }

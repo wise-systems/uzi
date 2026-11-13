@@ -384,9 +384,12 @@ type DeleteIssuesNotInParams struct {
 //
 // Since PRD #102 M6 the keep-set is the UNION of TWO fetches — the PRD-labelled set
 // and every open issue — so a caller that builds it from one of them wipes whatever
-// the other owns, on every poll. forgesvc.FullSync is the only production caller and
-// it fails closed if either fetch errors, which is what makes an empty keep-set here
-// mean "the forge really is empty" rather than "one request timed out".
+// the other owns, on every poll. forgesvc.FullSync is the production caller for a
+// forge-backed repo and it fails closed if either fetch errors, which is what makes an
+// empty keep-set here mean "the forge really is empty" rather than "one request timed
+// out". The linked issue sync's full form (forgesvc.syncLinkedIssues) is the other
+// caller: its keep-set is the eligibility tag's listing, evicted only after the
+// listing and every upsert succeeded.
 func (q *Queries) DeleteIssuesNotIn(ctx context.Context, arg DeleteIssuesNotInParams) (int64, error) {
 	result, err := q.db.Exec(ctx, deleteIssuesNotIn, arg.RepoID, arg.KeepIids)
 	if err != nil {
@@ -949,8 +952,18 @@ WHERE repo_id = $1::uuid
        OR EXISTS (SELECT 1 FROM repos lr WHERE lr.id = $1::uuid AND lr.issue_tracker_connection_id IS NOT NULL))
   AND status = 'completed'
   AND mr_iid IS NOT NULL
-  AND (mr_state IS NULL OR mr_state IN ('opened', 'locked'))
-ORDER BY created_at DESC
+  AND (mr_state IS NULL OR mr_state IN ('opened', 'locked')
+       OR (mr_state = 'closed'
+           AND issue_iid IS NOT NULL
+           AND kind NOT IN ('prompt', 'self_improve')
+           AND EXISTS (SELECT 1 FROM repos lr WHERE lr.id = $1::uuid AND lr.issue_tracker_connection_id IS NOT NULL)
+           AND NOT EXISTS (SELECT 1 FROM runs newer
+                           WHERE newer.repo_id = runs.repo_id AND newer.issue_iid = runs.issue_iid
+                             AND newer.kind NOT IN ('prompt', 'self_improve')
+                             AND newer.created_at > runs.created_at)
+           AND EXISTS (SELECT 1 FROM issues i
+                       WHERE i.repo_id = runs.repo_id AND i.forge_issue_iid = runs.issue_iid AND i.state = 'opened')))
+ORDER BY (mr_state IS NOT DISTINCT FROM 'closed'), created_at DESC
 LIMIT 100
 `
 
@@ -978,7 +991,14 @@ type ListBoardFreeMRStateWatchCandidatesRow struct {
 // ListMRWatchCandidates), not a sqlc param, so zero Go signature change. A repo linked to an
 // external issue tracker (PRD #4173 M4) is widened IN whole: every issue-lane run of such a repo
 // belongs here (the board lane excludes the repo), so linked runs record mr_state and cancel
-// rework with no board card; an unlinked repo matches exactly as before. Keep this rationale
+// rework with no board card; an unlinked repo matches exactly as before. On a linked repo the
+// lane also keeps watching an issue-lane run recorded mr_state='closed', so a reopen is recorded
+// back to 'opened' (the board lane's Lane A reopen-edge watch, Decision 10), bounded as Lane A is:
+// only the issue's LATEST run (no newer non-scheduled run of the issue, so a superseded rework
+// MR is not watched) and only while the cached issue exists AND is opened (an evicted or closed
+// issue is not polled forever). Live rows (NULL/opened/locked mr_state) sort ahead of closed
+// reopen-watch rows so the latter can never starve them under the LIMIT; among live rows the
+// order is created_at DESC as before, so an unlinked repo's order is unchanged. Keep this rationale
 // ABOVE the statement — a comment trailing after the `;` is grabbed by sqlc as the NEXT query's doc.
 func (q *Queries) ListBoardFreeMRStateWatchCandidates(ctx context.Context, repoID uuid.UUID) ([]ListBoardFreeMRStateWatchCandidatesRow, error) {
 	rows, err := q.db.Query(ctx, listBoardFreeMRStateWatchCandidates, repoID)
@@ -3036,8 +3056,8 @@ const upsertIssue = `-- name: UpsertIssue :one
 
 INSERT INTO issues (
     repo_id, forge_issue_iid, title, state, labels, assignee_ids, web_url, author,
-    has_prd_link, forge_updated_at, synced_at
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now())
+    has_prd_link, forge_updated_at, issue_key, synced_at
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, now())
 ON CONFLICT (repo_id, forge_issue_iid) DO UPDATE
 SET title            = EXCLUDED.title,
     state            = EXCLUDED.state,
@@ -3047,6 +3067,8 @@ SET title            = EXCLUDED.title,
     author           = EXCLUDED.author,
     has_prd_link     = EXCLUDED.has_prd_link,
     forge_updated_at = EXCLUDED.forge_updated_at,
+    -- A forge-only writer passes NULL; it must not erase the key of a linked row.
+    issue_key        = COALESCE(EXCLUDED.issue_key, issues.issue_key),
     synced_at        = now()
 RETURNING id, repo_id, forge_issue_iid, title, state, labels, web_url, author, has_prd_link, forge_updated_at, synced_at, board_position, assignee_ids, issue_key
 `
@@ -3062,6 +3084,7 @@ type UpsertIssueParams struct {
 	Author         pgtype.Text        `json:"author"`
 	HasPrdLink     bool               `json:"has_prd_link"`
 	ForgeUpdatedAt pgtype.Timestamptz `json:"forge_updated_at"`
+	IssueKey       pgtype.Text        `json:"issue_key"`
 }
 
 // Issues cache -------------------------------------------------------------
@@ -3087,6 +3110,7 @@ func (q *Queries) UpsertIssue(ctx context.Context, arg UpsertIssueParams) (Issue
 		arg.Author,
 		arg.HasPrdLink,
 		arg.ForgeUpdatedAt,
+		arg.IssueKey,
 	)
 	var i Issue
 	err := row.Scan(
@@ -3106,6 +3130,65 @@ func (q *Queries) UpsertIssue(ctx context.Context, arg UpsertIssueParams) (Issue
 		&i.IssueKey,
 	)
 	return i, err
+}
+
+const upsertIssueIfChanged = `-- name: UpsertIssueIfChanged :exec
+INSERT INTO issues (
+    repo_id, forge_issue_iid, title, state, labels, assignee_ids, web_url, author,
+    has_prd_link, forge_updated_at, issue_key, synced_at
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, now())
+ON CONFLICT (repo_id, forge_issue_iid) DO UPDATE
+SET title            = EXCLUDED.title,
+    state            = EXCLUDED.state,
+    labels           = EXCLUDED.labels,
+    assignee_ids     = EXCLUDED.assignee_ids,
+    web_url          = EXCLUDED.web_url,
+    author           = EXCLUDED.author,
+    has_prd_link     = EXCLUDED.has_prd_link,
+    forge_updated_at = EXCLUDED.forge_updated_at,
+    issue_key        = EXCLUDED.issue_key,
+    synced_at        = now()
+WHERE (issues.title, issues.state, issues.labels, issues.assignee_ids, issues.web_url, issues.author,
+       issues.has_prd_link, issues.forge_updated_at, issues.issue_key)
+      IS DISTINCT FROM
+      (EXCLUDED.title, EXCLUDED.state, EXCLUDED.labels, EXCLUDED.assignee_ids, EXCLUDED.web_url, EXCLUDED.author,
+       EXCLUDED.has_prd_link, EXCLUDED.forge_updated_at, EXCLUDED.issue_key)
+`
+
+type UpsertIssueIfChangedParams struct {
+	RepoID         uuid.UUID          `json:"repo_id"`
+	ForgeIssueIid  int64              `json:"forge_issue_iid"`
+	Title          string             `json:"title"`
+	State          string             `json:"state"`
+	Labels         []byte             `json:"labels"`
+	AssigneeIds    []byte             `json:"assignee_ids"`
+	WebUrl         string             `json:"web_url"`
+	Author         pgtype.Text        `json:"author"`
+	HasPrdLink     bool               `json:"has_prd_link"`
+	ForgeUpdatedAt pgtype.Timestamptz `json:"forge_updated_at"`
+	IssueKey       pgtype.Text        `json:"issue_key"`
+}
+
+// The linked issue sync's write (PRD #4173): the same columns as UpsertIssue (and the same
+// board_position omission, with the same reason), but a row whose cached values are all
+// unchanged is left untouched, so a tick that finds nothing new rewrites nothing and
+// issues.synced_at is not refreshed by it. Nothing reads issues.synced_at. issue_key is
+// compared as written (the linked sync always passes it).
+func (q *Queries) UpsertIssueIfChanged(ctx context.Context, arg UpsertIssueIfChangedParams) error {
+	_, err := q.db.Exec(ctx, upsertIssueIfChanged,
+		arg.RepoID,
+		arg.ForgeIssueIid,
+		arg.Title,
+		arg.State,
+		arg.Labels,
+		arg.AssigneeIds,
+		arg.WebUrl,
+		arg.Author,
+		arg.HasPrdLink,
+		arg.ForgeUpdatedAt,
+		arg.IssueKey,
+	)
+	return err
 }
 
 const upsertIssueLabels = `-- name: UpsertIssueLabels :one

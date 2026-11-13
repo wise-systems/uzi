@@ -107,6 +107,7 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 		Author:         pgconv.TextOrNull(created.Author),
 		HasPrdLink:     forgesvc.HasPRDLink(req.Description),
 		ForgeUpdatedAt: pgtype.Timestamptz{Time: updated, Valid: true},
+		IssueKey:       pgtype.Text{}, // only the linked sync writes issue_key (D10)
 	})
 	if err != nil {
 		// The issue exists on the forge; only the local cache write failed. The

@@ -8020,7 +8020,23 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 	// server applies cannot disagree. Promote writes the label forge-first AND updates
 	// this cache row in the same request, so the promote-then-run sequence is not racing
 	// the poller.
-	if !isEligibleIssue(issue.Labels, []string{s.uziLabel(ctx)}) &&
+	//
+	// On a repo linked to an issue tracker (PRD #4173 D14) the eligibility label is the
+	// link's stored eligibility tag name, not the configured uzi label, and bot
+	// assignment never counts (the issue tracker reports no assignees). The cache can
+	// hold an issue that was untagged since the last full sync, so the fresh read at
+	// capture below must carry the tag as well.
+	linkedEligibility := ""
+	if row.IssueTrackerConnectionID.Valid {
+		// Trimmed like schedsvc's eligibilityLabel: a blank stored name is no name.
+		if strings.TrimSpace(row.EligibilityTagName.String) == "" {
+			return store.Run{}, ErrNotPRDIssue
+		}
+		linkedEligibility = row.EligibilityTagName.String
+		if !isEligibleIssue(issue.Labels, []string{linkedEligibility}) {
+			return store.Run{}, ErrNotPRDIssue
+		}
+	} else if !isEligibleIssue(issue.Labels, []string{s.uziLabel(ctx)}) &&
 		!isAssignedToBot(issue.AssigneeIds, row.BotForgeUserID) {
 		return store.Run{}, ErrNotPRDIssue
 	}
@@ -8100,7 +8116,9 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 			return store.Run{}, ErrForgeBuild
 		}
 		// PRD #4173 DL-5: a linked repo's issue is read through the resolver, never the
-		// forge; the code-host half of the fetch (author eligibility) stays on the forge.
+		// forge. The code-host half of the fetch stays on the forge, but author eligibility
+		// does only for an unlinked repo: a linked repo's authors are decided by D11 mapping
+		// on the issue side (issueinput.WithIssueSide, applied by Fetch from tr).
 		tr, terr := issuesource.For(ctx, s.issueSources, row.IssueTrackerConnectionID.Valid, userID, repoID, f)
 		if terr != nil {
 			return store.Run{}, fmt.Errorf("%w: %v", ErrForgeBuild, terr)
@@ -8111,6 +8129,17 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 				return store.Run{}, fmt.Errorf("%w: %w", ErrDescriptionTooLarge, err)
 			}
 			return store.Run{}, ErrForgeIssueRead
+		}
+	}
+	if linkedEligibility != "" {
+		// The cached labels may be stale, so a linked run needs the fresh read; with no
+		// capture (no forge builder wired) there is nothing to check it against and the
+		// run is refused rather than started on the cache alone.
+		if capture == nil {
+			return store.Run{}, ErrForgeBuild
+		}
+		if !slices.Contains(capture.Issue.Labels, linkedEligibility) {
+			return store.Run{}, ErrNotPRDIssue
 		}
 	}
 	savedBody, rawDigest, inputReason := pgtype.Text{}, pgtype.Text{}, pgtype.Text{}

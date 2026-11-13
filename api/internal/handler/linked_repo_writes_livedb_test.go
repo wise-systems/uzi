@@ -14,6 +14,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/forge/forgetest"
@@ -27,6 +28,7 @@ import (
 
 type linkedHandlerFixture struct {
 	h      *Handler
+	pool   *pgxpool.Pool
 	srv    *youtracktest.Server
 	rec    *forgetest.Recorder
 	user   store.User
@@ -59,7 +61,7 @@ func newLinkedHandlerFixture(t *testing.T, withColumns bool) *linkedHandlerFixtu
 	if err != nil {
 		t.Fatal(err)
 	}
-	f := &linkedHandlerFixture{h: h, srv: srv, rec: rec, repo: uuid.New(),
+	f := &linkedHandlerFixture{h: h, pool: pool, srv: srv, rec: rec, repo: uuid.New(),
 		user: store.User{ID: uuid.New(), Email: fmt.Sprintf("lw-%s@e2e", uuid.NewString()[:8])}}
 	exec := func(sql string, args ...any) {
 		t.Helper()
@@ -148,17 +150,36 @@ func TestLinkedRepoIssueWritesAreRefusedWith409LiveDB(t *testing.T) {
 	}
 }
 
-// A manual issue sync on a linked repo is a 409 until the linked intake lands, not a 502.
-func TestLinkedRepoSyncIsA409UntilIntakeLandsLiveDB(t *testing.T) {
-	f := newLinkedHandlerFixture(t, true)
-	rr := f.call(f.h.SyncRepo, http.MethodPost, nil)
-	if rr.Code != http.StatusConflict || !strings.Contains(rr.Body.String(), "not available yet") {
-		t.Fatalf("status = %d body = %s", rr.Code, rr.Body.String())
+// assertNoWrites fails when the issue tracker saw anything but a read (GET) or the
+// forge saw any call: the linked intake and the board seed only read.
+func (f *linkedHandlerFixture) assertNoWrites(t *testing.T) {
+	t.Helper()
+	for _, r := range f.srv.Requests() {
+		if r.Method != http.MethodGet {
+			t.Errorf("the issue tracker saw a write request %s %s", r.Method, r.Path)
+		}
 	}
-	f.assertNothingSent(t)
+	if c := f.rec.Calls(); len(c) != 0 {
+		t.Errorf("the forge saw calls %v, want none", c)
+	}
 }
 
-// Opening the board of a linked repo seeds its column rows without any label write.
+// A manual issue sync on a linked repo is the linked intake: it reads the eligibility
+// tag's listing and writes nothing to the issue tracker.
+func TestLinkedRepoSyncRunsTheLinkedIntakeLiveDB(t *testing.T) {
+	f := newLinkedHandlerFixture(t, true)
+	rr := f.call(f.h.SyncRepo, http.MethodPost, nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rr.Code, rr.Body.String())
+	}
+	if len(f.srv.Requests()) == 0 {
+		t.Fatal("the linked sync never read the issue tracker")
+	}
+	f.assertNoWrites(t)
+}
+
+// Opening the board of a linked repo seeds its column rows without any label write; the
+// intake it triggers is read-only.
 func TestLinkedRepoBoardSeedsColumnsWithoutLabelWritesLiveDB(t *testing.T) {
 	f := newLinkedHandlerFixture(t, false)
 	rr := f.call(f.h.GetBoard, http.MethodGet, nil)
@@ -169,7 +190,7 @@ func TestLinkedRepoBoardSeedsColumnsWithoutLabelWritesLiveDB(t *testing.T) {
 	if err != nil || n != int64(len(forgesvc.DefaultColumns)) {
 		t.Fatalf("board columns = %d (%v), want the %d defaults", n, err, len(forgesvc.DefaultColumns))
 	}
-	f.assertNothingSent(t)
+	f.assertNoWrites(t)
 }
 
 // The forgeFactory test seam is for an unlinked row only: a linked row through it is an

@@ -101,6 +101,28 @@ type ytActivity struct {
 	Removed   ytTags  `json:"removed"`
 }
 
+// ytTextActivity is an activity of the issue's text (creation, summary or
+// description) as D11 reads it: who made the change, nothing of what changed.
+// An activity without an author (null) leaves Author nil.
+type ytTextActivity struct {
+	ID        string  `json:"id"`
+	Timestamp int64   `json:"timestamp"`
+	Author    *ytUser `json:"author"`
+	Category  *struct {
+		ID string `json:"id"`
+	} `json:"category"`
+}
+
+// ytCommentActivity is a change to a comment's text: who made it and the id of
+// the comment it changed.
+type ytCommentActivity struct {
+	ID     string  `json:"id"`
+	Author *ytUser `json:"author"`
+	Target *struct {
+		ID string `json:"id"`
+	} `json:"target"`
+}
+
 // checkIssue refuses an issue whose entity id, id-readable or tag ids are not
 // well formed: those ids end up in request paths and in WebURL. The tag count is
 // capped while decoding (ytTags).
@@ -142,7 +164,9 @@ func (y *youTrack) toIssue(w ytIssue) (forge.Issue, error) {
 		if y.foreignEligibility(t) {
 			continue
 		}
-		issue.Labels = append(issue.Labels, t.Name)
+		if name := y.tagName(t); !labelNameProblem(name) {
+			issue.Labels = append(issue.Labels, name)
+		}
 	}
 	return issue, nil
 }
@@ -152,6 +176,17 @@ func (y *youTrack) toIssue(w ytIssue) (forge.Issue, error) {
 // result always means the stored tag.
 func (y *youTrack) foreignEligibility(t ytTag) bool {
 	return y.eligibility.Name != "" && t.Name == y.eligibility.Name && t.ID != y.eligibility.ID
+}
+
+// tagName is the label name reported for t: the eligibility tag under its
+// stored name, whatever its live name, and any other tag under its live name.
+// Any user can name a tag, so a caller that passes the name on drops one that
+// labelNameProblem refuses (control or invisible characters, braces, too long).
+func (y *youTrack) tagName(t ytTag) string {
+	if y.eligibility.ID != "" && t.ID == y.eligibility.ID {
+		return y.eligibility.Name
+	}
+	return t.Name
 }
 
 // inBoundProject reports whether the issue sits in the bound project.

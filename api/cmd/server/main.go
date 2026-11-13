@@ -35,6 +35,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/healthsvc"
 	"github.com/vtmocanu/uzi/api/internal/hostedsvc"
 	"github.com/vtmocanu/uzi/api/internal/hub"
+	"github.com/vtmocanu/uzi/api/internal/issuesource"
 	"github.com/vtmocanu/uzi/api/internal/issuetracker"
 	"github.com/vtmocanu/uzi/api/internal/issuetrackersvc"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
@@ -1901,22 +1902,33 @@ func (g gateSubmitter) SubmitChatMessage(ctx context.Context, userID, runID uuid
 // failure (retry), all without a workersvc import on the slacksvc side.
 func (g gateSubmitter) ConfirmProposalForUser(ctx context.Context, userID, runID, propID uuid.UUID) (slacksvc.CreatedIssue, error) {
 	ci, err := g.svc.ConfirmProposalForUser(ctx, userID, runID, propID)
+	if err != nil {
+		return slacksvc.CreatedIssue{}, translateConfirmProposalErr(err)
+	}
+	return slacksvc.CreatedIssue{IID: ci.IID, WebURL: ci.WebURL, Title: ci.Title}, nil
+}
+
+// translateConfirmProposalErr maps a workersvc confirm failure to the slacksvc sentinel. The
+// issue-write refusal on a linked repo is matched BEFORE ErrForgeIssueWrite because workersvc
+// wraps it inside that error: retrying can never succeed, so Slack must not say "press Create
+// again".
+func translateConfirmProposalErr(err error) error {
 	switch {
 	case errors.Is(err, workersvc.ErrProposalNotPending):
-		return slacksvc.CreatedIssue{}, slacksvc.ErrChatProposalHandled
+		return slacksvc.ErrChatProposalHandled
 	case errors.Is(err, workersvc.ErrProposalNotFound):
-		return slacksvc.CreatedIssue{}, slacksvc.ErrChatProposalGone
+		return slacksvc.ErrChatProposalGone
 	case errors.Is(err, workersvc.ErrRepoNeverEnabled):
-		return slacksvc.CreatedIssue{}, slacksvc.ErrChatProposalRepoNeverEnabled
+		return slacksvc.ErrChatProposalRepoNeverEnabled
+	case errors.Is(err, issuesource.ErrIssueWriteNotOffered):
+		return slacksvc.ErrChatProposalLinkedRepo
 	case errors.Is(err, workersvc.ErrProposalRepoGone),
 		errors.Is(err, workersvc.ErrForgeBuild),
 		errors.Is(err, workersvc.ErrForgeIssueWrite),
 		errors.Is(err, workersvc.ErrForgesUnavailable):
-		return slacksvc.CreatedIssue{}, slacksvc.ErrChatProposalForge
-	case err != nil:
-		return slacksvc.CreatedIssue{}, err
+		return slacksvc.ErrChatProposalForge
 	}
-	return slacksvc.CreatedIssue{IID: ci.IID, WebURL: ci.WebURL, Title: ci.Title}, nil
+	return err
 }
 
 // DismissProposalForUser adapts the Slack proposal card's Dismiss (PRD #191 M4): the
