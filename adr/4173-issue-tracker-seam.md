@@ -7,7 +7,7 @@
 
 ## Decision (summary)
 
-Issue trackers other than the repo's forge sit behind a `Driver` in their own package, `api/internal/issuetracker`. A driver is `forge.IssueTracker` plus four connection operations. Connections live apart from forge connections (`issuetrackersvc`, table `issue_tracker_connections`) with their own base URL allowlist. The YouTrack driver adapts YouTrack's string ids inside itself, is built for exactly one project, and treats tags as user-owned objects chosen by id. A repo that was never enabled can link to one from M4; a repo with no link behaves as before.
+Issue trackers other than the repo's forge sit behind a `Driver` in their own package, `api/internal/issuetracker`. A driver is `forge.IssueTracker` plus four connection operations. Connections live apart from forge connections (`issuetrackersvc`, table `issue_tracker_connections`) with their own base URL allowlist. The YouTrack driver adapts YouTrack's string ids inside itself, is built for exactly one project, and treats tags as user-owned objects chosen by id. From M4 a repo created after the M4 migration can link to one before its first enable (D13); a repo with no link behaves as before.
 
 Shipped in M4: the repo link and `IssueTrackerForRepo` returning the linked issue tracker, with intake and runs from YouTrack issues. Not shipped yet: issue writes and board moves on YouTrack (M5), the web and CLI settings surfaces, docs and the live pass against a real YouTrack (M6). On a linked repo every issue write is refused with `ErrIssueWriteNotOffered`.
 
@@ -55,7 +55,7 @@ Shipped in M4: the repo link and `IssueTrackerForRepo` returning the linked issu
 - **S1. An issue tracker never gains code access.** `Driver` embeds `forge.IssueTracker`, not `forge.CodeHost`; a driver passed as a code host does not compile.
 - **S2. Code-host checks stay on the forge.** The privilege check, the protected-branch check and the worker-held forge credential act on the repo's forge connection and fail closed. M4 tests that a linked repo keeps them on the forge and that they fail closed with the issue tracker unreachable.
 - **S3. Credentials follow the forge rules.** Sealed token with AAD and no reveal path, https-only base URL on the separate empty-by-default allowlist re-checked in `DriverFor`, redirects refused, errors redacted. The redirect, oversized-body and token-in-error cases each have a test in `api/internal/issuetracker`.
-- **S4. Issue tracker text is untrusted input.** The driver bounds what it reads (response bytes, listing pages and items, nested items, label name length). YouTrack titles, descriptions and comments go through the same `issueinput` fencing as forge text; an oversized description or comment is bounded as on a forge, and M4 tests both.
+- **S4. Issue tracker text is untrusted input.** The driver bounds what it reads (response bytes, listing pages and items, nested items, label name length). YouTrack titles, descriptions and comments go through the same `issueinput` fencing as forge text; an oversized description is refused and an oversized comment by the connection's own account is cut to the same bound as on a forge, while an unmapped author's comment is withheld; M4 tests each.
 - **S5. The worker never holds an issue tracker token.** The allowlist does not feed worker egress, and the token is opened only inside `DriverFor` in the API. The worker read routes go through the API's resolver, so the worker never holds the token.
 
 ## Open questions for M6's live pass
@@ -66,6 +66,6 @@ Shipped in M4: the repo link and `IssueTrackerForRepo` returning the linked issu
 
 ## Consequences
 
-- Forge drivers, the neutral types and every caller are unchanged. A second issue tracker (Asana) is the real test of the seam: YouTrack specifics (the id adapter, the tag rules) must stay inside its driver.
+- Forge drivers and the neutral types are unchanged; callers resolve their issue side through the owner-scoped resolvers, and on a repo with no link they behave as before. A second issue tracker (Asana) is the real test of the seam: YouTrack specifics (the id adapter, the tag rules) must stay inside its driver.
 - Operators get one new empty setting. Until it is set no issue tracker connection can be created, and uzi boots as before.
 - The `projectID` guard is one half of a binding. M4 added the other half, the resolver (`IssueTrackerForRepo`, owner-scoped).
