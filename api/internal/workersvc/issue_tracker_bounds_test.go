@@ -2,6 +2,7 @@ package workersvc
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"strings"
 	"testing"
@@ -122,5 +123,41 @@ func TestOversizedIssueCommentIsBoundedLikeTheForgeEquivalent(t *testing.T) {
 	}
 	if ftotal != bound || !want.Thread.Truncated {
 		t.Fatalf("forge thread bytes=%d truncated=%v, want exactly %d and truncated", ftotal, want.Thread.Truncated, bound)
+	}
+}
+
+// An oversized YouTrack comment by the connection's own (mapped) account reaches the run
+// through the linked capture and is cut to exactly the forge bound, marked truncated, like
+// the forge equivalent above.
+func TestOversizedMappedIssueCommentIsTruncatedLikeTheForgeEquivalent(t *testing.T) {
+	const bound = 32768
+	srv := youtracktest.NewServer(t)
+	n := srv.SeedIssue("card", "body", youtracktest.EligibilityTagID)
+	srv.SetReporter(n, youtracktest.BotLogin)
+	srv.SeedComment(n, youtracktest.BotLogin, strings.Repeat("c", 3<<20))
+
+	row := linkedRepoRow()
+	row.ForgeProjectID = 77 // the driver refuses any other project id
+	row.EligibilityTagName.String = youtracktest.EligibilityTagName
+	fs := &fakeStore{repoRow: row, issueByID: store.Issue{Labels: []byte(`["` + youtracktest.EligibilityTagName + `"]`)}, createRunResult: store.Run{ID: uuid.New()}}
+	svc := New(fs, newBox(t), testParams())
+	svc.SetForges(m2Builder{&m2Forge{disposition: forge.AuthorEligible}})
+	svc.SetIssueSources(&fakeSources{tr: linkedYouTrack{Driver: youTrackDriver(t, srv)}})
+	if _, err := svc.CreateRun(context.Background(), uuid.New(), uuid.New(), n, "", nil, nil, false, nil, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	var th issueinput.Thread
+	if err := json.Unmarshal(fs.createRunParams.IssueComments, &th); err != nil {
+		t.Fatal(err)
+	}
+	total := 0
+	for _, c := range th.Comments {
+		total += len(c.Body)
+	}
+	if total != bound || !th.Truncated {
+		t.Fatalf("YouTrack thread bytes=%d truncated=%v, want exactly %d and truncated", total, th.Truncated, bound)
+	}
+	if len(th.Comments) == 0 || th.Comments[0].Reason != "" || !strings.Contains(th.Comments[0].Body, "cccc") {
+		t.Fatalf("the mapped account's comment did not reach the run: %+v", th.Comments)
 	}
 }

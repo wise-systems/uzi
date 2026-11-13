@@ -1007,7 +1007,7 @@ func run() error {
 	h := handler.New(pool, q, cfg, box, svc, wsvc, pcheck, liveHub, settingsCache)
 	// External issue tracker connections and the repo link (PRD #4173 M4). The link and
 	// the reconnect rule run in transactions on the pool. An empty allowlist
-	// (UZI_ISSUE_TRACKER_ALLOWED_BASE_URLS) still boots: Connect then refuses every URL.
+	// (ISSUE_TRACKER_ALLOWED_BASE_URLS) still boots: Connect then refuses every URL.
 	itSvc := issuetrackersvc.New(q, box, cfg.IssueTrackerBaseURLAllowed, issuetracker.New).
 		UseTransactions(pool, func(tx pgx.Tx) issuetrackersvc.Querier { return q.WithTx(tx) })
 	h.SetIssueTrackerService(itSvc)

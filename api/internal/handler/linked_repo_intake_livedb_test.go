@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"net/http/httptest"
 	"strconv"
 	"strings"
 	"testing"
@@ -156,6 +157,66 @@ func TestLinkedRepoIncrementalSyncCachesBelowTheMarksAndNeverEvictsLiveDB(t *tes
 	}
 	if _, ok := f.issueRow(t, f.issueN); !ok {
 		t.Fatal("an incremental sync evicted the moved issue")
+	}
+}
+
+// Acceptance 9: an incremental sync whose marks are earlier than the issue's updated time
+// advances them to the newest updated time, and a later incremental sync after the issue
+// moved to another project evicts nothing.
+func TestLinkedRepoIncrementalSyncAdvancesEarlierMarksLiveDB(t *testing.T) {
+	f := newLinkedHandlerFixture(t, true)
+	ctx := context.Background()
+	early := forgesvc.Marks{PRD: time.Unix(1000, 0), Open: time.Unix(1000, 0)}
+	got, err := f.h.svc.SyncIssuesIncremental(ctx, f.user.ID, f.repo, 77, f.tracker(t), early)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.PRD.After(early.PRD) {
+		t.Fatalf("marks = %+v, want PRD advanced past %v", got, early.PRD)
+	}
+	// The PRD mark advances to exactly the newest updated time the walk returned.
+	row, ok := f.issueRow(t, f.issueN)
+	if !ok {
+		t.Fatal("the incremental sync did not cache the issue")
+	}
+	if !got.PRD.Equal(row.ForgeUpdatedAt.Time) {
+		t.Fatalf("PRD mark = %v, want the issue's updated time %v", got.PRD, row.ForgeUpdatedAt.Time)
+	}
+	f.srv.MoveIssue(f.issueN, youtracktest.OtherProjectID)
+	if _, err := f.h.svc.SyncIssuesIncremental(ctx, f.user.ID, f.repo, 77, f.tracker(t), got); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := f.issueRow(t, f.issueN); !ok {
+		t.Fatal("an incremental sync evicted the moved issue")
+	}
+}
+
+// Acceptance (board contract): an unlinked repo's board cards carry no issue_key member.
+func TestUnlinkedBoardCardsCarryNoIssueKeyLiveDB(t *testing.T) {
+	ctx := context.Background()
+	f := newBoardWriterFixture(ctx, t, &boardWriterStub{})
+	mustExecT(ctx, t, f.pool, `INSERT INTO issues (repo_id, forge_issue_iid, title, state, labels, web_url, forge_updated_at, synced_at)
+	      VALUES ($1, 5, 'plain card', 'opened', $2, 'https://forge.example/i/5', now(), now())`, f.repoID, `["`+wantUziLabel+`"]`)
+	rr := httptest.NewRecorder()
+	f.h.GetBoard(rr, boardWriterReq(f.user, f.repoID, "", ""))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("board status = %d body = %s", rr.Code, rr.Body.String())
+	}
+	var body struct {
+		Board struct {
+			Cards []map[string]any `json:"cards"`
+		} `json:"board"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body.Board.Cards) == 0 {
+		t.Fatalf("the board has no cards, the check would be vacuous: %s", rr.Body.String())
+	}
+	for _, c := range body.Board.Cards {
+		if _, has := c["issue_key"]; has {
+			t.Fatalf("an unlinked repo's card carries issue_key: %v", c)
+		}
 	}
 }
 

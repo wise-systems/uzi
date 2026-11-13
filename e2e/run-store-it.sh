@@ -12,8 +12,8 @@
 #     quota that lets four workers through here.
 #
 # Spins up a THROWAWAY Postgres, points UZI_TEST_DATABASE_URL at it, applies the
-# real goose migrations, seeds fixtures, and runs every *LiveDB test in the seven
-# packages that carry one (store, handler, forgesvc, schedsvc, workersvc, recovery, poller -- the
+# real goose migrations, seeds fixtures, and runs every *LiveDB test in the eight
+# packages that carry one (store, handler, forgesvc, schedsvc, workersvc, recovery, poller, issuetrackersvc -- the
 # list on the `go test` line below; ci.yml runs this script once, via
 # `task test:codex-refresh-lostreply-e2e`, for both CI contexts).
 # Isolated: unique container + published loopback port, torn down on exit; never
