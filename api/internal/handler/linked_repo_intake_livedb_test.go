@@ -174,9 +174,13 @@ func TestLinkedRepoIncrementalSyncAdvancesEarlierMarksLiveDB(t *testing.T) {
 	if !got.PRD.After(early.PRD) {
 		t.Fatalf("marks = %+v, want PRD advanced past %v", got, early.PRD)
 	}
-	// The fake stamps the seeded issue's updated time on its own clock.
-	if want := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC); !got.PRD.After(want) {
-		t.Fatalf("PRD mark = %v, want the issue's updated time (after %v)", got.PRD, want)
+	// The PRD mark advances to exactly the newest updated time the walk returned.
+	row, ok := f.issueRow(t, f.issueN)
+	if !ok {
+		t.Fatal("the incremental sync did not cache the issue")
+	}
+	if !got.PRD.Equal(row.ForgeUpdatedAt.Time) {
+		t.Fatalf("PRD mark = %v, want the issue's updated time %v", got.PRD, row.ForgeUpdatedAt.Time)
 	}
 	f.srv.MoveIssue(f.issueN, youtracktest.OtherProjectID)
 	if _, err := f.h.svc.SyncIssuesIncremental(ctx, f.user.ID, f.repo, 77, f.tracker(t), got); err != nil {

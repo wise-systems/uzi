@@ -70,6 +70,11 @@ func TestLinkedUnmappedIssueAuthorManualStartIsCreatedLiveDB(t *testing.T) {
 	if err := f.pool.QueryRow(context.Background(), `SELECT count(*) FROM runs WHERE repo_id = $1 AND issue_iid = $2`, f.repo, f.issueN).Scan(&n); err != nil || n != 1 {
 		t.Fatalf("runs = %d (%v), want 1", n, err)
 	}
+	// The unmapped path ran: the run records the author as permission_unknown.
+	var reason *string
+	if err := f.pool.QueryRow(context.Background(), `SELECT issue_input_reason FROM runs WHERE repo_id = $1 AND issue_iid = $2`, f.repo, f.issueN).Scan(&reason); err != nil || reason == nil || *reason != "permission_unknown" {
+		t.Fatalf("issue_input_reason = %v (%v), want permission_unknown", reason, err)
+	}
 }
 
 // Acceptance 3 (scheduled half): an unmapped author's scheduled run is created but not

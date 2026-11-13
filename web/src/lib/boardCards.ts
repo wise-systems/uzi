@@ -61,7 +61,7 @@ export function isUziCard(
 ): boolean {
   const botId = botForgeUserID ?? 0;
   // A card the linked sync cached carries an issue_key and is eligible by its issue tracker
-  // tag (a stored name that differs from the configured uzi label), so it needs no label.
+  // tag (a stored name that may differ from the configured uzi label), so it needs no label.
   if (card.issue_key) return true;
   return card.labels.includes(uziLabel) || (botId > 0 && (card.assignee_ids ?? []).includes(botId));
 }
