@@ -74,6 +74,15 @@ func (s *wiringStore) ListEnabledRepoIDs(context.Context) ([]uuid.UUID, error) {
 	}
 	return ids, nil
 }
+func (s *wiringStore) ListEnabledLinkedRepoIDs(context.Context) ([]uuid.UUID, error) {
+	ids := []uuid.UUID{}
+	for _, r := range s.rows {
+		if r.IssueTrackerConnectionID.Valid {
+			ids = append(ids, r.ID)
+		}
+	}
+	return ids, nil
+}
 func (s *wiringStore) RecoveryStorageHealth(context.Context, store.RecoveryStorageHealthParams) ([]store.RecoveryStorageHealthRow, error) {
 	return []store.RecoveryStorageHealthRow{{}}, nil
 }

@@ -15,9 +15,11 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/forge/forgetest"
 	"github.com/vtmocanu/uzi/api/internal/forgesvc"
+	"github.com/vtmocanu/uzi/api/internal/healthsvc"
 	"github.com/vtmocanu/uzi/api/internal/issuetracker"
 	"github.com/vtmocanu/uzi/api/internal/issuetracker/youtracktest"
 	"github.com/vtmocanu/uzi/api/internal/issuetrackersvc"
@@ -71,6 +73,7 @@ type linkedEnv struct {
 	q       *store.Queries
 	svc     *forgesvc.Service
 	rec     *forgetest.Recorder
+	forge   *recordedPollForge
 	engine  *Engine
 	starter *apRuns
 	user    uuid.UUID
@@ -101,7 +104,8 @@ func newLinkedEnv(t *testing.T, srv *youtracktest.Server, drivers forgesvc.Issue
 	if err != nil {
 		t.Fatal(err)
 	}
-	rec := forgetest.NewRecorder(&recordedPollForge{})
+	fake := &recordedPollForge{}
+	rec := forgetest.NewRecorder(fake)
 	svc := forgesvc.NewWithForgeBuilder(q, box, time.Second, nil, func(forge.Type, string, string, time.Duration) (forge.Forge, error) {
 		return rec, nil
 	})
@@ -109,7 +113,7 @@ func newLinkedEnv(t *testing.T, srv *youtracktest.Server, drivers forgesvc.Issue
 	if err != nil {
 		t.Fatal(err)
 	}
-	env := &linkedEnv{ctx: ctx, pool: pool, q: q, svc: svc, rec: rec, user: uuid.New(), repo: uuid.New(), run7: uuid.New()}
+	env := &linkedEnv{ctx: ctx, pool: pool, q: q, svc: svc, rec: rec, forge: fake, user: uuid.New(), repo: uuid.New(), run7: uuid.New()}
 	exec := func(sql string, args ...any) {
 		t.Helper()
 		if _, err := pool.Exec(ctx, sql, args...); err != nil {
@@ -249,59 +253,169 @@ type syncOutcome struct {
 	class forge.ErrorClass
 }
 
-// recordOutcomes wires the engine's issue-sync health observer and returns what it saw.
-func recordOutcomes(e *linkedEnv) *[]syncOutcome {
-	var seen []syncOutcome
-	e.engine.SetSyncAttempt(func(uuid.UUID) func(bool, forge.ErrorClass) {
-		return func(ok bool, class forge.ErrorClass) { seen = append(seen, syncOutcome{ok, class}) }
-	})
-	return &seen
+// observed is what a linked repo's two health observers saw: the raw outcomes, plus the
+// real registries healthsvc reads, on a clock the test controls.
+type observed struct {
+	forge, issueTracker       []syncOutcome
+	forgeReg, issueTrackerReg *healthsvc.SyncRegistry
+	clock                     time.Time
 }
 
-// A linked repo reports its issue sync healthy only when the linked sync succeeded, and
-// still runs every code-host step when it did not.
-func TestLinkedRepoHealthFollowsTheLinkedIssueSyncLiveDB(t *testing.T) {
-	t.Run("healthy issue tracker reports ok", func(t *testing.T) {
-		srv := youtracktest.NewServer(t)
-		trustFake(t, srv)
-		env := newLinkedEnv(t, srv, nil)
-		seen := recordOutcomes(env)
-		env.poll(t)
-		if len(*seen) != 1 || !(*seen)[0].ok {
-			t.Fatalf("outcomes = %+v, want one healthy report", *seen)
+// observe wires the engine's forge.sync and issue_tracker.sync observers to recorders and
+// to real healthsvc registries.
+func observe(e *linkedEnv) *observed {
+	o := &observed{clock: time.Now()}
+	now := func() time.Time { return o.clock }
+	o.forgeReg, o.issueTrackerReg = healthsvc.NewSyncRegistry(now), healthsvc.NewSyncRegistry(now)
+	e.engine.SetSyncAttempt(func(id uuid.UUID) func(bool, forge.ErrorClass) {
+		reg := o.forgeReg.Begin(id)
+		return func(ok bool, class forge.ErrorClass) {
+			o.forge = append(o.forge, syncOutcome{ok, class})
+			reg(ok, class)
 		}
 	})
-	t.Run("a rejected issue tracker token reports class other, not a forge auth failure", func(t *testing.T) {
+	e.engine.SetIssueTrackerSyncAttempt(func(id uuid.UUID) func(bool, forge.ErrorClass) {
+		reg := o.issueTrackerReg.Begin(id)
+		return func(ok bool, class forge.ErrorClass) {
+			o.issueTracker = append(o.issueTracker, syncOutcome{ok, class})
+			reg(ok, class)
+		}
+	})
+	return o
+}
+
+// authClassError is a classified forge error: forge.Class maps it to ErrorClassAuth, as it
+// does a forge 401.
+type authClassError struct{}
+
+func (authClassError) Error() string           { return "401 Unauthorized" }
+func (authClassError) Class() forge.ErrorClass { return forge.ErrorClassAuth }
+
+// onlyLinkedRepo scopes the health checks' enumerations to the one seeded repo, so the
+// shared test database's other repos do not leave the checks pending.
+type onlyLinkedRepo struct {
+	*store.Queries
+	repo uuid.UUID
+}
+
+func (o onlyLinkedRepo) ListEnabledRepoIDs(context.Context) ([]uuid.UUID, error) {
+	return []uuid.UUID{o.repo}, nil
+}
+
+func (o onlyLinkedRepo) ListEnabledLinkedRepoIDs(context.Context) ([]uuid.UUID, error) {
+	return []uuid.UUID{o.repo}, nil
+}
+
+// health ages the clock past the danger band, then evaluates admin health through
+// healthsvc over the two registries the engine fed, returning the two sync checks.
+func (o *observed) health(t *testing.T, e *linkedEnv) (forgeCheck, issueTrackerCheck apitypes.HealthCheckDTO) {
+	t.Helper()
+	o.clock = o.clock.Add(time.Hour)
+	svc := healthsvc.New(healthsvc.Config{
+		Store:                    onlyLinkedRepo{e.q, e.repo},
+		Now:                      func() time.Time { return o.clock },
+		ForgeSyncRegistry:        o.forgeReg,
+		IssueTrackerSyncRegistry: o.issueTrackerReg,
+		ForgeSyncInterval:        time.Minute,
+	})
+	doc, err := svc.Evaluate(e.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range doc.Checks {
+		switch c.ID {
+		case "forge.sync":
+			forgeCheck = c
+		case "issue_tracker.sync":
+			issueTrackerCheck = c
+		}
+	}
+	if forgeCheck.ID == "" || issueTrackerCheck.ID == "" {
+		t.Fatalf("health doc lacks forge.sync or issue_tracker.sync: %+v", doc.Checks)
+	}
+	return forgeCheck, issueTrackerCheck
+}
+
+// A linked repo's forge.sync follows a code-host probe and its issue_tracker.sync follows
+// the linked issue sync; every code-host step still runs whichever fails.
+func TestLinkedRepoHealthSplitsForgeAndIssueTrackerLiveDB(t *testing.T) {
+	t.Run("healthy reports ok on both", func(t *testing.T) {
 		srv := youtracktest.NewServer(t)
 		trustFake(t, srv)
 		env := newLinkedEnv(t, srv, nil)
-		seen := recordOutcomes(env)
+		o := observe(env)
+		env.poll(t)
+		if len(o.forge) != 1 || !o.forge[0].ok || len(o.issueTracker) != 1 || !o.issueTracker[0].ok {
+			t.Fatalf("outcomes = forge %+v, issue tracker %+v, want one healthy report each", o.forge, o.issueTracker)
+		}
+		if !containsPrefix(env.rec.Calls(), "GetProject(") {
+			t.Fatalf("no code-host probe: %v", env.rec.Calls())
+		}
+	})
+	t.Run("a forge 401 turns forge.sync red with the forge action and leaves issue_tracker.sync ok", func(t *testing.T) {
+		srv := youtracktest.NewServer(t)
+		trustFake(t, srv)
+		env := newLinkedEnv(t, srv, nil)
+		env.forge.getProjectErr = authClassError{}
+		o := observe(env)
+		env.poll(t)
+		if len(o.forge) != 1 || o.forge[0].ok || o.forge[0].class != forge.ErrorClassAuth {
+			t.Fatalf("forge outcomes = %+v, want one auth failure", o.forge)
+		}
+		if len(o.issueTracker) != 1 || !o.issueTracker[0].ok {
+			t.Fatalf("issue tracker outcomes = %+v, want one healthy report", o.issueTracker)
+		}
+		env.assertCodeHostOnly(t)
+		fc, ic := o.health(t, env)
+		if fc.Severity != "danger" || fc.Action == nil || !strings.Contains(*fc.Action, "re-check the forge connection") {
+			t.Fatalf("forge.sync = %+v, want danger with the forge connection action", fc)
+		}
+		if ic.Severity != "ok" {
+			t.Fatalf("issue_tracker.sync = %+v, want ok", ic)
+		}
+	})
+	t.Run("a rejected issue tracker token fails issue_tracker.sync only", func(t *testing.T) {
+		srv := youtracktest.NewServer(t)
+		trustFake(t, srv)
+		env := newLinkedEnv(t, srv, nil)
+		o := observe(env)
 		// The stored token no longer matches the one the fake accepts: YouTrack answers 401.
 		srv.Token += "-rotated"
 		env.poll(t)
-		if len(*seen) != 1 || (*seen)[0].ok || (*seen)[0].class != forge.ErrorClassOther {
-			t.Fatalf("outcomes = %+v, want one unhealthy report of class %q (the forge connection is not at fault)", *seen, forge.ErrorClassOther)
+		if len(o.forge) != 1 || !o.forge[0].ok {
+			t.Fatalf("forge outcomes = %+v, want one healthy report", o.forge)
+		}
+		if len(o.issueTracker) != 1 || o.issueTracker[0].ok {
+			t.Fatalf("issue tracker outcomes = %+v, want one failure", o.issueTracker)
 		}
 		env.assertCodeHostOnly(t)
+		fc, ic := o.health(t, env)
+		if fc.Severity != "ok" {
+			t.Fatalf("forge.sync = %+v, want ok", fc)
+		}
+		if ic.Severity != "danger" || ic.Action == nil || strings.Contains(*ic.Action, "forge") {
+			t.Fatalf("issue_tracker.sync = %+v, want danger with an issue tracker action", ic)
+		}
+		t.Logf("issue_tracker.sync class %q action %q", o.issueTracker[0].class, *ic.Action)
 	})
-	t.Run("an unreachable issue tracker reports unhealthy, code-host steps still run", func(t *testing.T) {
+	t.Run("an unreachable issue tracker fails issue_tracker.sync, code-host steps still run", func(t *testing.T) {
 		srv := youtracktest.NewServer(t)
 		trustFake(t, srv)
 		env := newLinkedEnv(t, srv, nil)
-		seen := recordOutcomes(env)
+		o := observe(env)
 		srv.Close()
 		env.poll(t)
-		if len(*seen) != 1 || (*seen)[0].ok || (*seen)[0].class != forge.ErrorClassOther {
-			t.Fatalf("outcomes = %+v, want one unhealthy report of class %q", *seen, forge.ErrorClassOther)
+		if len(o.forge) != 1 || !o.forge[0].ok || len(o.issueTracker) != 1 || o.issueTracker[0].ok {
+			t.Fatalf("outcomes = forge %+v, issue tracker %+v, want forge healthy and issue tracker failing", o.forge, o.issueTracker)
 		}
 		env.assertCodeHostOnly(t)
 	})
-	t.Run("a refused resolver reports unhealthy, code-host steps still run", func(t *testing.T) {
+	t.Run("a refused resolver fails issue_tracker.sync, code-host steps still run", func(t *testing.T) {
 		env := newLinkedEnv(t, nil, &refusingDrivers{})
-		seen := recordOutcomes(env)
+		o := observe(env)
 		env.poll(t)
-		if len(*seen) != 1 || (*seen)[0].ok || (*seen)[0].class != forge.ErrorClassOther {
-			t.Fatalf("outcomes = %+v, want one unhealthy report of class %q", *seen, forge.ErrorClassOther)
+		if len(o.forge) != 1 || !o.forge[0].ok || len(o.issueTracker) != 1 || o.issueTracker[0].ok {
+			t.Fatalf("outcomes = forge %+v, issue tracker %+v, want forge healthy and issue tracker failing", o.forge, o.issueTracker)
 		}
 		env.assertCodeHostOnly(t)
 	})

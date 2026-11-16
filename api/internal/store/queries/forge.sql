@@ -1021,6 +1021,11 @@ WHERE id = @id AND prd_patch_settled_at IS NULL;
 -- name: ListEnabledRepoIDs :many
 SELECT id FROM repos WHERE enabled = true;
 
+-- name: ListEnabledLinkedRepoIDs :many
+-- Enabled repos linked to an issue tracker connection: the issue_tracker.sync health
+-- check's enumeration.
+SELECT id FROM repos WHERE enabled = true AND issue_tracker_connection_id IS NOT NULL;
+
 -- name: RemoveCachedIssueLabel :one
 -- Existing cached rows only: remove one label from the current array, preserving
 -- concurrent label additions and every non-label column. Array order is retained.

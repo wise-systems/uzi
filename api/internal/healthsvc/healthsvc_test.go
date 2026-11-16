@@ -46,6 +46,8 @@ type fakeStore struct {
 	custodyAggregateParams []store.GetCustodyAggregateForOwnerParams
 	enabledIDs             []uuid.UUID
 	enabledErr             error
+	linkedIDs              []uuid.UUID
+	linkedErr              error
 	workers                []store.ListAllWorkersRow
 	workersErr             error
 	workerQueries          atomic.Int32
@@ -95,6 +97,10 @@ func (f *fakeStore) GetUserByID(ctx context.Context, id uuid.UUID) (store.User, 
 
 func (f *fakeStore) ListEnabledRepoIDs(context.Context) ([]uuid.UUID, error) {
 	return f.enabledIDs, f.enabledErr
+}
+
+func (f *fakeStore) ListEnabledLinkedRepoIDs(context.Context) ([]uuid.UUID, error) {
+	return f.linkedIDs, f.linkedErr
 }
 
 func (f *fakeStore) ListWorkerUpgradeBlockers(_ context.Context, ids []uuid.UUID) ([]store.ListWorkerUpgradeBlockersRow, error) {
@@ -1186,10 +1192,10 @@ func TestEvaluateRollupAndRegistry(t *testing.T) {
 	// (integrations), so it is 14, not 11; PRD #1809 M6 added fleet.rundisk
 	// (workers), issue #2203 adds forge.sync (integrations), and issue #2213 adds
 	// fleet.quarantine and issue #3142 adds fleet.memory_authority (workers); pricing.codex follows release.check, db.size follows db and
-	// recovery.storage follows custody.holds, making 23 with agentsource.update after release.check and maintenance.active after schedules.paused (PRD #3454).
+	// recovery.storage follows custody.holds, making 24 with issue_tracker.sync after forge.sync, with agentsource.update after release.check and maintenance.active after schedules.paused (PRD #3454).
 	wantIDs := []string{
 		"fleet.roll", "fleet.capacity", "fleet.disk", "fleet.rundisk", "fleet.quarantine", "fleet.memory_authority", "queue.waiting", "queue.undispatched",
-		"controller.report", "db", "db.size", "loops", "forge.ciwatch", "forge.sync", "slack.socket",
+		"controller.report", "db", "db.size", "loops", "forge.ciwatch", "forge.sync", "issue_tracker.sync", "slack.socket",
 		"schedules.paused", "maintenance.active", "board.drift", "custody.holds", "recovery.storage", "release.check", "agentsource.update", "pricing.codex",
 	}
 	if len(doc.Checks) != len(wantIDs) {
