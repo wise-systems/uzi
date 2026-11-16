@@ -327,8 +327,11 @@ func (s *Service) DiscoverRepos(ctx context.Context, userID, connID uuid.UUID) (
 // only after it is held. A link that committed first is seen under the lock,
 // so only the column rows are written and the forge gets no label request; a
 // link that arrives later waits for this transaction and is then refused. The
-// forge label request therefore runs while the row lock is held, bounded by
-// the forge HTTP timeout. The guard runs before the transaction: it makes
+// forge label requests therefore run while the row lock and one pool
+// connection are held. The forge HTTP timeout bounds each request, not the
+// whole seed: a seed makes several (a project lookup, a label listing, one
+// create per missing label), so the hold can be several timeouts long. The
+// guard runs before the transaction: it makes
 // network calls of its own and reads nothing the link changes.
 func (s *Service) EnableRepo(ctx context.Context, userID, repoID uuid.UUID) (store.Repo, error) {
 	row, err := s.q.GetRepoForUser(ctx, store.GetRepoForUserParams{ID: repoID, UserID: userID})
