@@ -17,9 +17,9 @@ const intakePauseFn = "fn_run_admitted_during_intake_pause"
 var (
 	beginAtomicRE = regexp.MustCompile(`(?i)\bbegin\s+atomic\b`)
 	// The other SQL-standard form, a bare RETURN <expr> body: a RETURN after the RETURNS clause
-	// with no dollar quote or statement end between them. Keyed on the body, not the LANGUAGE
-	// clause, which may be omitted or quoted for this form.
-	sqlReturnBodyRE   = regexp.MustCompile(`(?is)\breturns\b[^;$]*?\breturn\b`)
+	// (whose LANGUAGE clause may be omitted or quoted) or, for a function with OUT parameters
+	// and no RETURNS clause, after LANGUAGE sql, with no dollar quote or statement end between.
+	sqlReturnBodyRE   = regexp.MustCompile(`(?is)\b(?:returns|language\s+sql)\b[^;$]*?\breturn\b`)
 	convertFnRE       = regexp.MustCompile(`(?i)create\s+or\s+replace\s+function\s+` + intakePauseFn + `\b`)
 	runsAlterRE       = regexp.MustCompile(`(?is)^\s*alter\s+table\s+(?:if\s+exists\s+)?(?:only\s+)?runs\b`)
 	defaultedAddColRE = regexp.MustCompile(`(?is)\badd\s+column\s+(?:if\s+not\s+exists\s+)?[^,;]*?\bdefault\b`)
