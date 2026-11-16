@@ -1,9 +1,11 @@
 package store_test
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -29,23 +31,31 @@ func TestRepoRemovalMarkersMigrationLiveDB(t *testing.T) {
 	if err != nil || n != 1 {
 		t.Fatalf("DeleteRepoForUser = %d, %v; want 1 row", n, err)
 	}
-	if got := count(`SELECT count(*) FROM repo_removal_markers WHERE connection_id=$1 AND forge_project_id=1 AND NOT was_linked`, f.forgeConn); got != 1 {
+	if got := count(`SELECT count(*) FROM repo_removal_markers WHERE user_id=$1 AND forge_type='github' AND base_url='https://example.com' AND forge_project_id=1 AND NOT was_linked`, f.user); got != 1 {
 		t.Fatalf("markers after the removal = %d, want 1", got)
 	}
 
 	// A linked removal, then an unlinked one of the same project: the flag stays set.
-	itlExec(t, pool, `UPDATE repo_removal_markers SET was_linked = true WHERE connection_id=$1`, f.forgeConn)
+	itlExec(t, pool, `UPDATE repo_removal_markers SET was_linked = true WHERE user_id=$1`, f.user)
 	id := uuid.New()
 	itlExec(t, pool, `INSERT INTO repos (id,connection_id,forge_project_id,path_with_namespace,web_url) VALUES ($1,$2,1,'o/again','https://example.com/o/again')`, id, f.forgeConn)
 	if itlAwaiting(t, pool, id) {
 		t.Fatal("a raw insert of a project with a marker must not be awaiting its first enable")
 	}
 	itlExec(t, pool, `DELETE FROM repos WHERE id=$1`, id)
-	if got := count(`SELECT count(*) FROM repo_removal_markers WHERE connection_id=$1 AND was_linked`, f.forgeConn); got != 1 {
+	if got := count(`SELECT count(*) FROM repo_removal_markers WHERE user_id=$1 AND was_linked`, f.user); got != 1 {
 		t.Fatalf("a second removal cleared the linked flag (rows still linked = %d)", got)
 	}
 
-	// Down: the table and triggers are gone, an enable of a re-inserted project is allowed.
+	// A re-inserted project with a linked marker cannot be enabled unlinked, until Down.
+	again := uuid.New()
+	itlExec(t, pool, `INSERT INTO repos (id,connection_id,forge_project_id,path_with_namespace,web_url) VALUES ($1,$2,1,'o/again','https://example.com/o/again')`, again, f.forgeConn)
+	var pgErr *pgconn.PgError
+	if _, err := pool.Exec(ctx, `UPDATE repos SET enabled = true WHERE id=$1`, again); !errors.As(err, &pgErr) || pgErr.Code != "UZ414" {
+		t.Fatalf("enable before Down err = %v, want SQLSTATE UZ414", err)
+	}
+
+	// Down: the table and triggers are gone, and the enable that was refused goes through.
 	if err := store.MigrateDownTo(ctx, dsn, 426); err != nil {
 		t.Fatalf("down: %v", err)
 	}
@@ -57,6 +67,9 @@ func TestRepoRemovalMarkersMigrationLiveDB(t *testing.T) {
 	}
 	if got := count(`SELECT count(*) FROM pg_proc WHERE proname LIKE 'repos_removal_marker_%'`); got != 0 {
 		t.Fatalf("Down left %d functions", got)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE repos SET enabled = true WHERE id=$1`, again); err != nil {
+		t.Fatalf("enable after Down: %v", err)
 	}
 	if err := store.Migrate(ctx, dsn); err != nil {
 		t.Fatalf("up again: %v", err)

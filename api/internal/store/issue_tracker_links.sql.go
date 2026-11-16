@@ -88,7 +88,11 @@ func (q *Queries) GetRepoIssueSourceForUser(ctx context.Context, arg GetRepoIssu
 }
 
 const lockRepoForEnableForUser = `-- name: LockRepoForEnableForUser :one
-SELECT r.awaiting_first_enable, r.issue_tracker_connection_id
+SELECT r.awaiting_first_enable, r.issue_tracker_connection_id,
+       (r.issue_tracker_connection_id IS NULL AND EXISTS (
+           SELECT 1 FROM repo_removal_markers m
+           WHERE m.user_id = c.user_id AND m.forge_type = c.forge_type AND m.base_url = c.base_url
+             AND m.forge_project_id = r.forge_project_id AND m.was_linked))::boolean AS source_locked
 FROM repos r
 JOIN forge_connections c ON c.id = r.connection_id
 WHERE r.id = $1 AND c.user_id = $2
@@ -103,6 +107,7 @@ type LockRepoForEnableForUserParams struct {
 type LockRepoForEnableForUserRow struct {
 	AwaitingFirstEnable      bool        `json:"awaiting_first_enable"`
 	IssueTrackerConnectionID pgtype.UUID `json:"issue_tracker_connection_id"`
+	SourceLocked             bool        `json:"source_locked"`
 }
 
 // The enable's half of the D13 row lock, scoped to the owning user. Call inside a
@@ -110,10 +115,13 @@ type LockRepoForEnableForUserRow struct {
 // so a link that committed first is visible. FOR NO KEY UPDATE conflicts with the link's
 // FOR UPDATE, so one of the two waits for the other, but it does not block inserts of
 // rows that reference the repo by foreign key (board columns, cards).
+// source_locked: the project was linked before it was removed and this row is not linked, so
+// its issue source cannot change and the enable is refused before any board or label work
+// (the repos trigger from 00427 refuses it too, later and less cheaply).
 func (q *Queries) LockRepoForEnableForUser(ctx context.Context, arg LockRepoForEnableForUserParams) (LockRepoForEnableForUserRow, error) {
 	row := q.db.QueryRow(ctx, lockRepoForEnableForUser, arg.ID, arg.UserID)
 	var i LockRepoForEnableForUserRow
-	err := row.Scan(&i.AwaitingFirstEnable, &i.IssueTrackerConnectionID)
+	err := row.Scan(&i.AwaitingFirstEnable, &i.IssueTrackerConnectionID, &i.SourceLocked)
 	return i, err
 }
 

@@ -1066,7 +1066,9 @@ type Repo struct {
 }
 
 type RepoRemovalMarker struct {
-	ConnectionID   uuid.UUID          `json:"connection_id"`
+	UserID         uuid.UUID          `json:"user_id"`
+	ForgeType      string             `json:"forge_type"`
+	BaseUrl        string             `json:"base_url"`
 	ForgeProjectID int64              `json:"forge_project_id"`
 	WasLinked      bool               `json:"was_linked"`
 	RemovedAt      pgtype.Timestamptz `json:"removed_at"`

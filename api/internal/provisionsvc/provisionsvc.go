@@ -372,6 +372,12 @@ func (s *Service) EnableRepo(ctx context.Context, userID, repoID uuid.UUID) (sto
 		if err != nil {
 			return err
 		}
+		// A project linked to an issue tracker before it was removed keeps that issue source: it
+		// is refused here, before any label work reaches the forge (the repos trigger from
+		// migration 00427 refuses the flip too, and enableError maps it the same way).
+		if lock.SourceLocked {
+			return removedLinkedRepoError()
+		}
 		// PRD #4173 D3: board columns are labels, on the issue-tracker half. A repo linked to an
 		// external issue tracker records the column rows only: uzi creates no labels or tags
 		// there (writes arrive in M5), and the forge's project is not where its issues live.
@@ -408,6 +414,12 @@ func (s *Service) EnableRepo(ctx context.Context, userID, repoID uuid.UUID) (sto
 // a repo that was linked to an issue tracker before its removal is enabled unlinked.
 const removedLinkedRepoSQLState = "UZ414"
 
+// removedLinkedRepoError is the 409 for a project that was linked to an issue tracker before
+// it was removed from uzi.
+func removedLinkedRepoError() *Error {
+	return &Error{Kind: KindConflict, Message: "this project was linked to an issue tracker before it was removed from uzi; its issue source cannot change, so it cannot be enabled or linked again"}
+}
+
 // enableError maps an EnableRepo transaction failure to the typed error the
 // caller returns: a typed *Error passes through, a missing row is not found,
 // the removed-linked-repo refusal is a conflict, and anything else is logged and becomes internal.
@@ -421,7 +433,7 @@ func (s *Service) enableError(err error) *Error {
 	}
 	var pe *pgconn.PgError
 	if errors.As(err, &pe) && pe.Code == removedLinkedRepoSQLState {
-		return &Error{Kind: KindConflict, Message: "this project was linked to an issue tracker before it was removed from uzi; its issue source cannot change, so it cannot be enabled as a forge-issue repo"}
+		return removedLinkedRepoError()
 	}
 	s.logger().Error("enable repo", "error", err)
 	return internal()
