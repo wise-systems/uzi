@@ -1,6 +1,6 @@
 -- +goose Up
--- Issue #18: Postgres 17.12 and later refuse any table-rewriting ALTER on runs (a defaulted or
--- generated ADD COLUMN, a column type change) while a function with an SQL-standard body reads
+-- Issue #18: Postgres 17.12 and later refuse an ADD COLUMN with a default or generated
+-- expression, and a column type change, on runs while a function with an SQL-standard body reads
 -- the runs row type. fn_run_admitted_during_intake_pause (00358) was the only such function.
 -- 00362, 00363, 00370, 00394, 00397 and 00407 convert it before their own ALTERs; this converts
 -- it on a database that applied all of those before the fix, so the next migration that adds a

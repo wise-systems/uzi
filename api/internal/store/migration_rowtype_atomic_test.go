@@ -6,8 +6,9 @@ import (
 	"testing"
 )
 
-// Issue #18: Postgres 17.12 and later refuse a table-rewriting ALTER on a table whose row type
-// is read by a function with an SQL-standard (BEGIN ATOMIC) body. These tests pin the shape of
+// Issue #18: Postgres 17.12 and later refuse an ADD COLUMN with a default or generated
+// expression, and a column type change, on a table whose row type is read by a function with an
+// SQL-standard body (BEGIN ATOMIC ... END, or a bare RETURN <expr>). These tests pin the shape of
 // the migration fix without a database: only 00358 may create such a function, and every
 // migration that adds a defaulted column to runs converts the function first.
 
@@ -15,8 +16,10 @@ const intakePauseFn = "fn_run_admitted_during_intake_pause"
 
 var (
 	beginAtomicRE = regexp.MustCompile(`(?i)\bbegin\s+atomic\b`)
-	// The other SQL-standard form: LANGUAGE sql followed by a bare RETURN <expr> body.
-	sqlReturnBodyRE   = regexp.MustCompile(`(?is)\blanguage\s+sql\b[^;$]*?\breturn\b`)
+	// The other SQL-standard form, a bare RETURN <expr> body: a RETURN after the RETURNS clause
+	// with no dollar quote or statement end between them. Keyed on the body, not the LANGUAGE
+	// clause, which may be omitted or quoted for this form.
+	sqlReturnBodyRE   = regexp.MustCompile(`(?is)\breturns\b[^;$]*?\breturn\b`)
 	convertFnRE       = regexp.MustCompile(`(?i)create\s+or\s+replace\s+function\s+` + intakePauseFn + `\b`)
 	runsAlterRE       = regexp.MustCompile(`(?is)^\s*alter\s+table\s+(?:if\s+exists\s+)?(?:only\s+)?runs\b`)
 	defaultedAddColRE = regexp.MustCompile(`(?is)\badd\s+column\s+(?:if\s+not\s+exists\s+)?[^,;]*?\bdefault\b`)
@@ -67,8 +70,8 @@ func TestNoSQLStandardBodyMigrationExceptIntakePause(t *testing.T) {
 		}
 		code := stripSQLComments(body)
 		if beginAtomicRE.MatchString(code) || sqlReturnBodyRE.MatchString(code) {
-			t.Errorf("%s contains an SQL-standard function body (BEGIN ATOMIC or LANGUAGE sql RETURN): Postgres 17.12+ refuses table-rewriting ALTERs "+
-				"(defaulted ADD COLUMN, column TYPE change) on a table whose row type such a function reads, "+
+			t.Errorf("%s contains an SQL-standard function body (BEGIN ATOMIC or a bare RETURN): Postgres 17.12+ refuses an ADD COLUMN "+
+				"with a default or generated expression, and a column TYPE change, on a table whose row type such a function reads, "+
 				"so a later migration could no longer alter that table (issue #18); use a string ($$) body", name)
 		}
 	}

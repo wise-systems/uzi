@@ -15,7 +15,8 @@ import (
 // function by itself (prosqlbody IS NULL afterwards). On any 17.x that is the whole claim; on
 // 17.12+ each MigrateTo additionally fails unless the migration converts the function before
 // its defaulted ADD COLUMN on runs, and the final probe fails unless the head schema accepts
-// one. The static ordering test covers older minors.
+// one, and no public function may keep an SQL-standard body at head. The static ordering test
+// covers older minors.
 func TestIntakePauseAdmissionStringBodyMigrationLiveDB(t *testing.T) {
 	_, dsn := cjCreateDatabase(t, "")
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
@@ -107,7 +108,7 @@ func TestIntakePauseAdmissionStringBodyMigrationLiveDB(t *testing.T) {
 		t.Fatalf("rows: %v", err)
 	}
 	if len(sqlStandard) > 0 {
-		t.Fatalf("head schema has SQL-standard function bodies %v; Postgres 17.12+ refuses table-rewriting ALTERs on a row type they read (issue #18)", sqlStandard)
+		t.Fatalf("head schema has SQL-standard function bodies %v; Postgres 17.12+ refuses a defaulted or generated ADD COLUMN and a column type change on a row type they read (issue #18)", sqlStandard)
 	}
 	tx, err := pool.Begin(ctx)
 	if err != nil {
