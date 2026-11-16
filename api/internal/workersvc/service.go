@@ -8158,7 +8158,11 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 		if err != nil {
 			return store.Run{}, err
 		}
-		if requested, _ := ctx.Value(scheduleApprovalKey{}).(bool); requested && autoApprove {
+		// PRD #4173 D11: a schedule fire asks for the check; a linked repo always gets it, so
+		// the label poller's CreateAutopilotRun (no schedule marker) cannot auto-approve an
+		// unmapped issue tracker author either.
+		requested, _ := ctx.Value(scheduleApprovalKey{}).(bool)
+		if linked := row.IssueTrackerConnectionID.Valid; (requested || linked) && autoApprove {
 			blockedReasons = capture.Reasons()
 			if len(blockedReasons) != 0 {
 				autoApprove = false

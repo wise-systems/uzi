@@ -246,3 +246,35 @@ func TestLinkedIssueTextEditedByAnotherUserBlocksAutoApproval(t *testing.T) {
 		})
 	}
 }
+
+// PRD #4173 D11: the label poller's CreateAutopilotRun carries no schedule marker, yet on a
+// linked repo an unmapped issue author must still block its auto-approval.
+func TestLinkedAutopilotRunFromTheLabelPollerHonoursD11(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("unmapped author is not auto-approved", func(t *testing.T) {
+		x := newLinkedMappingFixture(t, youtracktest.OtherLogin, nil)
+		if _, err := x.svc.CreateAutopilotRun(ctx, uuid.New(), uuid.New(), x.issue, "", nil); err != nil {
+			t.Fatal(err)
+		}
+		p := x.fs.createRunParams
+		if p == nil || p.AutoApprove || strings.Join(p.AutoApproveBlockedReasons, ",") != issueinput.Unknown {
+			t.Fatalf("create params = %+v, want AutoApprove=false and reasons [permission_unknown]", p)
+		}
+	})
+
+	t.Run("mapped author is auto-approved", func(t *testing.T) {
+		srv := youtracktest.NewServer(t)
+		n := srv.SeedIssue("a card", "card body", youtracktest.EligibilityTagID)
+		srv.SeedComment(n, youtracktest.BotLogin, "own")
+		x := newLinkedMappingFixture(t, youtracktest.BotLogin, nil)
+		x.svc.SetIssueSources(&fakeSources{tr: linkedYouTrack{Driver: youTrackDriver(t, srv)}})
+		if _, err := x.svc.CreateAutopilotRun(ctx, uuid.New(), uuid.New(), n, "", nil); err != nil {
+			t.Fatal(err)
+		}
+		p := x.fs.createRunParams
+		if p == nil || !p.AutoApprove || len(p.AutoApproveBlockedReasons) != 0 {
+			t.Fatalf("create params = %+v, want auto-approved", p)
+		}
+	})
+}
