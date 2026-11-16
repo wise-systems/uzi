@@ -367,7 +367,7 @@ func TestIssueTrackerSyncBandsAndActions(t *testing.T) {
 		{forge.ErrorClassTimeout, "check reachability of the issue tracker from the api pod."},
 		{forge.ErrorClassServerError, "issue-tracker side; check the issue tracker's status and rate limits, and wait."},
 		{forge.ErrorClassRateLimited, "issue-tracker side; check the issue tracker's status and rate limits, and wait."},
-		{forge.ErrorClassOther, "read the api logs for `poller: linked issue sync` errors."},
+		{forge.ErrorClassOther, "read the api logs for `poller: linked issue sync` and `poller: build linked issue tracker` errors."},
 	} {
 		t.Run(string(tc.class), func(t *testing.T) {
 			clock := &syncClock{t: fixedNow}

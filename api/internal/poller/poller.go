@@ -462,6 +462,8 @@ func (e *Engine) syncRepo(ctx context.Context, r store.ListEnabledReposWithConne
 		if e.itSyncAttempt != nil {
 			itComplete = e.itSyncAttempt(r.ID)
 		}
+		// Boundary: when the forge client cannot be built (the early return above) this
+		// attempt is never started for the tick, and forge.sync is red then.
 		itBegun = true
 		if trErr != nil {
 			slog.Error("poller: build linked issue tracker", "repo", r.PathWithNamespace, "error", trErr)

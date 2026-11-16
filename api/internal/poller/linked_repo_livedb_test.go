@@ -396,7 +396,12 @@ func TestLinkedRepoHealthSplitsForgeAndIssueTrackerLiveDB(t *testing.T) {
 		if ic.Severity != "danger" || ic.Action == nil || strings.Contains(*ic.Action, "forge") {
 			t.Fatalf("issue_tracker.sync = %+v, want danger with an issue tracker action", ic)
 		}
-		t.Logf("issue_tracker.sync class %q action %q", o.issueTracker[0].class, *ic.Action)
+		if o.issueTracker[0].class != forge.ErrorClassAuth {
+			t.Fatalf("issue tracker class = %q, want %q", o.issueTracker[0].class, forge.ErrorClassAuth)
+		}
+		if !strings.Contains(*ic.Action, "re-check the issue tracker connection") {
+			t.Fatalf("issue_tracker.sync action = %q, want the auth action naming the issue tracker connection", *ic.Action)
+		}
 	})
 	t.Run("an unreachable issue tracker fails issue_tracker.sync, code-host steps still run", func(t *testing.T) {
 		srv := youtracktest.NewServer(t)

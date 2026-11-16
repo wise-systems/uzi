@@ -152,7 +152,7 @@ func (s *Service) checkIssueTrackerSync(ctx context.Context, now time.Time) apit
 		list:     s.cfg.Store.ListEnabledLinkedRepoIDs,
 		naText:   "No enabled repositories linked to an issue tracker.",
 		actions: syncActions{
-			other:   "read the api logs for `poller: linked issue sync` errors.",
+			other:   "read the api logs for `poller: linked issue sync` and `poller: build linked issue tracker` errors.",
 			timeout: "check reachability of the issue tracker from the api pod.",
 			auth:    "the issue tracker connection's token is invalid or lacks access; re-check the issue tracker connection.",
 			server:  "issue-tracker side; check the issue tracker's status and rate limits, and wait.",
