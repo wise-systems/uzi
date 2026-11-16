@@ -160,6 +160,9 @@ func (s *fakeStore) GetRepoForUser(_ context.Context, a store.GetRepoForUserPara
 	}
 	return store.GetRepoForUserRow{ID: r.ID, ForgeProjectID: r.ForgeProjectID, PathWithNamespace: r.PathWithNamespace, ForgeType: "github", BaseUrl: testBase}, nil
 }
+func (s *fakeStore) LockRepoForEnableForUser(context.Context, store.LockRepoForEnableForUserParams) (store.LockRepoForEnableForUserRow, error) {
+	return store.LockRepoForEnableForUserRow{}, nil
+}
 func (s *fakeStore) SetRepoEnabledForUser(_ context.Context, a store.SetRepoEnabledForUserParams) (store.Repo, error) {
 	s.writes++
 	s.flips[a.ID]++

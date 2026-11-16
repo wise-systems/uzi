@@ -98,6 +98,9 @@ func (s *fakeStore) UpsertRepo(_ context.Context, a store.UpsertRepoParams) (sto
 func (s *fakeStore) GetRepoForUser(context.Context, store.GetRepoForUserParams) (store.GetRepoForUserRow, error) {
 	return s.repoRow, s.repoErr
 }
+func (s *fakeStore) LockRepoForEnableForUser(context.Context, store.LockRepoForEnableForUserParams) (store.LockRepoForEnableForUserRow, error) {
+	return store.LockRepoForEnableForUserRow{IssueTrackerConnectionID: s.repoRow.IssueTrackerConnectionID}, s.repoErr
+}
 func (s *fakeStore) SetRepoEnabledForUser(_ context.Context, a store.SetRepoEnabledForUserParams) (store.Repo, error) {
 	s.flipCalls++
 	s.enabled = a.Enabled

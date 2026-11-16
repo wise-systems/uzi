@@ -87,6 +87,36 @@ func (q *Queries) GetRepoIssueSourceForUser(ctx context.Context, arg GetRepoIssu
 	return i, err
 }
 
+const lockRepoForEnableForUser = `-- name: LockRepoForEnableForUser :one
+SELECT r.awaiting_first_enable, r.issue_tracker_connection_id
+FROM repos r
+JOIN forge_connections c ON c.id = r.connection_id
+WHERE r.id = $1 AND c.user_id = $2
+FOR NO KEY UPDATE OF r
+`
+
+type LockRepoForEnableForUserParams struct {
+	ID     uuid.UUID `json:"id"`
+	UserID uuid.UUID `json:"user_id"`
+}
+
+type LockRepoForEnableForUserRow struct {
+	AwaitingFirstEnable      bool        `json:"awaiting_first_enable"`
+	IssueTrackerConnectionID pgtype.UUID `json:"issue_tracker_connection_id"`
+}
+
+// The enable's half of the D13 row lock, scoped to the owning user. Call inside a
+// transaction before the enable's forge label work; the markers are read after the lock,
+// so a link that committed first is visible. FOR NO KEY UPDATE conflicts with the link's
+// FOR UPDATE, so one of the two waits for the other, but it does not block inserts of
+// rows that reference the repo by foreign key (board columns, cards).
+func (q *Queries) LockRepoForEnableForUser(ctx context.Context, arg LockRepoForEnableForUserParams) (LockRepoForEnableForUserRow, error) {
+	row := q.db.QueryRow(ctx, lockRepoForEnableForUser, arg.ID, arg.UserID)
+	var i LockRepoForEnableForUserRow
+	err := row.Scan(&i.AwaitingFirstEnable, &i.IssueTrackerConnectionID)
+	return i, err
+}
+
 const lockRepoForLinkForUser = `-- name: LockRepoForLinkForUser :one
 SELECT r.id, r.awaiting_first_enable, r.issue_tracker_connection_id
 FROM repos r
