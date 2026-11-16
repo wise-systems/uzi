@@ -4,7 +4,7 @@
 
 **Priority:** Medium
 
-**Status:** In progress, r8 2026-11-13. M1–M4 delivered; M5 and M6 pending. r3 narrowed scope to one real issue tracker; r4 fixed a repo's issue source before first enable (D13); r4 and r5 fixed the YouTrack id, tag and author decisions before the driver; r6 records the M3 rework that follows them; r7 records the M4 preconditions from the maintainer's M3 approval (id-scoped intake, `ListLabels` limited to usable tags) and the M4 design decisions; r8 records M4's completion; r9 (2026-11-16) records issue #17's follow-ups to M4 (the enable and link race, forge health on linked repos, removed and re-listed repos, the autopilot D11 guard, small items).
+**Status:** In progress, r9 2026-11-16. M1–M4 delivered; M5 and M6 pending. r3 narrowed scope to one real issue tracker; r4 fixed a repo's issue source before first enable (D13); r4 and r5 fixed the YouTrack id, tag and author decisions before the driver; r6 records the M3 rework that follows them; r7 records the M4 preconditions from the maintainer's M3 approval (id-scoped intake, `ListLabels` limited to usable tags) and the M4 design decisions; r8 records M4's completion; r9 (2026-11-16) records issue #17's follow-ups to M4 (the enable and link race, forge health on linked repos, removed and re-listed repos, the autopilot D11 guard, small items).
 
 **Delivery:** one PR per milestone, each merged before the next starts. No implementation or validation step touches `.github/workflows/**`.
 

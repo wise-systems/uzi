@@ -388,7 +388,7 @@ are the normal notice's: the same "Enable run-health detection"
 
 | Check | What it means | `warn` | `danger` | `unknown` / `na` |
 |---|---|---|---|---|
-| `forge.sync` | Completed poller issue-sync outcomes for each currently enabled repo; `I` is the effective poll interval | some repo's failure streak is 3+ `I`, unless danger applies | any streak is 10+ `I`, or every enabled repo has a streak of 3+ `I` (pending repos block this second condition) | `unknown` when enabled-repo enumeration fails, or any repo is pending without warn/danger; `na` when no repos are enabled |
+| `forge.sync` | Completed poller issue-sync outcomes for each currently enabled repo (for a repo linked to an issue tracker, the code-host probe instead); `I` is the effective poll interval | some repo's failure streak is 3+ `I`, unless danger applies | any streak is 10+ `I`, or every enabled repo has a streak of 3+ `I` (pending repos block this second condition) | `unknown` when enabled-repo enumeration fails, or any repo is pending without warn/danger; `na` when no repos are enabled |
 | `issue_tracker.sync` | Completed poller linked-issue-sync outcomes for each currently enabled repo linked to an issue tracker; `I` is the effective forge poll interval | some repo's failure streak is 3+ `I`, unless danger applies | any streak is 10+ `I`, or every enabled linked repo has a streak of 3+ `I` (pending repos block this second condition) | `unknown` when enabled-linked-repo enumeration fails, or any repo is pending without warn/danger; `na` when no enabled repo is linked to an issue tracker |
 | `forge.ciwatch` | Whether a repo has more eligible run branches than the CI watch's per-repo cap (`CI_WATCH_MAX_REFS`), so some go unwatched | any repo over the cap | — | `na` when the CI watch is disabled (`CI_WATCH_MAX_REFS=0`) |
 | `slack.socket` | The Slack socket's connection state | configured but disconnected for 5+ minutes | — | `na` when Slack is not configured |
@@ -492,8 +492,11 @@ is linked to an issue tracker; unlinked repos stay with `forge.sync`. It is
 evaluated right after `forge.sync` and has the same owner scope, evidence
 bounds, severity rules, `I` window (the effective forge poll interval),
 membership and reset behavior described above, over linked repos only. It is
-`na` when no enabled repo is linked to an issue tracker. Warn/danger actions
-use the latest failure class:
+`na` when no enabled repo is linked to an issue tracker. When the poller cannot
+build the repo's forge client, no issue tracker attempt is recorded that tick
+(`forge.sync` fails instead), so a linked repo whose forge connection is broken
+from the start stays pending here. Warn/danger actions use the latest failure
+class:
 
 | Class | Action |
 |---|---|
