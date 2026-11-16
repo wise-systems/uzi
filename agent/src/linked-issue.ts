@@ -16,7 +16,7 @@ const ISSUE_KEY_RE = /^[A-Za-z][A-Za-z0-9_]*-[1-9][0-9]*$/u;
 const ISSUE_KEY_MAX = 64;
 
 /** What a linked run's text says when its key is absent or malformed. */
-export const LINKED_ISSUE_FALLBACK_LABEL = "the linked issue";
+const LINKED_ISSUE_FALLBACK_LABEL = "the linked issue";
 
 export function linkedIssueKey(claim: { issue_key?: unknown }): LinkedIssue {
   const raw = claim.issue_key;
