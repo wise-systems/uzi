@@ -1065,6 +1065,13 @@ type Repo struct {
 	IssueTrackerLinkedAt              pgtype.Timestamptz `json:"issue_tracker_linked_at"`
 }
 
+type RepoRemovalMarker struct {
+	ConnectionID   uuid.UUID          `json:"connection_id"`
+	ForgeProjectID int64              `json:"forge_project_id"`
+	WasLinked      bool               `json:"was_linked"`
+	RemovedAt      pgtype.Timestamptz `json:"removed_at"`
+}
+
 type RepoToolProfile struct {
 	ID        uuid.UUID          `json:"id"`
 	UserID    uuid.UUID          `json:"user_id"`

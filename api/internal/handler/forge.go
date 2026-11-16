@@ -1444,6 +1444,8 @@ func writeProvisionError(w http.ResponseWriter, err error) {
 		httpx.Error(w, http.StatusNotFound, pe.Message)
 	case provisionsvc.KindBadGateway:
 		httpx.Error(w, http.StatusBadGateway, pe.Message)
+	case provisionsvc.KindConflict:
+		httpx.Error(w, http.StatusConflict, pe.Message)
 	default:
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 	}

@@ -14,6 +14,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/vtmocanu/uzi/api/internal/config"
 	"github.com/vtmocanu/uzi/api/internal/forge"
@@ -41,6 +42,9 @@ const (
 	KindGuardBlocked
 	// KindInternal: a database or crypto failure, already logged (500).
 	KindInternal
+	// KindConflict: the request conflicts with the repo's history (409): it was
+	// linked to an issue tracker before it was removed from uzi.
+	KindConflict
 )
 
 // Error is the typed failure of every Service method. Message is safe to
@@ -400,9 +404,13 @@ func (s *Service) EnableRepo(ctx context.Context, userID, repoID uuid.UUID) (sto
 	return repo, nil
 }
 
+// removedLinkedRepoSQLState is the SQLSTATE the repos trigger from migration 00427 raises when
+// a repo that was linked to an issue tracker before its removal is enabled unlinked.
+const removedLinkedRepoSQLState = "UZ414"
+
 // enableError maps an EnableRepo transaction failure to the typed error the
 // caller returns: a typed *Error passes through, a missing row is not found,
-// and anything else is logged and becomes internal.
+// the removed-linked-repo refusal is a conflict, and anything else is logged and becomes internal.
 func (s *Service) enableError(err error) *Error {
 	var te *Error
 	if errors.As(err, &te) {
@@ -410,6 +418,10 @@ func (s *Service) enableError(err error) *Error {
 	}
 	if errors.Is(err, pgx.ErrNoRows) {
 		return &Error{Kind: KindNotFound, Message: "repo not found"}
+	}
+	var pe *pgconn.PgError
+	if errors.As(err, &pe) && pe.Code == removedLinkedRepoSQLState {
+		return &Error{Kind: KindConflict, Message: "this project was linked to an issue tracker before it was removed from uzi; its issue source cannot change, so it cannot be enabled as a forge-issue repo"}
 	}
 	s.logger().Error("enable repo", "error", err)
 	return internal()
