@@ -316,6 +316,7 @@ func TestConnectionDeleteRacingARepoDeleteLiveDB(t *testing.T) {
 			if p == 0 {
 				first = id
 			}
+			// awaiting_first_enable defaults to false: every one of the three repos is used, so each removal owes a marker.
 			h.exec(`INSERT INTO repos (id, connection_id, forge_project_id, path_with_namespace, web_url, enabled)
 			        VALUES ($1, $2, $3, 'g/r', 'https://forge.e2e/g/r', false)`, id, conn, 5000+p)
 		}
@@ -344,6 +345,14 @@ func TestConnectionDeleteRacingARepoDeleteLiveDB(t *testing.T) {
 			if err != nil {
 				t.Fatalf("iteration %d: %v", i, err)
 			}
+		}
+		var markers int
+		if err := h.pool.QueryRow(ctx, `SELECT count(*) FROM repo_removal_markers WHERE user_id = $1 AND base_url = $2`,
+			h.user, "https://race-"+conn.String()+".e2e").Scan(&markers); err != nil {
+			t.Fatal(err)
+		}
+		if markers != 3 {
+			t.Fatalf("iteration %d: %d markers after both deletes, want 3 (one per used repo)", i, markers)
 		}
 	}
 }

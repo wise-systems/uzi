@@ -36,9 +36,10 @@ CREATE TABLE repo_removal_markers (
 -- A second removal of the same project keeps a linked flag already set. A BEFORE DELETE
 -- trigger must return OLD: a NULL return skips the delete.
 --
--- Inside the cascade of a forge connection delete the connection row is no longer visible, so
--- the lookup finds nothing and the row writes no marker: repos_removal_marker_connection_record
--- below has already written the markers of every repo of that connection.
+-- Inside the cascade of a forge connection delete the connection row may not be visible to the
+-- lookup; then this trigger skips, because repos_removal_marker_connection_record below (the
+-- forge_connections trigger) has already written the markers of every repo of that connection.
+-- A duplicate write would be harmless anyway: the upsert ORs was_linked.
 -- +goose StatementBegin
 CREATE FUNCTION repos_removal_marker_record() RETURNS trigger AS $$
 DECLARE
@@ -92,8 +93,10 @@ CREATE TRIGGER repos_removal_marker_connection_record
     FOR EACH ROW EXECUTE FUNCTION repos_removal_marker_connection_record();
 
 -- A project that has a marker is listed again as already used, never awaiting its first
--- enable. The first statement locks the row of the same project, if one exists: a removal of
--- it that has not committed yet holds that lock, so this waits for it, and under READ COMMITTED
+-- enable. The first statement locks the row of the same project, if one exists, FOR NO KEY
+-- UPDATE: a removal of it that has not committed yet holds a conflicting lock (DELETE takes
+-- FOR UPDATE), so this waits for it, while the FOR KEY SHARE that foreign-key inserts of
+-- board_columns and cards take on the repo row does not conflict. Under READ COMMITTED
 -- the lookup after it takes a fresh snapshot that sees the marker the removal committed.
 -- Without the wait the lookup could run before the removal committed and miss its marker.
 -- Triggers of one event fire in name order, so repos_awaiting_first_enable_guard (00425) runs
@@ -104,7 +107,7 @@ CREATE FUNCTION repos_removal_marker_relist() RETURNS trigger AS $$
 BEGIN
     PERFORM 1 FROM repos r
     WHERE r.connection_id = NEW.connection_id AND r.forge_project_id = NEW.forge_project_id
-    FOR UPDATE;
+    FOR NO KEY UPDATE;
     IF EXISTS (SELECT 1 FROM repo_removal_markers m
                JOIN forge_connections c ON c.user_id = m.user_id AND c.forge_type = m.forge_type AND c.base_url = m.base_url
                WHERE c.id = NEW.connection_id AND m.forge_project_id = NEW.forge_project_id) THEN
@@ -146,6 +149,7 @@ CREATE TRIGGER repos_removal_marker_enable_guard
     FOR EACH ROW EXECUTE FUNCTION repos_removal_marker_enable_guard();
 
 -- +goose Down
+SET LOCAL lock_timeout = '5s';
 DROP TRIGGER repos_removal_marker_enable_guard ON repos;
 DROP FUNCTION repos_removal_marker_enable_guard();
 DROP TRIGGER repos_removal_marker_relist ON repos;
