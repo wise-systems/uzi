@@ -90,6 +90,25 @@ func TestIntakePauseAdmissionStringBodyMigrationLiveDB(t *testing.T) {
 	if err := Migrate(ctx, dsn); err != nil {
 		t.Fatalf("Migrate to head: %v", err)
 	}
+	var sqlStandard []string
+	rows, err := pool.Query(ctx, `SELECT p.oid::regprocedure::text FROM pg_proc p
+		WHERE p.pronamespace = 'public'::regnamespace AND p.prosqlbody IS NOT NULL ORDER BY 1`)
+	if err != nil {
+		t.Fatalf("list SQL-standard function bodies: %v", err)
+	}
+	for rows.Next() {
+		var fn string
+		if err := rows.Scan(&fn); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		sqlStandard = append(sqlStandard, fn)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows: %v", err)
+	}
+	if len(sqlStandard) > 0 {
+		t.Fatalf("head schema has SQL-standard function bodies %v; Postgres 17.12+ refuses table-rewriting ALTERs on a row type they read (issue #18)", sqlStandard)
+	}
 	tx, err := pool.Begin(ctx)
 	if err != nil {
 		t.Fatalf("begin: %v", err)

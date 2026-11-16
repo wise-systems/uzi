@@ -5,7 +5,9 @@
 -- 00362, 00363, 00370, 00394, 00397 and 00407 convert it before their own ALTERs; this converts
 -- it on a database that applied all of those before the fix, so the next migration that adds a
 -- defaulted column to runs still applies after a Postgres minor upgrade. Same signature,
--- volatility and expression; idempotent.
+-- volatility and expression; idempotent. A string body records no dependency on the runs
+-- columns it reads, so a later migration that drops, renames or retypes runs.kind or
+-- runs.claim_generation must re-create this function in the same migration.
 -- +goose StatementBegin
 CREATE OR REPLACE FUNCTION fn_run_admitted_during_intake_pause(r runs) RETURNS boolean
 LANGUAGE sql STABLE PARALLEL SAFE AS $$

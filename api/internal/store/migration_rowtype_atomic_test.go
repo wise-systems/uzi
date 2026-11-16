@@ -14,7 +14,9 @@ import (
 const intakePauseFn = "fn_run_admitted_during_intake_pause"
 
 var (
-	beginAtomicRE     = regexp.MustCompile(`(?i)\bbegin\s+atomic\b`)
+	beginAtomicRE = regexp.MustCompile(`(?i)\bbegin\s+atomic\b`)
+	// The other SQL-standard form: LANGUAGE sql followed by a bare RETURN <expr> body.
+	sqlReturnBodyRE   = regexp.MustCompile(`(?is)\blanguage\s+sql\b[^;$]*?\breturn\b`)
 	convertFnRE       = regexp.MustCompile(`(?i)create\s+or\s+replace\s+function\s+` + intakePauseFn + `\b`)
 	runsAlterRE       = regexp.MustCompile(`(?is)^\s*alter\s+table\s+(?:if\s+exists\s+)?(?:only\s+)?runs\b`)
 	defaultedAddColRE = regexp.MustCompile(`(?is)\badd\s+column\s+(?:if\s+not\s+exists\s+)?[^,;]*?\bdefault\b`)
@@ -58,13 +60,14 @@ func readMigrations(t *testing.T) map[string]string {
 	return out
 }
 
-func TestNoBeginAtomicMigrationExceptIntakePause(t *testing.T) {
+func TestNoSQLStandardBodyMigrationExceptIntakePause(t *testing.T) {
 	for name, body := range readMigrations(t) {
 		if strings.HasPrefix(name, "00358_") {
 			continue
 		}
-		if beginAtomicRE.MatchString(stripSQLComments(body)) {
-			t.Errorf("%s contains a BEGIN ATOMIC function body: Postgres 17.12+ refuses table-rewriting ALTERs "+
+		code := stripSQLComments(body)
+		if beginAtomicRE.MatchString(code) || sqlReturnBodyRE.MatchString(code) {
+			t.Errorf("%s contains an SQL-standard function body (BEGIN ATOMIC or LANGUAGE sql RETURN): Postgres 17.12+ refuses table-rewriting ALTERs "+
 				"(defaulted ADD COLUMN, column TYPE change) on a table whose row type such a function reads, "+
 				"so a later migration could no longer alter that table (issue #18); use a string ($$) body", name)
 		}
