@@ -35,8 +35,10 @@ $$;
 -- +goose StatementEnd
 
 -- +goose StatementBegin
--- BEGIN ATOMIC records column dependencies on runs.kind and runs.claim_generation: a future
--- type change to either must drop and recreate this function.
+-- Issue #18: this SQL-standard body is replaced by an equivalent string body in 00362 (on a
+-- database that ran the earlier text of 00362, by the first of 00363, 00370, 00394, 00397,
+-- 00407 or 00426 it runs), because Postgres 17.12 and later refuse a defaulted ADD COLUMN or a
+-- column type change on runs while it exists.
 -- Admitted = claimed at least once, or a cross-check child (ClaimRun already binds it to a
 -- claimed lead). Everything else is a new root (PRD #3454 D4). Kept separate from
 -- fn_worker_accepts_new_intake so capacity and capability projections stay truthful (D2).
