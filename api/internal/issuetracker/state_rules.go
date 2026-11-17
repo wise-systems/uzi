@@ -48,8 +48,8 @@ func normaliseStateName(name string) string {
 
 // stateNameProblem reports whether a State name read from the issue tracker is
 // one the driver will not pass on: blank, over maxLabelNameLen bytes, or
-// carrying an invisible or control character, a default-ignorable code point or
-// a blank filler (Hangul and Braille fillers). Any user who administers a bundle
+// carrying an invisible or control character, an ignorable code point, a
+// variation selector or a blank filler (Hangul and Braille fillers). Any user who administers a bundle
 // can name a state, and the name ends up in errors and in the board.
 func stateNameProblem(name string) bool {
 	if strings.TrimSpace(name) == "" || len(name) > maxLabelNameLen {
@@ -63,15 +63,16 @@ func stateNameProblem(name string) bool {
 	return false
 }
 
-// stateNameFiller reports whether c is a default-ignorable code point or one of
-// the fillers that render blank: U+115F, U+1160, U+2800, U+3164 and U+FFA0.
+// stateNameFiller reports whether c is an Other_Default_Ignorable_Code_Point, a
+// variation selector, or one of the fillers that render blank: U+115F, U+1160,
+// U+2800, U+3164 and U+FFA0.
 // InvisibleRune is shared with other callers and is left as it is.
 func stateNameFiller(c rune) bool {
 	switch c {
 	case 0x115F, 0x1160, 0x2800, 0x3164, 0xFFA0:
 		return true
 	}
-	return unicode.Is(unicode.Other_Default_Ignorable_Code_Point, c)
+	return unicode.Is(unicode.Other_Default_Ignorable_Code_Point, c) || unicode.Is(unicode.Variation_Selector, c)
 }
 
 // maxQuotedNameLen bounds the name quoteName puts in an error.

@@ -49,10 +49,12 @@ func TestOpenableState(t *testing.T) {
 		s    State
 		want bool
 	}{
-		"unresolved":          {State{Name: "In Progress"}, true},
-		"resolved":            {State{Name: "Fixed", Resolved: true}, false},
-		"archived unresolved": {State{Name: "Old", Archived: true}, false},
-		"filler in the name":  {State{Name: "Open\u3164"}, false},
+		"unresolved":                     {State{Name: "In Progress"}, true},
+		"resolved":                       {State{Name: "Fixed", Resolved: true}, false},
+		"archived unresolved":            {State{Name: "Old", Archived: true}, false},
+		"filler in the name":             {State{Name: "Open\u3164"}, false},
+		"variation selector":             {State{Name: "Open\uFE0F"}, false},
+		"ideographic variation selector": {State{Name: "Open\U000E0100"}, false},
 	} {
 		if got := OpenableState(tc.s); got != tc.want {
 			t.Errorf("%s: OpenableState = %v, want %v", name, got, tc.want)
