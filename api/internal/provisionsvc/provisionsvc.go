@@ -69,7 +69,7 @@ type Store interface {
 	UpsertRepo(ctx context.Context, arg store.UpsertRepoParams) (store.Repo, error)
 	GetRepoForUser(ctx context.Context, arg store.GetRepoForUserParams) (store.GetRepoForUserRow, error)
 	LockRepoForEnableForUser(ctx context.Context, arg store.LockRepoForEnableForUserParams) (store.LockRepoForEnableForUserRow, error)
-	SetRepoEnabledForUser(ctx context.Context, arg store.SetRepoEnabledForUserParams) (store.Repo, error)
+	EnableRepoForUser(ctx context.Context, arg store.EnableRepoForUserParams) (store.Repo, error)
 	DeletePendingGuardrailOverrideRequestsForRepo(ctx context.Context, repoID uuid.UUID) error
 	forgesvc.BoardColumnStore
 }
@@ -377,7 +377,7 @@ func (s *Service) EnableRepo(ctx context.Context, userID, repoID uuid.UUID) (sto
 		}
 		// A project linked to an issue tracker before it was removed keeps that issue source: it
 		// is refused here, before any label work reaches the forge (the repos trigger from
-		// migration 00427 refuses the flip too, and enableError maps it the same way).
+		// migration 00467 refuses the flip too, and enableError maps it the same way).
 		if lock.SourceLocked {
 			return removedLinkedRepoError()
 		}
@@ -398,7 +398,10 @@ func (s *Service) EnableRepo(ctx context.Context, userID, repoID uuid.UUID) (sto
 			s.logger().Error("ensure board columns", "error", err)
 			return internal()
 		}
-		repo, err = q.SetRepoEnabledForUser(ctx, store.SetRepoEnabledForUserParams{ID: repoID, Enabled: true, UserID: userID})
+		// EnableRepoForUser also records the first-import intent (a 'waiting' import the
+		// poller runs; issue #4399), so the enable never imports issues itself and the row
+		// lock is not held across one.
+		repo, err = q.EnableRepoForUser(ctx, store.EnableRepoForUserParams{ID: repoID, UserID: userID})
 		return err
 	})
 	if err != nil {
@@ -413,7 +416,7 @@ func (s *Service) EnableRepo(ctx context.Context, userID, repoID uuid.UUID) (sto
 	return repo, nil
 }
 
-// removedLinkedRepoSQLState is the SQLSTATE the repos trigger from migration 00427 raises when
+// removedLinkedRepoSQLState is the SQLSTATE the repos trigger from migration 00467 raises when
 // a repo that was linked to an issue tracker before its removal is enabled unlinked.
 const removedLinkedRepoSQLState = "UZ414"
 

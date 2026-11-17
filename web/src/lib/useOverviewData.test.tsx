@@ -1,11 +1,13 @@
 // @vitest-environment jsdom
 // PRD #3878: the admin run list's loading rules inside the shared Overview data hook.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { StrictMode } from "react";
 import { act, cleanup, renderHook } from "@testing-library/react";
 import { api, type RecoveryCustodyHolds, type RunSummaryItem } from "./api";
 import { useAuth } from "../auth/AuthContext";
 import { useOverviewData } from "./useOverviewData";
 import { aRun, aUser, authValue, emptySelf } from "../pages/overviewFixtures";
+import { mockAgentSource } from "../mocks/data";
 
 vi.mock("./api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./api")>();
@@ -23,6 +25,8 @@ vi.mock("./api", async (importOriginal) => {
       adminListRuns: vi.fn(),
       getRecoveryHolds: vi.fn(),
       listUsers: vi.fn(),
+      adminRepoActivity: vi.fn(),
+      getAgentSource: vi.fn(),
     },
   };
 });
@@ -47,6 +51,8 @@ beforeEach(() => {
   mockApi.adminListRuns.mockResolvedValue({ runs: [] });
   mockApi.getRecoveryHolds.mockResolvedValue(holdsWith(1));
   mockApi.listUsers.mockResolvedValue({ users: [] });
+  mockApi.adminRepoActivity.mockResolvedValue({ repos: [] });
+  mockApi.getAgentSource.mockResolvedValue({ agent_source: structuredClone(mockAgentSource) });
 });
 
 afterEach(() => {
@@ -344,6 +350,87 @@ describe("useOverviewData admin users", () => {
   });
 });
 
+describe("useOverviewData admin repo activity", () => {
+  const row = (id: string) => ({ id, path_with_namespace: `org/${id}`, enabled: true, last_run_at: null });
+
+  it("loads once on mount and on no poll", async () => {
+    mockApi.adminRepoActivity.mockResolvedValue({ repos: [row("a")] });
+    const { result } = renderHook(() => useOverviewData({ includeAdminRepoActivity: true }));
+    await settle();
+    expect(mockApi.adminRepoActivity).toHaveBeenCalledTimes(1);
+    expect(result.current.adminRepoActivity).toEqual({ repos: [row("a")], failed: false });
+    await settle(65_000);
+    expect(mockApi.adminRepoActivity).toHaveBeenCalledTimes(1);
+  });
+
+  it("never calls the endpoint without the opt-in, or for a non-admin who asks", async () => {
+    renderHook(() => useOverviewData({ includeAdminRuns: true, includeAdminUsers: true }));
+    renderHook(() => useOverviewData());
+    await settle(30_000);
+    expect(mockApi.adminRepoActivity).not.toHaveBeenCalled();
+    vi.mocked(useAuth).mockReturnValue(authValue(aUser));
+    const { result } = renderHook(() => useOverviewData({ includeAdminRepoActivity: true }));
+    await settle(30_000);
+    expect(mockApi.adminRepoActivity).not.toHaveBeenCalled();
+    expect(result.current.adminRepoActivity).toEqual({ repos: null, failed: false });
+  });
+
+  it("flags failed with no rows, and leaves the other data alone", async () => {
+    mockApi.adminRepoActivity.mockRejectedValue(new Error("down"));
+    const { result } = renderHook(() => useOverviewData({ includeAdminRepoActivity: true, includeAdminRuns: true }));
+    await settle();
+    expect(result.current.adminRepoActivity).toEqual({ repos: null, failed: true });
+    expect(result.current.data).not.toBeNull();
+    expect(result.current.adminRuns.failed).toBe(false);
+  });
+
+  it("drops the rows on revoke and fetches again on a re-grant", async () => {
+    mockApi.adminRepoActivity.mockResolvedValue({ repos: [row("a")] });
+    const { result, rerender } = renderHook(() => useOverviewData({ includeAdminRepoActivity: true }));
+    await settle();
+    expect(result.current.adminRepoActivity.repos).toEqual([row("a")]);
+    vi.mocked(useAuth).mockReturnValue(authValue(aUser));
+    rerender();
+    await settle();
+    expect(result.current.adminRepoActivity).toEqual({ repos: null, failed: false });
+    vi.mocked(useAuth).mockReturnValue(authValue(admin));
+    rerender();
+    await settle();
+    expect(mockApi.adminRepoActivity).toHaveBeenCalledTimes(2);
+    expect(result.current.adminRepoActivity.repos).toEqual([row("a")]);
+  });
+});
+
+describe("useOverviewData admin agent source", () => {
+  it("reads once under StrictMode, independently of both polls", async () => {
+    const { result } = renderHook(() => useOverviewData({ includeAdminAgentSource: true }), { wrapper: StrictMode });
+    await settle();
+    expect(mockApi.getAgentSource).toHaveBeenCalledTimes(1);
+    expect(result.current.adminAgentSource?.config.enabled).toBe(true);
+    await settle(65_000);
+    expect(mockApi.getAgentSource).toHaveBeenCalledTimes(1);
+  });
+
+  it("never calls the admin read on the classic page or for a non-admin", async () => {
+    renderHook(() => useOverviewData());
+    await settle();
+    expect(mockApi.getAgentSource).not.toHaveBeenCalled();
+    vi.mocked(useAuth).mockReturnValue(authValue(aUser));
+    const { result } = renderHook(() => useOverviewData({ includeAdminAgentSource: true }));
+    await settle();
+    expect(mockApi.getAgentSource).not.toHaveBeenCalled();
+    expect(result.current.adminAgentSource).toBeNull();
+  });
+
+  it("fails without blanking the core Overview data", async () => {
+    mockApi.getAgentSource.mockRejectedValue(new Error("down"));
+    const { result } = renderHook(() => useOverviewData({ includeAdminAgentSource: true }));
+    await settle();
+    expect(result.current.adminAgentSource).toBeNull();
+    expect(result.current.data).not.toBeNull();
+  });
+});
+
 describe("useOverviewData recovery holds", () => {
   it("makes no holds request and returns null without the opt-in", async () => {
     const { result } = renderHook(() => useOverviewData({ includeAdminRuns: true }));
@@ -385,9 +472,11 @@ describe("useOverviewData recovery holds", () => {
     await settle(10_000);
     expect(mockApi.getRecoveryHolds).toHaveBeenCalledTimes(2);
     expect(result.current.holds?.aggregate.open_holds).toBe(1);
+    expect(result.current.holdsRequestFailed).toBe(true);
     mockApi.getRecoveryHolds.mockResolvedValue(holdsWith(3));
     await settle(10_000);
     expect(result.current.holds?.aggregate.open_holds).toBe(3);
+    expect(result.current.holdsRequestFailed).toBe(false);
   });
 
   it("stays null when the first load fails, without touching the personal data", async () => {
@@ -447,6 +536,7 @@ describe("useOverviewData recovery holds", () => {
     await settle();
     expect(result.current.holds?.aggregate.open_holds).toBe(3);
     expect(result.current.holdsFailed).toBe(false);
+    expect(result.current.holdsRequestFailed).toBe(false); // newer request is pending, not failed
   });
 
   it("applies an older success that lands after a newer request failed, with no holds yet", async () => {
@@ -462,6 +552,7 @@ describe("useOverviewData recovery holds", () => {
     await settle();
     expect(result.current.holds?.aggregate.open_holds).toBe(3);
     expect(result.current.holdsFailed).toBe(false);
+    expect(result.current.holdsRequestFailed).toBe(true); // newer failed request remains latest
   });
 
   it("ignores an older failure that lands after a newer success", async () => {
@@ -506,6 +597,7 @@ describe("useOverviewData recovery holds", () => {
     await settle(10_000);
     expect(result.current.data).not.toBeNull();
     expect(result.current.holds?.aggregate.open_holds).toBe(1);
+    expect(result.current.runsRefreshFailed).toBe(true);
     mockApi.getRecoveryHolds.mockResolvedValue(holdsWith(6));
     await settle(10_000);
     expect(result.current.holds?.aggregate.open_holds).toBe(6);

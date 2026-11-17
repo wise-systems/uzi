@@ -274,7 +274,7 @@ describe("agent-source Health navigation", () => {
     const check = doc.checks.find((c) => c.id === "agentsource.update")!;
     check.severity = "warn";
     check.action = "Untrusted action https://example.com/#arbitrary";
-    doc.counts = { ok: 22, warn: 1, danger: 0, unknown: 0, na: 0 };
+    doc.counts = { ...doc.counts, ok: doc.counts.ok - 1, warn: doc.counts.warn + 1 };
     mockApi.getAdminHealth.mockResolvedValue(doc);
     let resolveSettings!: (value: ReturnType<typeof response>) => void;
     mockApi.getSettings.mockReturnValue(new Promise((resolve) => { resolveSettings = resolve; }));
@@ -779,12 +779,14 @@ describe("AdminSettings — run judge (PRD #46)", () => {
     expect(container.textContent ?? "").not.toContain("judge_model");
   });
 
-  it("says each judge spends the credential of the run's provider", async () => {
+  it("says each judge spends the user's own credential, following their Judge runs on choice", async () => {
     const { container } = renderPage();
     await screen.findByLabelText("Codex judge model");
     const text = container.textContent ?? "";
-    expect(text).toContain("that user\u2019s own credential for the run\u2019s provider (Anthropic or Codex)");
-    expect(text).toContain("that user\u2019s own credential for the run\u2019s harness (Anthropic or Codex)");
+    expect(text).toContain("that user\u2019s own credential (Anthropic or Codex) for the harness");
+    expect(text).toContain("that user\u2019s own Claude or Codex credential, following their \u201cJudge runs on\u201d choice");
+    expect(text).toContain("never charged to the other provider");
+    expect(text).not.toContain("for the run\u2019s provider");
   });
 
   // PRD #3245 D8: no hard-coded built-in when the server sends no defaults.

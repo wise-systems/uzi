@@ -149,6 +149,7 @@ uzi run create --repo <id> --issue <iid> [--plan-file <path>]
                 [--agent-source own|repo] [--exclude-agents a,b]
                 [--planned-commit <sha>] [--require-base] [--force]
                 [--harness claude|codex]
+                [--model <id>] [--effort low|medium|high|xhigh|max]
 uzi run approve <id> [--agent-source own|repo] [--exclude-agents a,b]
                 [--override-capabilities]
                 [--expected-gate-revision <n>]
@@ -174,7 +175,7 @@ uzi run expedite <id> [--clear]
 uzi run rework <id> [-m|--message <text>]
 uzi run export <id> --output <path> [--capture <id>]
 uzi run fetches <id> [--json]
-uzi run recovery [<id>] [--json]
+uzi run recovery [<id> | --user <uuid>] [--json]
 uzi run discard <id> --hold <hold-id> [--yes]
 uzi run held <id> [--json]
 uzi run held expire <id> [--yes]
@@ -227,7 +228,8 @@ uzi repo list | remove <id> [--force]
 uzi project-sync status <repo> | resync <repo>
 uzi pr list [--repo <id>] | checks <iid> [--repo <id>] [--watch]
 uzi ci list [--repo <id>] [--limit <n>] | jobs <run-id> [--repo <id>] | fix <ref> [--repo <id>]
-uzi admin users | runs | workers | rate-limits | cli-tokens | products | guardrail-impact | blocked-repos | review-bots
+uzi admin users | workers | rate-limits | cli-tokens | products | guardrail-impact | blocked-repos | review-bots
+uzi admin runs [--all [--user <uuid>] [--since <rfc3339>]] [--json]
 uzi admin usage [--window lifetime|last_7_days]
 uzi admin health [--all] [--strict]
 uzi admin agent-source get | status
@@ -260,15 +262,16 @@ A few worth knowing:
 
 - **`uzi admin usage --window lifetime|last_7_days` selects the human report's
   window (default `lifetime`).** The factory summary and per-user rows use
-  the same window for usage-bearing runs, tokens, API-equivalent cost, outcomes and
-  recoverable failures. Failure rate is failed runs divided by finished runs,
-  including runs without usage; `RUNS` counts runs with usage. Cost shows
-  `$0.00` for metered zero and discloses runs without a cost estimate and
-  unreported runs. Incomplete totals include recorded partial costs.
-  Recoverable work may already have been landed.
-  The table's `CLAUDE/CODEX` column shows the selected window's runs by
-  harness (the same runs as `RUNS`, so the two numbers sum to it; cross-check
-  runs count under the harness they ran on). The column is omitted against an
+  the same window. `RUNS` counts primary work runs (issue, task, prompt, job,
+  self_improve) with recorded usage. Finished, failed and the failure rate
+  count terminal primary work runs, including runs without usage; failure rate
+  is failed runs divided by finished runs. Tokens and API-equivalent cost also
+  include helper runs (judge, cross_check, mr_rework, ci_fix); chat is
+  excluded. Cost shows `$0.00` for metered zero and discloses runs without a
+  cost estimate and unreported runs. Incomplete totals include recorded partial
+  costs. Recoverable work may already have been landed.
+  The table's `CLAUDE/CODEX` column splits the selected window's same primary
+  runs as `RUNS` by harness, so the two numbers sum to it. The column is omitted against an
   older API without the split.
   `--json` returns the complete API response with both windows and additive
   per-user seven-day fields, plus `harness_runs` / `last7_harness_runs` per
@@ -316,7 +319,10 @@ A few worth knowing:
   without a reachable server. Under `--json` the CLI's version stays top-level
   and the server's nests under `server`, leaving existing parsers untouched;
   fields the server did not stamp are omitted rather than sent empty, so an
-  absent `server.commit` means "unknown", never "empty".
+  absent `server.commit` means "unknown", never "empty". When the server's
+  release check has read the Homebrew tap, `server.homebrew_formulas`
+  (`uzi_cli`, `uzi_cli_rc`) carries each formula's tag; it is omitted when the
+  check is off, has not run, or both are unknown.
 - **`uzi tui` also surfaces an available update, unprompted.** Where `version`
   only tells you on request, the TUI checks at every startup and shows a modal
   when this binary is behind the latest published release — see [Startup: an
@@ -363,6 +369,23 @@ A few worth knowing:
   choice is `"agent_selection": {"source": "own"|"repo"}` on
   `POST /api/repos/{id}/runs` without `plan_md`; non-empty `exclusions`
   without `plan_md` returns 400 `exclusions require a plan file or an approval`.
+- **`run create --model <id>` and `--effort <level>` choose this run's model
+  and reasoning effort.** Each is sent only when you pass it, verbatim, and is
+  frozen onto the run, beating your Settings default for the run's lead;
+  omit them and nothing changes.
+  `--model` must be a single token without whitespace, and `--effort` one of
+  `low`, `medium`, `high`, `xhigh` or `max`; anything else is a usage error
+  (exit 2) before any request. Whether the model fits the run's harness is
+  the server's call: an incompatible pair (for example a Claude alias on a
+  Codex run) is refused with 422 `model_incompatible_with_harness` and the
+  CLI prints the server's message, creating no run. A `--model` also opts the
+  run out of the automatic harness choice; `--effort` alone does not. See
+  [Worker model](worker-model.md#a-model-chosen-when-starting-a-run) and
+  [Reasoning effort](worker-effort.md#a-run-level-effort). Over the API the
+  same choice is optional `"model"` and `"effort"` strings on
+  `POST /api/repos/{id}/runs`. `run get` shows the choice with the source
+  "this run" (`--json`: `model_source` / `effort_source` `run_override`,
+  `effort`).
 - **`run create --force` re-runs an issue that already has an open MR.** By
   default, creating a run for an issue whose last completed run still owns an
   open MR is refused (a 409, exit 5) — re-running would spend budget building
@@ -552,8 +575,13 @@ A few worth knowing:
   least 60 seconds (the server's minimum), so `0`, anything under a minute, a
   negative value, or an unparseable one is a usage error (exit 2). Valid on any non-terminal run
   of a kind the sweep can time out (issue, task, prompt, self-improve,
-  mr-rework, ci-fix), including a queued or parked one — a chat, judge, or
-  interactive-task run never times out, so extending one is a 409 (exit 5).
+  mr-rework, ci-fix), including a queued or parked one. A chat or judge
+  run, or an interactive task's session, has no server wall deadline, so
+  extending one is a 409 (exit 5), with one exception: the worker bounds each
+  follow-up of an interactive task with its wall budget and parks a follow-up
+  that uses it up (`paused`, `hold_reason: budget_exhausted`), and extend adds
+  the time to such a parked task and resumes it. No server deadline is
+  reported for an interactive run, so none is printed.
   `--by` is limited per request by the admin's maximum per extension
   (default 16h), not per run: you may extend the same run repeatedly, and
   each extension is an audited action. A request above that maximum, a
@@ -644,9 +672,12 @@ A few worth knowing:
   contract and cannot fix a commit-history publication hold. A separately
   approved milestone reconciliation reset can replace the contract and
   clear ceilings/decisions, but preserves stored non-closing intent.
-  For unpublished history without Stop, use continue with SHA-specific
-  guidance for the lead to reword its own unpublished commits. For published
-  history or Stop, cancel and manually deliver
+  Without Stop, use continue with SHA-specific guidance for the lead to
+  reword its own commits only when no offending commit (including any the
+  feed only counts beyond its listed SHAs) is reachable from the run branch
+  on the forge or a published checkpoint ref. Otherwise, or with Stop,
+  continue cannot clear the hold: finalize restores published commits as
+  ancestors. Cancel and manually deliver
   [preserved work](run-recovery.md#completion-publication-holds).
   Ordinary answers, non-closing declarations and auto-approval waive no work.
   `--json` emits the resumed run object.
@@ -929,7 +960,10 @@ A few worth knowing:
   hidden, deprecated alias) prints the judge's verdict, summary,
   recommendations, and triage tally for a run — see
   [Run judge](./judge.md#reading-a-review-from-the-cli) for the full `--json`
-  contract. The rest of the `review` group (`backlog`/`resolve`/`dismiss`/
+  contract. A run whose judge was skipped for a credential reason prints
+  `Judge skipped <date>: <reason>` (for example `Judge skipped 2026-11-12:
+  Codex had no usable credential.`) instead of "not judged", and `--json`
+  keeps the `skip` object. The rest of the `review` group (`backlog`/`resolve`/`dismiss`/
   `undo`/`stats`, plus `file` to turn a recommendation into a forge issue)
   triages recommendations, per run or across all of them — see
   [Reviewing and triaging from the CLI](#reviewing-and-triaging-from-the-cli)
@@ -950,13 +984,15 @@ A few worth knowing:
   run seeds every turn as a follow-up row, so `run inputs` against a chat
   run lists the whole conversation, not just steering messages; an issue or
   CI-fix run's queue starts empty and only ever holds what you actually sent
-  mid-run.
+  mid-run. Owner-only; another user's run is a 404 unless
+  [admin run debug](#admin-run-debug-reading-other-users-runs) applies (a foreign chat run still 404s).
 - **`run fetches <id>`** prints a research run's source log
   ([PRD #1906](../prds/done/1906-official-sources-web-research.md)): one row per web
   fetch the run attempted, oldest first, with `STARTED`, `VERDICT` (`allowed` or
   `refused`), `REASON`, `HTTP` status, `BYTES`, `CONTENT TYPE`, `URL` and
   `FINAL URL` (after redirects). The command follows every page of the log; a read taken while the run is still fetching can miss a row that commits late.
-  Owner-only: another user's run reads as not found (exit 4), and a run that
+  Owner-only: another user's run reads as not found (exit 4) unless
+  [admin run debug](#admin-run-debug-reading-other-users-runs) applies, and a run that
   never fetched, which is every run not bound to a site list, shows
   no rows. URLs are cut in the table; `--json` prints them whole with each file's
   sha256. The text cells are site- or agent-controlled and are printed with
@@ -1467,19 +1503,23 @@ before native bundle verification/import.
 ### Reviewing and resolving held work: `uzi run recovery` / `uzi run discard`
 
 A run's custody hold protects its committed-but-unpublished work per claim generation.
-The owner admission limit is the admin setting `custody_hold_limit` (default 8 counted
-holds; see [Admin settings](./admin-settings.md#custody-hold-limit)). `open_holds` is total open custody;
-`admission_counted_holds` excludes at most one hold per run backing a healthy, valid live
+The owner admission limit is the admin setting `custody_hold_limit` (default 8
+admission units; see [Admin settings](./admin-settings.md#custody-hold-limit)). `open_holds` is total open custody;
+`admission_counted_holds` counts admission units: it first excludes at most one hold per run backing a healthy, valid live
 current-generation claim without an owner decision. That requires exact owner/run/live-run
 and worker identity, an unreleased claim, a fresh non-null heartbeat (inclusive cutoff
 from the configured `WorkerHeartbeatStale`), and status `claimed`, `running`,
 `awaiting_approval`, `awaiting_input` or `awaiting_followup`. Missing, mismatched, stale,
 released, terminal and old/future-generation claims remain counted, as do decision holds;
 `active` attention alone does not establish eligibility. The discount releases nothing
-and does not permit pruning or teardown of held source.
+and does not permit pruning or teardown of held source. Of the remaining open holds, a run's
+open holds on the same original worker, from any of its generations, count as one unit together (whatever the
+worker's heartbeat); every other hold counts as one unit alone.
 
 New code runs wait at the admission limit. A previously claimed queued run with 1 to limit-1
-of its own total open holds can still resume; at the limit it loses that exemption. Concurrent
+of its own total open holds can still resume. A queued run whose own open holds (counted or not)
+reach the limit is not started even when its owner is below the limit, and an owner Resume does not
+bypass it; discard or settle that run's own holds to free it. Concurrent
 claims and later heartbeat staleness can exceed the limit: it is a statement-snapshot
 admission gate, not a strict ceiling. To find what held work you have, start here before
 choosing a run to export or an exact hold to discard:
@@ -1491,13 +1531,16 @@ uzi run recovery [--json]
 - The human view shows only open holds across your runs, oldest first by `created_at`.
   Its columns are `RUN ID`, `HOLD ID`, `GEN`, `DISPOSITION`, `ADMISSION`, `ARCHIVE` (whether an
   available capture exists), `WORKER`, and `AGE`. `ADMISSION` is the server's per-hold
-  custody admission membership: `counted (<reason>)`, `not counted`, or `-` when the
+  custody admission membership: `counted (<reason>)`, `not counted (<reason>)` (for example
+  `not counted (same_run_group)`: one of a run's open holds on the same original worker (any generation),
+  covered by that group's counted representative), or `-` when the
   server did not report it (a non-open hold or an older server), which is unknown, never
   `not counted`. Run and hold ids are shown in full.
-  Below the table it prints the owner-wide `open_holds`, `admission_counted_holds`,
+  Below the table it prints the owner-wide `open_holds`, `admission_units (admission_counted_holds): N`,
   `custody_hold_limit`, `decision_needed`, and `blocked_runs` aggregate. Read
-  `admission_counted_holds` against the limit for capacity, and `open_holds` for total
-  custody. `blocked_runs` excludes continuations eligible for the exemption. If the
+  `admission_counted_holds` (admission units) against the limit for capacity, and `open_holds` for total
+  custody. `blocked_runs` excludes continuations eligible for the exemption, and also counts queued runs
+  stopped by the hard per-run bound (their own open holds at the limit), even when the owner is below it. If the
   server cannot read a valid `custody_hold_limit`, the listing returns an error instead of
   guessing a limit; an admin saves a valid value in Admin → Instance settings. For each
   `source_only` hold it reports retained source and archive availability independently.
@@ -1530,9 +1573,12 @@ uzi run recovery <run-id> [--json]
   `retained_recovery_adoption_failed`, or `retained_continuation_unwitnessed`: it remains `source_only`, or `needs_action` after a failed
   latest capture, even with an available archive or capture in flight. Retained
   exhaustion with a finite retry can retry automatically; its NULL retry requires
-  owner Resume/Cancel. Adoption failure always requires owner Resume/Cancel; so does
+  owner Resume/Cancel. Adoption failure always requires an owner decision (Resume/Cancel; Cancel only for
+`secret_remediation_active`, where Resume is refused); so does
   the same cause when the worker refused an unsupported predecessor of an independent restore
   (no adoption was attempted).
+  An open hold at `recovery_wait` / `anthropic_spend_limit` (no retry time) is owner-held
+  like a NULL-retry `data_volume_full` hold: a worker's final proof does not release it.
   Archive readiness does not implicitly release this custody.
   The latest capture state and available archive are independent: an older download may
   omit latest work while a newer capture prepares/uploads. The same source, coverage,
@@ -1543,7 +1589,10 @@ uzi run recovery <run-id> [--json]
   prerequisite_closure. Its ids are accepted by
   `uzi run export --capture`; it's always `[]`
   rather than null, including when the run itself was deleted (a released hold outlives
-  its run) or the server predates capture-hold linking. Owner-only.
+  its run) or the server predates capture-hold linking. A capture whose hold is not among the
+  listed holds is attached nowhere in your own run's output. Owner-only, except under
+  [admin run debug](#admin-run-debug-reading-other-users-runs), whose read of another user's run
+  can also end with one `unattached` element (described there); your own run never shows it.
 - While the server retains the run's last published checkpoint on origin (PRD #1810), the
   human-readable output adds a line per hold naming where it lives: `hold <id> checkpoint:
   <ref> @ <12-char tip> (<state>)`, where `<ref>` is `refs/uzi-checkpoints/<checkpoint-key>` or, once
@@ -1681,6 +1730,60 @@ ref that is then acknowledged follows the retention rule. Remove the repo after 
 The body also carries `held_refs` (**at most 5** refs, each named with its state in the error
 text; any further ones are only counted, as `and N more`) and `held_count` (the true total).
 Retry the removal once the refs are deleted or settled.
+
+### Admin run debug: reading other users' runs
+
+Off by default. A deployment turns it on with `UZI_ADMIN_RUN_DEBUG` (chart value
+`api.adminRunDebug.enabled`; see [configuration](./configuration.md#admin-run-debug-issue-4198)).
+When it is on, a live admin using an `admin_ro` (`uza_`) CLI token can read, never change, another
+user's run data. A browser cookie or a `uzc_` token never qualifies, and demoting the admin takes
+effect on the next request. Each newly authorized cross-user read writes one audit log line.
+
+- **`uzi run inputs <id>` and `uzi run fetches <id>`** work on a foreign run. A foreign chat run still
+  reads as not found. A debug-served inputs or archives response carries `admin_debug_read: true`.
+- **`uzi run recovery --user <uuid>`** lists that user's open custody holds, owner-wide; with `--json` it
+  prints the whole holds DTO (aggregate plus every hold, settled ones included), as the no-argument
+  `--json` does. `--user` takes the full user UUID, no run id. Without `--json` it also prints a
+  one-line read-only notice on stderr.
+- **`uzi run recovery <run-id>`** on a foreign run lists that run's holds and capture metadata. The
+  holds are shown only when the run's capture metadata read succeeds as an admin debug read
+  (`admin_debug_read: true`); if that read fails the result is empty, as for a run you cannot read.
+  Only on such a debug read, and never for your own run, captures whose hold is not among the
+  listed holds arrive with `--json` as ONE final element after the hold elements, carrying no
+  `generation`, `id` or `state` keys, so scripts that read holds should skip elements with
+  `unattached: true`:
+
+```json
+{"run_id": "<run-id>", "unattached": true, "captures": [ ... ]}
+```
+
+  Each entry in `captures` has the same shape as a hold's `captures` entries above. The human view
+  prints a `captures (no listed hold)` table instead.
+- **`uzi admin runs --all [--user <uuid>] [--since <rfc3339>]`** lists runs of every status, newest
+  first (`created_at`, then `id`), capped at 500 rows, with the same run-kind exclusions as the active
+  listing (chat, judge and cross-check runs). `--user` limits it to one owner, `--since` to runs
+  created at or after an RFC3339 time. `--user` and `--since` without `--all` exit 2. When the cap is hit
+  the CLI prints `note: showing the newest 500 runs; narrow with --user or --since` on stderr. `--json`
+  prints a `{runs, truncated}` envelope of summary rows instead of the table.
+- **Still owner-only on a foreign run, flag or not:** every steer or other write, archive download, and
+  `uzi run export` (it exits 4 with a message that export is refused, since debug reads are
+  metadata-only). `run discard` stays owner-only too. The TUI shows no steer controls on a foreign run.
+- **Hints.** When a read that admin run debug could serve is refused or not found (a 404, 401 or 403
+  from `run inputs`, `run fetches`, `run recovery --user` or `admin runs --all`), the CLI prints
+  `hint: reading another user's run needs the server flag UZI_ADMIN_RUN_DEBUG (chart
+  api.adminRunDebug.enabled) and an admin_ro (uza_) token` on stderr, at most once per command.
+  `uzi run recovery <run-id>` prints it only when you hold nothing on the run and one of its per-run
+  reads (the run's holds or its capture metadata) returns 404, the answer a refused foreign read
+  gets. Other per-run read failures (401, 403, server errors) stay silent with exit 0. A failed
+  scoped-holds read can still show captures from a successful archives read that the server marked
+  as an admin debug read; the result is empty only when neither read supplies admissible data.
+  A cancelled or expired command context fails the command. A read that hits the 30-second HTTP
+  client timeout while the context is still active follows the other per-run failures: it stays
+  silent with exit 0. The CLI cannot tell
+  a refusal from a missing run or an expired token, so the hint is advisory. It never changes the
+  exit code: commands that fail on the error still fail with it. When one of your own holds lists
+  the run, `run recovery <run-id>` prints no hint (a hold can outlive its run), and with `--json` a
+  capture read failing with anything other than a 404 exits with that error.
 
 ### A failed run's salvage copy: `refs/uzi-salvage/<run-id>`
 
@@ -1935,7 +2038,10 @@ and, when an upgrade is still needed, shows a modal on top of the board. If the
 formula-owned installed CLI already meets the offered release, it shows a restart
 hint instead. A stable `uzi-cli` install checks stable releases; an `uzi-cli-rc`
 install checks the newer of the latest stable and latest release candidate, while
-staying on its opt-in formula. A stable install needing an upgrade looks like this:
+staying on its opt-in formula. A Homebrew install is offered the "Update now"
+action only once its own formula carries the release (see the first bullet below);
+until then the modal shows release notes only. A stable install whose formula
+carries the release looks like this:
 
 ```
 ▲ Update available
@@ -1952,7 +2058,19 @@ A newer release is available.
   the running binary: `brew upgrade vtmocanu/tap/uzi-cli` for stable or
   `brew upgrade vtmocanu/tap/uzi-cli-rc` for the RC channel, even when it currently
   runs a stable version. These tap-qualified targets select uzi's stable and opt-in
-  RC formulae. Choosing it exits the TUI and runs Homebrew in the foreground, so
+  RC formulae. The action appears only once that **owning** formula installs the
+  offered version or newer, as last read by the server's release check (every
+  `UZI_RELEASE_CHECK_INTERVAL`, default `6h`; see [Update checks](updates.md)). An
+  RC-owned install offered a newer stable is gated on `uzi-cli-rc`, not `uzi-cli`.
+  When the formula is behind, unreadable or unknown, or the server is older and does
+  not report formula versions, the prompt shows release notes only (Not now / Don't
+  remind me, plus `Release notes: <url>`). The tap can lag the GitHub release, so
+  this avoids offering an upgrade Homebrew cannot yet perform. Two consequences:
+  "Not now" on a notes-only prompt is not reopened later in that session when the
+  formula catches up, and "Don't remind me for `<version>`" also suppresses a later
+  Update now for that version. A ready offer is not a promise: `brew upgrade` uses
+  your local tap clone and your Homebrew auto-update settings, so it can still end
+  in the not-reached message below. Choosing it exits the TUI and runs Homebrew in the foreground, so
   the source-build output and any failure stay visible. It does not force a tap
   refresh: Homebrew inherits `HOMEBREW_AUTO_UPDATE_SECS` and
   `HOMEBREW_NO_AUTO_UPDATE` from your environment. A zero exit from Homebrew is
@@ -2216,6 +2334,16 @@ A missing name reads `no worker yet` on a non-terminal run and `—` on a
 completed, failed, or cancelled run. The floor run summary (cost, count, and
 visible row range) sits right-aligned with the account meters, or on its own
 line when space is insufficient.
+
+The floor state word distinguishes `checking`, `reworking`, `compl blocked`,
+`xchecking`, and plan-gate cross-check outcomes (`xchk revise`, `xchk blocked`,
+`xchk n/a`). Each has a one-cell glyph and a word, so the meaning survives
+`NO_COLOR`. A run's detail names its completion phase and any live plan or
+advisory code cross-check on separate lines; `uzi run get` prints a
+`CROSS_CHECK` row while either check is live. The detail read refreshes this
+presence from the server rather than keeping a board snapshot. A held
+completion-blocked run appears under NEEDS YOU and has its own `‖ N` count in
+the floor summary, since it needs an owner decision.
 
 The floor summary, workers list and worker detail share one request chain,
 polling every 5s while any is visible, including an unfocused top pane.
@@ -2964,6 +3092,35 @@ its container restarts, see
 `memory_authority_lost_at` in `uzi admin workers --json`, or the worker view in
 `uzi tui`.
 
+### Hibernated workers
+
+A [hibernated](hosted-workers.md#hibernation) hosted worker shows `hibernating`,
+`hibernated` or `waking` as its status in `uzi worker list` and
+`uzi admin workers`; a wake not confirmed in time shows `(wake error)` after it, and a manual
+cordon keeps its ` · cordoned (manual)` marker after the state.
+`--json` carries `hibernation_state`, `hibernation_reason`, `hibernated_at`,
+`wake_requested_at` and `wake_error`, and `hibernation_cleanup` (`{state, outcome, reason}`, the
+[cache cleanup](hosted-workers.md#cache-cleanup-before-sleep) before sleep). `uzi tui` shows the state too. There is no
+write verb: hibernating and waking are web-only admin actions.
+
+`--json` also carries the automatic pass's last recorded blocker as
+`hibernation_blocked_reason`, `hibernation_blocked_since` and `hibernation_blocked_at`
+(each null when unset; the same scoping as `hibernation_reason`), and, for a hosted worker,
+the display-only `roll_marker`. After the table, `uzi worker list`, `uzi worker get` and
+`uzi admin workers` print, when set:
+
+```text
+Hibernation blocker (last recorded) worker <id>: <label> (since <RFC3339>, last observed <RFC3339>)
+Roll marker worker <id>: <state> · canary · completed · target <v> · group <g> · reservation · blocked: <text> · observed <RFC3339>
+```
+
+The blocker line is the last recorded blocker, not the current state: it is not cleared
+when the worker returns to work. In the roll marker line only the state is always shown;
+`canary`, `completed`, `target`, `group`, `reservation`, `blocked` and `observed` appear
+only when set. See
+[Diagnosing a blocked hibernation or a stuck roll](hosted-workers.md#diagnosing-a-blocked-hibernation-or-a-stuck-roll)
+for the fields and the `unknown`, `unavailable` and `absent` states.
+
 `uzi run get` gains four rows, each emitted only when the server has
 something to say:
 
@@ -2972,6 +3129,7 @@ something to say:
 | `HOME` | the server has a fresh worker report of the run's size | the run's HOME and cache size, e.g. `4.2 GiB (cache 3.0 GiB)`; `at least` leads when the size walk was truncated (both numbers are then lower bounds) |
 | `CHECKPOINT` | the run is parked (`limit_wait`, `recovery_wait`, or `paused`) and the worker reported it | whether the checkpoint published for this park contains the run's latest committed work: `contains the latest work`, or `does NOT contain the latest committed work (the worker keeps it)` |
 | `DISK` | the run is parked with cause `data_volume_full` | the [waiting-for-disk-space sentence](run-recovery-wait.md#worker-data-volume-full), the timed retry or owner Resume/Cancel guidance (unknown timing labeled separately), and the run's lifetime count of counted disk parks |
+| `SPEND_LIMIT` | the run is held in `recovery_wait` with cause `anthropic_spend_limit` (and not re-queued) | one line: `Anthropic API spend limit reached · Resume uses this run's current credential selection. If it still selects the capped token, raise the limit first: uzi run resume <id> · To choose another token now: uzi token list, then uzi run set-token <id> <label> · Cancel: uzi run cancel <id>`. The "To choose another token now" part is omitted on `chat`, `judge`, `self_improve` and `job` runs, which do not accept a switch. No automatic resume. See [Anthropic API spend limit](run-recovery-wait.md#anthropic-api-spend-limit) |
 | `EST. TAIL` | a Claude run has usage no result frame covered (an interrupted session) | the [estimated tail](run-cost.md#estimated-tail-of-an-interrupted-session), kept apart from `COST`: `~$1.23 estimated (price-table version) · 1.2M in/34k out · partial: <reasons>`, `<$0.01 estimated` under half a cent, or `cost unknown (unpriced)`; hidden for the all-zero, complete tail |
 
 `CHECKPOINT` shows while the run is actually parked (`limit_wait`,
@@ -3403,6 +3561,14 @@ reports the error. `uzi settings get` shows `Default harness: automatic
 after Codex account mode, then the same overflow line; its decoded settings
 JSON includes `harness_overflow_enabled`.
 
+`uzi settings get` ends with a `Judge runs on:` line for the per-user
+[Judge runs on](./judge.md#judge-runs-on) setting: `Judge runs on: Same as the
+run (default)` when unset, otherwise `Judge runs on: Claude (your setting)` or
+`Judge runs on: Codex (your setting)`. `--json` carries the stored
+`judge_runs_on` (`claude`, `codex` or `null`) and, in `effective`, the
+`judge_harness` cell. The setting is changed in **Settings → Run defaults →
+Run judge**; there is no CLI write verb for it.
+
 Overflow applies at creation to new implicit issue runs started manually,
 by autopilot or by a schedule, with both harnesses usable, and only when your
 default harness is an explicit Claude or Codex: with the default automatic it
@@ -3811,6 +3977,8 @@ A run's raw `status` (in `run get --json`, `run list --json` and
   those interruptions on a capped backoff. Disk parks (`data_volume_full`) have
   three timed counted retries by default, then hold for owner Resume/Cancel;
   preventive parks stay uncounted and timed. See [Worker data volume full](run-recovery-wait.md#worker-data-volume-full).
+  An Anthropic API spend limit (`anthropic_spend_limit`) is owner-held with no timer; see
+  [Anthropic API spend limit](run-recovery-wait.md#anthropic-api-spend-limit).
   Empty-turn and resumed-gate recovery have no lifetime cap;
   negotiated `codex_idle_stall` parks instead have three timed retries by default,
   then require owner Resume/Cancel. See [Codex idle stalls](#codex-idle-stalls).
@@ -3821,7 +3989,8 @@ A run's raw `status` (in `run get --json`, `run list --json` and
   without an automatic timer. Retained-source budget exhaustion can use cause
   `retained_recovery_exhausted`: three timed retries by default, then an owner
   hold with no countdown. An integrity refusal uses `retained_recovery_adoption_failed`,
-  requiring owner Resume or Cancel with no automatic retry; it also holds a run whose
+  requiring owner Resume or Cancel with no automatic retry (Resume is refused on the
+  `secret_remediation_active` detail); it also holds a run whose
   predecessor an independent restore does not support (canonical, hosted or no boundary
   record), where no adoption was attempted. A retained continuation
   whose departure was never witnessed uses the server-only cause
@@ -3895,6 +4064,20 @@ A run's raw `status` (in `run get --json`, `run list --json` and
   registration (the refusal lifts on the worker's acknowledgement, a stale
   heartbeat, worker removal or re-registration), and `run cancel` always works; see
   [Credential-switch holds](run-recovery.md#credential-switch-holds).
+  `settling` means the worker is still finishing its own operations; `unsettled`
+  means it finished them but did not prove the run's processes stopped (nothing
+  was applied, and the next claim re-proves that). They are distinct states;
+  the only change between them is `settling` to `unsettled`, when the worker acknowledges.
+  On a worker with in-place switching, `run set-token` on a live Claude run
+  switches the token without releasing the claim (same worker, same working
+  directory; it resumes the same session where the provider allows, otherwise
+  a fresh session in the same directory with a `resume_lineage_break` notice,
+  reason `credential_switch_resume_refused`).
+  If the worker cannot prove whether that switch took effect, the run is
+  `paused` with no hold reason and a `credential_switch_uncertain` message in
+  the run feed (posted by the worker):
+  `uzi run resume <id>` re-resolves the token from the run's current choice
+  and continues. See [Paused after an uncertain token switch](./run-pause.md#paused-after-an-uncertain-token-switch).
   A `paused` run created with `--require-base` can also be **held because
   its kept work is not attested** (`hold_reason: base_attestation_missing`):
   it continued its own work, but no checkpoint proves that work was produced
@@ -3912,6 +4095,12 @@ A run's raw `status` (in `run get --json`, `run list --json` and
   `HOLD` row reading `repo agents unreadable`; resume the run with
   `uzi run resume <id>` once the repository can be fetched, or cancel it. See
   [Repo agents](repo-agents.md#which-revision-is-read).
+  A `paused` run can also be **held because its chosen model or effort cannot
+  run on its harness** (`hold_reason: run_override_unavailable`): `run get`
+  prints a `HOLD` row reading `model choice unavailable`, and `run wait` and
+  `run logs --follow` print a notice naming the hold. `uzi run resume <id>` retries only
+  if the choice has become available on that harness; otherwise cancel the run
+  (`uzi run cancel <id>`) and start a new run with a different choice.
 
 For an ordinary pause, human `run get` makes one supplemental message read
 (`tail=100`). Its pause detail reads **paused by the run's lead** for
@@ -3941,10 +4130,10 @@ hold presentation and remedies are unchanged. See
 
 `limit_wait` and timed `recovery_wait` causes auto-resume on a timer.
 `worker_requeue_exhausted` instead requires owner Resume or Cancel; the Codex
-account hold waits for its account. `codex_idle_stall`, `data_volume_full` and
+account hold waits for its account. `anthropic_spend_limit` has no timer and needs owner Resume, Switch token or Cancel. `codex_idle_stall`, `data_volume_full` and
 `retained_recovery_exhausted` retry when their timestamp is finite (even if due);
 explicit NULL instead needs owner Resume/Cancel, and omitted timing is unknown. `retained_recovery_adoption_failed` requires
-owner Resume/Cancel regardless of retry timing, including when it holds an unsupported restore predecessor. `pool_wait` instead clears only when a token is
+owner Resume/Cancel regardless of retry timing, including when it holds an unsupported restore predecessor. On the `secret_remediation_active` detail Resume is refused (409); export or operator recovery, then Cancel. `pool_wait` instead clears only when a token is
 opted into the pool (or on demand with `uzi run resume-now`), so waiting alone
 does not resume it.
 
@@ -4191,7 +4380,7 @@ for renewal bounds, storage risks and rollout requirements.
 a predecessor needs secret-scan remediation review, or this release does not support
 the predecessor for independent restore. The agent did not start. Local work and custody are
 preserved; the run is owner-held with no automatic retry, regardless of a
-displayed retry timestamp. In the remediation case, Resume holds again unless
+displayed retry timestamp. In the #4058 predecessor-remediation case, Resume holds again unless
 that remediation was resolved through a separately authorized route. The same cause
 also holds a run whose predecessor an independent restore does not support (canonical,
 hosted or no boundary record, when the earlier checks pass): the worker refused before
@@ -4202,10 +4391,29 @@ you cancel or discard it
 
 Read `uzi run recovery <id>` and export an available archive before deciding.
 Use `uzi run resume <id>` (or `resume-now`) to request another bounded attempt,
-or `uzi run cancel <id>` to end the run. Resume preserves remaining wall time
+or `uzi run cancel <id>` to end the run, except on the active detail below. Resume preserves remaining wall time
 and may need `uzi run extend` first. It does not guarantee success: repeated
 adoption failure holds again. An earlier archive may omit latest local work.
 Timers, token changes and credential changes do not release this hold.
+
+The run's `recovery_wait_detail` (shown by `uzi run get --json`) can qualify the hold:
+
+- `secret_remediation_active`: the retained source still descends from a
+  secret-scan-flagged commit, so retrying unchanged cannot help. `uzi run get`, `list`,
+  `wait`, `inputs` and the TUI board and detail never offer Resume. They show both
+  routes, then Cancel: export an available archive (`uzi run export <id> --output <path>`,
+  which may omit later work kept on the worker; an archive is not proven to hold the
+  latest work), or an operator recovers the retained work from worker storage
+  ([Run recovery](run-recovery.md#retained-source-failure-and-local-proof)). `uzi run resume` and
+  `resume-now` return 409 before any write (no claim, generation, audit row or custody
+  release): "The retained source is held under an active secret-scan remediation; Resume
+  cannot succeed unchanged. An available recovery archive (`uzi run export <id>`) may
+  omit later work kept on the worker; an operator can recover the retained work from
+  worker storage. Cancel ends the run."
+- `remediation_proof_unknown`: the proof could not be verified, so a retry may help;
+  the output says so and Resume stays available.
+- absent: unclassified; the generic guidance above applies. The #4058 and #3644 holds
+  stay unclassified.
 
 Default wait and log follow stop for this owner decision, and the TUI marks
 NEEDS YOU. Explicit `--until` keeps its selected status set. See
@@ -4235,8 +4443,10 @@ rest (`queued`/`claimed`/`running`/`limit_wait`/`pool_wait`/`recovery_wait`/`pau
 except a default wait also stops at `recovery_wait` with cause
 `worker_requeue_exhausted`, `worker_memory_pressure`,
 `retained_recovery_adoption_failed`, `retained_continuation_unwitnessed`, or
-owner-held `retained_recovery_exhausted` or `codex_idle_stall` (NULL retry), and at a `paused` run held on
-`base_attestation_missing`, for an owner decision:
+owner-held `retained_recovery_exhausted` or `codex_idle_stall` (NULL retry), `anthropic_spend_limit` (an
+Anthropic API spend-limit hold, Resume, Switch token or Cancel), and at a `paused` run held on
+`base_attestation_missing`, `run_override_unavailable` or a credential-switch
+hold, for an owner decision:
 timed limit and recovery waits retry on a timer, pool waits need an available pooled token,
 and ordinary owner or lead pauses need `uzi run resume`. A bare `run wait` means
 "wait for the plan gate, a clarification, an interactive task's park,

@@ -42,7 +42,7 @@ func recordedRunFixture(t *testing.T) (*Service, *forgetest.Recorder, *fakeStore
 // capture runs inside it (no capture handed in through the context).
 func TestRecordedCallsCreateRunManual(t *testing.T) {
 	svc, rec, fs := recordedRunFixture(t)
-	if _, err := svc.CreateRun(context.Background(), uuid.New(), uuid.New(), 4, "caller raw body", nil, nil, false, nil, nil, nil, nil); err != nil {
+	if _, err := svc.CreateRun(context.Background(), uuid.New(), uuid.New(), 4, "caller raw body", nil, nil, false, nil, nil, nil, nil, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	if fs.createRunParams == nil {
@@ -55,7 +55,7 @@ func TestRecordedCallsCreateRunManual(t *testing.T) {
 // captures the issue input once and hands it to CreateRun.
 func TestRecordedCallsStartRunForUser(t *testing.T) {
 	svc, rec, fs := recordedRunFixture(t)
-	if _, err := svc.StartRunForUser(context.Background(), uuid.New(), uuid.New(), 4, nil, nil, false, nil, nil, nil, nil); err != nil {
+	if _, err := svc.StartRunForUser(context.Background(), uuid.New(), uuid.New(), 4, nil, nil, false, nil, nil, nil, nil, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	if fs.createRunParams == nil {

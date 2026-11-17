@@ -91,11 +91,11 @@ func linkedRunFixture(t *testing.T, withSources bool) (*Service, *fakeStore, *fo
 func TestLinkedRunCaptureUsesResolverAndNeverAsksForgeAboutTrackerAuthors(t *testing.T) {
 	sites := map[string]func(*Service, uuid.UUID, uuid.UUID) error{
 		"CreateRun": func(s *Service, user, repo uuid.UUID) error {
-			_, err := s.CreateRun(context.Background(), user, repo, 4, "caller body", nil, nil, false, nil, nil, nil, nil)
+			_, err := s.CreateRun(context.Background(), user, repo, 4, "caller body", nil, nil, false, nil, nil, nil, nil, nil, nil)
 			return err
 		},
 		"StartRunForUser": func(s *Service, user, repo uuid.UUID) error {
-			_, err := s.StartRunForUser(context.Background(), user, repo, 4, nil, nil, false, nil, nil, nil, nil)
+			_, err := s.StartRunForUser(context.Background(), user, repo, 4, nil, nil, false, nil, nil, nil, nil, nil, nil)
 			return err
 		},
 	}
@@ -125,11 +125,11 @@ func TestLinkedRunCaptureUsesResolverAndNeverAsksForgeAboutTrackerAuthors(t *tes
 func TestLinkedRunCaptureWithoutSourcesFailsClosed(t *testing.T) {
 	for name, run := range map[string]func(*Service) error{
 		"CreateRun": func(s *Service) error {
-			_, err := s.CreateRun(context.Background(), uuid.New(), uuid.New(), 4, "b", nil, nil, false, nil, nil, nil, nil)
+			_, err := s.CreateRun(context.Background(), uuid.New(), uuid.New(), 4, "b", nil, nil, false, nil, nil, nil, nil, nil, nil)
 			return err
 		},
 		"StartRunForUser": func(s *Service) error {
-			_, err := s.StartRunForUser(context.Background(), uuid.New(), uuid.New(), 4, nil, nil, false, nil, nil, nil, nil)
+			_, err := s.StartRunForUser(context.Background(), uuid.New(), uuid.New(), 4, nil, nil, false, nil, nil, nil, nil, nil, nil)
 			return err
 		},
 	} {
@@ -152,7 +152,7 @@ func TestLinkedRunCaptureWithoutSourcesFailsClosed(t *testing.T) {
 func TestUnlinkedRunCaptureNeverConsultsResolver(t *testing.T) {
 	svc, _, _, _, src := linkedRunFixture(t, true)
 	svc.q.(*fakeStore).repoRow.IssueTrackerConnectionID = pgtype.UUID{}
-	if _, err := svc.StartRunForUser(context.Background(), uuid.New(), uuid.New(), 4, nil, nil, false, nil, nil, nil, nil); err != nil {
+	if _, err := svc.StartRunForUser(context.Background(), uuid.New(), uuid.New(), 4, nil, nil, false, nil, nil, nil, nil, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	if len(src.calls) != 0 {

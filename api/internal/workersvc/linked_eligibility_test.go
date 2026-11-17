@@ -42,7 +42,7 @@ func linkedGateService(t *testing.T, tag string, cachedLabels []byte, fresh []st
 
 func TestLinkedRunGateUsesTheStoredEligibilityTag(t *testing.T) {
 	create := func(svc *Service) error {
-		_, err := svc.CreateRun(context.Background(), uuid.New(), uuid.New(), 4, "", nil, nil, false, nil, nil, nil, nil)
+		_, err := svc.CreateRun(context.Background(), uuid.New(), uuid.New(), 4, "", nil, nil, false, nil, nil, nil, nil, nil, nil)
 		return err
 	}
 	t.Run("the stored tag on the cache and the fresh read starts a run", func(t *testing.T) {

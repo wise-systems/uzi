@@ -53,6 +53,9 @@ func TestStatusReportConsumerContract(t *testing.T) {
 	if got.PollIntervalSeconds != 10 {
 		t.Errorf("PollIntervalSeconds = %d, want 10", got.PollIntervalSeconds)
 	}
+	if got.Hibernation != 2 {
+		t.Errorf("Hibernation = %d, want 2 (PRD #4208 protocol version)", got.Hibernation)
+	}
 	if got.ReportedAt.IsZero() {
 		t.Error("ReportedAt did not decode; it is display-only but it must still arrive")
 	}
@@ -74,6 +77,15 @@ func TestStatusReportConsumerContract(t *testing.T) {
 		pacing.RetainedImage == nil || *pacing.RetainedImage != "0.11.6" ||
 		pacing.RetainedVersion == nil || *pacing.RetainedVersion != "0.11.6" {
 		t.Errorf("workers[0].Pacing lost golden values: %+v", pacing)
+	}
+	marker, err := workersvc.ParseRollMarkerReport(stuck.RollMarker)
+	if err != nil || marker == nil {
+		t.Fatalf("workers[0].RollMarker did not normalize: %v, %+v", err, marker)
+	}
+	if marker.State != "present" || !marker.Canary || !marker.Completed || marker.TargetVersion != "0.11.7" ||
+		marker.CoverageGroup != "0123456789abcdef" || !marker.Reservation ||
+		marker.Blocked == nil || *marker.Blocked != "waiting_for_registration" {
+		t.Errorf("workers[0].RollMarker lost golden values: %+v", marker)
 	}
 	if stuck.Phase != "stuck" {
 		t.Errorf("workers[0].Phase = %q, want stuck", stuck.Phase)

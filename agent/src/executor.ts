@@ -5,6 +5,7 @@ import fs from "node:fs/promises";
 import { watch } from "node:fs";
 import path from "node:path";
 import type { Logger } from "./log.js";
+import type { SecretSet } from "./redact.js";
 import type { CapturedMemoryContext } from "./codex/broker.js";
 import type { ExecutorSealResult, ExecutorTerminalSeal } from "./codex/executor-lifetime.js";
 import type { UsageSink } from "./usage-recorder.js";
@@ -134,7 +135,16 @@ export interface EmittedMessage {
   agentInstance?: string;
   agentLabel?: string;
   payload: Record<string, unknown>;
+  /** Issue #4201: the credential epoch this frame belongs to. Copied to the wire only when > 0
+   *  (the base epoch is the absent field), so an older api never receives it. */
+  credentialEpochOrdinal?: number;
 }
+
+/** Issue #4201: where an executor reached the in-place credential switch hook from. */
+export type InPlaceSwitchSite =
+  | "gate_resumed" | "plan_turn" | "plan_gate" | "plan_gate_exhausted" | "plan_source"
+  | "plan_gate_revision" | "implement_ready" | "question_reentry" | "ask_user"
+  | "follow_up" | "implement_turn" | "retained" | "escaped";
 
 /**
  * PRD #1497 M2: the outcome of a capture-first wall park ({@link RunContext.parkForWall}). See that
@@ -163,6 +173,21 @@ export type SecretRemediationDecision =
   | { action: "proceed" }
   | { action: "remediate"; followUp: string }
   | { action: "fail" };
+
+/**
+ * Issue #4313: thrown by `RunContext.secretRemediationGate` when a cancel, claim fence, terminal
+ * lifecycle fence, graceful worker shutdown or disk stop stopped the gate before it reached a decision.
+ * It is not a decision: none is returned, no attempt is spent and nothing is emitted. State the gate already
+ * wrote before the stop (restriction and scan records, in-memory known/everKnown/withholdPaths) and any
+ * negative knowledge it records on stopping (a latched trusted finding set) remain. The executor
+ * routes the control that caused it (terminal, cancel, disk park, or a cancel when none is visible).
+ */
+export class SecretRemediationStoppedError extends Error {
+  constructor() {
+    super("secret remediation gate stopped before a decision");
+    this.name = "SecretRemediationStoppedError";
+  }
+}
 
 /** Marks only the exhausted revision's owner-event wait, excluding recovery work. */
 export type PlanRevisionOwnerWaitObserver = (waiting: boolean) => void;
@@ -293,6 +318,9 @@ export interface RunContext {
   redactText?: (s: string) => string;
   /** Anthropic subscription OAuth token (CLAUDE_CODE_OAUTH_TOKEN) for the SDK. */
   oauthToken?: string;
+  /** Issue #4201: the run's current Anthropic credential, an immutable `{token, ordinal}` snapshot
+   *  that an in-place switch advances. Absent on stubs, which keep reading `oauthToken`. */
+  credential?: () => Readonly<{ token: string; ordinal: number }>;
   /** PRD #362 M3c: the model the inline run-summary generator runs on, resolved
    *  user-value-wins from users.summary_model over the instance summary_model at
    *  issue-run claim assembly. Absent ⇒ the generator uses the SDK/account default
@@ -335,7 +363,7 @@ export interface RunContext {
   capturedMemory?(): CapturedMemoryContext | undefined;
   /** Issue #2471: the run's redaction secrets, present with `capturedMemory`; the guarded Claude
    *  command lane redacts its inline output windows against them. Never sent to the model. */
-  guardedCommandSecrets?: readonly string[];
+  guardedCommandSecrets?: readonly string[] | SecretSet;
   /** Issue #2471: register a listener told, with the runner's own stop, when the worker memory
    *  runtime invalidates this flight's memory authority mid-run. Present with `capturedMemory`.
    *  Returns the unsubscribe. Not fired by epoch renewal, non-running reports or preservation. */
@@ -652,6 +680,17 @@ export interface RunContext {
    * or the authority of the done/checkpoint/finalize guards.
    */
   secretRemediationGate?(options?: { unpublishedOnly: true }): Promise<SecretRemediationDecision>;
+  /**
+   * Issue #4258: the advisory, NON-TERMINAL mid-run secret remediation consumer. The executor calls it
+   * at an admitted work-turn boundary (never at the done point, never on an interactive run, and
+   * only when no interruption and no system text such as a clarification answer, completion rework,
+   * code repair or resume-preflight remediation owns the turn; otherwise the trigger stays pending). The runner re-validates everything
+   * from scratch (a pending content-free trigger recorded by the mid-turn checkpoint scan is only a
+   * hint) and returns ONLY `proceed` or `remediate` (with a mid-run rewrite follow-up); it never
+   * returns `fail`. It never changes the authority of the done, checkpoint or finalize guards, which
+   * keep holding publication while a flagged commit is reachable. Absent is treated as `proceed`.
+   */
+  midRunSecretRemediation?(): Promise<SecretRemediationDecision>;
   /** Advisory code gate at a finalizing done exit; permits one repair pass. `repairAvailable: false` means no
    *  implementation iteration remains: the gate must not start a repair (findings stay unreported) and never
    *  extends the iteration budget. Absent is treated as available. */
@@ -787,10 +826,16 @@ export interface RunContext {
    *     a later NORMAL completion cleans up as usual. This is the fall-through the PRD requires
    *     (D3/D14), exactly like a declined `now` pause continues rather than parks.
    *
+   * A third outcome exists only when the api serves the in-place apply route (issue #4201):
+   *   - `"applied"` — the new token was applied server-side and published to `credential()`; the
+   *     caller continues in place exactly as for `"gave_up"` (same worker, generation, cwd and session
+   *     id) but must rebind its token copies first and read `ctx.signal` afresh. `opts` carries the
+   *     site and whether the executor's guarded lane is settled (the proof's executor-side half).
+   *
    * Absent on the stub/test executors ⇒ the loop/waiters re-throw the CredentialSwitchSignal to the
    * runner's outer catch, byte-identical to the pre-fix behaviour.
    */
-  attemptCredentialSwitch?(): Promise<"released" | "gave_up">;
+  attemptCredentialSwitch?(opts?: { site: InPlaceSwitchSite; laneSettled: boolean }): Promise<"released" | "gave_up" | "applied">;
   /**
    * PRD #1247 M5b (MAJOR-6): run `fn` with credential-switch trips DEFERRED — a matching switch
    * signal is held (not tripped, the turn not aborted) for the duration, then honored at the next
@@ -1108,6 +1153,12 @@ export interface Executor {
    * flight's shared slots are released. Never rejects. Absent on the stub/test and Codex executors.
    */
   joinOwnedOperations?(): Promise<void>;
+  /**
+   * Issue #4201: the executor's half of the in-place switch's quiescence proof for an executor that
+   * has already unwound (the runner's escaped-signal arm cannot ask a live executor). False when a
+   * guarded-lane quiesce failed or the lane is poisoned; absent means proven. Reads only.
+   */
+  laneSettlementProven?(): boolean;
   /**
    * issue #1830: drop the run's rebuildable HOME caches IN PLACE (run-caches.ts dropRunCaches), for
    * a run the hard disk layer cannot park (it waits at a gate, or is finalizing). Kills no process

@@ -212,12 +212,18 @@ park of that cause retries itself and keeps polling. An integrity refusal,
 `STOP=recovery_wait:retained_recovery_adoption_failed`) regardless of retry timing:
 local work and custody are preserved, with no automatic retry. Back up available
 work, then ask the owner to Resume or Cancel; Resume requests a bounded attempt,
-not assured success, and another adoption failure holds again. A server-only
+not assured success, and another adoption failure holds again. With `recovery_wait_detail`
+`secret_remediation_active` Resume is refused (409): never Resume; export an available
+archive (may omit later work) or `scripts/backup-runs.sh`, then Cancel. `remediation_proof_unknown`:
+a retry may help. A server-only
 `retained_continuation_unwitnessed` park (claimed flight never witnessed starting;
 claim released, work and custody preserved, no automatic retry; not an integrity
 refusal) stops the same way (`STOP=recovery_wait:retained_continuation_unwitnessed`)
 regardless of retry timing: back up, then ask the owner to Resume or Cancel. Other
-`recovery_wait` causes keep polling under their existing rules. Every `worker_memory_pressure`
+`recovery_wait` causes keep polling under their existing rules. An `anthropic_spend_limit` park
+(#3767: the provider refused on a spend limit, null retry stamp) never resumes itself and always stops
+(`STOP=recovery_wait:anthropic_spend_limit`, exit 0): back up, then the owner raises the limit and
+Resumes, runs `uzi run set-token` (switchable kinds only; not chat, judge, self_improve or job), or cancels. Every `worker_memory_pressure`
 park stops with `STOP=recovery_wait:worker_memory_pressure` (exit 0), regardless of `memory_hold`:
 remaining interventions do not authorize automatic retries. Back up available work first,
 then ask the owner to Resume or Cancel.

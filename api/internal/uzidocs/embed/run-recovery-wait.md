@@ -6,7 +6,7 @@ audience: user
 
 # Recovering from a transient interruption
 
-`recovery_wait` also includes owner-only [worker recovery exhaustion](#worker-recovery-exhausted), which has no timer or automatic resume. [Codex idle stalls](#codex-idle-stalls), [worker data volume full](#worker-data-volume-full) and retained-source exhaustion can also become owner-held. The transient-interruption retries below do not describe those holds.
+`recovery_wait` also includes owner-only [worker recovery exhaustion](#worker-recovery-exhausted), which has no timer or automatic resume. [Codex idle stalls](#codex-idle-stalls), [worker data volume full](#worker-data-volume-full) and retained-source exhaustion can also become owner-held, and an [Anthropic API spend limit](#anthropic-api-spend-limit) is always owner-held. The transient-interruption retries below do not describe those holds.
 
 Uzi retries in place and, if the trouble persists, parks the run in
 `recovery_wait` on these transient interruptions:
@@ -15,7 +15,10 @@ Uzi retries in place and, if the trouble persists, parks the run in
   turn count of zero and no model activity, plan, question, or completion.
 - A **transient Claude provider error** — a failed turn carrying a 408, 429,
   or 5xx status, including when its reason is not `api_error`; a failed
-  `api_error` with no status also qualifies.
+  `api_error` with no status also qualifies. So does a 403 whose error text
+  carries the Cloudflare block-page title `Attention Required! | Cloudflare`:
+  the provider's edge answering with a block or challenge page, which may clear
+  without a credential change.
 - A **transient Codex provider error** — on the Codex harness, a turn that
   ends failed because the provider was overloaded (`serverOverloaded`), had an
   internal server error (`internalServerError`), or had no flex capacity
@@ -37,9 +40,11 @@ after a turn that actually did work, missing turn-count metadata, a real
 wall timeout, and cancellation are not classified as a transient recovery.
 Measured Codex idle timeouts generally use the [idle-stall policy](#codex-idle-stalls) below; qualifying zero-output silence after a provider-reported retry uses [provider-outage recovery](#provider-outage-streaks) instead.
 
-A **permanent** provider error — for example 401, 403, or 400 (bad
+A **permanent** provider error — for example 401, any other 403, or 400 (bad
 credentials or a bad request) — is not a transient interruption. The run
-fails fast with an accurate reason and does not park here. On the Codex
+keeps its existing handling: it fails fast with an accurate reason and does
+not park here, except where a dedicated path applies (a lead spend-limit 400
+has its own owner hold). On the Codex
 harness, a turn that ends with a transport failure carrying a permanent status
 (400, 401, 403, and so on), or with an authentication, model, or other
 non-transport failure, is not retried here either.
@@ -357,9 +362,55 @@ roll until you cancel or discard it. See
 1. Read `uzi run recovery <id>` and export an available archive before deciding;
    an earlier archive may omit the latest local work.
 2. Choose `uzi run resume <id>` to request another bounded attempt, or
-   `uzi run cancel <id>` to end the run. Resume does not guarantee success.
+   `uzi run cancel <id>` to end the run. Resume does not guarantee success. On
+   `secret_remediation_active` Resume is refused (409): export an available
+   archive or have an operator recover from worker storage, then Cancel.
 3. If adoption fails again, the run holds again. Without a fresh owner Resume,
    redispatch reholds without another capture or model turn.
+
+**Recovery detail (#4177).** A run on this cause can carry a closed-set
+`recovery_wait_detail` (the Run field; valid only on `recovery_wait` /
+`retained_recovery_adoption_failed`):
+
+- `secret_remediation_active`: the retained source still descends from a
+  secret-scan-flagged commit, so retrying unchanged cannot help.
+- `remediation_proof_unknown`: the worker could not verify the remediation
+  proof (an unknown ancestry probe or an untrusted scan), so a retry may help.
+- Absent (NULL): unclassified. The generic text above applies and nothing new is
+  permitted; a missing classification never permits adoption.
+
+On `secret_remediation_active`, owner Resume (`uzi run resume`, `resume-now`, the
+web Resume) is refused with a 409 before any write: no claim, no claim
+generation, no audit row and no custody released. The message is "The retained
+source is held under an active secret-scan remediation; Resume cannot succeed
+unchanged. An available recovery archive (`uzi run export <id>`) may omit later
+work kept on the worker; an operator can recover the retained work from worker
+storage. Cancel ends the run." The resume SQL is fenced on the same predicate.
+The two routes are an available archive (`uzi run export <id> --output <path>`,
+which may omit later work; an archive is not proven to hold the latest work) or
+operator recovery from retained worker storage (see
+[Run recovery](run-recovery.md#retained-source-failure-and-local-proof), the
+failed source-only paragraph), then Cancel. `uzi run get`, `list`, `wait`, `inputs`,
+and the TUI print no Resume command in this state and the web run page shows Resume
+disabled with the reason; for
+`remediation_proof_unknown` they say a retry may help.
+
+The worker reports the detail as optional `recovery_detail` on the park, only
+after the API advertises the register feature
+`recovery_detail_adoption_refusal_v1`; the API 400s any other value, state,
+cause or a non-positive `claim_generation`. Deploy the API first. A confirmed
+restricted ancestor or a trusted scan finding gives `secret_remediation_active`;
+an unknown ancestry probe or an untrusted scan gives `remediation_proof_unknown`;
+an unknown probe after an abort or deadline, a deadline that rewrites the blocker,
+and every other refusal give no detail. After a worker process crash between
+persisting the blocker and the park, a fresh claim re-derives the class from the
+persisted journal, read-only and authenticated, in its own bounded operation;
+anything it cannot verify gives no detail, so a class known only from a
+callback is NULL after such a crash. This covers a process crash only and claims
+nothing for storage or power loss. A worker could under-report the class: the
+detail is advisory text for the owner, not an authority. The #4058 predecessor
+remediation hold and the unsupported-predecessor hold stay unclassified. See the
+[ADR-1197 #4177 amendment](../adr/1197-transient-recovery-park.md#amendment-2026-11-12-4177-a-closed-set-detail-on-the-adoption-failed-park-resume-refused-on-an-active-secret-remediation).
 
 A valid legacy budget-exhaustion renewal on an upgraded worker records its raw
 owner baseline before recovery work. If adoption then fails, the next owner
@@ -466,6 +517,32 @@ Resume. Downgrading workers during pending recovery is unsupported: older
 workers may drop its durable recovery fields. See
 [Recovering unpublished work](./run-recovery.md#retained-source-failure-and-local-proof).
 
+### Source-end declined hold
+
+A retained continuation may stop at `retained_recovery_adoption_failed` with
+detail `source_end_declined`: the previous flight definitively could not end
+its source use. It is owner-held, with no automatic retry. Pending work,
+queued source ends and uncertain end reports keep their existing bounded retry;
+they do not establish this detail.
+
+1. Read `uzi run recovery <id>`. Export an available archive and verify your
+   backup before considering discard; it may omit the latest work.
+2. On an upgraded API, **Resume** requires a different, nonempty current
+   registration for the retained worker. An unchanged or missing registration
+   or unavailable worker is refused even while heartbeats continue. A new
+   registration permits one explicit guarded attempt; it does not prove that
+   the old process died or its sources are usable. Nothing restarts the worker
+   or resumes the run automatically.
+3. **Cancel** remains available and keeps source custody. If the worker cannot
+   return, Resume may remain refused permanently. Arrange separately authorized
+   recovery from retained storage, an available archive or eligible verified
+   restore. Discard is a separate decision after backup verification.
+
+The CLI/TUI and web show the source-end hold and conditional Resume guidance.
+An older API may clear the detail and requeue on Resume under the existing cap;
+the worker's source guards still apply. Upgrade serving APIs before relying on
+the new refusal. See [the implementation boundary](../adr/4365-retained-source-end-hold.md).
+
 ### Unwitnessed continuation hold
 
 A retained continuation is a run with an open custody hold from an earlier claim
@@ -518,9 +595,14 @@ Nothing restarts the worker for you.
 Boundaries. Workers that provide neither witness (an old agent that sends no
 registration evidence and never lists the run in a snapshot) and workers that
 re-register between refusals are not witnessed; they remain bounded only by the per-run custody
-bound (`custody_hold_limit`, default 8, ADR-1751 D2a), which can still block the
-owner. If `custody_hold_limit` is below the requeue budget the run stays
-`queued` with health `custody_limit` instead of parking. Migration 00404's Down
+bound (`custody_hold_limit`, default 8, ADR-1751 D2a), which since #4162 is a hard
+bound: it blocks only that run, whatever the owner's admission units. If
+`custody_hold_limit` is below the requeue budget the run stays `queued` with the
+per-run reason ("this run has reached its own custody hold limit; retained holds
+still protect its work; resolve or discard this run's own retained holds to let it
+start", not the owner custody-limit wait) instead of parking. Resume does not
+bypass it and creates no further claim or hold; discard or settle that run's own
+holds to free it. Migration 00404's Down
 refuses while any run is parked at this cause (Resume or Cancel it first) and
 clears the cause on other rows.
 
@@ -1195,6 +1277,90 @@ remove that work before it is recovered.
   can read `data_volume_full (the worker's data volume stayed full after N
   counted disk parks)`. This is historical compatibility, not current cap policy.
 
+## Anthropic API spend limit
+
+A Claude run on an Anthropic API key can reach the **spend limit** its
+Anthropic organization or workspace sets. uzi does not fail that run. It parks
+it in `recovery_wait` with cause `anthropic_spend_limit`, keeps the worker's
+work and custody, and waits for you. This is not the usage window behind
+[`limit_wait`](run-limit-wait.md), and credit depletion (an exhausted prepaid
+or promotional balance) is **not** covered by this hold.
+
+### What you'll see
+
+- A **spend limit: owner hold** badge on the run, and a panel on the run page
+  with **Resume** and **Cancel**. On the run kinds that accept a credential
+  switch it also offers **Run with another token** and a **Manage tokens**
+  link to Settings.
+- The run feed and Slack name the hold.
+- `uzi run get <id>` shows a `SPEND_LIMIT` row with the owner guidance.
+  `uzi run list` appends `(spend limit: owner hold)` to the STATUS cell.
+- `uzi run wait` stops on it by default, as it does for other owner holds.
+- `uzi tui` bands it into NEEDS YOU.
+
+### No timer, no automatic resume
+
+The hold has no retry time, and no timer, sweeper or automatic resume leaves
+it. Nothing switches credentials for you. The only exits are yours:
+
+- **Resume** (`uzi run resume <id>`, or Resume on the run page) re-queues the
+  run. The next claim chooses the credential again through the run's own
+  selection, in this order (`resolveClaimSecret` in
+  `api/internal/workersvc/secretchoice.go`):
+  1. For a `self_improve` run, the judge's credential binding is checked
+     **first**.
+  2. Otherwise the per-run credential override, if one is set. A pin whose
+     token was deleted falls through, as it does today.
+  3. Then the worker binding: a static pin (the owner's default token when
+     none is pinned) or, in auto mode, the pool ranker (an empty pool waits in
+     `pool_wait`).
+
+  Resume is refused once the run's wall-clock budget is spent (chat, judge,
+  interactive and never-started runs are exempt).
+
+  Resume uses this run's current credential selection. If it still selects the capped token, raise the limit first. To choose another token now, use Switch token or `uzi run set-token`.
+
+  That last sentence applies only to the kinds that accept a credential
+  switch: not `chat`, `judge`, `self_improve` or `job` runs. In auto mode,
+  Resume re-ranks the pool and may pick the capped token again, or another
+  pooled token; excluding the capped token is follow-up
+  [#4163](https://github.com/vtmocanu/uzi/issues/4163).
+- **Switch token** (web **Switch token** / **Run with another token**, or
+  `uzi token list` then `uzi run set-token <id> <label>`) points the run at a
+  different token.
+- **Cancel** ends the run.
+
+### What triggers it
+
+A narrow, documented text match. Anthropic exposes no structured signal for a
+spend limit (checked against Claude Agent SDK 0.3.316), so uzi matches the
+provider text of the lead's terminal result. The hold applies only when that
+result is a failure with terminal reason `api_error` and HTTP status 400, and
+the provider message, after removing one leading `API Error: 400 ` or
+`API Error: ` wrapper, **starts with** one of:
+
+- `You have reached your specified API usage limits.` (organization limit)
+- `You have reached your specified workspace API usage limits.` (workspace limit)
+
+See Anthropic's [errors page](https://platform.claude.com/docs/en/api/errors).
+The sentence anywhere other than the start, any other 400, a 429 or 402, other
+terminal reasons, successful turns and subagent errors keep their existing
+handling. A spend-limit terminal wins over earlier rate-limit evidence in the
+same run: it never becomes an automatic [`limit_wait`](run-limit-wait.md).
+
+### Which runs
+
+The hold covers `issue`, `task`, `prompt`, `ci_fix`, `mr_rework` and
+`self_improve` runs. `chat` runs, review runs (a `task` with a review target),
+`job`, `judge` and `cross_check` runs are not covered and keep today's terminal
+failure.
+
+### Rollout
+
+The hold needs both a worker and an api that support it (worker protocol
+feature `recovery_cause_anthropic_spend_limit`). A newer worker on an older api
+keeps today's terminal failure, with no retry loop.
+
 ## Worker recovery exhausted
 
 When automatic worker-death recovery is exhausted, the server decides from
@@ -1293,9 +1459,11 @@ historical-evidence rules above remain in force.
   `retained_recovery_exhausted` has bounded timed retries followed by an owner
   hold (a capacity-only window is held for the owner below the cap); see [Retained recovery exhausted](#retained-recovery-exhausted).
   `retained_recovery_adoption_failed` instead requires owner Resume or Cancel,
-  with no automatic retry, including for an unsupported restore predecessor; see [Retained recovery adoption failed](#retained-recovery-adoption-failed).
+  with no automatic retry, including for an unsupported restore predecessor; Resume is refused on the `secret_remediation_active` detail; see [Retained recovery adoption failed](#retained-recovery-adoption-failed).
   `retained_continuation_unwitnessed` is likewise owner Resume or Cancel with no
   automatic retry; see [Unwitnessed continuation hold](#unwitnessed-continuation-hold).
+  `anthropic_spend_limit` is owner Resume, Switch token or Cancel with no timer;
+  see [Anthropic API spend limit](#anthropic-api-spend-limit).
 - `limit_wait`: a usage-limit window must reset. See
   [Paused on a usage limit](run-limit-wait.md).
 - `pool_wait`: no token is available in the selected pool. It needs an

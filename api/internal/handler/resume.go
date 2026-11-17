@@ -81,14 +81,28 @@ func (h *Handler) ResumeRunNow(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusConflict, hint)
 			return
 		}
-		if !run.RecoveryWaitCause.Valid || (run.RecoveryWaitCause.String != "forge_unreachable" && run.RecoveryWaitCause.String != "data_volume_full" && run.RecoveryWaitCause.String != "worker_requeue_exhausted" && run.RecoveryWaitCause.String != "worker_memory_pressure" && run.RecoveryWaitCause.String != "retained_recovery_exhausted" && run.RecoveryWaitCause.String != "codex_idle_stall" && run.RecoveryWaitCause.String != "retained_recovery_adoption_failed" && run.RecoveryWaitCause.String != "retained_continuation_unwitnessed") {
+		if !run.RecoveryWaitCause.Valid || (run.RecoveryWaitCause.String != "forge_unreachable" && run.RecoveryWaitCause.String != "data_volume_full" && run.RecoveryWaitCause.String != "worker_requeue_exhausted" && run.RecoveryWaitCause.String != "worker_memory_pressure" && run.RecoveryWaitCause.String != "retained_recovery_exhausted" && run.RecoveryWaitCause.String != "codex_idle_stall" && run.RecoveryWaitCause.String != "retained_recovery_adoption_failed" && run.RecoveryWaitCause.String != "retained_continuation_unwitnessed" && run.RecoveryWaitCause.String != "anthropic_spend_limit") {
 			httpx.Error(w, http.StatusConflict, fmt.Sprintf("run is %s", run.Status))
+			return
+		}
+		// Issue #4177: an active secret-scan remediation cannot be resumed unchanged. Refused before
+		// any write, so no claim, generation, hold or audit row is created. An absent or unknown
+		// detail never lands here and keeps the generic path.
+		if secretRemediationActive(run) {
+			httpx.Error(w, http.StatusConflict, secretRemediationResumeRefusal(runID))
 			return
 		}
 		var resumeErr error
 		switch run.RecoveryWaitCause.String {
 		case "data_volume_full":
 			_, resumeErr = h.q.ResumeDataVolumeFullHold(r.Context(), store.ResumeDataVolumeFullHoldParams{
+				ID: runID, UserID: user.ID, GlobalTimeoutSeconds: int32(h.cfg.RunTimeout.Seconds()),
+			})
+		case "anthropic_spend_limit":
+			// Issue #3767: owner Resume of the spend-limit hold; the next claim re-selects the credential
+			// through the run's own claim ladder (a run-pinned secret is kept; auto mode may pick another
+			// pooled token, issue #4163).
+			_, resumeErr = h.q.ResumeAnthropicSpendLimitHold(r.Context(), store.ResumeAnthropicSpendLimitHoldParams{
 				ID: runID, UserID: user.ID, GlobalTimeoutSeconds: int32(h.cfg.RunTimeout.Seconds()),
 			})
 		case "forge_unreachable":
@@ -116,12 +130,32 @@ func (h *Handler) ResumeRunNow(w http.ResponseWriter, r *http.Request) {
 				})
 			}
 		default:
+			if sourceEndDeclined(run) {
+				if h.wsvc == nil {
+					resumeErr = pgx.ErrNoRows
+					break
+				}
+				resumeErr = h.wsvc.ResumeSourceEndHold(r.Context(), user.ID, run, int32(h.cfg.RunTimeout.Seconds()))
+				break
+			}
 			_, resumeErr = h.q.ResumeWorkerRecoveryEpisode(r.Context(), store.ResumeWorkerRecoveryEpisodeParams{
 				ID: runID, UserID: user.ID, GlobalTimeoutSeconds: int32(h.cfg.RunTimeout.Seconds()),
 			})
 		}
 		if resumeErr != nil {
 			if errors.Is(resumeErr, pgx.ErrNoRows) {
+				// The write is fenced on the same predicate; a park that classified itself active
+				// between the read and the write is the refusal, not a generic changed hold.
+				if run.RecoveryWaitCause.String == "retained_recovery_adoption_failed" {
+					if cur, err := h.q.GetRunByIDForUser(r.Context(), store.GetRunByIDForUserParams{ID: runID, UserID: user.ID}); err == nil && secretRemediationActive(cur) {
+						httpx.Error(w, http.StatusConflict, secretRemediationResumeRefusal(runID))
+						return
+					}
+					if cur, err := h.q.GetRunByIDForUser(r.Context(), store.GetRunByIDForUserParams{ID: runID, UserID: user.ID}); err == nil && sourceEndDeclined(cur) {
+						httpx.Error(w, http.StatusConflict, sourceEndResumeRefusal)
+						return
+					}
+				}
 				httpx.Error(w, http.StatusConflict, "run cannot resume: hold changed or no remaining budget")
 				return
 			}
@@ -341,3 +375,23 @@ func (h *Handler) resumePolicyHold(w http.ResponseWriter, r *http.Request, userI
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 	}
 }
+
+// secretRemediationActive reports whether the run is parked at retained_recovery_adoption_failed
+// with the closed-set detail secret_remediation_active. Any other state, cause, NULL or unknown
+// value is false, so an unclassified park keeps the generic resume path.
+func secretRemediationActive(run store.Run) bool {
+	return run.Status == "recovery_wait" &&
+		run.RecoveryWaitCause.Valid && run.RecoveryWaitCause.String == "retained_recovery_adoption_failed" &&
+		run.RecoveryWaitDetail.Valid && run.RecoveryWaitDetail.String == workersvc.RecoveryDetailSecretRemediationActive
+}
+
+func secretRemediationResumeRefusal(runID uuid.UUID) string {
+	return fmt.Sprintf("The retained source is held under an active secret-scan remediation; Resume cannot succeed unchanged. An available recovery archive (uzi run export %s) may omit later work kept on the worker; an operator can recover the retained work from worker storage. Cancel ends the run.", runID)
+}
+
+func sourceEndDeclined(run store.Run) bool {
+	return run.Status == "recovery_wait" && run.RecoveryWaitCause.String == "retained_recovery_adoption_failed" &&
+		run.RecoveryWaitDetail.String == workersvc.RecoveryDetailSourceEndDeclined
+}
+
+const sourceEndResumeRefusal = "The retained source could not end safely. Resume requires the owning worker to register again; a stale heartbeat alone does not release this hold. Ask an operator to recover retained work from worker storage before restarting the worker. Re-registration permits only a new recovery attempt: every retained source still needs its own verified recovery proof. An available recovery archive may omit later retained work. Cancel ends the run."

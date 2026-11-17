@@ -425,6 +425,7 @@ func protocolFeatures(activeSnapshotEnabled, heldPublicationEnabled, publication
 		{"refresh_publication_context_v1"},
 		{"completion_semantic_publication_v1"}, // PRD #1230 D4: independent of completion_non_closing_v1; advertises the semantic coverage park report
 		{"dind_maintenance_v1"},
+		{capability.HibernationInventoryV1}, // PRD #4208 M1: this api binds a worker's pre-scale-down volume inventory (the heartbeat's hibernation_inventory and hibernation_exclusion members)
 		{"worker_memory_pressure_v1"},
 		{"memory_park_settlement_v1"},        // issue #3639: this api accepts the memory-park settlement receipt and answers the claim body's memory_park_reference
 		{"worker_memory_authority_claim_v1"}, // issue #3142: this api accepts the run-lane claim body's memory_authority member
@@ -459,12 +460,23 @@ func protocolFeatures(activeSnapshotEnabled, heldPublicationEnabled, publication
 		// park and holds it owner-side without counting it. A worker sends the marker ONLY after
 		// seeing this token, because an older api's strict decoder 400s the unknown field.
 		{workersvc.RetainedCapacityHoldFeature},
+		// Issue #4177: this api accepts recovery_detail on a retained_recovery_adoption_failed park
+		// and refuses Resume for the secret_remediation_active value. A worker sends the field ONLY
+		// after seeing this token, because an older api's strict decoder 400s the unknown field.
+		{workersvc.RecoveryDetailFeature},
+		{workersvc.RetainedSourceEndHoldFeature},
 		// Issue #3859: this api accepts the nested registration_evidence object on a `running`
 		// report ({register_nonce, claim_generation, registration_epoch}) and answers
 		// registration_evidence "recorded" | "refused" on the ACK, whether or not the status write
 		// applied. Advertised UNCONDITIONALLY: a worker sends the object ONLY after seeing this
 		// token, because an older api's strict decoder 400s the unknown field.
 		{"run_registration_evidence_v1"},
+		// Issue #4257: this api accepts the optional checkpoint_publication object on a `running`
+		// report ({state, since, claim_generation, register_nonce, report_seq}), stores it as a
+		// fenced, server-ordered fact and answers checkpoint_publication "recorded" | "cleared" |
+		// "refused" | "unrecorded" on the ACK. Advertised UNCONDITIONALLY: a worker sends the object
+		// ONLY after seeing this token, because an older api's strict decoder 400s the unknown field.
+		{workersvc.CheckpointPublicationWithheldFeature},
 		{"recovery_cause_retained_recovery_adoption_failed"},
 		{"recovery_cause_data_volume_full"},
 		// PRD #1733: this api accepts {status:"recovery_wait", recovery_cause:"provider_outage"}
@@ -475,6 +487,11 @@ func protocolFeatures(activeSnapshotEnabled, heldPublicationEnabled, publication
 		// because an older api's strict decoder 400s productive_turns and because only a worker
 		// that handles a "paused" ack may receive one.
 		{"recovery_cause_provider_outage"},
+		// Issue #3767: this api accepts {status:"recovery_wait", recovery_cause:"anthropic_spend_limit"}
+		// and parks it as an owner-held hold with a NULL retry. Advertised UNCONDITIONALLY: a worker
+		// types the park only after seeing this token, because an older api answers an unknown
+		// recovery_cause 400 and the worker would fail the run.
+		{"recovery_cause_anthropic_spend_limit"},
 		// Fenced ordinary and disk recovery parks can atomically consume completed-turn evidence.
 		{"provider_progress_on_recovery_park_v1"},
 		// PRD #1809 M6 (D8): this api accepts checkpoint_contains_latest on a park report (the
@@ -496,6 +513,13 @@ func protocolFeatures(activeSnapshotEnabled, heldPublicationEnabled, publication
 		// with disposition "held" / "hold_settled". Advertised UNCONDITIONALLY: a worker sends
 		// the two reports ONLY after seeing this token, because an older api 400s the unknown states.
 		{"credential_switch_hold"},
+		// Issue #4201: this api serves POST /api/worker/runs/{id}/credential-switch/apply, accepts
+		// op_id on the credential_switch_failed and credential_switch_held reports, accepts
+		// {status:"credential_switch_uncertain", claim_generation, register_nonce, op_id}, and accepts
+		// a per-message credential_epoch_ordinal on the message append. Advertised UNCONDITIONALLY:
+		// a worker applies a switch in place ONLY after seeing this token, because an older api 404s
+		// the route and 400s the unknown fields and state.
+		{workersvc.CredentialSwitchApplyFeature},
 		// Issue #3985: this api accepts {status:"clarification_settled", claim_generation,
 		// clarification_settlement:{question_id, revision_input_id, gate_revision}} and answers it
 		// with disposition "clarification_settled". It returns a plan cross-check run parked at
@@ -582,6 +606,9 @@ func (h *Handler) WorkerHeartbeat(w http.ResponseWriter, r *http.Request) {
 		OutboxRootUnusable      json.RawMessage                    `json:"outbox_root_unusable"`
 		DindMeter               json.RawMessage                    `json:"dind_meter"`
 		DindMaintenanceReadyACK *workersvc.DindMaintenanceReadyACK `json:"dind_maintenance_ready_ack"`
+		// HibernationCachePruneReport (PRD #4206) is the agent's report on its hibernation
+		// cache prune attempt, a sibling of the maintenance ACK and never a kind inside it.
+		HibernationCachePruneReport *workersvc.HibernationCachePruneReport `json:"hibernation_cache_prune_report"`
 		// ActiveSnapshot is the worker's active-run snapshot (PRD #1390 M2a), its OWN isolated
 		// json.RawMessage like Stats/Outbox and for the same reason: a malformed body must drop
 		// the snapshot WITHOUT failing the heartbeat's liveness. The worker sends it only when
@@ -595,10 +622,25 @@ func (h *Handler) WorkerHeartbeat(w http.ResponseWriter, r *http.Request) {
 		// without failing the heartbeat's liveness. The worker sends it only while latched
 		// and only after the register response advertised `worker_residue_quarantine`.
 		ResidueQuarantine json.RawMessage `json:"residue_quarantine"`
+		// HibernationExclusion (PRD #4208 M1) is the worker's report that it still holds, or
+		// has lost, the writer exclusion its volume inventory was taken under. A malformed member
+		// is answered 400 rather than dropped. The whole heartbeat is refused, so the agent's
+		// strip-and-retry fallback resends it without its extension members: a held=false can be
+		// dropped there and liveness is kept. The consequence is an unproven exclusion, not a hidden
+		// one: no exclusion-final follows, so the inventory is never confirmed as still held.
+		HibernationExclusion *workersvc.HibernationExclusionReport `json:"hibernation_exclusion"`
 	}
 	if err := httpx.DecodeJSON(r, &req); err != nil && !errors.Is(err, io.EOF) {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
 		return
+	}
+	var exclusion *workersvc.HibernationExclusion
+	if req.HibernationExclusion != nil {
+		var perr error
+		if exclusion, perr = req.HibernationExclusion.Parse(); perr != nil {
+			httpx.Error(w, http.StatusBadRequest, "invalid request body")
+			return
+		}
 	}
 	// Second step: validate + clamp the isolated stats (Decision 5). A malformed or
 	// invalid sample drops to nil (columns written NULL) and the heartbeat still 200s.
@@ -691,6 +733,48 @@ func (h *Handler) WorkerHeartbeat(w http.ResponseWriter, r *http.Request) {
 	}
 	if slices.Contains(updated.ProtocolCapabilities, capability.DindMaintenanceV1) {
 		response["dind_maintenance"] = maintenance
+	}
+	if slices.Contains(updated.ProtocolCapabilities, capability.HibernationCachePruneV1) {
+		// The report is applied in its own transaction after the heartbeat committed, and the
+		// field is built from the row that transaction committed, so an agent never reads a
+		// phase older than its own report. Any stale or mismatched report is a 409.
+		committed := updated
+		if rep := req.HibernationCachePruneReport; rep != nil {
+			row, repErr := h.wsvc.ReportHibernationCachePrune(r.Context(), wkr.ID, *rep)
+			if errors.Is(repErr, workersvc.ErrHibernationCleanupConflict) {
+				httpx.Error(w, http.StatusConflict, "hibernation cache prune precondition failed")
+				return
+			}
+			if repErr != nil {
+				slog.Error("worker heartbeat: hibernation cache prune report", "worker_id", wkr.ID.String(), "error", repErr)
+				httpx.Error(w, http.StatusInternalServerError, "internal error")
+				return
+			}
+			committed = row
+		}
+		response["hibernation_cache_prune"] = workersvc.HibernationCachePruneFromWorker(committed)
+	} else if req.HibernationCachePruneReport != nil {
+		httpx.Error(w, http.StatusConflict, "hibernation cache prune precondition failed")
+		return
+	}
+	// PRD #4208 M1: the hibernation half runs in its own transaction that locks the worker row
+	// first (Service.HibernationHeartbeat), so an exclusion report is always recorded under the
+	// worker lock, never on the lockless liveness write above. Only a preparing worker with the
+	// capability is asked for an inventory; a worker that reports an exclusion is always heard.
+	if exclusion != nil || (updated.HibernationState == "preparing" && slices.Contains(updated.ProtocolCapabilities, capability.HibernationInventoryV1)) {
+		member, herr := h.wsvc.HibernationHeartbeat(r.Context(), wkr.ID, exclusion)
+		switch {
+		case errors.Is(herr, workersvc.ErrHibernationUnavailable):
+		case herr != nil:
+			slog.Error("worker heartbeat: hibernation inventory", "worker_id", wkr.ID.String(), "error", herr)
+			// Liveness is already committed, but omission in a 200 would tell the worker to
+			// release its exclusion. Fail the heartbeat so it keeps the observation unknown
+			// and retries any exclusion report instead of acknowledging evidence we lost.
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		case member != nil:
+			response["hibernation_inventory"] = member
+		}
 	}
 	httpx.JSON(w, http.StatusOK, response)
 }
@@ -1541,7 +1625,25 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 			if result.RegistrationEvidence != "" {
 				stale["registration_evidence"] = result.RegistrationEvidence
 			}
+			if result.CheckpointPublication != "" {
+				stale["checkpoint_publication"] = result.CheckpointPublication
+			}
 			httpx.JSON(w, http.StatusConflict, stale)
+		case errors.Is(err, workersvc.ErrCredentialSwitchUncertainParkPending):
+			// Issue #4201: a pending wall or reserve pause owns the park; the worker takes that one
+			// instead of the uncertain hold. Nothing was written. Same {run, reason} shape as the
+			// other typed 409 refusals.
+			httpx.JSON(w, http.StatusConflict, map[string]any{
+				"run":    h.workerRunDTO(r.Context(), run),
+				"reason": "park_pending",
+			})
+		case errors.Is(err, workersvc.ErrCredentialSwitchReleaseRetired):
+			// Issue #4201 m3a: the worker's current registration negotiated in-place apply, so a v1
+			// release (or an un-fenced hold) is a protocol bug. Nothing was written.
+			httpx.JSON(w, http.StatusConflict, map[string]any{
+				"run":    h.workerRunDTO(r.Context(), run),
+				"reason": "credential_switch_release_retired",
+			})
 		case errors.Is(err, workersvc.ErrRunNotOwned):
 			// Issue #2950: a machine-readable reason so the worker can BLOCK (not retire) its
 			// write-ahead terminal journal instead of retrying a 404 forever. Body is exactly
@@ -1566,17 +1668,36 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 				ack["registration_evidence"] = result.RegistrationEvidence
 			}
 			httpx.JSON(w, http.StatusConflict, ack)
-		case errors.Is(err, workersvc.ErrInvalidRegistrationEvidence):
+		case errors.Is(err, workersvc.ErrInvalidRegistrationEvidence), errors.Is(err, workersvc.ErrInvalidCheckpointPublication):
 			httpx.Error(w, http.StatusBadRequest, err.Error())
 		case errors.Is(err, workersvc.ErrJobNeverParks):
 			// The service error text already reads "invalid run state: a job run never parks (<state>)".
 			httpx.Error(w, http.StatusBadRequest, err.Error())
 		case errors.Is(err, workersvc.ErrInvalidState):
-			httpx.Error(w, http.StatusBadRequest, "state must be one of running, awaiting_approval, awaiting_input, awaiting_followup, limit_wait, recovery_wait, paused, pause_failed, credential_switch, credential_switch_failed, credential_switch_held, credential_switch_hold_settled, clarification_settled, completed, failed")
+			httpx.Error(w, http.StatusBadRequest, "state must be one of running, awaiting_approval, awaiting_input, awaiting_followup, limit_wait, recovery_wait, paused, pause_failed, credential_switch, credential_switch_failed, credential_switch_held, credential_switch_hold_settled, credential_switch_uncertain, clarification_settled, completed, failed")
 		default:
 			slog.Error("worker run state", "error", err)
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
 		}
+		return
+	}
+	if !applied && req.State == "recovery_wait" && req.RecoveryCause != nil &&
+		*req.RecoveryCause == "retained_recovery_adoption_failed" && req.RecoveryDetail != nil &&
+		*req.RecoveryDetail == workersvc.RecoveryDetailSourceEndDeclined && req.ClaimGeneration != nil &&
+		*req.ClaimGeneration > 0 && run.ClaimGeneration == *req.ClaimGeneration && req.RegisterNonce != "" &&
+		run.Status == "recovery_wait" && run.RecoveryWaitCause.String == *req.RecoveryCause &&
+		run.RecoveryWaitDetail.String == *req.RecoveryDetail && run.ClaimReleasedAt.Valid &&
+		run.ReleasedWorkerID.Valid && run.ReleasedWorkerID.Bytes == wkr.ID &&
+		run.ReleasedWorkerNonce.Valid && run.ReleasedWorkerNonce.String == req.RegisterNonce && run.StopKind.String == "" {
+		// The service validated current registration and prior evidence under the worker lock.
+		// ACK a lost response to that exact hold without repeating transition effects.
+		ack, ackErr := h.workerStateAck(w, r, run)
+		if ackErr != nil {
+			httpx.Error(w, http.StatusInternalServerError, "semantic completion authority unavailable")
+			return
+		}
+		ack["applied"] = false
+		httpx.JSON(w, http.StatusOK, ack)
 		return
 	}
 	if !applied {
@@ -1612,6 +1733,9 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 		if result.RegistrationEvidence != "" {
 			ack["registration_evidence"] = result.RegistrationEvidence
 		}
+		if result.CheckpointPublication != "" {
+			ack["checkpoint_publication"] = result.CheckpointPublication
+		}
 		httpx.JSON(w, http.StatusConflict, ack)
 		return
 	}
@@ -1622,6 +1746,9 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 	}
 	if result.RegistrationEvidence != "" {
 		ack["registration_evidence"] = result.RegistrationEvidence
+	}
+	if result.CheckpointPublication != "" {
+		ack["checkpoint_publication"] = result.CheckpointPublication
 	}
 	if result.RevisionInputID != nil {
 		ack["revision_input_id"] = *result.RevisionInputID
@@ -1654,6 +1781,10 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 		// Issue #3181: the settlement acknowledgement applied (or replayed): the hold is now
 		// credential_switch_unsettled and the owner's Resume is open.
 		ack["disposition"] = "hold_settled"
+	case "credential_switch_uncertain":
+		// Issue #4201: the uncertain-apply park applied (or replayed): the run is paused for the
+		// owner with its claim, worker and session kept. The worker keys on this.
+		ack["disposition"] = "uncertain"
 	case "clarification_settled":
 		// Issue #3985: the settlement applied (or replayed): the run is back at awaiting_approval
 		// with the human revise still pending. The worker keys on this.
@@ -1678,11 +1809,56 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 		httpx.JSON(w, http.StatusOK, workerReconciledStateAck{
 			RevisionInputID: result.RevisionInputID, SupersededRevisionInputIDs: supersededIDs,
 			Run: ack["run"], CredentialSwitch: ack["credential_switch"], Disposition: ack["disposition"],
+			CheckpointPublication: result.CheckpointPublication, RegistrationEvidence: result.RegistrationEvidence,
 			leadReconciliationResponse: reconciliationResponse(0, result.Reconciliation),
 		})
 		return
 	}
 	httpx.JSON(w, http.StatusOK, ack)
+}
+
+// maxCredentialSwitchApplyBody bounds the apply request: 64 old_cumulative entries of keys up to 200
+// bytes plus the fixed fields fit well inside it.
+const maxCredentialSwitchApplyBody = 32 << 10
+
+// WorkerCredentialSwitchApply answers POST /api/worker/runs/{id}/credential-switch/apply (issue
+// #4201): the in-place Claude credential switch. The body is strict and bounded; the response
+// carries a plaintext token on an applied outcome, so it is never cacheable. A run the worker does
+// not hold is the same exact 404 the other worker run routes answer; every other refusal is a 200
+// with an outcome the worker dispatches on.
+func (h *Handler) WorkerCredentialSwitchApply(w http.ResponseWriter, r *http.Request) {
+	wkr, ok := mw.WorkerFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "worker authentication required")
+		return
+	}
+	runID, ok := httpx.PathUUID(w, r, "id", "run")
+	if !ok {
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	var req workersvc.CredentialSwitchApplyRequest
+	if err := httpx.DecodeJSONStrictBounded(r, &req, maxCredentialSwitchApplyBody); err != nil {
+		httpx.RespondDecodeError(w, err, "invalid request body")
+		return
+	}
+	res, err := h.wsvc.ApplyCredentialSwitch(r.Context(), wkr, runID, req)
+	if err != nil {
+		switch {
+		case errors.Is(err, workersvc.ErrInvalidApplyRequest):
+			httpx.Error(w, http.StatusBadRequest, err.Error())
+		case errors.Is(err, workersvc.ErrRunNotOwned):
+			httpx.Error(w, http.StatusNotFound, "run not found for this worker")
+		default:
+			// The error never carries token bytes (the service returns it before any token is read
+			// back into a result), and the result itself is not logged here.
+			slog.Error("worker credential switch apply", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+		}
+		return
+	}
+	slog.Info("worker credential switch apply", "run_id", runID, "worker_id", wkr.ID, "result", res)
+	httpx.JSON(w, http.StatusOK, res)
 }
 
 // workerStateAck builds the state-report ack body: the run DTO plus, when a held-state switch is

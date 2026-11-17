@@ -617,6 +617,32 @@ describe("RunEventRow rendering", () => {
   });
 });
 
+describe("run_override_unavailable feed row (issue #3250)", () => {
+  it("renders setting, value and harness as readable text, not an unrenderable row", () => {
+    const { container } = render(
+      <RunEventRow
+        msg={msg({ seq: 1, kind: "run_override_unavailable", payload: { setting: "model", value: "opus-9", harness: "codex", note: "x" } })}
+        live={false}
+      />,
+    );
+    expect(container.textContent).toContain("Model choice unavailable");
+    expect(container.textContent).toContain('model "opus-9" cannot run on the codex harness');
+    expect(container.textContent).not.toContain("unrenderable");
+  });
+
+  it("renders markup as inert text and truncates a long value", () => {
+    const { container } = render(
+      <RunEventRow
+        msg={msg({ seq: 1, kind: "run_override_unavailable", payload: { setting: "model", value: `<img src=x onerror=alert(1)>${"v".repeat(400)}`, harness: "claude" } })}
+        live={false}
+      />,
+    );
+    expect(container.querySelector("img")).toBeNull();
+    expect(container.textContent).toContain("<img src=x");
+    expect(container.textContent!.length).toBeLessThan(300);
+  });
+});
+
 describe("highlightShell", () => {
   const renderCmd = (cmd: string) => render(<div data-testid="h">{highlightShell(cmd)}</div>);
 
@@ -1374,6 +1400,40 @@ describe("RunEventRow — steer_ack (PRD #634)", () => {
     const { container } = render(
       <RunEventRow msg={msg({ seq: 31, kind: "steer_ack", payload })} live={false} />,
     );
+    expect(container.textContent).not.toContain("unrenderable");
+  });
+});
+
+// PRD #1247 M9 / issue #4201: the server's token-switch messages. Both used to fall through to
+// "unrenderable credential_switch event".
+describe("RunEventRow — token switch (issue #4201)", () => {
+  it("reads 'switched in place' for a switch with an ordinal", () => {
+    const { container } = render(<RunEventRow msg={msg({ seq: 40, agent: null, kind: "credential_switch",
+      payload: { label: "console-key", select_reason: "override_pinned", secret_id: "sec-1", ordinal: 2 } })} live={false} />);
+    expect(container.textContent).toContain("Switched in place to “console-key” (pinned by override)");
+    expect(container.textContent).not.toContain("unrenderable");
+  });
+
+  it("a claim-time switch (no ordinal) does not claim to be in place", () => {
+    const { container } = render(<RunEventRow msg={msg({ seq: 41, agent: null, kind: "credential_switch",
+      payload: { label: null, select_reason: "auto", secret_id: "sec-1" } })} live={false} />);
+    expect(container.textContent).toContain("Switched to an unlabelled token (auto-selected)");
+    expect(container.textContent).not.toMatch(/in place/);
+  });
+
+  it("strips a bidi override from the user-authored label", () => {
+    const { container } = render(<RunEventRow msg={msg({ seq: 42, agent: null, kind: "credential_switch",
+      payload: { label: "\u202Eyek-elosnoc", select_reason: "pinned", secret_id: "sec-1", ordinal: 1 } })} live={false} />);
+    expect(container.textContent).toContain("Switched in place to “yek-elosnoc” (pinned token)");
+    expect(container.textContent).not.toContain("\u202E");
+  });
+
+  it("renders an unconfirmed switch as fixed owner-pause copy, interpolating nothing", () => {
+    const { container, getByTestId } = render(<RunEventRow msg={msg({ seq: 43, agent: null, kind: "credential_switch_uncertain",
+      payload: { text: "hostile <b>text</b>" } })} live={false} />);
+    expect(getByTestId("credential-switch-uncertain").textContent).toBe(
+      "Could not confirm the token switch. The run is paused until you resume it.");
+    expect(container.textContent).not.toContain("hostile");
     expect(container.textContent).not.toContain("unrenderable");
   });
 });

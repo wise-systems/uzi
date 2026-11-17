@@ -240,12 +240,13 @@ For a queued sweep issue without a run ID, use the watcher's `watch-issue.sh` at
    keep polling (`limit_wait` and `pool_wait` resume on their own; a `recovery_wait` may need an owner action, so read its cause; a `data_volume_full` park is counted and exits the poller 4), except `recovery_wait` with cause
    `worker_requeue_exhausted`, `retained_recovery_adoption_failed` and `retained_continuation_unwitnessed` (each regardless of retry timing),
    `worker_memory_pressure` (regardless of remaining interventions),
+   `anthropic_spend_limit` (owner Resume after raising the limit, `uzi run set-token` (switchable kinds only; not chat, judge, self_improve or job), or Cancel),
    or `retained_recovery_exhausted` with its retry stamp explicitly null: the poller
    stops on it (exit 0) because only the owner can Resume or Cancel; back up first (`uzi-watcher` recovery).
    Adoption failure is an integrity hold: retained adoption or a predecessor remediation
    record refused source use (the agent did not start), with local work and custody
    preserved and no automatic retry. Resume requests a bounded attempt; success is not assured,
-   and repeated failure holds again. Unwitnessed means a claimed flight was never seen starting; claim released, work and custody kept, no automatic retry, not an integrity refusal. `paused` stops the poller because it never
+   and repeated failure holds again; on `recovery_wait_detail` `secret_remediation_active` Resume is refused (409), so export an available archive (may omit later work) or operator recovery, then Cancel. Unwitnessed means a claimed flight was never seen starting; claim released, work and custody kept, no automatic retry, not an integrity refusal. `paused` stops the poller because it never
    resumes on its own: read `hold_reason`. A run that hit its wall-clock limit is `paused`
    with `hold_reason: budget_exhausted` (PRD #1497), never `failed`: extend it (`uzi run
    extend RUN --by 2h`) and re-arm the poller; an owner pause waits for its owner.
@@ -276,6 +277,7 @@ For a queued sweep issue without a run ID, use the watcher's `watch-issue.sh` at
    | 8 | PR conflicts with its base (`mergeable=CONFLICTING`): GitHub runs no CI on it | step 5 |
    | 9 | a lookup stayed unreadable for `--max-unknown` polls (default 5; no checks yet on a mergeable head is pending for `--ci-grace`, 15 min); `RESULT` names it | inspect that lookup; never merge on it |
    | 10 | active ci_fix, even with green CI, or recent terminal ci_fix while CI is red | follow *CI-fix branch ownership*; plain red without either remains exit 1 |
+   | 12 | `RESULT=gh_rate_limited`: GitHub core or GraphQL allowance exhausted | re-arm after `GH_RETRY_AT`; never treat this as ready, findings, or CodeRabbit quota |
 
    Let an auto-review that is already running finish; never re-trigger it. Greptile skips a
    conflicting PR and a head pushed after its trigger: trigger on the final head. `--reviewer` also
@@ -327,7 +329,7 @@ For a queued sweep issue without a run ID, use the watcher's `watch-issue.sh` at
      “Already reviewed the last commit.” Decide whether the existing coverage plus a local
      review is sufficient for this risk class. If a bot review is still warranted, post
      `@coderabbitai full review` once and return to step 2; never auto-post it.
-   - **File-limit refusal (status or command reply).** `N files exceed the limit of 100`,
+   - **File-limit refusal (check-run, status or command reply).** `N files exceed the limit of 100`,
      including CodeRabbit's answer to `@coderabbitai full review`, means switch to Greptile: post
      `@greptileai review`, then `--reviewer greptile --reviewer-grace 2`. A command reply need
      not change the commit status, so do not wait for a particular watcher exit.
@@ -426,7 +428,7 @@ For a queued sweep issue without a run ID, use the watcher's `watch-issue.sh` at
    `--fresh`. After a merge or renumber, regenerate sqlc (a renumber reorders generated
    columns) and run the full gate on CI: a clean merge can still break a signature one side changed. Resolve a conflicted generated `*.sql.go` by regenerating it
    after its `queries/*.sql`, never by hand. When either side adds a migration, require the
-   `test-codex-refresh-lostreply-e2e` job's `LiveDB: N passed, 0 skipped` line (`test-api-store-it` only mirrors that job's result) on the exact head, since a test
+   `LiveDB: N passed, 0 skipped` line from both `test-livedb-workersvc` and `test-codex-refresh-lostreply-e2e` (`test-api-store-it` only mirrors their results) on the exact head, since a test
    pinned to an older schema can break on the other side's new columns.
    Ordinary PRs add their own lowercase UUID-v4 fragment before a PR exists, initially citing
    the relevant issue; see [fragment guidance](../../../changelog.d/README.md). Do not union
@@ -681,6 +683,17 @@ session-peers registry, so a Codex thread with a shim is a peer like any Claude 
   purge leaves a claimless trail; its 6-hour stale TTL starts when terminal claim cleanup
   preserves it, so `reap` never removes it during the same pass or a healthy post-merge watch.
   Nothing here is a lock on the PR itself, only on the merge step.
+
+GitHub quota exhaustion is separate from a review bot's quota. On failed or unknown reads,
+`watch-pr.sh`, `watch-prs-ci.sh`, `watch-run-ci.sh` and `cr-rate-limit.sh` consult the
+shared `lib/gh-ratelimit.sh`. Confirmed primary exhaustion exits 12 immediately with
+`GH_RATE_LIMITED=1`, `GH_RATE_LIMIT_RESOURCE`, `GH_RATE_LIMIT_RESET` (epoch),
+`GH_RATE_LIMIT_RESET_AT` (UTC) and `GH_RETRY_AT` (latest reset plus five seconds).
+Do not keep polling or spend the unknown-lookup budget. Arrange an owned continuation
+after that time, then re-arm against the current head and gates. This exit does not
+extend an observer's deadline or schedule a callback. Missing/unreadable quota data,
+secondary limits and zero allocations retain the existing error/unknown behavior.
+The uzi-watcher `watch-run.sh` and `watch-issue.sh` call only `uzi`, so need no GitHub quota path.
 
 ## Waiting, uniformly
 

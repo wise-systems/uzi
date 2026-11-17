@@ -3,7 +3,7 @@ import { aggregateDisclosure } from "./costStatus";
 import type { UsageWindow } from "../components/UsageCards";
 
 // The per-user rows and the factory total row of the admin usage breakdown, for one window.
-// Shared by the current Overview's PerUserUsageTable and the preview's By user table, so the
+// Shared by the classic Overview's PerUserUsageTable and the default Overview's By user table, so the
 // two cannot disagree about sorting, the window's source fields or the PR-count rule.
 
 // A RunUsage bundle split the way the run view splits it: fresh = fresh input +
@@ -39,6 +39,9 @@ export function perUserRows(admin: AdminUsage, window: UsageWindow) {
   );
   // An older API without the seven-day fields: the caller shows its unavailable message.
   // No row may dereference the missing fields.
+  // The factory's raw counts for the window, for the preview table's cost-note chips.
+  const factorySubscription = recent ? admin.factory.last7_subscription_run_count : admin.factory.lifetime_subscription_run_count;
+  const factoryUnreported = recent ? admin.factory.last7_unreported_run_count : admin.factory.lifetime_unreported_run_count;
   const usable = !recent || available;
   const rows = (usable ? admin.users : []).map((u) => ({
     ...u,
@@ -59,5 +62,5 @@ export function perUserRows(admin: AdminUsage, window: UsageWindow) {
   // window's split, the same rule as the PRs.
   const showHarness = rows.every((r) => r.selectedHarness != null);
   const factoryRuns = recent ? rows.reduce((sum, u) => sum + u.selectedRuns, 0) : admin.factory.run_count;
-  return { available, rows, showPRs, showHarness, factoryRuns, factoryPRs, factoryOutcomes, factory, factoryDisclosure };
+  return { available, rows, showPRs, showHarness, factoryRuns, factoryPRs, factoryOutcomes, factory, factoryDisclosure, factorySubscription, factoryUnreported };
 }

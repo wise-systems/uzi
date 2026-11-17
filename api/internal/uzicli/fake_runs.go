@@ -145,18 +145,18 @@ func (f *FakeClient) RunLogsPage(_ context.Context, id string, q LogsPageQuery) 
 	return out, nil
 }
 
-func (f *FakeClient) RunReview(_ context.Context, id string) (*apitypes.ReviewDTO, *apitypes.PendingJudgeDTO, error) {
+func (f *FakeClient) RunReview(_ context.Context, id string) (*apitypes.ReviewDTO, *apitypes.PendingJudgeDTO, *apitypes.JudgeSkipDTO, error) {
 	if f.Err != nil {
-		return nil, nil, f.Err
+		return nil, nil, nil, f.Err
 	}
 	if r, ok := f.Reviews[id]; ok {
 		// r may be nil: a visible-but-unjudged run. The pending judge is looked up
 		// independently and may be set alongside either — a nil review with a pending
 		// judge is "a verdict is on its way", a non-nil one with a pending judge is a
 		// re-judge in flight.
-		return r, f.PendingJudges[id], nil
+		return r, f.PendingJudges[id], f.JudgeSkips[id], nil
 	}
-	return nil, nil, Exitf(ExitNotFound, "run %s not found", id)
+	return nil, nil, nil, Exitf(ExitNotFound, "run %s not found", id)
 }
 
 // RunInputs mirrors the live owner-only endpoint: a key present in InputsByID is
@@ -170,6 +170,17 @@ func (f *FakeClient) RunInputs(_ context.Context, id string) ([]apitypes.SteerIn
 		return in, nil
 	}
 	return nil, Exitf(ExitNotFound, "run %s not found", id)
+}
+
+// RunInputsMeta is RunInputs plus the canned admin_debug_read marker: RunInputsAdminDebug[id]
+// true models a foreign run served under admin run debug. RunInputsMetaCalls counts calls.
+func (f *FakeClient) RunInputsMeta(ctx context.Context, id string) ([]apitypes.SteerInputDTO, bool, error) {
+	f.RunInputsMetaCalls++
+	in, err := f.RunInputs(ctx, id)
+	if err != nil {
+		return nil, false, err
+	}
+	return in, f.RunInputsAdminDebug[id], nil
 }
 
 // RunLeadConfigHistory mirrors the owner-or-admin endpoint: a key present in LeadConfigHistoryByID
@@ -345,7 +356,7 @@ func (f *FakeClient) AcceptCompletionDecision(_ context.Context, id string, crit
 	return f.DecideRun, nil
 }
 
-func (f *FakeClient) CreateRun(_ context.Context, repoID string, issueIID int64, waitOnLimit *bool, mrReworkEnabled *bool, force bool, seed *CreateRunSeed, agentSource string, credOverride *CreateRunCredentialOverride, harness string) (CreatedRunResult, error) {
+func (f *FakeClient) CreateRun(_ context.Context, repoID string, issueIID int64, waitOnLimit *bool, mrReworkEnabled *bool, force bool, seed *CreateRunSeed, agentSource string, credOverride *CreateRunCredentialOverride, harness, model, effort string) (CreatedRunResult, error) {
 	f.LastCreateRepoID = repoID
 	f.LastCreateIssueIID = issueIID
 	f.LastCreateWaitOnLimit = waitOnLimit
@@ -355,6 +366,8 @@ func (f *FakeClient) CreateRun(_ context.Context, repoID string, issueIID int64,
 	f.LastCreateAgentSource = agentSource
 	f.LastCreateCredOverride = credOverride
 	f.LastCreateHarness = harness
+	f.LastCreateModel = model
+	f.LastCreateEffort = effort
 	if f.Err != nil {
 		return CreatedRunResult{}, f.Err
 	}

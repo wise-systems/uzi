@@ -11,6 +11,10 @@ import (
 // (PRD #4173) lives in queries/runtime.sql: at every site that carries the ci_config_guard_v1
 // claim clause, and nowhere else. A new mirror of the claim gate that forgets it changes this
 // table. The live-DB tests in workersvc prove the behaviour at each site.
+//
+// ListUnplaceableQueuedRunsForEphemeral no longer carries the per-worker clauses inline: they
+// live in fn_placement_admitting_workers (PRD #4205 M5), which the hibernation wake-demand query
+// calls too, so the clause is pinned once in the function body (the migration that adds it).
 func TestIssueKeyClaimClauseCountPinned(t *testing.T) {
 	raw, err := os.ReadFile("queries/runtime.sql")
 	if err != nil {
@@ -39,10 +43,9 @@ func TestIssueKeyClaimClauseCountPinned(t *testing.T) {
 		}
 	}
 	want := map[string]int{
-		"ClaimRun":                              2, // the claimant and the fleet-spread peer arm
-		"CountOnlineWorkersClaimableForRun":     1,
-		"ListUnplaceableQueuedRunsForEphemeral": 1,
-		"ListSaturationQueuedRunsForEphemeral":  2,
+		"ClaimRun":                             2, // the claimant and the fleet-spread peer arm
+		"CountOnlineWorkersClaimableForRun":    1,
+		"ListSaturationQueuedRunsForEphemeral": 2,
 	}
 	for name, n := range want {
 		if got[name] != n {
@@ -69,5 +72,16 @@ func TestIssueKeyClaimClauseCountPinned(t *testing.T) {
 		if got[name] != n {
 			t.Errorf("%s mirrors the ci_config_guard clause %d times but the issue_key clause %d times", name, n, got[name])
 		}
+	}
+}
+
+// TestIssueKeyClauseLivesInThePlacementFunction pins the issue_key_v1 claim clause in the body of
+// fn_placement_admitting_workers (its LAST definition across the migrations), the one place the
+// capability-gap trigger and the wake-demand query both read the per-worker claim clauses.
+func TestIssueKeyClauseLivesInThePlacementFunction(t *testing.T) {
+	body := placementFunctionBody(t, "migrations")
+	clause := regexp.MustCompile(`\('issue_key_v1' = ANY\(w\.protocol_capabilities\) OR NOT EXISTS \(SELECT 1 FROM repos lr WHERE lr\.id = r\.repo_id AND lr\.issue_tracker_connection_id IS NOT NULL\)\)`)
+	if n := len(clause.FindAllString(body, -1)); n != 1 {
+		t.Fatalf("fn_placement_admitting_workers carries %d issue_key clauses, want 1", n)
 	}
 }

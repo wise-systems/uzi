@@ -242,6 +242,10 @@ func newRunLogsCmd(env Env, gf *globalFlags) *cobra.Command {
 					}
 					return drain()
 				}
+				if isSpendLimitHold(run) {
+					_, _ = fmt.Fprintf(env.Stderr, "run %s %s\n", cellText(args[0]), spendLimitHoldLine(run))
+					return drain()
+				}
 				if isForgeOwnerHold(run) {
 					for _, line := range append([]string{forgeParkLine(run)}, forgeHoldLines(run)...) {
 						_, _ = fmt.Fprintln(env.Stderr, line)
@@ -250,7 +254,7 @@ func newRunLogsCmd(env Env, gf *globalFlags) *cobra.Command {
 				}
 				holdKey := workerHoldNoticeKey(run)
 				if run.Status == statusLimitWait || run.Status == statusPoolWait || run.Status == statusRecoveryWait ||
-					isIterationHold(run) || isCredentialDisabledHold(run) || isCredentialsResetHold(run) || isProviderUnavailableHold(run) || isCredentialSwitchHold(run) || isBaseAttestationHold(run) {
+					(run.Status == statusPaused && holdAnnouncesEntry(strOr(run.HoldReason, ""))) {
 					if parkedIn != holdKey {
 						parkedIn = holdKey
 						// pool_wait and recovery_wait are the sibling silences limit_wait is
@@ -262,7 +266,7 @@ func newRunLogsCmd(env Env, gf *globalFlags) *cobra.Command {
 						// hold to another is announced as the new hold.
 						switch run.Status {
 						case statusPaused:
-							if isIterationHold(run) || isProviderUnavailableHold(run) || isCredentialSwitchHold(run) || isBaseAttestationHold(run) || isCredentialsResetHold(run) {
+							if !isCredentialDisabledHold(run) {
 								_, _ = fmt.Fprintf(env.Stderr, "run %s %s; still following\n", cellText(args[0]), pausedHoldNotice(run))
 								break
 							}

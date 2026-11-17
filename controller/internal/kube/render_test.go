@@ -1023,6 +1023,74 @@ func TestSecretCarriesTheTokenAndRelaysTheCA(t *testing.T) {
 	}
 }
 
+// An operator's extra CA is appended to the api's CA in the same Secret entry, never
+// replacing it: Node reads ONE NODE_EXTRA_CA_CERTS file, so a worker that got only the
+// extra CA could no longer verify the api it claims runs from.
+func TestSecretAppendsTheExtraCAAfterTheAPICA(t *testing.T) {
+	api := "-----BEGIN CERTIFICATE-----\napi-ca\n-----END CERTIFICATE-----"
+	extra := "-----BEGIN CERTIFICATE-----\nextra-ca\n-----END CERTIFICATE-----\n"
+	cfg := testConfig()
+	cfg.APICAPEM, cfg.ExtraCAPEM = []byte(api), []byte(extra)
+	if got := string(RenderSecret(cfg, desired("abc"), "uzw_t").Data["ca.crt"]); got != api+"\n"+extra {
+		t.Fatalf("ca.crt = %q, want the api CA then the extra CA", got)
+	}
+
+	// Extra CA alone (api TLS off): it is the whole bundle and NODE_EXTRA_CA_CERTS points at it.
+	only := testConfig()
+	only.ExtraCAPEM = []byte(extra)
+	if got := string(RenderSecret(only, desired("abc"), "uzw_t").Data["ca.crt"]); got != extra {
+		t.Fatalf("ca.crt = %q, want the extra CA alone", got)
+	}
+	var found string
+	for _, e := range RenderDeployment(only, desired("abc"), testSpec(t, "base", "m")).Spec.Template.Spec.Containers[0].Env {
+		if e.Name == "NODE_EXTRA_CA_CERTS" {
+			found = e.Value
+		}
+	}
+	if found != "/run/secrets/ca.crt" {
+		t.Errorf("NODE_EXTRA_CA_CERTS = %q with only an extra CA, want the relayed bundle's path", found)
+	}
+}
+
+// The Claude CLI gets the bundle (UZI_CLI_CA_FILE) only when an extra CA exists and the uid
+// split is off: the CLI never dials the api, and under the split it runs as a uid that
+// cannot read the Secret file.
+func TestCLICAFileOnlyWithAnExtraCAAndNoUIDSplit(t *testing.T) {
+	cliCA := func(cfg RenderConfig) string {
+		for _, e := range RenderDeployment(cfg, desired("abc"), testSpec(t, "base", "m")).Spec.Template.Spec.Containers[0].Env {
+			if e.Name == "UZI_CLI_CA_FILE" {
+				return e.Value
+			}
+		}
+		return ""
+	}
+	cfg := testConfig()
+	cfg.APICAPEM = []byte("api")
+	if got := cliCA(cfg); got != "" {
+		t.Errorf("api CA only: UZI_CLI_CA_FILE = %q, want unset", got)
+	}
+	cfg.ExtraCAPEM = []byte("extra")
+	if got := cliCA(cfg); got != "/run/secrets/ca.crt" {
+		t.Errorf("extra CA: UZI_CLI_CA_FILE = %q, want the bundle path", got)
+	}
+	cfg.UIDSplit = true
+	if got := cliCA(cfg); got != "" {
+		t.Errorf("uid split: UZI_CLI_CA_FILE = %q, want unset", got)
+	}
+}
+
+// An isolated lane worker never takes the uid split (its CLI runs as the worker uid and can
+// read the Secret file), so workers.uidSplit must not withhold the CLI's extra CA from it.
+func TestCLICAFileOnIsolatedLaneEvenWithUIDSplit(t *testing.T) {
+	cfg := laneTestConfig()
+	cfg.APICAPEM = []byte("api")
+	cfg.ExtraCAPEM = []byte("extra")
+	cfg.UIDSplit = true
+	if got := envMap(laneWorkerContainer(t, cfg, desiredIsolated("abc")))["UZI_CLI_CA_FILE"]; got != "/run/secrets/ca.crt" {
+		t.Errorf("isolated lane + uid split: UZI_CLI_CA_FILE = %q, want the bundle path", got)
+	}
+}
+
 func TestWorkerEnvDefaultsToSingleRunCap(t *testing.T) {
 	// testConfig() leaves MaxConcurrentRuns at its zero value, which must still render
 	// "1" — the default cap, so any RenderConfig{} built in a test keeps working. The
@@ -1850,6 +1918,65 @@ func TestDindPruneEnvIsDockerOnlyAndGatedOnKnobAndEphemeral(t *testing.T) {
 		on.DinDPruneEnabled = true
 		if SpecHashOf(off, desired("abc"), testSpec(t, "base", "m")) != SpecHashOf(on, desired("abc"), testSpec(t, "base", "m")) {
 			t.Error("the prune knob moved a plain worker's spec hash; it must be docker-only")
+		}
+	})
+}
+
+// UZI_DIND_BUILDER_PRUNE_ENABLED (issue #4291): docker workers only, always explicit, "true"
+// iff its own knob is on AND the worker is not ephemeral, rendered independently of the
+// master UZI_DIND_PRUNE_ENABLED (the agent ANDs them). Exactly one of each env appears.
+func TestDindBuilderPruneEnvIsDockerOnlyAndIndependentOfMaster(t *testing.T) {
+	count := func(c corev1.Container, name string) (string, int) {
+		v, n := "", 0
+		for _, e := range c.Env {
+			if e.Name == name {
+				v, n = e.Value, n+1
+			}
+		}
+		return v, n
+	}
+	for _, p := range dindPostures() {
+		for _, tc := range []struct {
+			name                       string
+			master, builder, ephemeral bool
+			wantPrune, wantBuilder     string
+		}{
+			{"on", true, true, false, "true", "true"},
+			{"builder off", true, false, false, "true", "false"},
+			{"master off builder on", false, true, false, "false", "true"},
+			{"both off", false, false, false, "false", "false"},
+			{"ephemeral", true, true, true, "false", "false"},
+		} {
+			t.Run(p.name+"/"+tc.name, func(t *testing.T) {
+				cfg := p.cfg
+				cfg.DinDPruneEnabled = tc.master
+				cfg.DinDBuilderPruneEnabled = tc.builder
+				w := desiredDocker("abc")
+				w.Ephemeral = tc.ephemeral
+				pod := RenderDeployment(cfg, w, testSpec(t, "base", "m")).Spec.Template.Spec
+				c := containerByName(t, pod.Containers, workerContainerName)
+				if got, n := count(c, "UZI_DIND_PRUNE_ENABLED"); n != 1 || got != tc.wantPrune {
+					t.Errorf("UZI_DIND_PRUNE_ENABLED = %q (x%d), want %q once", got, n, tc.wantPrune)
+				}
+				if got, n := count(c, "UZI_DIND_BUILDER_PRUNE_ENABLED"); n != 1 || got != tc.wantBuilder {
+					t.Errorf("UZI_DIND_BUILDER_PRUNE_ENABLED = %q (x%d), want %q once", got, n, tc.wantBuilder)
+				}
+			})
+		}
+	}
+
+	t.Run("plain worker", func(t *testing.T) {
+		cfg := dockerTestConfig()
+		cfg.DinDBuilderPruneEnabled = true
+		pod := RenderDeployment(cfg, desired("abc"), testSpec(t, "base", "m")).Spec.Template.Spec
+		if v, n := count(containerByName(t, pod.Containers, workerContainerName), "UZI_DIND_BUILDER_PRUNE_ENABLED"); n != 0 {
+			t.Errorf("a plain worker must carry no UZI_DIND_BUILDER_PRUNE_ENABLED, got %q", v)
+		}
+		off := testConfig()
+		on := testConfig()
+		on.DinDBuilderPruneEnabled = true
+		if SpecHashOf(off, desired("abc"), testSpec(t, "base", "m")) != SpecHashOf(on, desired("abc"), testSpec(t, "base", "m")) {
+			t.Error("the builder prune knob moved a plain worker's spec hash; it must be docker-only")
 		}
 	})
 }

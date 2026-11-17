@@ -91,6 +91,9 @@ func runWait(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Command, runI
 		if (isOwnerRequiredWorkerHold(run) || isRecoveryDecisionPark(run)) && workerKey != lastWorkerHoldKey {
 			_, _ = fmt.Fprintf(env.Stderr, "run %s: %s\n", runID, workerExhaustionLine(run))
 		}
+		if isSpendLimitHold(run) && workerKey != lastWorkerHoldKey {
+			_, _ = fmt.Fprintf(env.Stderr, "run %s: %s\n", cellText(runID), spendLimitHoldLine(run))
+		}
 		if line := providerParkLine(run); line != "" && (run.Status != lastStatus || cause != lastRecoveryCause) {
 			_, _ = fmt.Fprintf(env.Stderr, "run %s: %s\n", cellText(runID), line)
 		}
@@ -119,24 +122,16 @@ func runWait(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Command, runI
 				_, _ = fmt.Fprintf(env.Stderr,
 					"run %s: parked at its time limit; waiting for the owner (uzi run extend %s --by 2h)\n", runID, runID)
 			}
-			// Iteration and provider holds require an owner action; paused remains nonterminal.
-			if isIterationHold(run) || isProviderUnavailableHold(run) {
-				_, _ = fmt.Fprintf(env.Stderr, "run %s: %s\n", cellText(runID), pausedHoldNotice(run))
-			}
-			if isCredentialSwitchHold(run) {
-				_, _ = fmt.Fprintf(env.Stderr, "run %s: %s\n", cellText(runID), pausedHoldNotice(run))
-			}
-			if isCredentialsResetHold(run) {
-				_, _ = fmt.Fprintf(env.Stderr, "run %s: %s\n", cellText(runID), pausedHoldNotice(run))
-			}
-			if isCredentialDisabledHold(run) {
-				_, _ = fmt.Fprintf(env.Stderr,
-					"run %s: held, a credential it needs is disabled; %s\n", runID, credentialDisabledAction(run))
-			}
-			// issue #3194: a base-attestation hold never moves by itself; the default wait
-			// stops on it below, and the line names the recovery verbs.
-			if isBaseAttestationHold(run) {
-				_, _ = fmt.Fprintf(env.Stderr, "run %s: %s\n", cellText(runID), pausedHoldNotice(run))
+			// Every non-completion hold (nonCompletionHolds) names itself once on entry; a
+			// credential_disabled hold keeps its own wording. A base-attestation hold never moves by
+			// itself: the default wait stops on it below, and its notice names the recovery verbs.
+			if run.Status == statusPaused && holdAnnouncesEntry(hold) {
+				if isCredentialDisabledHold(run) {
+					_, _ = fmt.Fprintf(env.Stderr,
+						"run %s: held, a credential it needs is disabled; %s\n", runID, credentialDisabledAction(run))
+				} else if notice := pausedHoldNotice(run); notice != "" {
+					_, _ = fmt.Fprintf(env.Stderr, "run %s: %s\n", cellText(runID), notice)
+				}
 			}
 		} else if run.Status == statusPaused && hold != lastHold {
 			// A move between holds keeps the status at paused, so the status line above
@@ -157,7 +152,7 @@ func runWait(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Command, runI
 				runID, cellText(run.Status))
 		}
 
-		if targets[run.Status] || (defaultUntil && (isDiskOwnerHold(run) || isForgeOwnerHold(run) || isOwnerRequiredWorkerHold(run) || isCredentialSwitchHold(run) || isBaseAttestationHold(run))) {
+		if targets[run.Status] || (defaultUntil && (isDiskOwnerHold(run) || isForgeOwnerHold(run) || isOwnerRequiredWorkerHold(run) || isSpendLimitHold(run) || stopsDefaultWait(run))) {
 			// PRD #603: `--min-plan-seq N` (N >= 0) gates ONLY the awaiting_approval
 			// stop so a wait after `run revise` returns on the REVISED plan, not the
 			// stale gate left by the pre-revise plan. Every other target — terminals,
@@ -255,7 +250,7 @@ func newRunWaitCmd(env Env, gf *globalFlags) *cobra.Command {
 		Short: "Block until a run reaches a chosen state",
 		Long: "Poll a run until its status enters the `--until` set, then exit 0 (PRD #264).\n\n" +
 			"With no `--until`, it stops on any state that needs you or ends the run: " +
-			strings.Join(defaultWaitStates, ", ") + ", or disk automatic retries exhausted / forge automatic retries exhausted / worker recovery exhausted / worker memory pressure / owner-held retained recovery exhausted / owner-held Codex idle stall (recovery_wait; owner Resume or Cancel), " +
+			strings.Join(defaultWaitStates, ", ") + ", or disk automatic retries exhausted / forge automatic retries exhausted / worker recovery exhausted / worker memory pressure / owner-held retained recovery exhausted / owner-held Codex idle stall (recovery_wait; owner Resume or Cancel), or the Anthropic API spend-limit owner hold (recovery_wait, anthropic_spend_limit; owner Resume, set-token or Cancel), " +
 			"or a --require-base run held because its kept work is not attested against the planned base (paused, " +
 			"base_attestation_missing; recover its kept work with the run recovery or run export commands). " +
 			"Explicit --until uses only the named statuses. Ordinary transient recovery_wait keeps polling. It does NOT stop " +

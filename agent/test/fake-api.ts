@@ -15,6 +15,17 @@ import type {
   WorkerRunListItem,
   WorkerRunMessage,
 } from "../src/protocol.js";
+import { RunRunner } from "../src/runner.js";
+
+/** Issue #4158: every listening fake learns each claim a RunRunner executes, so the api's
+ *  cross-check running rule (opt-in, FakeApi.modelCrossCheckRunningRule) also applies to a claim a
+ *  test hands straight to RunRunner.execute without going through the claim route or enqueueClaim. */
+const liveFakeApis = new Set<FakeApi>();
+const originalExecute = RunRunner.prototype.execute;
+RunRunner.prototype.execute = function (this: RunRunner, claim: ClaimResponse): Promise<void> {
+  for (const fake of liveFakeApis) fake.registerClaim(claim);
+  return originalExecute.call(this, claim);
+};
 
 /** Issue #1673/#1604: the input receipt routes (POST /inputs/{ack,applied,discarded}). */
 type ReceiptKind = "ack" | "applied" | "discarded";
@@ -71,10 +82,27 @@ export class FakeApi {
   private readonly switchAfterAck = new Set<string>();
   /** Runs with a pending switch: GET drains nothing (the server fence) and APPLIED is refused. */
   private readonly switchPendingRuns = new Set<string>();
+  /** Issue #4201: the in-place-negotiated server DRAINS inputs (with receipts and the switch signal) while a switch
+   *  is pending, and its ACK is accepted; APPLIED for non-revise rows is
+   *  still refused 409 switch_pending until the stamp clears. Off: the v1 contract (GET drains nothing). */
+  inPlaceInputDrain = false;
   private readonly delayedReceipts = new Map<ReceiptKind, number>();
   /** Issue #1604: a pending switch whose `credential_switch {generation}` signal rides every GET
    *  (the real server's transport). Absent keeps the #1673 shape: no signal on the GET. */
   private readonly switchSignalGeneration = new Map<string, number>();
+  /** Issue #4201: the op id of a pending switch, riding the GET /inputs `credential_switch` signal. */
+  private readonly switchOpIds = new Map<string, string>();
+  /** Issue #4201: scripted outcomes of POST /runs/{id}/credential-switch/apply, consumed in order. */
+  private readonly applyScripts = new Map<string, ApplyScript[]>();
+  /** Issue #4201: ops the fake already applied (the real server is idempotent per op: a retry replays). */
+  private readonly appliedOps = new Map<string, { token: string; ordinal: number; messageSeq: number }>();
+  private readonly appliedOrdinal = new Map<string, number>();
+  /** Issue #4201: every apply request, with the wire fields the server fences on. */
+  readonly applyRequests: Array<{ runId: string; body: Record<string, unknown> }> = [];
+  /** Issue #4201: every `credential_switch_uncertain` report. */
+  readonly uncertainRequests: Array<{ runId: string; body: Record<string, unknown> }> = [];
+  private readonly uncertainReplyDrops = new Map<string, number>();
+  private readonly uncertainRefusals = new Set<string>();
   /** Issue #1604: the claim generation that ACKed each input id, per run, so the server's
    *  own-revise APPLIED exemption under switch_pending (D6) can be mirrored. */
   private readonly ackGenerationByRun = new Map<string, Map<number, number>>();
@@ -316,6 +344,10 @@ export class FakeApi {
   /** Focused receipt fixture: hold a message response until its request is aborted. */
   holdMessagesUntilAbort?: (runId: string, body: Record<string, unknown>) => boolean;
   abortedHeldMessages = 0;
+  /** Focused latency fixture: wall-clock delay (ms) applied by the HTTP route before a messages batch is recorded.
+   *  It is HTTP-only: acceptMessages never traverses it. */
+  delayMessagesMs?: (runId: string, body: Record<string, unknown>) => number;
+  delayedMessages = 0;
   readonly usageRequests: Record<string, unknown>[] = [];
   checkedTransport = false;
   private readonly checkedFencedRuns = new Set<string>();
@@ -540,11 +572,13 @@ export class FakeApi {
     // exits and --test-timeout does not end it (measured 2026-09-29: a passing test
     // that leaves a listening server open hangs its file until killed from outside).)
     this.server.unref();
+    liveFakeApis.add(this);
     const { port } = this.server.address() as AddressInfo;
     return `http://127.0.0.1:${port}`;
   }
 
   async close(): Promise<void> {
+    liveFakeApis.delete(this);
     await new Promise<void>((resolve, reject) =>
       this.server.close((err) => (err ? reject(err) : resolve())),
     );
@@ -561,7 +595,9 @@ export class FakeApi {
   requeueRun(claim: ClaimResponse, nextGeneration: number): ClaimResponse {
     this.requeues++;
     const next = { ...claim, claim_generation: nextGeneration };
-    this.setOwnershipStatus(claim.run_id, "running", nextGeneration);
+    // Under the opt-in running model the re-offered run is `claimed` until its first accepted
+    // `running` report, as on the server; otherwise the fake keeps its historical `running`.
+    this.setOwnershipStatus(claim.run_id, this.modelCrossCheckRunningRule ? "claimed" : "running", nextGeneration);
     this.enqueueClaim(next);
     return next;
   }
@@ -575,14 +611,119 @@ export class FakeApi {
   redispatchRun(claim: ClaimResponse, nextGeneration: number): ClaimResponse {
     this.redispatches++;
     const next = { ...claim, claim_generation: nextGeneration };
-    this.setOwnershipStatus(claim.run_id, "running", nextGeneration);
+    this.setOwnershipStatus(claim.run_id, this.modelCrossCheckRunningRule ? "claimed" : "running", nextGeneration);
     this.enqueueClaim(next);
     return next;
   }
 
   enqueueClaim(claim: ClaimResponse): void {
     this.receiptGeneration.set(claim.run_id, claim.claim_generation ?? 0);
+    const prev = this.claimByRun.get(claim.run_id);
+    this.registerClaim(claim);
+    // A new claim generation re-offers the run as `claimed`; a repeat of the same generation keeps
+    // a row status a test set explicitly (registerClaim defaults an unknown run to `claimed`).
+    if (prev !== undefined && (claim.claim_generation ?? 0) > (prev.claim_generation ?? 0))
+      this.rowStatusByRun.set(claim.run_id, "claimed");
     this.claimQueue.push(claim);
+  }
+
+  // --- cross-check running rule (issue #4158) ------------------------------------------------
+  private readonly claimByRun = new Map<string, ClaimResponse>();
+  /** The status the api's run row holds: the latest of a recorded report, a claim and
+   *  setOwnershipStatus. */
+  private readonly rowStatusByRun = new Map<string, string>();
+  /** The plan_md the run row stores: the last plan an accepted awaiting_approval report carried. */
+  private readonly storedPlanByRun = new Map<string, string>();
+
+  /** Tell the fake which claim a run executes under, so the api's cross-check running rule (see
+   *  {@link crossCheckRunningAdmitted}) applies to it. enqueueClaim, the claim route and every
+   *  RunRunner.execute call (the module-level wrapper above) call it.
+   *  Only with modelCrossCheckRunningRule on, and only a cross-check claim (gated, or required; an
+   *  ordinary one too under modelOrdinaryRunningRule) is modelled; any other claim keeps the fake's
+   *  accept-everything behaviour. */
+  registerClaim(claim: ClaimResponse): void {
+    // Keep the newest claim generation: RunRunner.execute registers before the runner's queued-
+    // duplicate gate, so an older claim must not replace a newer one's lane.
+    const prev = this.claimByRun.get(claim.run_id);
+    if (prev !== undefined && (prev.claim_generation ?? 0) > (claim.claim_generation ?? 0)) return;
+    this.claimByRun.set(claim.run_id, claim);
+    // The row's auto_approve is monotone true -> false (SetRunAwaitingApproval clears it): the
+    // first claim seeds it, a later claim may only turn it off.
+    this.autoApproveByRun.set(claim.run_id, claim.auto_approve === true && this.autoApproveByRun.get(claim.run_id) !== false);
+    if (typeof claim.plan_md === "string" && claim.plan_md !== "") {
+      this.storedPlanByRun.set(claim.run_id, claim.plan_md);
+      // A claim resuming a published gate (positive resume_gate_revision) carries the stored plan
+      // as the presented payload when the fake holds no real gate for the run (gateRevisions off).
+      const revision = claim.resume_gate_revision;
+      if (typeof revision === "number" && revision > 0) this.presentedSeedByRun.set(claim.run_id, { plan: claim.plan_md, revision });
+    }
+    if (!this.rowStatusByRun.has(claim.run_id)) this.rowStatusByRun.set(claim.run_id, "claimed");
+  }
+
+  /** The run row's auto_approve as the cross-check rule reads it. */
+  private readonly autoApproveByRun = new Map<string, boolean>();
+  /** Presented payload seeded from a gate-resume claim, used until a real gate is recorded. */
+  private readonly presentedSeedByRun = new Map<string, { plan: string; revision: number }>();
+  /** Every `running` report the modelled cross-check rule refused, in order (status = the row's status). */
+  readonly crossCheckRunningRefusals: { runId: string; status: string }[] = [];
+
+  /** Overwrite the plan the run row stores without republishing the gate: the api state where
+   *  plan_md no longer equals the presented gate payload. */
+  setStoredPlan(runId: string, plan: string): void {
+    this.storedPlanByRun.set(runId, plan);
+  }
+
+  /** Issue #4158: opt in to the api's SetRunRunning cross-check rule on the /state route (and to
+   *  the server's `claimed` re-offer and running-ownership flip that go with it). Off by default:
+   *  existing tests were written against an accept-all fake and are not yet migrated, so turning it
+   *  on by default is left to the follow-up that retires the live-switch path (#4201). */
+  modelCrossCheckRunningRule = false;
+
+  /** Issue #4158: with modelCrossCheckRunningRule on, also hold ORDINARY (non-cross-check) runs to the api's running rule too
+   *  (their awaiting_approval arm needs any applied, non-superseded approve_plan). Off by default, so
+   *  every other test keeps the fake's accept-everything behaviour for ordinary runs. */
+  modelOrdinaryRunningRule = false;
+
+  /** The run's cross-check model, or undefined when the run is not modelled. */
+  private crossCheckModel(runId: string): CrossCheckModel | undefined {
+    const claim = this.claimByRun.get(runId);
+    if (!claim || !this.modelCrossCheckRunningRule) return undefined;
+    const auto = this.autoApproveByRun.get(runId) === true;
+    const lane: CrossCheckLane | undefined = claim.plan_cross_check_gated === true && !auto ? "gated"
+      : claim.plan_cross_check_required === true ? (auto ? "required_auto" : "required")
+      : this.modelOrdinaryRunningRule ? "ordinary" : undefined;
+    if (lane === undefined) return undefined;
+    const gate = this.gateByRun.get(runId);
+    const seed = this.presentedSeedByRun.get(runId);
+    const real = gate !== undefined && gate.revision > 0;
+    return {
+      lane,
+      plan: this.storedPlanByRun.get(runId),
+      presentedPlan: real ? gate.snapshot.plan_md : seed?.plan,
+      gateRevision: real ? gate.revision : seed?.revision ?? 0,
+    };
+  }
+
+  /** The run's approve_plan rows as the api's guard reads them. */
+  private crossCheckApprovals(runId: string): CrossCheckApproval[] {
+    const applied = this.appliedByRun.get(runId);
+    return (this.inputsByRun.get(runId) ?? []).filter((row) => row.kind === "approve_plan").map((row) => ({
+      applied: applied?.has(row.id) ?? false,
+      superseded: this.isDiscarded(runId, row.id) || this.isInputSuperseded(runId, row.id),
+      bound: row.gate_binding === "bound",
+      gateRevision: row.gate_revision,
+    }));
+  }
+
+  /** The run's current row status when a `running` report must be refused, else undefined. */
+  private crossCheckRunningRefusal(runId: string): string | undefined {
+    const model = this.crossCheckModel(runId);
+    if (!model) return undefined;
+    const status = this.rowStatusByRun.get(runId) ?? "claimed";
+    // SetRunRunning moves only a live source row (or keeps a running one); paused, queued and the
+    // other non-source statuses are refused whatever the approval state.
+    if (status !== "running" && !RUNNING_REPORT_SOURCES.has(status)) return status;
+    return crossCheckRunningAdmitted(model, this.crossCheckApprovals(runId), status) ? undefined : status;
   }
 
   /** Make the next `times` /state calls fail with `status` before succeeding. */
@@ -692,7 +833,7 @@ export class FakeApi {
   // an owner Resume is refused until the settled acknowledgement moves it to credential_switch_unsettled.
   private readonly switchHolds = new Map<string, { state: "settling" | "unsettled"; generation: number }>();
   /** Every hold / hold-settled report received, with the wire fields the server fences on. */
-  readonly holdRequests: Array<{ runId: string; status: string; claim_generation?: number; register_nonce?: string }> = [];
+  readonly holdRequests: Array<{ runId: string; status: string; claim_generation?: number; register_nonce?: string; op_id?: string }> = [];
   private readonly holdReplyDrops = new Map<string, number>();
   private holdRefusals = new Set<string>();
 
@@ -721,6 +862,22 @@ export class FakeApi {
     return "resumed";
   }
 
+  /** Reports the fake refused with 409 credential_switch_release_retired (a negotiated registration's v1 release or op-less hold). */
+  readonly retiredSwitchRefusals: Array<{ runId: string; status: string }> = [];
+
+  private forcedApplyNegotiated = false;
+
+  /** For a test whose client negotiates in-place apply without registering: the fake then behaves as the api does for it. */
+  negotiateApply(): void {
+    this.forcedApplyNegotiated = true;
+  }
+
+  /** The newest registration advertised credential_switch_in_place_v1, which the api stamps as negotiated. */
+  private currentRegistrationNegotiatedApply(): boolean {
+    return this.forcedApplyNegotiated ||
+      (this.registers[this.registers.length - 1]?.protocol_capabilities?.includes("credential_switch_in_place_v1") ?? false);
+  }
+
   private credentialSwitchHoldState(runId: string, body: StateRequest, res: http.ServerResponse): void {
     const send = (status: number, payload: unknown): void => {
       res.writeHead(status, { "Content-Type": "application/json" });
@@ -730,6 +887,7 @@ export class FakeApi {
       runId, status: body.status,
       ...(body.claim_generation !== undefined ? { claim_generation: body.claim_generation } : {}),
       ...(body.register_nonce !== undefined ? { register_nonce: body.register_nonce } : {}),
+      ...((body as { op_id?: string }).op_id !== undefined ? { op_id: (body as { op_id?: string }).op_id } : {}),
     });
     if (!body.register_nonce) return send(400, { error: "register_nonce is required" });
     const generation = body.claim_generation as number;
@@ -876,9 +1034,98 @@ export class FakeApi {
    *  and carries `credential_switch {generation}` (the server's transport), and APPLIED is refused
    *  switch_pending except for the claim's own ACKed revise_plan rows (D6). The worker's
    *  credential_switch (or credential_switch_failed) report clears it, as the server's release does. */
-  requestCredentialSwitch(runId: string, generation: number): void {
+  requestCredentialSwitch(runId: string, generation: number, opId?: string): void {
     this.switchPendingRuns.add(runId);
     this.switchSignalGeneration.set(runId, generation);
+    if (opId !== undefined) this.switchOpIds.set(runId, opId);
+  }
+
+  /** Issue #4201: script the next apply outcomes for this run (consumed in order). An empty queue
+   *  answers like an api without the route (chi's text/plain 404). */
+  scriptApply(runId: string, ...steps: ApplyScript[]): void {
+    this.applyScripts.set(runId, [...(this.applyScripts.get(runId) ?? []), ...steps]);
+  }
+
+  /** Issue #4201: apply the next `count` uncertain reports server-side, then drop the connection (a lost ACK). */
+  dropUncertainReplies(runId: string, count: number): void {
+    this.uncertainReplyDrops.set(runId, count);
+  }
+
+  /** Issue #4201: refuse (409, not applied) every uncertain report for this run until cleared. */
+  refuseUncertain(runId: string, refuse = true): void {
+    if (refuse) this.uncertainRefusals.add(runId); else this.uncertainRefusals.delete(runId);
+  }
+
+  /** Issue #4201: the server's apply of one op: appends the `credential_switch` feed frame at
+   *  max(seq)+1 and clears the pending switch; a repeat of the same op replays the same answer. */
+  private applySwitch(runId: string, opId: string, token: string): { token: string; ordinal: number; messageSeq: number; replay: boolean } {
+    const prior = this.appliedOps.get(opId);
+    if (prior) return { ...prior, replay: true };
+    const list = this.messagesByRun.get(runId) ?? [];
+    const seen = this.seenSeqByRun.get(runId) ?? new Set<number>();
+    const messageSeq = Math.max(0, ...list.map((m) => m.seq)) + 1;
+    seen.add(messageSeq);
+    list.push({ seq: messageSeq, kind: "credential_switch", payload: { op_id: opId } } as unknown as OutgoingMessage);
+    this.messagesByRun.set(runId, list);
+    this.seenSeqByRun.set(runId, seen);
+    const ordinal = (this.appliedOrdinal.get(runId) ?? 0) + 1;
+    this.appliedOrdinal.set(runId, ordinal);
+    const applied = { token, ordinal, messageSeq };
+    this.appliedOps.set(opId, applied);
+    this.switchPendingRuns.delete(runId);
+    this.switchSignalGeneration.delete(runId);
+    this.switchOpIds.delete(runId);
+    return { ...applied, replay: false };
+  }
+
+  private handleApply(res: http.ServerResponse, runId: string, json: Record<string, unknown>): void {
+    this.applyRequests.push({ runId, body: structuredClone(json) });
+    this.requestLog.push("apply");
+    const opId = String(json.op_id ?? "");
+    const step = this.appliedOps.has(opId) ? undefined : this.applyScripts.get(runId)?.shift();
+    const replyJson = (status: number, body: unknown): void => send(res, status, body);
+    if (this.appliedOps.has(opId) && !step) {
+      const a = this.applySwitch(runId, opId, "");
+      return replyJson(200, { outcome: "applied", token: a.token, ordinal: a.ordinal, message_seq: a.messageSeq, replay: true });
+    }
+    if (!step || step.outcome === "route_absent") {
+      res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
+      res.end("404 page not found\n");
+      return;
+    }
+    switch (step.outcome) {
+      case "applied": {
+        const a = this.applySwitch(runId, opId, step.token);
+        if (step.replyLost) { res.destroy(); return; }
+        return replyJson(200, { outcome: "applied", token: a.token, ordinal: a.ordinal, message_seq: a.messageSeq, replay: a.replay });
+      }
+      case "superseded":
+        if (step.newOpId !== undefined) this.switchOpIds.set(runId, step.newOpId);
+        return replyJson(200, { outcome: "superseded" });
+      case "not_applied": return replyJson(200, { outcome: "not_applied", reason: step.reason ?? "no_pending_switch" });
+      case "refused_committed": return replyJson(200, { outcome: "refused_committed", reason: step.reason ?? "already_committed" });
+      case "fenced": return replyJson(404, { error: "run not found for this worker" });
+      case "garbage": return replyJson(500, { error: "boom" });
+    }
+  }
+
+  private credentialSwitchUncertainState(runId: string, body: StateRequest, res: http.ServerResponse): void {
+    const raw = structuredClone(body) as unknown as Record<string, unknown>;
+    this.uncertainRequests.push({ runId, body: raw });
+    if (typeof raw.op_id !== "string" || raw.op_id === "") return send(res, 400, { error: "invalid request body" });
+    // As the api: a missing registration nonce on an op-carrying report changes nothing and is a not-applied 409.
+    if (!body.register_nonce) return send(res, 409, { applied: false, run: { id: runId, status: "running", hold_reason: null } });
+    if (this.uncertainRefusals.has(runId)) return send(res, 409, { applied: false, run: { id: runId, status: "running", hold_reason: null } });
+    this.states.push({ runId, body });
+    this.requestLog.push("state:credential_switch_uncertain");
+    this.setOwnershipStatus(runId, "paused", body.claim_generation as number);
+    const drops = this.uncertainReplyDrops.get(runId) ?? 0;
+    if (drops > 0) {
+      this.uncertainReplyDrops.set(runId, drops - 1);
+      res.destroy();
+      return;
+    }
+    send(res, 200, { run: { id: runId, status: "paused", hold_reason: null }, disposition: "uncertain" });
   }
 
   /** Issue #1604: drop every /state report for this run matching `matches` (the connection is
@@ -1075,6 +1322,7 @@ export class FakeApi {
    *  PRD #1391 Run B M4: an optional `generation` rides the 200 as `claim_generation`, so a test
    *  can model the queued-duplicate router seeing a DIFFERENT generation own the run. */
   setOwnershipStatus(runId: string, status: string, generation?: number, inventoryGuarded?: boolean, holdReason?: string): void {
+    this.rowStatusByRun.set(runId, status);
     this.ownershipByRun.set(runId, {
       httpStatus: 200,
       status,
@@ -1312,6 +1560,7 @@ export class FakeApi {
       const claim = this.claimQueue.shift();
       if (!claim) return sendEmpty(res, 204);
       this.claimsServed++;
+      this.registerClaim(claim);
       return send(res, 200, claim);
     }
 
@@ -1463,6 +1712,8 @@ export class FakeApi {
       const ownReviseOnly =
         active && Array.isArray(ids) && ids.length > 0 &&
         ids.every((id) => rows.some((row) => row.id === id && row.kind === "revise_plan") && ackGens?.get(id) === generation);
+      // The in-place-negotiated server (inPlaceInputDrain) accepts the ACK of what it drained, but still refuses APPLIED
+      // while the stamp is pending: an applied row leaves replay, so it waits until the switch has settled in place.
       if (kind === "applied" && this.switchPendingRuns.has(runId) && !ownReviseOnly)
         return sendReceipt(409, { error: "input receipt conflicts with claim", reason: "switch_pending" });
       const delay = this.delayedReceipts.get(kind) ?? 0;
@@ -1581,6 +1832,9 @@ export class FakeApi {
       return reply(answer.status, answer.body, answer.drop);
     }
 
+    const applyMatch = /^\/api\/worker\/runs\/([^/]+)\/credential-switch\/apply$/.exec(p);
+    if (req.method === "POST" && applyMatch) return this.handleApply(res, applyMatch[1] as string, json);
+
     const runMatch =
       /^\/api\/worker\/runs\/([^/]+)\/(messages|state|inputs)$/.exec(p);
     if (runMatch) {
@@ -1591,6 +1845,11 @@ export class FakeApi {
           await new Promise<void>((resolve) => res.once("close", resolve));
           this.abortedHeldMessages++;
           return;
+        }
+        const delayMs = this.delayMessagesMs?.(runId, json) ?? 0;
+        if (delayMs > 0) {
+          this.delayedMessages++;
+          await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
         }
         return this.handleMessages(res, runId, json);
       }
@@ -1627,7 +1886,7 @@ export class FakeApi {
         const rows = this.inputsByRun.get(runId) ?? [];
         const applied = this.appliedByRun.get(runId) ?? new Set<number>();
         const switchPending = this.switchPendingRuns.has(runId);
-        const pending = (switchPending
+        const pending = (switchPending && !this.inPlaceInputDrain
           ? []
           : rows.filter((row) => !applied.has(row.id)).sort((a, b) => a.id - b.id)
         ).slice(0, this.inputPageSize ?? Infinity);
@@ -1641,7 +1900,7 @@ export class FakeApi {
         return sendInputs(200, {
           inputs: pending,
           receipts: true,
-          ...(signal !== undefined ? { credential_switch: { generation: signal } } : {}),
+          ...(signal !== undefined ? { credential_switch: { generation: signal, ...(switchPending && this.switchOpIds.has(runId) ? { op_id: this.switchOpIds.get(runId) } : {}) } } : {}),
           ...(this.nowSummary.has(runId) ? { now_summary: this.nowSummary.get(runId) } : {}),
         });
       }
@@ -1927,14 +2186,33 @@ export class FakeApi {
     return send(res, 404, { error: "not found", path: p });
   }
 
+  /**
+   * In-process acceptance of a messages batch: the same recording (failure injection, seq dedupe,
+   * generation bookkeeping) the HTTP route applies, without a loopback request. A rejected batch throws,
+   * as a non-2xx response would. The caller supplies the real messages; nothing is manufactured here.
+   */
+  acceptMessages(runId: string, body: { messages: OutgoingMessage[]; claim_generation?: number }): number {
+    const result = this.recordMessages(runId, body as unknown as Record<string, unknown>);
+    if (result.status !== 200) throw new Error(`fake api rejected messages: HTTP ${result.status}`);
+    return (result.body as { accepted: number }).accepted;
+  }
+
   private handleMessages(
     res: http.ServerResponse,
     runId: string,
     json: Record<string, unknown>,
   ): void {
+    const result = this.recordMessages(runId, json);
+    send(res, result.status, result.body);
+  }
+
+  private recordMessages(
+    runId: string,
+    json: Record<string, unknown>,
+  ): { status: number; body: unknown } {
     if (this.msgFailRemaining > 0) {
       this.msgFailRemaining--;
-      return send(res, this.msgFailStatus, { error: "injected failure" });
+      return { status: this.msgFailStatus, body: { error: "injected failure" } };
     }
     const incoming = (json.messages ?? []) as OutgoingMessage[];
     // PRD #1247 M5b: record the wrapper as it arrived, so a test can assert claim_generation was
@@ -1962,7 +2240,7 @@ export class FakeApi {
     }
     this.messagesByRun.set(runId, list);
     this.seenSeqByRun.set(runId, seen);
-    send(res, 200, { accepted: incoming.length });
+    return { status: 200, body: { accepted: incoming.length } };
   }
 
   /** Classify on a copy: source-fenced reports must pass their checks before allocation,
@@ -2030,6 +2308,16 @@ export class FakeApi {
     // Mirror worker state decoding: PostgreSQL plans persist without NUL bytes.
     // worker_messages_poison_livedb_test.go exercises this server contract.
     if (body.plan_md !== undefined) body.plan_md = body.plan_md.replaceAll("\u0000", "");
+    if ((body.status as string) === "credential_switch_uncertain")
+      return this.credentialSwitchUncertainState(runId, body, res);
+    // Mirrors the api (issue #4201 m3a): a registration that negotiated in-place apply never releases a
+    // claim for a switch, and an op-less credential_switch_held is refused too. Nothing is recorded.
+    if (this.currentRegistrationNegotiatedApply() &&
+        (body.status === "credential_switch" ||
+         (body.status === "credential_switch_held" && (body as { op_id?: string }).op_id === undefined))) {
+      this.retiredSwitchRefusals.push({ runId, status: body.status });
+      return send(res, 409, { error: "credential switch release is retired for an in-place apply worker", reason: "credential_switch_release_retired" });
+    }
     if (body.status === "credential_switch_held" || body.status === "credential_switch_hold_settled")
       return this.credentialSwitchHoldState(runId, body, res);
     const typedRefusal = this.typedParkRefusal.get(runId);
@@ -2123,6 +2411,14 @@ export class FakeApi {
     ) {
       return send(res, 409, { error: "run is not running", run: { id: runId, status: lastStatus } });
     }
+    // Issue #4158 (opt-in, modelCrossCheckRunningRule): the api's SetRunRunning refuses a running
+    // report for a human-gated cross-check run that holds a stored plan unless a bound approval for
+    // the current gate revision applied.
+    if (body.status === "running") {
+      const refusedAt = this.crossCheckRunningRefusal(runId);
+      if (refusedAt !== undefined) this.crossCheckRunningRefusals.push({ runId, status: refusedAt });
+      if (refusedAt !== undefined) return send(res, 409, { error: "running report refused", run: { id: runId, status: refusedAt } });
+    }
     const receipt = this.revisionReceipts.get(runId);
     const receiptReplay = this.planRevisionRetries && receipt !== undefined &&
       receipt.body === JSON.stringify(body) &&
@@ -2184,9 +2480,26 @@ export class FakeApi {
     }
     if (body.plan_agent_source !== undefined && this.planAgentSourceAckHold) await this.planAgentSourceAckHold;
     if (this.checkedTransport && body.status === "awaiting_approval") this.checkedFencedRuns.add(runId);
+    // Issue #4201: an op-carrying credential_switch_failed report without the registration nonce changes nothing and gets
+    // the ordinary not-applied 409.
+    if (body.status === "credential_switch_failed" && (body as { op_id?: unknown }).op_id !== undefined && !(body as { register_nonce?: unknown }).register_nonce)
+      return send(res, 409, { applied: false, run: { id: runId, status: "running", hold_reason: null } });
     this.states.push({ runId, body });
     this.requestLog.push(`state:${body.status}`);
     this.lastRecordedStatus.set(runId, body.status);
+    this.rowStatusByRun.set(runId, body.status);
+    if (body.status === "awaiting_approval" && typeof body.plan_md === "string" && body.plan_md !== "")
+      this.storedPlanByRun.set(runId, body.plan_md);
+    // SetRunAwaitingApproval clears auto_approve on every accepted park (PRD #71 M5 safety fix).
+    if (body.status === "awaiting_approval") this.autoApproveByRun.set(runId, false);
+    if (body.status === "running") {
+      const owned = this.ownershipByRun.get(runId);
+      // SetRunRunning only moves a live row (claimed or a wait-for-human status); it refuses terminal,
+      // paused, queued, limit_wait, pool_wait and recovery_wait rows, so those keep their status.
+      if (this.modelCrossCheckRunningRule && owned?.httpStatus === 200 && owned.status !== undefined &&
+        RUNNING_REPORT_SOURCES.has(owned.status))
+        this.ownershipByRun.set(runId, { ...owned, status: "running" });
+    }
     this.timeline.push({ type: "state", runId, status: body.status, ...(body.plan_md !== undefined ? { plan_md: body.plan_md } : {}) });
     // Issue #1604: the server's release (or give-up clear) ends a pending switch.
     // A release also fences the released claim: its later receipts are refused as `released`.
@@ -2299,6 +2612,65 @@ export class FakeApi {
     this.stateAckCredentialSwitchOnce.delete(runId);
     return { credential_switch: { generation: armed.generation } };
   }
+}
+
+/** Issue #4201: one scripted answer of POST /runs/{id}/credential-switch/apply. `replyLost` applies the
+ *  op server-side and then drops the connection (the worker cannot tell it from a failure). */
+export type ApplyScript =
+  | { outcome: "applied"; token: string; replyLost?: boolean }
+  | { outcome: "superseded"; newOpId?: string }
+  | { outcome: "not_applied"; reason?: string }
+  | { outcome: "refused_committed"; reason?: string }
+  | { outcome: "fenced" }
+  | { outcome: "route_absent" }
+  | { outcome: "garbage" };
+
+/** Row statuses the api's SetRunRunning moves to `running` (runtime.sql). */
+const RUNNING_REPORT_SOURCES = new Set(["claimed", "awaiting_approval", "awaiting_input", "awaiting_followup"]);
+
+/** The cross-check lanes of the running rule. `gated` and `required` are the human-gated lanes
+ *  (required without auto_approve); `required_auto` and `ordinary` exist so the rule can be stated
+ *  for every lane the shared fixture names. */
+export type CrossCheckLane = "gated" | "required" | "required_auto" | "ordinary";
+
+/** What the api's run row holds that the running rule reads. */
+export interface CrossCheckModel {
+  lane: CrossCheckLane;
+  /** The stored plan_md; undefined or "" = no plan stored yet. */
+  plan: string | undefined;
+  /** plan_md of the presented gate payload; undefined = nothing presented. */
+  presentedPlan: string | undefined;
+  /** The run's current gate revision. */
+  gateRevision: number;
+}
+
+/** One approve_plan input row. */
+export interface CrossCheckApproval {
+  applied: boolean;
+  /** Settled with disposition 'superseded' (a discarded or revise-superseded approve). */
+  superseded: boolean;
+  bound: boolean;
+  gateRevision: number | undefined;
+}
+
+/** The api's SetRunRunning guard for a `running` report on a run row in `status`
+ *  (api/internal/store/queries/runtime.sql). A human-gated cross-check run (gated, or required
+ *  without auto_approve) that holds a plan must have a presented payload equal to that plan and an
+ *  applied, non-superseded approve_plan bound to the CURRENT gate revision, in every status. An
+ *  ordinary run needs, only in awaiting_approval, any applied non-superseded approve; an
+ *  auto-approved required run is never admitted out of awaiting_approval. The pre-plan running
+ *  report of a human-gated run is admitted (outside awaiting_approval).
+ *
+ *  Approximation: the fake compares only the plan_md of the presented payload. The SQL also compares
+ *  milestones, required_tools and size_class (and its pre-plan milestones clause for an auto-approved
+ *  required run or a gated run); none of those is modelled here. `required_auto` is the row while auto_approve is
+ *  still true; the fake moves a run out of it when it accepts an awaiting_approval report. */
+export function crossCheckRunningAdmitted(model: CrossCheckModel, approvals: CrossCheckApproval[], status: string): boolean {
+  const live = approvals.filter((a) => a.applied && !a.superseded);
+  if (model.lane === "ordinary") return status !== "awaiting_approval" || live.length > 0;
+  if (model.lane === "required_auto") return status !== "awaiting_approval";
+  if ((model.plan ?? "") === "") return status !== "awaiting_approval";
+  return model.presentedPlan === model.plan && live.some((a) => a.bound && a.gateRevision === model.gateRevision);
 }
 
 /** PRD #1795: the approval-relevant payload of a gate presentation (plan_changed_files excluded). */

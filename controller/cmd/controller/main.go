@@ -88,13 +88,15 @@ func main() {
 	}
 
 	materializerCfg := kube.RenderConfig{
-		RollConcurrency:              cfg.RollConcurrency,
-		RollTargetVersion:            cfg.RollTargetVersion,
-		Namespace:                    cfg.WorkerNamespace,
-		DockerNamespace:              cfg.WorkerDockerNamespace,
-		PodEpochRuntime:              cfg.WorkerPodEpochRuntime,
-		EpochReclaimDeletionCanaryID: cfg.WorkerEpochReclaimDeletionCanaryID,
-		DinDImage:                    cfg.WorkerDinDImage,
+		RollConcurrency:               cfg.RollConcurrency,
+		RollTargetVersion:             cfg.RollTargetVersion,
+		Namespace:                     cfg.WorkerNamespace,
+		DockerNamespace:               cfg.WorkerDockerNamespace,
+		PodEpochRuntime:               cfg.WorkerPodEpochRuntime,
+		EpochReclaimDeletionCanaryID:  cfg.WorkerEpochReclaimDeletionCanaryID,
+		EpochScratchDeletion:          cfg.WorkerEpochScratchDeletion,
+		RetireScratchOutcomesDisabled: !cfg.WorkerRetireScratchOutcomes,
+		DinDImage:                     cfg.WorkerDinDImage,
 		// Config carries the POSITIVE `rootless` bool (matching the chart value); the
 		// render side carries the NEGATIVE `non-rootless` so its zero value is the safe
 		// rootless posture. Invert here, at the one wiring point.
@@ -124,6 +126,8 @@ func main() {
 		StorageClass:                cfg.WorkerStorageClass,
 		PriorityClassName:           cfg.WorkerPriorityClassName,
 		NodeSelector:                cfg.WorkerNodeSelector,
+		DeploymentLabels:            cfg.WorkerDeploymentLabels,
+		DeploymentAnnotations:       cfg.WorkerDeploymentAnnotations,
 		Tolerations:                 cfg.WorkerTolerations,
 		MaxConcurrentRuns:           cfg.WorkerMaxConcurrentRuns,
 		MemoryGuardEnabled:          cfg.WorkerMemoryGuardEnabled,
@@ -145,11 +149,13 @@ func main() {
 		// Per-run Codex command-cache byte budget; empty renders no env (worker default).
 		CommandCacheRunBytes: cfg.WorkerCommandCacheRunBytes,
 		APICAPEM:             cfg.APICAPEM,
+		ExtraCAPEM:           cfg.WorkerExtraCAPEM,
 		// Where the join-token Secret mounts (issue #1761); empty keeps /run/secrets.
 		SecretMountPath: cfg.WorkerSecretMountPath,
 		// The docker worker's gated DinD prune (issue #1759) rides the disk self-heal
 		// toggle: one knob governs every automatic reclaim.
-		DinDPruneEnabled: cfg.WorkerDiskRecycleEnabled,
+		DinDPruneEnabled:        cfg.WorkerDiskRecycleEnabled,
+		DinDBuilderPruneEnabled: cfg.WorkerDinDBuilderPruneEnabled,
 		// The isolated research lane (PRD #1906 M5). Empty namespace = lane off: an
 		// isolated worker is then skipped, never rendered into Namespace. The fetcher URL
 		// and CA reach isolated pods only (UZI_FETCHER_URL, and UZI_FETCHER_CA_FILE
@@ -219,6 +225,7 @@ func main() {
 		// the line you read first when a worker is running the wrong code.
 		"worker_image", cfg.WorkerImageRepo+"/agent-<template>:"+cfg.WorkerImageTag,
 		"worker_ca_relayed", len(cfg.APICAPEM) > 0,
+		"worker_extra_ca", len(cfg.WorkerExtraCAPEM) > 0,
 		// The docker tier's posture at a glance: whether this controller will render
 		// docker workers at all, and into which privileged namespace (empty = off, and
 		// docker workers in the poll are then skipped, not rendered into the default).

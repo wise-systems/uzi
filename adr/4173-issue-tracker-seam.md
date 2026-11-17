@@ -1,7 +1,7 @@
 # ADR-4173: The issue tracker seam
 
 **Status**: Accepted (PRD #4173, M4 landed; M5–M6 pending)
-**Date**: 2026-11-11 (updated 2026-11-13)
+**Date**: 2026-11-11 (updated 2026-11-17)
 **Deciders**: the maintainer + agent team
 **PRD**: [prds/4173-external-issue-trackers.md](../prds/4173-external-issue-trackers.md) — the PRD carries the milestones and the Decision Log; this ADR carries the durable shape of what M3 and M4 built and the invariants a later change must keep.
 
@@ -37,18 +37,20 @@ Shipped in M4: the repo link and `IssueTrackerForRepo` returning the linked issu
 
 - The driver is built for one project through `issuetracker.Binding{Project, ProjectID, EligibilityTag}`: all three set or none (`ValidBinding`). A driver built with none serves only the connection operations.
 - Every `IssueTracker` method refuses a `projectID` other than the bound one with `ErrProjectMismatch` before any request. This catches a mismatched number only. Two connections can expose the same forge project number, so the owner-scoped repo resolver in M4 must still bind the right repo and connection, and M4 tests that collision.
-- `issueIID` is YouTrack's `numberInProject`. Each per-issue call checks the issue reached is in the bound project and carries the number, so a moved issue reads as not found. YouTrack has no conditional write, so a move between that check and the write is not caught.
+- `issueIID` is YouTrack's `numberInProject`. Each per-issue call checks the issue reached is in the bound project and carries the number, so an issue moved before an operation reads as not found and is not written. YouTrack has no conditional write, so an issue moved after that check can still be written, and `UpdateIssueLabels` can send several tag writes after one check. This window is documented, not closed.
 - `IssueNote.ID` is 0, not derived from YouTrack's string comment id. Account ids are 0, with the login kept as text.
 - `ListStates` takes the project it reads, because states belong to a project.
 - The readable id is `issues.issue_key` (`<SHORT>-<n>`), nullable with a CHECK, written only by the linked sync and NULL for forge issues.
 
 ### D14. The tag rules
 
-- The eligibility tag is chosen by id. Its name resolves to the stored id whoever owns the tag, for reads and for writes.
-- Any other name resolves only to a tag owned by the connection's account, which the driver learns from `users/me`. A missing one is created, owned by that account, with the eligibility tag's sharing settings. The eligibility tag is never created, and a drifted name never resolves to the eligibility id.
-- Reads drop a tag that only shares the eligibility name.
-- `ListTags` returns the tags the token can see, with owner and read/use sharing settings. `AccountCanApply` and `OthersCanApply` judge the use settings, and the owner counts as covered. A named group counts for others only with `UsersCount >= 2`; the anonymous response recorded from a real YouTrack (`testdata/youtrack_tags_recorded.json`) omits `usersCount`, so on such a response only the All Users group counts. This fails closed. The link step uses these to refuse a link (M4).
+- The eligibility tag is chosen by id. Its name resolves to the stored id whoever owns the tag, for reads and for writes. A rename in YouTrack changes nothing for a caller: no request carries a tag name (intake lists the tag's issues by id, below), and reads report the tag under the stored name.
+- Any other name resolves only to a tag owned by the connection's account, which the driver learns from `users/me`. A missing one is created, owned by that account, with the eligibility tag's sharing settings plus that tag's owner as a named user. The eligibility tag is never created, and a drifted name never resolves to the eligibility id.
+- Reads follow the same rules as writes: an issue's labels and label events report the eligibility tag and account-owned tags whose name differs from the stored eligibility name. They leave out all other tags, including an account-owned tag that shares the eligibility name.
+- `ListTags` returns the tags the token can see, with owner and read/use sharing settings. `AccountCanApply` and `OthersCanApply` judge the use settings, and the owner counts as covered. A named group counts for others only with `UsersCount >= 2`; the anonymous response recorded from a real YouTrack (`testdata/youtrack_tags_recorded.json`) omits `usersCount`, so on such a response only the All Users group counts. This fails closed. The link step uses these to refuse a link (M4). Both are facts about tag sharing only: they do not prove that anyone can edit issues in the linked project, which uzi does not read. That is a limitation the admin confirms at link time.
 - Intake lists the eligibility tag's issues by id (`GET /api/tags/{id}/issues`), filtered on the client by the stored tag id, and `ListLabels` returns only the tags the driver can use: the stored eligibility name plus tags the connection's account owns.
+
+Port note (2026-11-17): M4 was rebased onto the final M3. Of the M3 review changes only two are replaced, both by the maintainer's M4 preconditions: the driver does not read the eligibility tag's live name for a server query (intake lists the tag's issues by id), and `ListLabels` returns only the usable tags. The rest of the review stands, including the token-holding account refusal, the context-path base URL refusal, the owner added to a created tag's sharing and label reads that follow the write rules. The PRD Decision Log entry of the same date has the detail.
 
 ## Invariants a future change must keep
 

@@ -356,8 +356,10 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	// PRD #1429 M2 (D4): claim assembly is HARNESS-AUTHORITATIVE — the Codex/Claude split is
 	// decided HERE, BEFORE the Anthropic credential ladder, not after the payload is built. A
 	// Codex run NEVER traverses the ladder: claimSecretID / openWithAutoRetry / recordRunCredential
-	// are skipped, so it opens no Anthropic credential, writes no run_credential_epochs Anthropic
-	// row, and carries no anthropic_oauth_token (anthropic stays nil → AnthropicOAuthToken == "").
+	// are skipped, so it opens no Anthropic credential, never calls SetRunAnthropicSecret and carries
+	// no anthropic_oauth_token (anthropic stays nil → AnthropicOAuthToken == ""). Its credential
+	// epoch (the bound Codex secret, select_reason codex_binding) is journaled by recordCodexEpoch
+	// once the Codex secrets below are attached (issue #4201).
 	// Its Codex secrets are attached just below, in the harnessCodex block after the payload
 	// literal. A Claude run keeps the exact existing ladder — byte-identical.
 	var anthropic []byte
@@ -442,10 +444,19 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		// records the existing visible fallback note and falls back to the lane, or the harness
 		// default when that lane is unset or dropped.
 		leadSettings = resolveLeadSettings(LeadSettingsInput{
-			Harness:   harness,
-			RunModel:  run.Model,
-			LaneModel: laneModel,
+			Harness:         harness,
+			RunModel:        run.Model,
+			RunModelSource:  run.ModelSource,
+			RunEffort:       run.Effort,
+			RunEffortSource: run.EffortSource,
+			LaneModel:       laneModel,
 		})
+		// PRD #3250: a run_override model or effort the claim cannot honor parks the run (never a
+		// fallback). Checked before any fallback note, the custom-Codex capability re-check and the
+		// late effort read, so a held run writes no harness_model_fallback line.
+		if u := leadSettings.Unhonorable; u != nil {
+			return nil, &runOverrideUnavailableError{Setting: u.Setting, Value: u.Value, Harness: u.Harness}
+		}
 		leadResolved = true
 		defaultModel = leadSettings.Model
 		if leadSettings.DroppedLaneModel.Valid {
@@ -478,9 +489,10 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	// The run owner's per-user default reasoning effort (PRD #617). NULL now
 	// resolves to the uzi default `medium` at this sink (via resolveHarnessEffortPtr /
 	// agenttmpl.ResolveHarnessEffort, issue #1157); an explicit level is carried and
-	// the owner's `runtime` choice (PRD #3247) yields no default_effort at all. Unlike
-	// DefaultModel there is no per-schedule freeze — the owner's per-user value is the
-	// only source, except for a checker child, which carries its frozen cross-check
+	// the owner's `runtime` choice (PRD #3247) yields no default_effort at all. A start-time
+	// run_override effort frozen onto the run (runs.effort, PRD #3250) wins over the owner's value
+	// through leadEffortFor; otherwise the owner's per-user value is the only source, except for a
+	// checker child, which carries its frozen cross-check
 	// resolution (an unpinned checker is CrossCheckDefaultEffort). That checker effort
 	// is always a canonical level (validated pin or high), never `runtime`, so it
 	// passes through resolveHarnessEffortPtr unchanged and the worker's ordinary
@@ -496,12 +508,22 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	}
 	// PRD #3244: the effort column is read here, after the model block and its notes (statement
 	// order unchanged), so the effort half of the lead settings is completed now. A lead-lane claim
-	// ships resolveLeadEffort's value as DefaultEffort (nil for the owner's runtime default), so the
-	// value and its source come from one agenttmpl.ResolveHarnessEffort call.
+	// ships leadEffortFor's value as DefaultEffort (nil for the owner's runtime default), so the
+	// value and its source come from one resolver.
 	var defaultModelSource, defaultEffortSource *string
 	shippedEffort := resolveHarnessEffortPtr(harness, defaultEffort)
+	if checkerResolution == nil {
+		// PRD #3250: a frozen run_override effort ships on every non-checker claim, including the
+		// lanes the lead block skips (a Codex review). An out-of-set one parks here, before any
+		// payload exists; the lead block above already caught it for the lanes it covers.
+		eff, _, bad := leadEffortFor(harness, run.Effort, run.EffortSource, defaultEffort)
+		if bad {
+			return nil, &runOverrideUnavailableError{Setting: "effort", Value: run.Effort.String, Harness: harness}
+		}
+		shippedEffort = eff
+	}
 	if leadResolved && leadcfg.LeadLane(run.Kind, run.ReviewTargetRunID.Valid, run.EgressProfileID.Valid) {
-		leadSettings.Effort, leadSettings.EffortSource = resolveLeadEffort(harness, defaultEffort)
+		leadSettings.Effort, leadSettings.EffortSource, _ = leadEffortFor(harness, run.Effort, run.EffortSource, defaultEffort)
 		shippedEffort = leadSettings.Effort
 		es := string(leadSettings.EffortSource)
 		defaultEffortSource = &es
@@ -1028,6 +1050,9 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 			return nil, fmt.Errorf("%w: %w", errCredentialUnavailable, err)
 		}
 		payload.Secrets.Codex = codex
+		// Issue #4201: journal the Codex binding this claim spends as the generation's epoch row,
+		// so a run's credential history is complete for both harnesses.
+		s.recordCodexEpoch(ctx, run)
 	}
 
 	// PRD #1798 D9: the existing PR's description record, for a PR-producing run whose PR
@@ -1436,6 +1461,40 @@ func (s *Service) resolveClaimSummaryModel(ctx context.Context, run store.Run) *
 	}
 	m := agenttmpl.ResolveSummaryModel(string(harness), user, instance).Model
 	return &m
+}
+
+// selectReasonCodexBinding is the run_credential_epochs.select_reason of a Codex claim: the run's
+// frozen Codex binding, never a ladder pick.
+const selectReasonCodexBinding = "codex_binding"
+
+// recordCodexEpoch journals the Codex claim's credential epoch (issue #4201): the bound Codex secret
+// id, its label and select_reason codex_binding, keyed by the claim generation. It uses
+// RecordCodexCredentialEpoch, not the Claude pair, so it never touches runs.anthropic_secret_id and
+// never settles a Claude switch stamp. Idempotent on (run, generation), so a re-assembled claim
+// writes nothing new. Best effort: the journal is attribution history, and the capability the claim
+// already minted must not be orphaned by a failure to record it, so an error is logged and the claim
+// proceeds.
+func (s *Service) recordCodexEpoch(ctx context.Context, run store.Run) {
+	var secretID pgtype.UUID
+	var label string
+	if run.CodexSecretID.Valid {
+		secretID = run.CodexSecretID
+		meta, err := s.q.GetUserSecretMetaByID(ctx, store.GetUserSecretMetaByIDParams{ID: uuid.UUID(run.CodexSecretID.Bytes), UserID: run.UserID})
+		if err == nil {
+			label = meta.Label
+		} else if !errors.Is(err, pgx.ErrNoRows) {
+			slog.Warn("workersvc: codex credential epoch label lookup failed", "run_id", run.ID.String(), "error", err)
+		}
+	}
+	if err := s.q.RecordCodexCredentialEpoch(ctx, store.RecordCodexCredentialEpochParams{
+		RunID:           run.ID,
+		ClaimGeneration: run.ClaimGeneration,
+		SecretID:        secretID,
+		Label:           pgconv.TextOrNull(label),
+		SelectReason:    pgconv.TextOrNull(selectReasonCodexBinding),
+	}); err != nil {
+		slog.Warn("workersvc: codex credential epoch not recorded", "run_id", run.ID.String(), "generation", run.ClaimGeneration, "error", err)
+	}
 }
 
 // linkedIssueKey is the issue tracker key (PRD #4173) of an issue run on a linked

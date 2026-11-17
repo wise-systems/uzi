@@ -34,13 +34,13 @@ func TestFakeReviewTriState(t *testing.T) {
 		"judged":   {Verdict: "good"},
 		"unjudged": nil,
 	}}
-	if rv, _, err := f.RunReview(context.Background(), "judged"); err != nil || rv == nil {
+	if rv, _, _, err := f.RunReview(context.Background(), "judged"); err != nil || rv == nil {
 		t.Fatalf("judged: rv=%v err=%v", rv, err)
 	}
-	if rv, _, err := f.RunReview(context.Background(), "unjudged"); err != nil || rv != nil {
+	if rv, _, _, err := f.RunReview(context.Background(), "unjudged"); err != nil || rv != nil {
 		t.Fatalf("unjudged: want (nil,nil), got rv=%v err=%v", rv, err)
 	}
-	if _, _, err := f.RunReview(context.Background(), "absent"); ExitCodeFor(err) != ExitNotFound {
+	if _, _, _, err := f.RunReview(context.Background(), "absent"); ExitCodeFor(err) != ExitNotFound {
 		t.Fatalf("absent: exit = %d, want %d", ExitCodeFor(err), ExitNotFound)
 	}
 }
@@ -61,21 +61,21 @@ func TestFakePendingJudgeIsIndependentOfReview(t *testing.T) {
 			"rejudge": {State: "running"},
 		},
 	}
-	rv, pj, err := f.RunReview(context.Background(), "pending")
+	rv, pj, _, err := f.RunReview(context.Background(), "pending")
 	if err != nil || rv != nil || pj == nil || pj.State != "scheduled" {
 		t.Fatalf("pending: want (nil, scheduled, nil), got rv=%v pj=%+v err=%v", rv, pj, err)
 	}
-	if rv, pj, err := f.RunReview(context.Background(), "unjudged"); err != nil || rv != nil || pj != nil {
+	if rv, pj, _, err := f.RunReview(context.Background(), "unjudged"); err != nil || rv != nil || pj != nil {
 		t.Fatalf("unjudged: want (nil,nil,nil), got rv=%v pj=%+v err=%v", rv, pj, err)
 	}
-	rv, pj, err = f.RunReview(context.Background(), "rejudge")
+	rv, pj, _, err = f.RunReview(context.Background(), "rejudge")
 	if err != nil || rv == nil || pj == nil || pj.State != "running" {
 		t.Fatalf("rejudge: want (review, running, nil), got rv=%v pj=%+v err=%v", rv, pj, err)
 	}
 	// A pending judge does NOT rescue an absent Reviews key: only that map decides
 	// found-vs-404, exactly as before this field existed.
 	f.PendingJudges["absent"] = &apitypes.PendingJudgeDTO{State: "running"}
-	if _, _, err := f.RunReview(context.Background(), "absent"); ExitCodeFor(err) != ExitNotFound {
+	if _, _, _, err := f.RunReview(context.Background(), "absent"); ExitCodeFor(err) != ExitNotFound {
 		t.Fatalf("absent: exit = %d, want %d", ExitCodeFor(err), ExitNotFound)
 	}
 }
@@ -392,7 +392,7 @@ func TestHTTPClientReviewNull(t *testing.T) {
 		_, _ = w.Write([]byte(`{"review":null}`))
 	}))
 	defer srv.Close()
-	rv, pj, err := newTestClient(srv).RunReview(context.Background(), "r1")
+	rv, pj, _, err := newTestClient(srv).RunReview(context.Background(), "r1")
 	if err != nil || rv != nil || pj != nil {
 		t.Fatalf("null review: want (nil,nil,nil), got rv=%v pj=%v err=%v", rv, pj, err)
 	}
@@ -403,7 +403,7 @@ func TestHTTPClientReviewPresent(t *testing.T) {
 		_, _ = w.Write([]byte(`{"review":{"id":"rv1","verdict":"needs_work","status":"failed"}}`))
 	}))
 	defer srv.Close()
-	rv, _, err := newTestClient(srv).RunReview(context.Background(), "r1")
+	rv, _, _, err := newTestClient(srv).RunReview(context.Background(), "r1")
 	if err != nil || rv == nil || rv.Verdict != "needs_work" || rv.Status != "failed" {
 		t.Fatalf("present review: rv=%+v err=%v", rv, err)
 	}
@@ -432,7 +432,7 @@ func TestHTTPClientReviewPendingJudge(t *testing.T) {
 				_, _ = w.Write([]byte(tc.body))
 			}))
 			defer srv.Close()
-			rv, pj, err := newTestClient(srv).RunReview(context.Background(), "r1")
+			rv, pj, _, err := newTestClient(srv).RunReview(context.Background(), "r1")
 			if err != nil {
 				t.Fatalf("err = %v", err)
 			}
@@ -458,6 +458,25 @@ func TestHTTPClientReviewPendingJudge(t *testing.T) {
 	}
 }
 
+// The envelope's "skip" key (issue #3257) decodes into the third return value; a mistagged
+// field would silently drop it and the CLI would print "not judged".
+func TestHTTPClientReviewSkip(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"review":null,"pending_judge":null,"skip":{"harness":"codex","reason":"no_usable_credential","at":"2026-11-10T23:30:00Z"}}`))
+	}))
+	defer srv.Close()
+	rv, pj, skip, err := newTestClient(srv).RunReview(context.Background(), "r1")
+	if err != nil || rv != nil || pj != nil {
+		t.Fatalf("rv=%v pj=%v err=%v, want (nil, nil, skip, nil)", rv, pj, err)
+	}
+	if skip == nil {
+		t.Fatal("skip = nil, want the decoded skip")
+	}
+	if skip.Harness != "codex" || skip.Reason != "no_usable_credential" || !skip.At.Equal(time.Date(2026, 11, 10, 23, 30, 0, 0, time.UTC)) {
+		t.Fatalf("skip = %+v", skip)
+	}
+}
+
 // A real 404 (run absent or not visible) is exit 4 — reserved, distinct from the
 // null-review exit-0 path above.
 func TestHTTPClientReview404(t *testing.T) {
@@ -466,7 +485,7 @@ func TestHTTPClientReview404(t *testing.T) {
 		_, _ = w.Write([]byte(`{"error":"run not found"}`))
 	}))
 	defer srv.Close()
-	_, _, err := newTestClient(srv).RunReview(context.Background(), "r1")
+	_, _, _, err := newTestClient(srv).RunReview(context.Background(), "r1")
 	if ExitCodeFor(err) != ExitNotFound {
 		t.Fatalf("exit = %d, want %d", ExitCodeFor(err), ExitNotFound)
 	}
@@ -881,7 +900,7 @@ func TestHTTPClientOnlyReturnsExitError(t *testing.T) {
 		{"list-runs", func(c *HTTPClient) error { _, e := c.ListRuns(context.Background()); return e }},
 		{"get-run", func(c *HTTPClient) error { _, e := c.GetRun(context.Background(), "r1"); return e }},
 		{"run-logs", func(c *HTTPClient) error { _, e := c.RunLogs(context.Background(), "r1", 0); return e }},
-		{"run-review", func(c *HTTPClient) error { _, _, e := c.RunReview(context.Background(), "r1"); return e }},
+		{"run-review", func(c *HTTPClient) error { _, _, _, e := c.RunReview(context.Background(), "r1"); return e }},
 		{"run-inputs", func(c *HTTPClient) error { _, e := c.RunInputs(context.Background(), "r1"); return e }},
 		{"list-workers", func(c *HTTPClient) error { _, e := c.ListWorkers(context.Background()); return e }},
 		{"list-repos", func(c *HTTPClient) error { _, e := c.ListRepos(context.Background()); return e }},
@@ -899,7 +918,7 @@ func TestHTTPClientOnlyReturnsExitError(t *testing.T) {
 		{"start-cli-auth", func(c *HTTPClient) error { _, e := c.StartCLIAuth(context.Background(), "ch", "desc"); return e }},
 		{"poll-cli-auth", func(c *HTTPClient) error { _, e := c.PollCLIAuth(context.Background(), "req", "ver"); return e }},
 		{"create-run", func(c *HTTPClient) error {
-			_, e := c.CreateRun(context.Background(), "p1", 7, nil, nil, false, nil, "", nil, "")
+			_, e := c.CreateRun(context.Background(), "p1", 7, nil, nil, false, nil, "", nil, "", "", "")
 			return e
 		}},
 		{"submit-run-input", func(c *HTTPClient) error {
@@ -1052,7 +1071,7 @@ func TestCreateRunWireBodyOmitsAbsentWaitOnLimit(t *testing.T) {
 			}))
 			defer srv.Close()
 
-			if _, err := newTestClient(srv).CreateRun(context.Background(), "p1", 42, tc.in, nil, false, nil, "", nil, ""); err != nil {
+			if _, err := newTestClient(srv).CreateRun(context.Background(), "p1", 42, tc.in, nil, false, nil, "", nil, "", "", ""); err != nil {
 				t.Fatalf("CreateRun: %v", err)
 			}
 			if !strings.Contains(body, `"issue_iid":42`) {
@@ -1100,7 +1119,7 @@ func TestCreateRunWireBodyMrRework(t *testing.T) {
 			}))
 			defer srv.Close()
 
-			if _, err := newTestClient(srv).CreateRun(context.Background(), "p1", 42, nil, tc.in, false, nil, "", nil, ""); err != nil {
+			if _, err := newTestClient(srv).CreateRun(context.Background(), "p1", 42, nil, tc.in, false, nil, "", nil, "", "", ""); err != nil {
 				t.Fatalf("CreateRun: %v", err)
 			}
 			if got := strings.Contains(body, "mr_rework_enabled"); got != tc.wantPresent {
@@ -1148,7 +1167,7 @@ func TestCreateRunWireBodyCredentialOverride(t *testing.T) {
 			}))
 			defer srv.Close()
 
-			if _, err := newTestClient(srv).CreateRun(context.Background(), "p1", 42, nil, nil, false, nil, "", tc.in, ""); err != nil {
+			if _, err := newTestClient(srv).CreateRun(context.Background(), "p1", 42, nil, nil, false, nil, "", tc.in, "", "", ""); err != nil {
 				t.Fatalf("CreateRun: %v", err)
 			}
 			if got := strings.Contains(body, "credential_override"); got == tc.wantAbsent {
@@ -1252,7 +1271,7 @@ func TestCreateRunWireBodyForce(t *testing.T) {
 			}))
 			defer srv.Close()
 
-			if _, err := newTestClient(srv).CreateRun(context.Background(), "p1", 42, nil, nil, tc.in, nil, "", nil, ""); err != nil {
+			if _, err := newTestClient(srv).CreateRun(context.Background(), "p1", 42, nil, nil, tc.in, nil, "", nil, "", "", ""); err != nil {
 				t.Fatalf("CreateRun: %v", err)
 			}
 			if got := strings.Contains(body, "force"); got != tc.wantPresent {
@@ -1546,7 +1565,7 @@ func TestCreateRunWireBodySeededPlan(t *testing.T) {
 			}))
 			defer srv.Close()
 
-			if _, err := newTestClient(srv).CreateRun(context.Background(), "p1", 42, nil, nil, false, tc.seed, tc.agentSource, nil, ""); err != nil {
+			if _, err := newTestClient(srv).CreateRun(context.Background(), "p1", 42, nil, nil, false, tc.seed, tc.agentSource, nil, "", "", ""); err != nil {
 				t.Fatalf("CreateRun: %v", err)
 			}
 			for _, want := range tc.wantContains {

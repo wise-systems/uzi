@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"strconv"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -442,8 +443,14 @@ type RenderConfig struct {
 	// gets UZI_EPOCH_RECLAIM_DELETION=1. Empty means off. The env is omitted, never
 	// rendered as "0", so every unselected template stays byte-identical.
 	EpochReclaimDeletionCanaryID string
-	RollConcurrency              int
-	RollTargetVersion            string
+	// EpochScratchDeletion enables scratch cleanup for persistent DinD workers.
+	EpochScratchDeletion bool
+	// RetireScratchOutcomesDisabled renders UZI_RETIRE_SCRATCH_OUTCOMES=0 into every
+	// worker pod. Negative on purpose: the zero value keeps the default (records on)
+	// and leaves existing templates byte-identical.
+	RetireScratchOutcomesDisabled bool
+	RollConcurrency               int
+	RollTargetVersion             string
 	// Namespace is the dedicated worker namespace: it contains nothing but hosted
 	// workers, which is what bounds a compromised controller.
 	Namespace string
@@ -531,6 +538,13 @@ type RenderConfig struct {
 	// so one knob governs every automatic reclaim. Docker-only, so it never touches a
 	// plain worker's spec/hash.
 	DinDPruneEnabled bool
+	// DinDBuilderPruneEnabled gates the pressure-only builder-cache prune leg (issue #4291).
+	// Rendered as UZI_DIND_BUILDER_PRUNE_ENABLED on docker workers only — "true" iff this
+	// is set AND the worker is not ephemeral, else "false". Rendered independently of
+	// DinDPruneEnabled: the agent ANDs the two, so the master still disables this leg.
+	// Wired from UZI_WORKER_DIND_BUILDER_PRUNE_ENABLED. Docker-only, so it never touches a
+	// plain worker's spec/hash.
+	DinDBuilderPruneEnabled bool
 	// ServiceAccountName is the workers' own zero-permission SA. It carries the
 	// imagePullSecrets (so the controller need not know about Harbor) and its token is
 	// never automounted.
@@ -554,6 +568,11 @@ type RenderConfig struct {
 	// (json omitempty), so an install that clears it hashes exactly as before this
 	// field existed. Changing it re-hashes the template and rolls every worker.
 	NodeSelector map[string]string
+	// DeploymentLabels / DeploymentAnnotations are the operator's extra metadata on every
+	// worker Deployment's OWN metadata (never the pod template, so they move no spec
+	// hash). config refuses a label that would replace one objectLabels stamps.
+	DeploymentLabels      map[string]string
+	DeploymentAnnotations map[string]string
 	// Tolerations are rendered onto every worker pod, all three tiers. Nil renders no
 	// tolerations key (json omitempty), so an install without them hashes exactly as
 	// before this field existed. Changing them re-hashes the template and rolls.
@@ -585,6 +604,10 @@ type RenderConfig struct {
 	// controller already creates — no new RBAC verb, so Decision 1's Secrets line
 	// stays verbatim. Empty means the worker verifies against the system roots.
 	APICAPEM []byte
+	// ExtraCAPEM is the operator's extra CA bundle (UZI_WORKER_EXTRA_CA_FILE), appended
+	// after APICAPEM in the same Secret entry so a worker trusts both: Node reads one
+	// NODE_EXTRA_CA_CERTS file. Empty leaves the entry exactly APICAPEM.
+	ExtraCAPEM []byte
 	// UIDSplit opts into the Codex uid-split worker profile (PRD #1493 M1). When true the
 	// worker + seed-nix containers start as root with a short fixed capability set (see
 	// podTemplate) so the image's root entrypoint branch can establish Codex's three-identity
@@ -641,6 +664,19 @@ func (c RenderConfig) secretMountPath() string {
 func (c RenderConfig) tokenPath() string  { return c.secretMountPath() + "/" + tokenKey }
 func (c RenderConfig) caCertPath() string { return c.secretMountPath() + "/" + caCertKey }
 
+// workerCABundle is what a worker trusts beyond the system roots: the api's CA, then the
+// operator's extra CA. A PEM bundle is a plain concatenation; the newline keeps a file
+// without a trailing one from gluing two certificates' armor lines together.
+func (c RenderConfig) workerCABundle() []byte {
+	switch {
+	case len(c.ExtraCAPEM) == 0:
+		return c.APICAPEM
+	case len(c.APICAPEM) == 0:
+		return c.ExtraCAPEM
+	}
+	return append(append(append([]byte{}, c.APICAPEM...), '\n'), c.ExtraCAPEM...)
+}
+
 // fetcherCACertPath is where an isolated worker finds the fetcher CA: the join-token
 // Secret's mount, key fetcherCACertKey.
 func (c RenderConfig) fetcherCACertPath() string {
@@ -692,12 +728,13 @@ func IsOurs(labels map[string]string) (string, bool) {
 // never updated (the controller cannot read Secrets back, and delete+recreate would
 // destroy the join token — which after delivery is the only copy in existence). So
 // a CA ROOT rotation strands existing workers, and the remedy is v1's answer to
-// everything: delete + reprovision. The chart's caDuration is 5 years precisely
+// everything: delete + reprovision. The operator's extra CA (ExtraCAPEM) shares the
+// entry and the limit: adding or changing it reaches workers created afterwards. The chart's caDuration is 5 years precisely
 // because re-trusting a new root means touching every worker at once.
 func RenderSecret(cfg RenderConfig, w protocol.DesiredWorker, token string) *corev1.Secret {
 	data := map[string][]byte{tokenKey: []byte(token)}
-	if len(cfg.APICAPEM) > 0 {
-		data[caCertKey] = cfg.APICAPEM
+	if ca := cfg.workerCABundle(); len(ca) > 0 {
+		data[caCertKey] = ca
 	}
 	// The fetcher CA (PRD #1906 M5), isolated workers only. Written once at creation like
 	// the api CA, from the bundle the controller read once at boot: a rotated fetcher CA
@@ -1028,11 +1065,17 @@ func RenderDeployment(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Sp
 	tmpl.Annotations[AnnotationSpecHash] = hash
 
 	replicas := int32(1)
+	labels := maps.Clone(cfg.DeploymentLabels)
+	if labels == nil {
+		labels = map[string]string{}
+	}
+	maps.Copy(labels, objectLabels(w.ID)) // provenance always wins
 	return &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      deploymentName(w.ID),
-			Namespace: cfg.namespaceFor(w),
-			Labels:    objectLabels(w.ID),
+			Name:        deploymentName(w.ID),
+			Namespace:   cfg.namespaceFor(w),
+			Labels:      labels,
+			Annotations: maps.Clone(cfg.DeploymentAnnotations),
 		},
 		Spec: appsv1.DeploymentSpec{
 			Replicas: &replicas,
@@ -1106,17 +1149,28 @@ func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) c
 			corev1.EnvVar{Name: "WORKER_MEMORY_GUARD_MAX_INTERVENTIONS", Value: strconv.FormatInt(cfg.MemoryGuardMaxInterventions, 10)},
 		)
 	}
+	if cfg.RetireScratchOutcomesDisabled {
+		env = append(env, corev1.EnvVar{Name: "UZI_RETIRE_SCRATCH_OUTCOMES", Value: "0"})
+	}
 	if cfg.GoBuildParallelism > 0 {
 		env = append(env, corev1.EnvVar{Name: "WORKER_GO_BUILD_PARALLELISM", Value: strconv.Itoa(cfg.GoBuildParallelism)})
 	}
 	if cfg.GoMaxProcs > 0 {
 		env = append(env, corev1.EnvVar{Name: "WORKER_GO_MAXPROCS", Value: strconv.Itoa(cfg.GoMaxProcs)})
 	}
-	if len(cfg.APICAPEM) > 0 {
+	if len(cfg.workerCABundle()) > 0 {
 		// Node reads this path before startup and agent/src/client.ts uses plain fetch
-		// with no custom dispatcher, so trusting the cluster CA is pure pod spec —
-		// nothing in agent/ parses a CA today and nothing needs to.
+		// with no custom dispatcher, so trusting the cluster CA (plus any extra CA) is
+		// pure pod spec — nothing in agent/ parses a CA today and nothing needs to.
 		env = append(env, corev1.EnvVar{Name: "NODE_EXTRA_CA_CERTS", Value: cfg.caCertPath()})
+	}
+	if len(cfg.ExtraCAPEM) > 0 && (!cfg.UIDSplit || w.Isolated) {
+		// The Claude CLI's own trust (agent/src/sdk-env.ts): only when an extra CA exists,
+		// since the CLI never dials the api. Not under the uid split: the CLI then runs as
+		// `runner`, which cannot read the root:worker 0440 Secret file, and every Node
+		// process the agent starts would warn about it. An isolated lane worker never takes
+		// the split (see uidSplit below), so its CLI can read the file and gets the path.
+		env = append(env, corev1.EnvVar{Name: "UZI_CLI_CA_FILE", Value: cfg.caCertPath()})
 	}
 	if w.Isolated {
 		// The isolated lane's fetcher (PRD #1906 M5): the agent reads exactly these two
@@ -1187,6 +1241,14 @@ func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) c
 			prune = "true"
 		}
 		env = append(env, corev1.EnvVar{Name: "UZI_DIND_PRUNE_ENABLED", Value: prune})
+
+		// The builder-cache prune leg gate (issue #4291): same docker-only, always-explicit,
+		// non-ephemeral rule, rendered independently of the master above (the agent ANDs them).
+		builderPrune := "false"
+		if cfg.DinDBuilderPruneEnabled && !w.Ephemeral {
+			builderPrune = "true"
+		}
+		env = append(env, corev1.EnvVar{Name: "UZI_DIND_BUILDER_PRUNE_ENABLED", Value: builderPrune})
 	}
 
 	// The Codex command sandbox mode (PRD #1493 M1), worker container only. Normalize an
@@ -1343,6 +1405,9 @@ func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) c
 			corev1.EnvVar{Name: "UZI_POD_EPOCH_EVIDENCE_FILE", Value: podEpochMountPath + "/evidence"})
 		if cfg.PodEpochRuntime != "" {
 			env = append(env, corev1.EnvVar{Name: PodEpochRuntimeEnv, Value: cfg.PodEpochRuntime})
+		}
+		if cfg.EpochScratchDeletion && !w.Ephemeral {
+			env = append(env, corev1.EnvVar{Name: "UZI_EPOCH_SCRATCH_DELETION", Value: "1"})
 		}
 		if epochReclaimDeletionCanary(cfg, w) {
 			env = append(env, corev1.EnvVar{Name: "UZI_EPOCH_RECLAIM_DELETION", Value: "1"})

@@ -5,6 +5,7 @@ import { describe, expect, it, vi } from "vitest";
 import { aRun } from "../pages/overviewFixtures";
 import {
   crossCheckTag,
+  issueLineTag,
   issueLineModel,
   issueLineOtherRuns,
   issueLineStage,
@@ -116,6 +117,17 @@ describe("issueLineModel counts", () => {
     expect(model.captions.prNote).toBe("Not counted as active");
   });
 
+  // #4167: a newer run that saw the merge outranks an older run's stale "opened".
+  it("keeps an issue out of the PR column when only an older run still says opened", () => {
+    const old = aRun({ id: "old", status: "completed", issue_iid: 3644, mr_iid: 4100, mr_state: "opened", repo_id: "r1", finished_at: "2026-11-08T00:00:00Z" });
+    const merged = aRun({ id: "new", status: "completed", issue_iid: 3644, mr_iid: 4100, mr_state: "merged", repo_id: "r1", finished_at: "2026-11-09T00:00:00Z" });
+    const model = issueLineModel({ ownRuns: [old, merged], otherRuns: [] });
+    expect(model.prs).toEqual([]);
+    const prIds = new Set(model.prs.map((r) => r.id));
+    expect(issueLineStage(old, prIds)).toBe("none");
+    expect(issueLineStage(merged, prIds)).toBe("none");
+  });
+
   it("counts a PR for the viewer only, never another user's", () => {
     const theirs = aRun({ id: "x", status: "completed", mr_iid: 9, mr_state: "opened", owner_email: "mira@uzi.local" });
     expect(issueLineModel({ ownRuns: [], otherRuns: [theirs] }).prs).toEqual([]);
@@ -160,6 +172,23 @@ describe("issueLineModel counts", () => {
       "Lead drafting a plan",
       "Implement, review, validate",
     ]);
+  });
+
+  it("counts completion checks and rework in Building, including another user's run", () => {
+    const model = issueLineModel({
+      ownRuns: [
+        aRun({ id: "check", status: "running", completion_phase: "checking" }),
+        aRun({ id: "rework", status: "running", completion_phase: "reworking" }),
+        aRun({ id: "plain", status: "running" }),
+        aRun({ id: "blocked", status: "paused", completion_phase: "blocked" }),
+      ],
+      otherRuns: [aRun({ id: "other-check", status: "running", completion_phase: "checking", owner_email: "mira@uzi.local" })],
+    });
+    expect(model.entries.building).toHaveLength(4);
+    expect(model.entries.parked.map((e) => e.run.id)).toEqual(["blocked"]);
+    expect(model.captions.building).toBe("1 building · 2 checking completion · 1 reworking");
+    expect(issueLineModel({ ownRuns: [aRun({ status: "running", completion_phase: "checking" })], otherRuns: [] }).captions.building)
+      .toBe("1 checking completion");
   });
 });
 
@@ -418,6 +447,25 @@ describe("crossCheckTag", () => {
     });
     expect(model.onLine).toBe(0);
     expect(model.entries.other).toHaveLength(0);
+  });
+});
+
+describe("Issue work completion tags (#4283)", () => {
+  it("does not label an absent or empty phase, and leaves a blocked run in Parked", () => {
+    for (const completion_phase of [undefined, ""] as const) {
+      const run = aRun({ status: "running", completion_phase });
+      expect(issueLineTag(run, "building")).toBeNull();
+    }
+    const blocked = aRun({ status: "paused", completion_phase: "blocked" });
+    expect(issueLineStage(blocked, none)).toBe("parked");
+    expect(issueLineTag(blocked, "parked")).toBeNull();
+  });
+
+  it("leaves the plan cross-check and review-gate tags unchanged", () => {
+    const plan = aRun({ status: "running", is_planning: true, cross_check_active: "plan" });
+    expect(issueLineTag(plan, "planning")).toEqual(crossCheckTag(plan, "planning"));
+    const gate = aRun({ status: "awaiting_approval", plan_cross_check_gate_reason: "revisions_exhausted" });
+    expect(issueLineTag(gate, "review")).toEqual(crossCheckTag(gate, "review"));
   });
 });
 

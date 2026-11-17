@@ -159,8 +159,12 @@ func newRunExtendCmd(env Env, gf *globalFlags) *cobra.Command {
 			"a negative value or an unparseable one is a usage error (exit 2).\n\n" +
 			"For Iteration limit reached, Extend adds wall time only and leaves the run paused; use Resume separately.\n\n" +
 			"Valid on any non-terminal run of a kind the sweep can time out (an issue, task, prompt, " +
-			"self-improve, mr-rework or ci-fix run), including a queued or parked one. A chat, judge " +
-			"or interactive-task run never times out, so extending one is a 409 (exit 5); a request " +
+			"self-improve, mr-rework or ci-fix run), including a queued or parked one. A chat or judge run, " +
+			"or an interactive task's session, has no server wall deadline, so extending one is a 409 " +
+			"(exit 5), with one exception: the worker bounds each follow-up of an interactive task with " +
+			"its wall budget and parks a follow-up that uses it up (paused, hold reason budget_exhausted), " +
+			"and extend adds the time to such a parked task and resumes it. No server deadline is reported " +
+			"for an interactive run, so none is printed. A request " +
 			"over the per-extension maximum or past the total-time limit, or extending while the admin " +
 			"has turned extensions off, is also a 409, with the server's message printed verbatim. " +
 			"So is a --require-base run held because its kept work is not attested against the planned " +
@@ -440,8 +444,9 @@ func newRunInputsCmd(env Env, gf *globalFlags) *cobra.Command {
 		Use:   "inputs <run-id>",
 		Short: "List a run's steer queue (follow-ups) with delivery status",
 		Long: "List the steer queue sent to a run (PRD #95, #634), newest first, each with its " +
-			"KIND and state plus a relative age. Owner-only: a read-only admin token gets 404 on " +
-			"another user's run.\n\n" +
+			"KIND and state plus a relative age. Owner-only: another user's run is a 404, except " +
+			"that a live admin's admin_ro (uza_) token may read it when the server runs with " +
+			"UZI_ADMIN_RUN_DEBUG (read-only, audited).\n\n" +
 			"The queue lists two kinds. A follow-up (kind='follow_up') carries a delivery state — " +
 			"queued (the worker has not received it yet), received (the worker has it), routed " +
 			"(steering has acted on it), included in a prompt (the turn carrying it reached the model), " +
@@ -464,7 +469,7 @@ func newRunInputsCmd(env Env, gf *globalFlags) *cobra.Command {
 			}
 			list, err := c.RunInputs(cmd.Context(), args[0])
 			if err != nil {
-				return err
+				return hintOnForeignReadRefusal(env, err)
 			}
 			p := env.printer(gf)
 			if p.Format == uzicli.FormatJSON {

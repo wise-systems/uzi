@@ -95,6 +95,8 @@ var runDTOKeys = []string{
 	// PRD #122 M1: the FROZEN milestone list, always on the wire (nil ⇒ null ⇒ a run
 	// with no milestones, which is every pre-feature run).
 	"auto_approve", "plan_cross_check_required", "code_cross_check_required", "plan_cross_check_gate_reason", "plan_cross_check_diff_refusal",
+	// Issue #4345: the live presence field shared by list and detail, null when neither check runs.
+	"cross_check_active",
 	// issue #857: the run's trigger provenance (what/how/who started it), NOT NULL
 	// (DEFAULT 'manual') so always on the wire.
 	"trigger_source",
@@ -265,6 +267,9 @@ var runDTOKeys = []string{
 	// PRD #300: the per-schedule model a schedule froze onto the run at fire time (nil ⇒
 	// null ⇒ the run inherited the owner's per-user default). Always on the wire.
 	"model",
+	// PRD #3250: the start-time effort and the writers (run_override | schedule_pin) of the frozen
+	// model and effort, each nullable and always on the wire.
+	"effort", "model_source", "effort_source",
 	// PRD #305: the frozen "apply model also to agents" flag (bool NOT NULL ⇒ always
 	// present; false is the default for a run that did not opt in).
 	"override_subagent_model",
@@ -376,7 +381,7 @@ func TestRunListItemDTOTags(t *testing.T) {
 	// worker_name field shadows the embedded one (json collapses the duplicate tag to one key), so it
 	// is NOT appended here any more.
 	// is_revising moved onto RunDTO (issue #2760), so it is in runDTOKeys.
-	want := append(append([]string{}, runDTOKeys...), "judge_verdict", "judge_todo_count", "cross_check_active")
+	want := append(append([]string{}, runDTOKeys...), "judge_verdict", "judge_todo_count")
 	assertTags(t, "RunListItemDTO(no owner)", RunListItemDTO{}, want...)
 	// owner_email present when set.
 	email := "u@example.test"
@@ -801,12 +806,26 @@ func TestIncidentalFindingFileResultDTOTags(t *testing.T) {
 // The literals below are what json.Marshal actually emits: a map's keys are sorted, so
 // pending_judge precedes review regardless of the order they are written here.
 func TestReviewNullEnvelope(t *testing.T) {
-	b, err := json.Marshal(map[string]any{"review": (*ReviewDTO)(nil), "pending_judge": (*PendingJudgeDTO)(nil)})
+	b, err := json.Marshal(map[string]any{"review": (*ReviewDTO)(nil), "pending_judge": (*PendingJudgeDTO)(nil), "skip": (*JudgeSkipDTO)(nil)})
 	if err != nil {
 		t.Fatalf("marshal null review envelope: %v", err)
 	}
-	if string(b) != `{"pending_judge":null,"review":null}` {
-		t.Fatalf("null review envelope = %s, want {\"pending_judge\":null,\"review\":null}", b)
+	if string(b) != `{"pending_judge":null,"review":null,"skip":null}` {
+		t.Fatalf("null review envelope = %s, want {\"pending_judge\":null,\"review\":null,\"skip\":null}", b)
+	}
+	// The skipped-judge case (issue #3257): review and pending_judge null, skip populated with
+	// the three documented keys.
+	at := time.Date(2026, 11, 10, 9, 8, 7, 0, time.UTC)
+	b, err = json.Marshal(map[string]any{
+		"review":        (*ReviewDTO)(nil),
+		"pending_judge": (*PendingJudgeDTO)(nil),
+		"skip":          JudgeSkipDTO{Harness: "codex", Reason: "no_usable_credential", At: at},
+	})
+	if err != nil {
+		t.Fatalf("marshal skip envelope: %v", err)
+	}
+	if string(b) != `{"pending_judge":null,"review":null,"skip":{"harness":"codex","reason":"no_usable_credential","at":"2026-11-10T09:08:07Z"}}` {
+		t.Fatalf("skip envelope = %s", b)
 	}
 	// A populated review round-trips through the same envelope key, with pending_judge
 	// still present and null (the settled-verdict case).
@@ -944,6 +963,10 @@ var workerDTOKeys = []string{
 	// Issue #3142: when the api first gated this worker's run-lane claims for lost memory
 	// authority (api clock). Null when not gated; overlaid from an in-process tracker.
 	"memory_authority_lost_at",
+	// PRD #4205: worker hibernation lifecycle. hibernation_state is always present;
+	// the reason, hibernated_at, wake_requested_at and wake_error are null outside the
+	// state that sets them. Display-only for the workers UI.
+	"hibernation_state", "hibernation_reason", "hibernation_blocked_reason", "hibernation_blocked_since", "hibernation_blocked_at", "hibernated_at", "wake_requested_at", "wake_error", "hibernation_cleanup",
 }
 
 func TestWorkerDTOTags(t *testing.T) {
@@ -1203,7 +1226,7 @@ func TestUserSettingsDTOTags(t *testing.T) {
 		// PRD #2603: the per-user model-written "Now" summary switch (null ⇒ default ON).
 		"now_summary_enabled",
 		// PRD #3245: the Codex judge lane and the read-only resolved judge cells.
-		"codex_judge_model", "judge_models",
+		"codex_judge_model", "judge_models", "judge_runs_on",
 		// PRD #3248: the Codex summary lane and the read-only resolved summary cells.
 		"codex_summary_model", "summary_models",
 		// PRD #3247: the read-only resolved ordinary effort cells.
@@ -1353,6 +1376,11 @@ func TestAdminDockerAllowlistDTOTags(t *testing.T) {
 	assertTags(t, "AdminDockerAllowlistReposDTO", AdminDockerAllowlistReposDTO{}, "repos")
 }
 
+func TestAdminRepoActivityDTOTags(t *testing.T) {
+	assertTags(t, "AdminRepoActivityDTO", AdminRepoActivityDTO{}, "repos")
+	assertTags(t, "RepoActivityDTO", RepoActivityDTO{}, "id", "path_with_namespace", "enabled", "last_run_at")
+}
+
 func TestAdminBlockedReposDTOTags(t *testing.T) {
 	assertTags(t, "AdminBlockedReposDTO", AdminBlockedReposDTO{}, "repos", "checks_unknown",
 		// PRD #1432: the pending cross-user override-request queue, non-omitempty
@@ -1400,6 +1428,14 @@ func TestRecoveryArchiveSummaryDTOTags(t *testing.T) {
 		"preparing", "uploading", "available", "needs_action", "expired", "discarded")
 	assertTags(t, "RecoveryArchiveSummaryDTO", RecoveryArchiveSummaryDTO{},
 		"supported", "legacy", "has_open_hold", "counts", "archives")
+	// admin_debug_read is omitempty (issue #4198): present only on an admin run debug read.
+	assertTags(t, "RecoveryArchiveSummaryDTO(admin debug)", RecoveryArchiveSummaryDTO{AdminDebugRead: true},
+		"supported", "legacy", "has_open_hold", "counts", "archives", "admin_debug_read")
+}
+
+func TestRunInputsEnvelopeDTOTags(t *testing.T) {
+	assertTags(t, "RunInputsEnvelopeDTO", RunInputsEnvelopeDTO{}, "inputs")
+	assertTags(t, "RunInputsEnvelopeDTO(admin debug)", RunInputsEnvelopeDTO{AdminDebugRead: true}, "inputs", "admin_debug_read")
 }
 
 // The worker-facing archive RPC shapes (M3 consumes; mirrored in agent/src/protocol.ts).

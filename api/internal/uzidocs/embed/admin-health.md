@@ -6,8 +6,8 @@ audience: operator
 
 # Admin health
 
-Admin health ([PRD #1484](../prds/done/1484-admin-health-tab.md)) is a read-only,
-admin-only diagnostic of what uzi itself can tell about its own ability to run
+Admin health ([PRD #1484](../prds/done/1484-admin-health-tab.md)) is an admin-only
+diagnostic of what uzi itself can tell about its own ability to run
 work: worker rolls and capacity, the queue, the controller's own liveness,
 background loops, the database, integrations, and a handful of housekeeping
 signals. It exists because, before this, an admin had no instance-level way to
@@ -31,18 +31,22 @@ It surfaces six ways:
     default, showing a chip per check; a check that needs attention links up
     to its item, and expanding a group lists each check's own summary;
   - **Fleet, all users**: a cross-user table (owner, worker, status, version,
-    upgrade, blocking reason, last seen).
+    upgrade, blocking reason, last seen). It is read-only except for the
+    worker [hibernation](./hosted-workers.md#hibernation) controls: a
+    Hibernate button on an idle persistent hosted worker, a Wake button on a
+    hibernating, hibernated or waking one, a status chip for each of those
+    states, and the last wake failure. A refused hibernate shows its reason.
 
   The sidebar Admin nav item and the tab itself carry a count pill when
   anything needs attention, red when any check is danger and amber
   otherwise; its accessible label names each severity ("3 health checks need
   attention: 2 danger, 1 warning").
-- **Overview**, for an admin: a self-hiding card beside the custody-hold
-  alert. When every check passes it collapses to one quiet line ("System
-  health: all N checks passing"); otherwise it shows the verdict and the top
-  three attention items, including each item's evidence and docs link,
-  with one Open health link to the Health tab. It makes no request at all
-  for a non-admin.
+- **Overview**, for an admin: a health chip in the page header opens a popover.
+  When every check passes it lists them by area; otherwise it shows every
+  attention item with its evidence and docs link, plus a disclosure for passing
+  checks. The popover has an Open health link. During the short classic-Overview
+  soak, `/overview/classic` still has the older self-hiding health card beside
+  its custody alert. Neither page makes an admin-health request for a non-admin.
 - **An app-wide Danger banner**, admins only, shown while `blocking` is
   `true`. It carries the instance-blocker verdict, the first instance danger
   check's own summary, an Open health link, and **Snooze 1 h** — per admin, per danger
@@ -58,9 +62,11 @@ It surfaces six ways:
 - **One notice per admin per Danger episode**, as a Slack DM for a linked
   admin, selects checks with server-supplied `scope: instance` and severity
   `danger`. The current instance checks are `db`, `db.size`, `controller.report`,
-  `loops`, `fleet.roll`, `agentsource.update` and `pricing.codex`; the rest are
-  `owner`. `fleet.roll` remains instance infrastructure even when the hosted
-  workers belong to a single owner.
+  `loops`, `fleet.roll`, `fleet.hibernation_wake`, `fleet.hibernation_cleanup`, `fleet.hibernation`, `fleet.hibernation_retirement`, `maintenance.active`,
+  `agentsource.update` and `pricing.codex`; the rest are `owner`. `fleet.roll` remains instance infrastructure even when the hosted
+  workers belong to a single owner. Instance scope alone does not send a DM: `fleet.hibernation`,
+  `fleet.hibernation_wake` and `fleet.hibernation_retirement` never reach `danger`,
+  so they raise no notice.
 
   Episodes follow `blocking`: the opening evaluation sends nothing, and the
   next still-blocking evaluation claims one notice per admin. Another instance
@@ -197,6 +203,10 @@ except `forge.sync` and `issue_tracker.sync`, whose windows follow the effective
 | `fleet.rundisk` | Whether one run is close to filling its worker's data volume (PRD #1809 M6, D8) | a fresh worker's largest reported run HOME is 40%+ of the data volume's total bytes, or the volume has less than 5% of its inodes free | — | `unknown` when the largest-run-size lookup itself fails |
 | `fleet.quarantine` | Whether any worker has latched a [residue quarantine](worker-setup.md#quarantined-worker) (an unreadable, unattributed runner-uid process was found, so it claims nothing until its container restarts) | any worker with a fresh heartbeat reports a quarantine; the evidence names at most 10 workers (the summary carries the full count), each with how long ago it latched and the run that detected it (the worker's reported cause is not shown here: read `residue_quarantine_cause` in `uzi admin workers --json` or the worker view in `uzi tui`) | — | — |
 | `fleet.memory_authority` | Whether any worker has lost [memory authority](worker-setup.md#lost-memory-authority) (the api withholds guard-bound runs from it until its container restarts) | any worker with a fresh heartbeat has a gated claim recorded; the evidence names at most 10 workers (the summary carries the full count), each with how long ago it was first gated | — | — |
+| `fleet.hibernation_wake` | Whether a [hibernated worker's wake](hosted-workers.md#hibernation) failed or is not confirmed (scope `instance`) | a wake failed, or is not confirmed within 15 minutes; the evidence names at most 10 workers (the first evidence row, `Workers`, carries the full count) | — | `na` when no hosted workers are configured |
+| `fleet.hibernation_cleanup` | Whether a [hibernating worker's cache cleanup](hosted-workers.md#cache-cleanup-before-sleep) has an unknown settlement, which keeps the worker's claims fenced (scope `instance`) | — | any attempt's settlement is unknown; it stays until the same attempt reports or the controller observes its pod stopped, and blocks the worker's delete | `na` when no hosted workers are configured |
+| `fleet.hibernation` | Idle persistent hosted workers that [automatic hibernation](hosted-workers.md#automatic-hibernation) could not hibernate, and workers kept awake only by long-parked runs (title "Automatic hibernation", scope `instance`); the evidence is an exact "Workers" count, then up to 50 worker lines in total, idle workers first and then parked ones, such as `worker <name> idle 20d, hibernation blocked: recovery custody hold`, `worker <name> idle 20d, hibernation blocked: controller refused (roll reservation)` or `worker <name> blocked: assigned run parked (<run id prefix>, paused)`, and a "More" line when more than 50 match | an idle persistent hosted worker past `worker_hibernation_idle_after` has a recorded hibernation refusal (custody hold, manual cordon, maintenance, image roll, draining, intake fenced, a queued run waking it, controller not advertising hibernation, no pod identity, controller refused; for controller refused the evidence names the controller's reason as `controller refused (<label>)`, one of roll reservation, roll blocked, disk pressure, DinD maintenance, busy, layout migration held, roll evidence unavailable or roll cohort cleanup pending, and an unknown code shows sanitized and cut to at most 20 bytes; see [Diagnosing a blocked hibernation or a stuck roll](hosted-workers.md#diagnosing-a-blocked-hibernation-or-a-stuck-roll)), or a worker's only assigned runs are parked (`recovery_wait`, `paused`, `limit_wait`) for longer than the threshold; it clears once the blocker is gone and the worker hibernates | — | `unknown` when the settings or the query cannot be read; `na` when no hosted workers are configured or automatic hibernation is off (`worker_hibernation_enabled` and `worker_hibernation_auto` must both be on) |
+| `fleet.hibernation_retirement` | A **dry run** of [volume retirement](hosted-workers.md#volume-retirement-dry-run-m1) for workers that have been hibernated a long time (scope `instance`). Nothing is deleted: it says which workers a later release could retire and which are blocked, and why | a worker past the 21-day (504 hour) retirement period is blocked, or more than 50 workers are hibernated so only the oldest 50 were evaluated (the summary says "evaluated 50 of N (oldest first)"); each evidence row is a short worker id with `blocked by <code> (<source>)` (a missing receipt names the retained source and the run, `<kind>:<path> run <id>`, cut to fit, so a long path can hide the run), followed by `; class policy <policy>, actual PV unverified` when the inventory recorded the claims, or, for a worker nothing blocks, a fixed sentence that it "would retire only after M2 verifies" the actual PV reclaim policy and that no pod ran between observations (flagged when the StorageClass policy is `Retain` or unknown), `not yet eligible: <time> left` (blocker and class policy appended as for a blocked worker), or `cancelled: wake requested`; at most 10 rows, blocked workers first | — | `na` when no worker is hibernated or waking; `unknown` when the evaluation itself fails |
 
 `fleet.quarantine` reads the worker's own heartbeat report, which the api keeps in
 memory only. A worker without a fresh heartbeat is skipped (`fleet.capacity`
@@ -270,6 +280,22 @@ neither sends a run-health nudge, contributes to `queue.waiting` or `fleet.capac
 nor triggers ordinary ephemeral capacity provisioning. Adding capacity or expediting
 the run does not bypass the hold. Moving between these two reasons keeps the expected
 wait episode; leaving both for a genuine wait restamps `health_since`.
+
+For a regular-intake continuation whose assigned worker lacks
+`repo_agent_source_v1`, either hold instead ends with
+"; assigned worker also lacks repo_agent_source_v1 required by this continuation".
+This suffix keeps the expected-wait classification and suppresses nudges; it does
+not predict placement after the deadline. After the hold, health diagnoses current
+prerequisites first, then fleet capability absence and the assigned dependency.
+At the final dependency fallback, "compatible worker currently unavailable" needs
+both a confirmed online source-capable peer and zero claimable workers in composed
+eligibility. A free peer is not a promise of claimability.
+
+The upgrade blocker diagnostic intentionally has broader scope than run health:
+for any queued assigned run, a source requirement **or** a recorded source commit
+plus an assigned worker missing the capability is an independent fact, including
+generation zero and cross-check or egress lanes. Stronger health reasons may take
+precedence without removing that upgrade fact.
 
 A running lead awaiting a required code cross-check also uses `waiting_worker`,
 with the reason "waiting until <UTC deadline> for code cross-check". The deadline
@@ -512,7 +538,7 @@ class:
 | `schedules.paused` | A user with a [pause-all](scheduling.md#pausing-everything-at-once) in force while still owning enabled schedules — their labelled issues look queued but will not fire | any such user | — | — |
 | `maintenance.active` | [Instance maintenance mode](instance-maintenance.md) is on: new runs wait in the queue. Carries the start time, reason and readout counts (active, held, custody). Liveness and readiness are unaffected | while on | — | `unknown` when the state cannot be read. A missing state row reads as paused, so the check warns |
 | `board.drift` | A board column move given up (stuck pending past the give-up boundary) on a run that has an issue, in the last 24 hours | any given-up move | — | — |
-| `custody.holds` | An owner at the [recovery custody admission limit](run-recovery.md) | any owner at the limit | — | `unknown` when the `custody_hold_limit` setting cannot be read; `na` only when the health service has no settings wired |
+| `custody.holds` | An owner at the [recovery custody admission limit](run-recovery.md), counted in admission units (a run's generations on one original worker are one unit) | any owner at the limit | — | `unknown` when the `custody_hold_limit` setting cannot be read; `na` only when the health service has no settings wired |
 | `recovery.storage` | Logical recovery/shared byte-budget pressure and current persisted quota-refused recovery captures; [diagnosis](./recovery-storage-diagnosis.md) | any enabled byte budget at 80% or more, or any matching refusal marker | — | `unknown` when the read fails, the aggregate is missing or the four-second deadline is reached |
 | `release.check` | Whether this instance is far behind the latest release, per the same derivation [Update checks](updates.md) uses | far behind | — | `na` when the upstream release check is disabled |
 | `agentsource.update` | Persisted [agent-source discovery](agent-source.md#update-checks-and-the-update-badge), compared with the current pin and last-applied SHA | newer semver tag or tracked branch moved | — | `na` when disabled, unconfigured or SHA-pinned; `unknown` before a recorded check or on a settings read failure |

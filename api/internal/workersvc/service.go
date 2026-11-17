@@ -600,6 +600,7 @@ type Store interface {
 	// view once per run row.
 	ListRunUsageTotalsForRuns(ctx context.Context, runIds []uuid.UUID) ([]store.RunUsageTotal, error)
 	ListActiveRunsAll(ctx context.Context, backgroundGraceCutoff pgtype.Timestamptz) ([]store.ListActiveRunsAllRow, error)
+	ListRunsAdminDebug(ctx context.Context, arg store.ListRunsAdminDebugParams) ([]store.ListRunsAdminDebugRow, error)
 	ListAllWorkers(ctx context.Context) ([]store.ListAllWorkersRow, error)
 	GetRunOwnedByWorker(ctx context.Context, arg store.GetRunOwnedByWorkerParams) (store.Run, error)
 	// GetRunOwnershipByWorker is RunOwnership's read: GetRunOwnedByWorker's row plus the
@@ -747,6 +748,13 @@ type Store interface {
 	// authz, the command-not-found scan input, and the review upsert.
 	GetUserByID(ctx context.Context, id uuid.UUID) (store.User, error)
 	CreateJudgeRun(ctx context.Context, arg store.CreateJudgeRunParams) (store.Run, error)
+	// Visible judge skip (issue #3257): the creation guard (isolation, target lock, skip
+	// delete) and the skip writer/reader. See judge_skip.go.
+	CurrentTransactionIsolation(ctx context.Context) (string, error)
+	LockRunForJudge(ctx context.Context, id uuid.UUID) (uuid.UUID, error)
+	DeleteJudgeSkipForTarget(ctx context.Context, targetRunID uuid.UUID) error
+	RecordJudgeSkip(ctx context.Context, arg store.RecordJudgeSkipParams) (int64, error)
+	GetJudgeSkipForTarget(ctx context.Context, targetRunID uuid.UUID) (store.JudgeSkip, error)
 	// Per-user judge spend guards (PRD #69 M5 Decision 9, Gate 5). Read-only count
 	// queries feeding the cooldown and daily-budget backstops in maybeEnqueueJudge.
 	// LastJudgeEnqueuedAt returns a NULLABLE timestamp (NULL ⇒ user never judged).
@@ -1027,6 +1035,9 @@ type Store interface {
 	// credential_switch_unsettled behind the incarnation fence; CredentialSwitchHoldSettling is
 	// the fence ResumePausedRun refuses on, as a read.
 	HoldCredentialSwitchUnsettled(ctx context.Context, arg store.HoldCredentialSwitchUnsettledParams) (int64, error)
+	// StampWorkerCredentialSwitchApplyNonce records, at registration, that the registration with
+	// this nonce negotiated in-place credential apply (issue #4201 m3a); see applyNegotiated.
+	StampWorkerCredentialSwitchApplyNonce(ctx context.Context, arg store.StampWorkerCredentialSwitchApplyNonceParams) error
 	SettleCredentialSwitchHold(ctx context.Context, arg store.SettleCredentialSwitchHoldParams) (int64, error)
 	CredentialSwitchHoldSettling(ctx context.Context, arg store.CredentialSwitchHoldSettlingParams) (bool, error)
 	// SettleRunClarificationToGate / GetClarificationGateSettlementReplay are the issue #3985
@@ -1097,6 +1108,10 @@ type Store interface {
 	// RecordRunRegistrationEvidence (issue #3859) stores the worker's registration witness from
 	// its first running report. It runs BEFORE SetRunRunning and does not depend on that write.
 	RecordRunRegistrationEvidence(ctx context.Context, arg store.RecordRunRegistrationEvidenceParams) (int64, error)
+	// RecordRunCheckpointWithheld and ClearRunCheckpointWithheld (issue #4257) write the fenced,
+	// report_seq-ordered checkpoint-publication-withheld fact and return its ACK outcome.
+	RecordRunCheckpointWithheld(ctx context.Context, arg store.RecordRunCheckpointWithheldParams) (string, error)
+	ClearRunCheckpointWithheld(ctx context.Context, arg store.ClearRunCheckpointWithheldParams) (string, error)
 	// SweepTaskNeverDispatched terminalizes a kind='task' (handoff) run left queued with
 	// dispatched_at NULL past the dispatch grace window (issue #1367): the CLI never landed
 	// its push/dispatch, so ClaimRun never offers it and no other sweep touches it. Server-
@@ -1404,6 +1419,15 @@ type Store interface {
 	// RunCredentialEpochs service method.
 	RecordRunCredentialEpoch(ctx context.Context, arg store.RecordRunCredentialEpochParams) error
 	ListRunCredentialEpochs(ctx context.Context, arg store.ListRunCredentialEpochsParams) ([]store.RunCredentialEpoch, error)
+	// Issue #4201 (in-place credential switch): the child-epoch journal, the per-frame epoch
+	// ordinal ceiling the append path clamps against, the Codex claim's epoch row, the
+	// credential_switch_uncertain park and the per-epoch usage legs the run view telescopes.
+	GetRunCredentialSwitchEpochByOp(ctx context.Context, arg store.GetRunCredentialSwitchEpochByOpParams) (store.RunCredentialSwitchEpoch, error)
+	ListRunCredentialSwitchEpochs(ctx context.Context, arg store.ListRunCredentialSwitchEpochsParams) ([]store.RunCredentialSwitchEpoch, error)
+	ListRunUsageByCredentialEpoch(ctx context.Context, runID uuid.UUID) ([]store.ListRunUsageByCredentialEpochRow, error)
+	MaxCommittedCredentialEpochOrdinal(ctx context.Context, arg store.MaxCommittedCredentialEpochOrdinalParams) (int32, error)
+	RecordCodexCredentialEpoch(ctx context.Context, arg store.RecordCodexCredentialEpochParams) error
+	SetRunCredentialSwitchUncertainHold(ctx context.Context, arg store.SetRunCredentialSwitchUncertainHoldParams) (int64, error)
 	// SetRunCredentialOverride writes the per-run override columns for `uzi run set-token`
 	// (PRD #1247 M4, D4): the FIRST write in every writable-state branch of the verb,
 	// before the state-specific transition. Both params are nullable (inherit clears
@@ -2001,6 +2025,17 @@ type Service struct {
 	// ephemeralSettings reads the instance ephemeral-worker kill-switch for the queued reason
 	// of a profile-bound run (PRD #1906 M5). Optional (nil-safe); set via SetEphemeralSettings.
 	ephemeralSettings EphemeralSettingsReader
+	// hibernationSettings reads the worker-hibernation kill-switch (PRD #4205). Optional;
+	// set via SetHibernationSettings. Nil is "off".
+	hibernationSettings HibernationSettings
+	// hibernationAuto reads the automatic hibernation settings (issue #4207). Optional; nil
+	// disables HibernationAutoPass. autoPassMu guards lastAutoPass, the start of the last
+	// pass that ran, which paces the pass to HibernationAutoPassEvery. autoPassAfterList is a
+	// TEST-ONLY hook called after the candidate list is read and before any lock is taken.
+	hibernationAuto   HibernationAutoSettings
+	autoPassMu        sync.Mutex
+	lastAutoPass      time.Time
+	autoPassAfterList func()
 	// isolatedLaneDisabled is true when the deployment did not enable the isolated research
 	// lane (issue #1965); set via SetIsolatedLaneEnabled. Stored negated so a Service that never
 	// calls the setter (tests, other wiring) keeps the pre-#1965 queued reasons.
@@ -2016,6 +2051,14 @@ type Service struct {
 	// read and before its transaction begins. TEST-ONLY: unexported and nil in production; a test
 	// uses it to move the run in that window and prove the switch is refused.
 	beforeCredentialSwitchTx func()
+	// afterApplySecretLock runs in ApplyCredentialSwitch right after the chosen token row is
+	// share-locked, before the transaction continues. TEST-ONLY: unexported and nil in production; the
+	// rotation-race test parks the apply here while a concurrent rotation tries to take the row.
+	afterApplySecretLock func()
+	// beforeApplySecretLock runs in ApplyCredentialSwitch right before the chosen token row is
+	// share-locked (NOWAIT), once per attempt. TEST-ONLY: unexported and nil in production; the
+	// busy-row tests hold or release a competing lock here.
+	beforeApplySecretLock func()
 	// leaseClaimProbe, when set by a test, is told the outcome of every claim that ran through a
 	// lease: whether ClaimRun admitted a run through it and whether the rebind applied. TEST-ONLY:
 	// nil in production.
@@ -2089,20 +2132,26 @@ type Service struct {
 	// heldPrepareFn / heldSendFn / heldListFn are step A's broker seams (issue #2545): the
 	// read-only pack pre-verify, the single create-only push and the reconcile listing. They
 	// default to pushbroker.PrepareHeldPack, SendHeldCreate and ListRefTips (set in New); tests
-	// stub them with a fake forge. heldSlots is the process-wide step-A semaphore.
+	// stub them with a fake forge. heldSlots is the shared publication semaphore;
+	// heldSlotsMu protects each worker reservation together with its global slot.
 	// heldOutcomeHook, when set, runs inside tx2 before its commit (fault injection).
 	heldPrepareFn      func(ctx context.Context, o pushbroker.HeldPackOptions) (*pushbroker.PreparedHeldPack, error)
 	heldSendFn         func(ctx context.Context, p *pushbroker.PreparedHeldPack) (pushbroker.HeldCreateOutcome, error)
 	heldListFn         func(ctx context.Context, o pushbroker.ListRefsOptions, refs ...string) (map[string]string, error)
 	prerequisite       *prerequisiteRuntime
 	heldSlots          chan struct{}
+	heldSlotsMu        sync.Mutex
+	heldSlotWorkers    map[uuid.UUID]struct{}
 	heldBeforeSendHook func()
 	heldOutcomeHook    func() error
 	// heldDeleteFn is the held cleanup's CAS delete (default pushbroker.Delete); heldCleanupHook,
 	// when set, runs inside the cleanup transaction after the run lock and before any forge call
 	// (test fault injection). Both belong to SweepHeldPublications (held_cleanup.go).
-	heldDeleteFn       func(ctx context.Context, o pushbroker.DeleteOptions) error
-	heldCleanupHook    func(stage string)
+	heldDeleteFn    func(ctx context.Context, o pushbroker.DeleteOptions) error
+	heldCleanupHook func(stage string)
+	// terminal holds the terminal-preservation route's broker seams and fault-injection points
+	// (terminal_preservation.go); its zero value uses the pushbroker functions.
+	terminal           terminalHooks
 	salvageLeadPending bool
 	// createRefFn is the go-git recovery-ref CREATOR (PRD #1810 M3, D2): supersession preserves
 	// a retained checkpoint tip under refs/uzi-recovery/<run id> before freeing the branch ref.
@@ -2165,6 +2214,12 @@ type Service struct {
 	codexSelectHook            func(ctx context.Context)
 	codexSelectLockedHook      func(ctx context.Context)
 	codexSelectBeforeFenceHook func(ctx context.Context, picked uuid.UUID)
+	// judgeBeforeLockHook / judgeAfterInsertHook are test seams in the judge insert closures
+	// (issue #3257): the first runs in the creating transaction after the isolation check and
+	// before the target lock, the second after the judge INSERT and before the commit. Nil in
+	// production.
+	judgeBeforeLockHook  func(ctx context.Context)
+	judgeAfterInsertHook func(ctx context.Context)
 	// claimHooks are the run-lane claim race seams (PRD #1590 M1): a LiveDB test injects a
 	// concurrent account or claim mutation between ClaimRun and assembly, after the Codex mint,
 	// or between assembly and the final exact-claim transaction. Nil in production, so every
@@ -2459,6 +2514,7 @@ func New(q Store, box *secretbox.Box, p Params) *Service {
 		heldListFn:           pushbroker.ListRefTips,
 		heldDeleteFn:         pushbroker.Delete,
 		heldSlots:            make(chan struct{}, heldPublishMaxConcurrent),
+		heldSlotWorkers:      make(map[uuid.UUID]struct{}, heldPublishMaxConcurrent),
 		prerequisite:         newPrerequisiteRuntime(),
 		createRefFn:          pushbroker.CreateRef,
 		listRefTipsFn:        pushbroker.ListRefTips,
@@ -2653,6 +2709,9 @@ func (s *Service) RegisterWithCrossCheckSlots(ctx context.Context, wkr store.Wor
 		if err != nil {
 			return store.Worker{}, "", err
 		}
+		if row.CredentialSwitchApplyNonce, err = s.stampApplyNonce(ctx, s.q, wkr.ID, protocolCaps, nonce); err != nil {
+			return store.Worker{}, "", err
+		}
 		// The snapshot is never persisted here, but a valid finalize list still applies via s.q.
 		if err := runAttested(s.q); err != nil {
 			return store.Worker{}, "", err
@@ -2704,6 +2763,24 @@ func (s *Service) RegisterWithCrossCheckSlots(ctx context.Context, wkr store.Wor
 	row, err := qtx.RegisterWorker(ctx, regParams)
 	if err != nil {
 		return store.Worker{}, "", err
+	}
+	if row.CredentialSwitchApplyNonce, err = s.stampApplyNonce(ctx, qtx, wkr.ID, protocolCaps, nonce); err != nil {
+		return store.Worker{}, "", err
+	}
+	// PRD #4205: a Register against a waking worker is settlement evidence; against a
+	// preparing worker it retargets the admission pod. Both are recorded in this same
+	// transaction under the row lock taken above.
+	if prior.HibernationState == "waking" || prior.HibernationState == "preparing" {
+		if err := s.settleRegisteredWaking(ctx, qtx, store.Worker(row), registeredPodUID); err != nil {
+			return store.Worker{}, "", err
+		}
+	}
+	// PRD #4208 M1: a Register is also evidence against a bound volume inventory (another pod, or
+	// the same pod's process restarting), under the same row lock.
+	if prior.HibernationState == "preparing" || prior.HibernationState == "hibernated" {
+		if err := s.inventoryOnRegister(ctx, qtx, store.Worker(row), registeredPodUID); err != nil {
+			return store.Worker{}, "", err
+		}
 	}
 	// Validate before any snapshot/FK write and capture the conservative union,
 	// including orphan phases even when there is no valid active snapshot.
@@ -4038,6 +4115,13 @@ type IncomingMessage struct {
 	// folds; the refold reads each frame's PERSISTED run_messages.claim_generation. nil = legacy /
 	// unknown (a pre-feature frame, or a legacy worker's unfenced batch), folded as NULL provenance.
 	ClaimGeneration *int64 `json:"-"`
+	// CredentialEpochOrdinal is the in-generation credential switch epoch the frame was produced
+	// under (issue #4201, feature credential_switch_apply_v1): 0 or absent is the claim's base
+	// epoch, n>=1 the nth applied in-place switch. The append path stores it as sent unless it
+	// names an epoch the server has not committed for the claim, in which case the frame is
+	// permanently unattributed (-1). The fold copies it onto run_usage and the refold reads the
+	// persisted run_messages value back, so the two never disagree.
+	CredentialEpochOrdinal *int32 `json:"credential_epoch_ordinal,omitempty"`
 }
 
 // resultUsagePayload is the subset of a terminal result frame's payload the fold
@@ -4144,7 +4228,12 @@ type StateRequest struct {
 	// SetRunRunning guard refuses still leaves the witness that lets the sweep tell a departed
 	// flight from a slow one. Valid only on `running`; httpx.DecodeJSON rejects unknown fields, so
 	// the field MUST exist here or a new worker's report 400s.
-	RegistrationEvidence       *RegistrationEvidence           `json:"registration_evidence,omitempty"`
+	RegistrationEvidence *RegistrationEvidence `json:"registration_evidence,omitempty"`
+	// CheckpointPublication (issue #4257, feature checkpoint_publication_withheld_v1) is the
+	// worker's content-free report that checkpoint publication is withheld by a secret-scan
+	// restriction, or that it cleared. Valid only on `running`; recorded AFTER the status write as a
+	// fenced, server-ordered fact and never able to fail it.
+	CheckpointPublication      *CheckpointPublicationReport    `json:"checkpoint_publication,omitempty"`
 	SourcePublication          *SourcePublicationReport        `json:"source_publication,omitempty"`
 	RegisterNonce              string                          `json:"register_nonce,omitempty"`
 	MemoryEpisode              *int64                          `json:"memory_episode,omitempty"`
@@ -4156,7 +4245,12 @@ type StateRequest struct {
 	RequireRunning bool `json:"require_running,omitempty"`
 	// CompletionFinalHead is the durably delivered final SHA, negotiated separately from permits.
 	CompletionFinalHead *string `json:"completion_final_head,omitempty"`
-	State               string  `json:"status"` // running|awaiting_approval|awaiting_input|awaiting_followup|limit_wait|recovery_wait|paused|pause_failed|credential_switch|credential_switch_failed|credential_switch_held|credential_switch_hold_settled|clarification_settled|completed|failed
+	State               string  `json:"status"` // running|awaiting_approval|awaiting_input|awaiting_followup|limit_wait|recovery_wait|paused|pause_failed|credential_switch|credential_switch_failed|credential_switch_held|credential_switch_hold_settled|credential_switch_uncertain|clarification_settled|completed|failed
+	// OpID is the credential-switch operation id (issue #4201, feature credential_switch_apply_v1)
+	// the credential_switch_failed, credential_switch_held and credential_switch_uncertain reports
+	// are fenced to. Optional on the first two (absent keeps the pre-#4201 unfenced behaviour),
+	// required on the third. httpx.DecodeJSON rejects unknown fields, so it MUST exist here.
+	OpID *string `json:"op_id,omitempty"`
 	// ClarificationSettlement (issue #3985, feature clarification_revision_settlement_v1) names the
 	// answered question, the pending human revise and the gate revision a clarification_settled
 	// report settles back to awaiting_approval. It is valid only on, and required by,
@@ -4471,6 +4565,14 @@ type StateRequest struct {
 	// httpx.DecodeJSON rejects unknown fields, so a worker sends it only once the api advertises
 	// the retained_recovery_capacity_hold_v1 feature.
 	RetainedCapacityOnly *bool `json:"retained_capacity_only,omitempty"`
+	// RecoveryDetail qualifies a recovery_cause "retained_recovery_adoption_failed" park with
+	// "secret_remediation_active" (Resume refused), "remediation_proof_unknown" (retry may help),
+	// or "source_end_declined" (requires register_nonce). Absent means unclassified. SetState
+	// rejects other values, states, causes or non-positive/missing claim_generation before SQL
+	// as ErrInvalidState (validateRecoveryDetail). The first two require the advertised feature
+	// recovery_detail_adoption_refusal_v1; source_end_declined requires retained_source_end_hold_v1
+	// paired with run_registration_evidence_v1. httpx.DecodeJSON rejects unknown fields.
+	RecoveryDetail *string `json:"recovery_detail,omitempty"`
 	// ProductiveTurns qualifies a recovery_cause "provider_outage" park (PRD #1733): the number
 	// of model turns the PARKING FLIGHT completed without error since its claim. A positive value
 	// is progress and starts a new provider-park streak at this park; zero or absent continues
@@ -4620,6 +4722,9 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 	if err := validateRetainedCapacityOnly(req); err != nil {
 		return store.Run{}, false, err
 	}
+	if err := validateRecoveryDetail(req); err != nil {
+		return store.Run{}, false, err
+	}
 	if err := validateReportOnlyShape(req); err != nil {
 		return store.Run{}, false, err
 	}
@@ -4651,7 +4756,8 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 	if err != nil {
 		return store.Run{}, false, err
 	}
-	if diskHoldRefusesReport(owned, req) {
+
+	if (req.RecoveryDetail == nil || *req.RecoveryDetail != RecoveryDetailSourceEndDeclined) && ownerHoldRefusesReport(owned, req) {
 		if req.ClaimGeneration != nil && (owned.ClaimGeneration != *req.ClaimGeneration || owned.ClaimReleasedAt.Valid) {
 			return owned, false, ErrStaleClaim
 		}
@@ -4668,6 +4774,10 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 	if err := validateCappedReportOnly(owned, req); err != nil {
 		return owned, false, err
 	}
+	if req.RecoveryDetail != nil && *req.RecoveryDetail == RecoveryDetailSourceEndDeclined {
+		return s.parkSourceEndDeclined(ctx, wkr, runID, req)
+	}
+
 	if s.txBeginner == nil && parentTx == nil && semanticCompletionRequiresLock(owned) &&
 		(stateUsesGenerationFence(req.State, owned) || req.State == "pause_failed" ||
 			req.State == stateClarificationSettled ||
@@ -4678,7 +4788,7 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 	// not nest beneath the generic state fence on another connection.
 	if s.txBeginner != nil && (req.State == "pause_failed" || req.State == "credential_switch" || req.State == "credential_switch_failed" ||
 		req.State == stateCredentialSwitchHeld || req.State == stateCredentialSwitchHoldSettled ||
-		req.State == stateClarificationSettled) {
+		req.State == stateCredentialSwitchUncertain || req.State == stateClarificationSettled) {
 		locked, _, tx, err := s.beginClaimMutation(ctx, wkr, runID, req.ClaimGeneration)
 		if err != nil {
 			return owned, false, err
@@ -4782,6 +4892,9 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 	}
 	if req.State == stateCredentialSwitchHoldSettled {
 		return s.settleCredentialSwitchHold(ctx, owned, wkr, req)
+	}
+	if req.State == stateCredentialSwitchUncertain {
+		return s.uncertainCredentialSwitch(ctx, owned, wkr, req)
 	}
 	if req.State == stateClarificationSettled {
 		return s.settleClarificationToGate(ctx, owned, wkr, req)
@@ -4948,7 +5061,7 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 			// stale_claim disposition. The deferred Rollback releases the lock.
 			return locked, false, ErrStaleClaim
 		}
-		if diskHoldRefusesReport(locked, req) {
+		if ownerHoldRefusesReport(locked, req) {
 			return locked, false, nil
 		}
 		if locked.Status == "paused" && locked.HoldReason.String == IterationBudgetExhausted {
@@ -5006,7 +5119,7 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 		if err := validateSourcePublicationLive(locked, wkr, req); err != nil {
 			return locked, false, err
 		}
-		if diskHoldRefusesReport(locked, req) {
+		if ownerHoldRefusesReport(locked, req) {
 			return locked, false, nil
 		}
 		owned = locked
@@ -5049,7 +5162,7 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 		if err := recheckPublicationEnrollment(ctx, qtx, runID, workerLocked); err != nil {
 			return store.Run{}, false, err
 		}
-		if diskHoldRefusesReport(locked, req) {
+		if ownerHoldRefusesReport(locked, req) {
 			return locked, false, nil
 		}
 		owned = locked
@@ -6426,6 +6539,14 @@ func (s *Service) ConsumeInputs(ctx context.Context, wkr store.Worker, runID uui
 	return result, nil
 }
 
+// inPlaceSwitchDrains reports whether a pending credential switch leaves the worker's /inputs
+// draining normally: the worker registered the in-place capability AND uses the receipts path
+// (the only drain that is a read-only replay, so a drain the worker never applies loses nothing).
+func inPlaceSwitchDrains(wkr store.Worker) bool {
+	return slices.Contains(wkr.ProtocolCapabilities, capability.CredentialSwitchInPlaceV1) &&
+		slices.Contains(wkr.ProtocolCapabilities, capability.InputReceiptsV1)
+}
+
 func (s *Service) consumeInputsLocked(ctx context.Context, wkr store.Worker, runID uuid.UUID) (ConsumeInputsResult, error) {
 	run, err := s.runOwnedByWorker(ctx, runID, wkr)
 	if err != nil {
@@ -6436,10 +6557,14 @@ func (s *Service) consumeInputsLocked(ctx context.Context, wkr store.Worker, run
 			RunID: run.ID, Generation: run.ClaimGeneration,
 		}}, nil
 	}
-	if sig := PendingCredentialSwitchSignal(run); sig != nil {
+	sig := PendingCredentialSwitchSignal(run)
+	if sig != nil && !inPlaceSwitchDrains(wkr) {
 		// Pending switch: signal + no drain, so a racing answer/follow-up survives for the reclaim.
 		return ConsumeInputsResult{CredentialSwitch: sig}, nil
 	}
+	// Issue #4201: an in-place worker (inPlaceSwitchDrains) keeps its claim through the switch, so
+	// there is no reclaim for the inputs to wait for. It falls through to the read-only receipts
+	// replay below and the signal rides alongside the inputs.
 	if run.ClaimReleasedAt.Valid {
 		// Released-but-not-reclaimed: claim_released_at is set by ReleaseCredentialSwitch (a credential
 		// switch released this claim) OR by ParkRunsAtWall (PRD #1497: the server parked the run at its
@@ -6458,7 +6583,7 @@ func (s *Service) consumeInputsLocked(ctx context.Context, wkr store.Worker, run
 		for _, row := range rows {
 			out = append(out, inputDTO(row.ID, row.Kind, row.Body, row.CreatedAt, row.GateBinding, row.GateRevision))
 		}
-		return ConsumeInputsResult{Inputs: out, Receipts: true, OwnerID: run.UserID}, nil
+		return ConsumeInputsResult{Inputs: out, Receipts: true, OwnerID: run.UserID, CredentialSwitch: sig}, nil
 	}
 	rows, err := s.q.ConsumeRunInputs(ctx, runID)
 	if err != nil {
@@ -7717,21 +7842,64 @@ func (s *Service) WorkerProjectionForOwner(ctx context.Context, userID, workerID
 // could still need it. (The M1 live_worker_id ON DELETE RESTRICT FK is the fail-closed
 // backstop; this guard turns it into a clean, enumerated 409 instead of a raw
 // constraint 500.)
+//
+// #4389: a hibernation cache prune attempt can settle between a DELETE that matched no row and
+// the re-read. A present worker whose attempt is no longer unsettled is therefore retried once
+// through the WHOLE guarded delete (active runs, custody, then the DELETE), so a run or hold
+// that appeared meanwhile is refused exactly as on a first attempt. If the retry also matches
+// no row, the second re-read decides with no further retry: absent → ErrWorkerNotFound, a new
+// unsettled attempt → *WorkerHibernationCleanupUnsettledError, still present and settled (both
+// attempts lost a cleanup start/settle race) → ErrWorkerDeleteRaced (a retryable 409). A
+// lookup error other than not-found is returned unchanged.
 func (s *Service) DeleteWorker(ctx context.Context, userID, workerID uuid.UUID) error {
+	for attempt := 1; ; attempt++ {
+		n, err := s.deleteWorkerGuarded(ctx, userID, workerID)
+		if err != nil {
+			return err
+		}
+		if n > 0 {
+			break
+		}
+		cur, gerr := s.q.GetWorkerByIDForUser(ctx, store.GetWorkerByIDForUserParams{ID: workerID, UserID: userID})
+		if errors.Is(gerr, pgx.ErrNoRows) {
+			return ErrWorkerNotFound
+		}
+		if gerr != nil {
+			return gerr
+		}
+		if cleanupUnsettled(cur.CleanupPhase) {
+			return &WorkerHibernationCleanupUnsettledError{Phase: cur.CleanupPhase}
+		}
+		if attempt >= 2 {
+			return ErrWorkerDeleteRaced
+		}
+	}
+	// The worker is gone; drop its last-known outbox depth (PRD #1391 M5) so a
+	// removed worker's stale depth does not linger on the fleet view. In-memory and
+	// best-effort — the TTL prune is the backstop for any path that skips this.
+	s.outbox.evict(workerID)
+	s.quarantine.evictIfSet(workerID)
+	s.memAuthority.evictIfSet(workerID)
+	return nil
+}
+
+// deleteWorkerGuarded is one guarded delete attempt for DeleteWorker: the active-runs and
+// custody refusals, then the owner-scoped DELETE. It returns the deleted row count.
+func (s *Service) deleteWorkerGuarded(ctx context.Context, userID, workerID uuid.UUID) (int64, error) {
 	active, err := s.q.CountWorkerNonTerminalRuns(ctx, store.CountWorkerNonTerminalRunsParams{
 		WorkerID: pgconv.UUID(workerID), UserID: userID,
 	})
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if active > 0 {
 		rows, err := s.q.ListWorkerNonTerminalRuns(ctx, store.ListWorkerNonTerminalRunsParams{
 			WorkerID: pgconv.UUID(workerID), UserID: userID,
 		})
 		if err != nil {
-			return err
+			return 0, err
 		}
-		return &WorkerHasActiveRunsError{Runs: rows, Total: active}
+		return 0, &WorkerHasActiveRunsError{Runs: rows, Total: active}
 	}
 	// OWNER-SCOPED (userID): the count filters on user_id so a FOREIGN owner's held worker
 	// returns 0 here and falls through to the owner-scoped DeleteWorkerForUser → 404, instead
@@ -7742,7 +7910,7 @@ func (s *Service) DeleteWorker(ctx context.Context, userID, workerID uuid.UUID) 
 		UserID:   userID,
 	})
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if holds > 0 {
 		// #3921: name the blocking holds (same predicate as the count, capped). A listing
@@ -7752,24 +7920,13 @@ func (s *Service) DeleteWorker(ctx context.Context, userID, workerID uuid.UUID) 
 			UserID:   userID,
 		})
 		if err != nil {
-			return err
+			return 0, err
 		}
-		return &WorkerHasCustodyError{Holds: holds, List: list}
+		return 0, &WorkerHasCustodyError{Holds: holds, List: list}
 	}
-	n, err := s.q.DeleteWorkerForUser(ctx, store.DeleteWorkerForUserParams{ID: workerID, UserID: userID})
-	if err != nil {
-		return err
-	}
-	if n == 0 {
-		return ErrWorkerNotFound
-	}
-	// The worker is gone; drop its last-known outbox depth (PRD #1391 M5) so a
-	// removed worker's stale depth does not linger on the fleet view. In-memory and
-	// best-effort — the TTL prune is the backstop for any path that skips this.
-	s.outbox.evict(workerID)
-	s.quarantine.evictIfSet(workerID)
-	s.memAuthority.evictIfSet(workerID)
-	return nil
+	// PRD #4206: an unsettled hibernation cache prune keeps its claim fence until settled, and the
+	// delete query repeats the predicate so a concurrent attempt cannot slip past this read.
+	return s.q.DeleteWorkerForUser(ctx, store.DeleteWorkerForUserParams{ID: workerID, UserID: userID})
 }
 
 // CreateRun queues a manually-started run from a board card. The issue must be a
@@ -7782,7 +7939,7 @@ func (s *Service) DeleteWorker(ctx context.Context, userID, workerID uuid.UUID) 
 // PRD #1429 M2: explicit is the manual request's optional harness (D2), nil ⇒ implicit D11;
 // rawOverride is the raw #1247 credential override validated against the resolved harness inside
 // the create transaction (D5). The old pre-transaction createRunEffectiveHarness guesser is gone.
-func (s *Service) CreateRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, force bool, seed *SeededPlan, requested *AgentSelection, explicit *Harness, rawOverride *RawCredentialOverride) (store.Run, error) {
+func (s *Service) CreateRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, force bool, seed *SeededPlan, requested *AgentSelection, explicit *Harness, rawOverride *RawCredentialOverride, model, effort *string) (store.Run, error) {
 	// waitOnLimit nil ⇒ inherit the owner's default. It is a *bool rather than a bool
 	// because "the caller said false" and "the caller said nothing" are different
 	// requests, and collapsing them would make every API client that omits the field
@@ -7794,8 +7951,10 @@ func (s *Service) CreateRun(ctx context.Context, userID, repoID uuid.UUID, issue
 	//
 	// This is THE interactive, human-initiated path (the board / issue-view Start
 	// button, and `uzi run start` through the same HTTP endpoint).
-	// nil model: a non-scheduled human run inherits the owner's per-user Worker default
-	// (PRD #300) — the per-schedule override applies only to runs a schedule fires.
+	// model / effort (PRD #3250): the manual request's optional start-time choice. nil model
+	// inherits the owner's per-user Worker default (PRD #300); a present one is a run_override,
+	// stamped with its source and checked against the resolved harness inside the create
+	// transaction. nil effort leaves the effort pair NULL.
 	// false overrideSubagentModel (PRD #305): an interactive run is not a schedule fire,
 	// so it stays in the default lane where subagent pins win.
 	// force (issue #856): threaded straight through so the interactive/CLI caller can
@@ -7803,7 +7962,7 @@ func (s *Service) CreateRun(ctx context.Context, userID, repoID uuid.UUID, issue
 	// credOverride nil ⇒ inherit the worker binding (PRD #1247 M1); the create-time
 	// user choice is wired in M2. Threaded through the signature now so M2 does not
 	// reopen this seam (the freeze).
-	return s.createRun(ctx, userID, repoID, issueIID, "manual", description, false, waitOnLimit, mrReworkEnabled, nil, false, force, seed, requested, nil /*credOverride: manual uses rawOverride*/, explicit, rawOverride)
+	return s.createRun(ctx, userID, repoID, issueIID, "manual", description, false, waitOnLimit, mrReworkEnabled, model, runOverrideSource(model), effort, false, force, seed, requested, nil /*credOverride: manual uses rawOverride*/, explicit, rawOverride)
 }
 
 // CreateScheduledRun queues a NON-auto-approve scheduled issue run (PRD #241: a timer
@@ -7814,7 +7973,7 @@ func (s *Service) CreateScheduledRun(ctx context.Context, userID, repoID uuid.UU
 	// false force (issue #856): a scheduled run never bypasses the open-MR dedup.
 	// credOverride: the schedule's stored (pre-validated) override, written as-is. explicit: the
 	// schedule's pin or fresh issue-label selection (nil ⇒ implicit D11 at fire time).
-	return s.createRun(ctx, userID, repoID, issueIID, "schedule", description, false, waitOnLimit, mrReworkEnabled, model, overrideSubagentModel, false, seed, nil, credOverride, explicit, nil /*rawOverride*/)
+	return s.createRun(ctx, userID, repoID, issueIID, "schedule", description, false, waitOnLimit, mrReworkEnabled, model, scheduleModelSource(model), nil /*effort*/, overrideSubagentModel, false, seed, nil, credOverride, explicit, nil /*rawOverride*/)
 }
 
 // CreateAutopilotRun queues a run the poller's autopilot detection started on a
@@ -7843,7 +8002,7 @@ func (s *Service) CreateAutopilotRun(ctx context.Context, userID, repoID uuid.UU
 	// choice, so it inherits the worker binding exactly as before.
 	// explicit is the fresh issue-label selection; nil keeps implicit D11 resolution.
 	// No raw credential override is supplied by the poller.
-	return s.createRun(ctx, userID, repoID, issueIID, "autopilot", description, true, nil, nil, nil, false, false, nil, nil, nil /*credOverride*/, explicit, nil /*rawOverride*/)
+	return s.createRun(ctx, userID, repoID, issueIID, "autopilot", description, true, nil, nil, nil, modelSourceNone, nil /*effort*/, false, false, nil, nil, nil /*credOverride*/, explicit, nil /*rawOverride*/)
 }
 
 // CreateScheduledAutopilotRun queues an auto-approve scheduled issue run. It carries
@@ -7853,7 +8012,7 @@ func (s *Service) CreateScheduledAutopilotRun(ctx context.Context, userID, repoI
 	// false force (issue #856): a scheduled autopilot run never bypasses the open-MR dedup.
 	// credOverride: the schedule's stored override; explicit: the schedule's pinned harness
 	// or fresh issue-label selection (nil ⇒ implicit D11 at fire time).
-	return s.createRun(context.WithValue(ctx, scheduleApprovalKey{}, true), userID, repoID, issueIID, "autopilot", description, true /*autoApprove*/, waitOnLimit, mrReworkEnabled, model, overrideSubagentModel, false /*force*/, nil /*seed*/, nil, credOverride, explicit, nil /*rawOverride*/)
+	return s.createRun(context.WithValue(ctx, scheduleApprovalKey{}, true), userID, repoID, issueIID, "autopilot", description, true /*autoApprove*/, waitOnLimit, mrReworkEnabled, model, scheduleModelSource(model), nil /*effort*/, overrideSubagentModel, false /*force*/, nil /*seed*/, nil, credOverride, explicit, nil /*rawOverride*/)
 }
 
 // SeededPlan carries a create-time externally-authored plan and its optional agent
@@ -7890,10 +8049,19 @@ type SeededPlan struct {
 // stored choice), written to the columns as-is; rawOverride is an UNVALIDATED request override
 // (manual/chat-start) validated against the D11-resolved harness INSIDE the create transaction
 // (D5). At most one of credOverride/rawOverride is non-nil.
-func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, triggerSource string, description string, autoApprove bool, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, force bool, seed *SeededPlan, requested *AgentSelection, credOverride *CredentialOverride, explicit *Harness, rawOverride *RawCredentialOverride) (store.Run, error) {
+//
+// modelSrc (PRD #3250) is the explicit provenance of model, set by each public entrypoint and never
+// inferred from triggerSource: run_override from a manual request's model, schedule_pin from a
+// schedule's, none otherwise. A run_override model is checked against the resolved harness inside
+// the create transaction; effort, when present, is stamped with effort_source run_override.
+func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, triggerSource string, description string, autoApprove bool, waitOnLimit *bool, mrReworkEnabled *bool, model *string, modelSrc modelSource, effort *string, overrideSubagentModel bool, force bool, seed *SeededPlan, requested *AgentSelection, credOverride *CredentialOverride, explicit *Harness, rawOverride *RawCredentialOverride) (store.Run, error) {
+	// PRD #3250: an effort is stored only as an exact canonical level, whichever caller supplied it.
+	if effort != nil && !validRunEffort(*effort) {
+		return store.Run{}, ErrInvalidRunEffort
+	}
 	// The description cap is enforced HERE, once, so the manual (handler → 422) and
 	// autopilot (poller → too-large comment) paths cannot drift (PRD #19 M5). Checked
-	// first: it is pure input validation, independent of the repo/issue gates below.
+	// with the other pure input validation, before the repo/issue gates below.
 	if len(description) > MaxIssueDescriptionBytes {
 		return store.Run{}, ErrDescriptionTooLarge
 	}
@@ -8267,6 +8435,17 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 		if credOverride != nil && resolved.Harness == HarnessCodex {
 			return store.Run{}, ErrCredentialOverrideHarnessUnsupported
 		}
+		// PRD #3250: a run_override model must be servable by the RESOLVED harness. After the
+		// credential-override validation and the pin lock above so every credential refusal keeps
+		// its precedence; a refusal rolls back the whole create (no run row, no Codex binding
+		// freeze, no queued notify). Schedule pins keep the soft harnessModelCompatible fallback.
+		if modelSrc == modelSourceRunOverride && (model == nil || !runOverrideModelHonorable(resolved.Harness, *model)) {
+			refused := ""
+			if model != nil {
+				refused = *model
+			}
+			return store.Run{}, &ModelIncompatibleError{Model: refused, Harness: resolved.Harness}
+		}
 		// Stamp unseeded issue runs for either resolved harness when the switch is on.
 		var completionContractVersion pgtype.Int4
 		if interlockOn {
@@ -8312,6 +8491,11 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 			// nil for every non-scheduled caller (interactive, label-poller autopilot) →
 			// NULL → the run inherits the owner's per-user Worker default at claim assembly.
 			Model: pgconv.TextPtr(model),
+			// PRD #3250: where the model came from (NULL with no model) and the start-time effort
+			// pair. Listed explicitly per runtime.sql's silently-omittable-narg warning.
+			ModelSource:  pgconv.TextOrNull(string(modelSrc)),
+			Effort:       pgconv.TextPtr(effort),
+			EffortSource: effortSourceFor(effort),
 			// PRD #305: the schedule's "apply model also to agents" opt-in, frozen onto the
 			// run at fire time. false for every non-scheduled caller (interactive,
 			// label-poller autopilot) → the default lane where subagent pins win. M1 stores
@@ -8457,10 +8641,11 @@ func (s *Service) ListRunMessages(ctx context.Context, userID, runID uuid.UUID, 
 
 // ListFollowUpInputs returns a run's follow_up steer queue (newest-first, uncapped)
 // for the web/CLI queue (PRD #95). GetRun resolves owner-or-404 FIRST, so a non-owner
-// — including an admin_ro token on another user's run — gets ErrRunNotFound and the
-// handler 404s. This is strict owner-only (matching the follow-up WRITE), NOT the
-// owner-or-admin view: follow-ups are never in run_messages, so an owner-or-admin read
-// here would leak another user's steer text.
+// gets ErrRunNotFound for a run it does not own. This is strict owner-only (matching the
+// follow-up WRITE), NOT the owner-or-admin view: follow-ups are never in run_messages, so
+// an owner-or-admin read here would leak another user's steer text. The only cross-user
+// read is the handler's admin run debug path, which passes the run's owner as userID
+// after its own predicate and audit.
 func (s *Service) ListFollowUpInputs(ctx context.Context, userID, runID uuid.UUID) ([]store.RunUserInput, error) {
 	if _, err := s.GetRun(ctx, userID, runID); err != nil {
 		return nil, err
@@ -8575,6 +8760,18 @@ func (s *Service) ListActiveRunsAll(ctx context.Context) ([]store.ListActiveRuns
 	return s.q.ListActiveRunsAll(ctx, s.activeRunsPriorityCutoff())
 }
 
+// ListRunsAdminDebug returns up to maxRows runs of every status across all users (or
+// one user when userID is non-nil), newest first, optionally created at or after since,
+// excluding chat, judge, and cross-check runs (issue #4198 admin run debug listing).
+func (s *Service) ListRunsAdminDebug(ctx context.Context, userID *uuid.UUID, since *time.Time, maxRows int32) ([]store.ListRunsAdminDebugRow, error) {
+	return s.q.ListRunsAdminDebug(ctx, store.ListRunsAdminDebugParams{
+		BackgroundGraceCutoff: s.activeRunsPriorityCutoff(),
+		UserID:                pgconv.UUIDPtr(userID),
+		Since:                 pgconv.TimePtr(since),
+		MaxRows:               maxRows,
+	})
+}
+
 // activeRunsPriorityCutoff builds the ListActiveRunsAll @background_grace_cutoff param
 // (PRD #320 D8 fail-open flag for the row's priority_class), shared by both callers of
 // the query (the admin DTO path and the self_improve in-flight avoid-set).
@@ -8588,6 +8785,18 @@ func (s *Service) RunUsageTotal(ctx context.Context, runID uuid.UUID) (store.Get
 	return s.q.GetRunUsageTotal(ctx, runID)
 }
 
+// RunCredentialSwitchEpochs returns the in-generation epochs in-place switches opened in one run
+// (issue #4201), owner-scoped, oldest first.
+func (s *Service) RunCredentialSwitchEpochs(ctx context.Context, runID, userID uuid.UUID) ([]store.RunCredentialSwitchEpoch, error) {
+	return s.q.ListRunCredentialSwitchEpochs(ctx, store.ListRunCredentialSwitchEpochsParams{RunID: runID, UserID: userID})
+}
+
+// RunUsageByCredentialEpoch returns a run's raw usage legs with their epoch attribution, for the
+// run view's per-epoch telescoping (issue #4201). The caller has already established ownership.
+func (s *Service) RunUsageByCredentialEpoch(ctx context.Context, runID uuid.UUID) ([]store.ListRunUsageByCredentialEpochRow, error) {
+	return s.q.ListRunUsageByCredentialEpoch(ctx, runID)
+}
+
 // RunCredentialEpochs returns one run's applied-switch attribution journal, oldest
 // generation first (PRD #1247 M1, D7), owner-scoped through the query's run join. Empty
 // for a run that has never been claimed. Consumed by the handler's GetRun for the
@@ -8597,7 +8806,7 @@ func (s *Service) RunCredentialEpochs(ctx context.Context, runID, userID uuid.UU
 }
 
 // SelfUsage returns the user's own lifetime + last-7-days usage totals and their
-// usage-bearing run count (PRD #40 M3, GET /api/usage).
+// primary work run count with usage (PRD #40 M3, GET /api/usage).
 func (s *Service) SelfUsage(ctx context.Context, userID uuid.UUID) (store.SelfUsageRow, error) {
 	return s.q.SelfUsage(ctx, userID)
 }

@@ -60,6 +60,54 @@ func (q *Queries) AdminListDockerAllowlistRepos(ctx context.Context, dockerRepoA
 	return items, nil
 }
 
+const adminListEnabledRepoActivity = `-- name: AdminListEnabledRepoActivity :many
+SELECT r.id, r.path_with_namespace, r.enabled,
+  (SELECT max(ru.created_at) FROM runs ru WHERE ru.repo_id = r.id)::timestamptz AS last_run_at
+FROM repos r
+WHERE r.enabled OR EXISTS (SELECT 1 FROM runs a WHERE a.repo_id = r.id
+  AND a.status NOT IN ('completed','failed','cancelled') AND a.kind NOT IN ('chat','judge','cross_check'))
+ORDER BY r.path_with_namespace, r.id
+`
+
+type AdminListEnabledRepoActivityRow struct {
+	ID                uuid.UUID          `json:"id"`
+	PathWithNamespace string             `json:"path_with_namespace"`
+	Enabled           bool               `json:"enabled"`
+	LastRunAt         pgtype.Timestamptz `json:"last_run_at"`
+}
+
+// Issue #4334: the admin cross-user repo-activity list. UNSCOPED (admin-only,
+// gated by RequireAdminRO on the route, precedent AdminListReposWithPrivilege). Returns every repo
+// that is enabled OR has a listed-active run, i.e. a non-terminal run whose kind is
+// not chat/judge/cross_check. That predicate mirrors the listed-active filter of
+// ListActiveRunsAll in runtime.sql, minus its LIMIT 500, so the count is exact.
+// last_run_at is the newest runs.created_at of any kind (NULL when the repo never
+// ran).
+func (q *Queries) AdminListEnabledRepoActivity(ctx context.Context) ([]AdminListEnabledRepoActivityRow, error) {
+	rows, err := q.db.Query(ctx, adminListEnabledRepoActivity)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []AdminListEnabledRepoActivityRow{}
+	for rows.Next() {
+		var i AdminListEnabledRepoActivityRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.PathWithNamespace,
+			&i.Enabled,
+			&i.LastRunAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const adminListReposWithPrivilege = `-- name: AdminListReposWithPrivilege :many
 SELECT r.id, r.path_with_namespace, r.enabled,
        r.guardrail_override_reason, r.guardrail_override_by, r.guardrail_override_at,
@@ -134,6 +182,31 @@ func (q *Queries) AdminListReposWithPrivilege(ctx context.Context) ([]AdminListR
 	return items, nil
 }
 
+const claimRepoInitialImport = `-- name: ClaimRepoInitialImport :execrows
+UPDATE repos SET
+  initial_import_state = 'running',
+  initial_import_error_class = NULL,
+  initial_import_updated_at = now()
+WHERE repos.id = $1
+  AND repos.initial_import_generation = $2
+  AND repos.initial_import_state IN ('waiting','running','failed')
+`
+
+type ClaimRepoInitialImportParams struct {
+	ID                      uuid.UUID `json:"id"`
+	InitialImportGeneration int64     `json:"initial_import_generation"`
+}
+
+// The poller's claim of the repo's owed first import at the generation it read.
+// Zero rows means the generation moved (disable/enable) or the import is not owed.
+func (q *Queries) ClaimRepoInitialImport(ctx context.Context, arg ClaimRepoInitialImportParams) (int64, error) {
+	result, err := q.db.Exec(ctx, claimRepoInitialImport, arg.ID, arg.InitialImportGeneration)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const clearBoardOrderExcept = `-- name: ClearBoardOrderExcept :exec
 UPDATE issues
 SET board_position = NULL
@@ -174,7 +247,7 @@ SET guardrail_override_reason = NULL,
     guardrail_override_by     = NULL,
     guardrail_override_at     = NULL
 WHERE id = $1
-RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, awaiting_first_enable, issue_tracker_connection_id, issue_tracker_project_id, issue_tracker_project_short, eligibility_tag_id, eligibility_tag_name, issue_tracker_linked_at
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, initial_import_state, initial_import_generation, initial_import_error_class, initial_import_updated_at, awaiting_first_enable, issue_tracker_connection_id, issue_tracker_project_id, issue_tracker_project_short, eligibility_tag_id, eligibility_tag_name, issue_tracker_linked_at
 `
 
 // PRD #66 M8 (D8): revoke the admin per-repo override, re-arming the guardrail
@@ -204,6 +277,10 @@ func (q *Queries) ClearRepoGuardrailOverride(ctx context.Context, id uuid.UUID) 
 		&i.CrossCheckRepoInstructionsEnabled,
 		&i.IgnoredInferredCapabilities,
 		&i.AgentSourceDefault,
+		&i.InitialImportState,
+		&i.InitialImportGeneration,
+		&i.InitialImportErrorClass,
+		&i.InitialImportUpdatedAt,
 		&i.AwaitingFirstEnable,
 		&i.IssueTrackerConnectionID,
 		&i.IssueTrackerProjectID,
@@ -338,7 +415,7 @@ WITH deletion_scope AS MATERIALIZED (
         THEN cc.lead_run_id ELSE candidates.id END
         AND parent.kind <> 'cross_check'
 ), locked_parents AS MATERIALIZED (
-    SELECT lead.id, lead.user_id, lead.repo_id, lead.issue_iid, lead.issue_title, lead.issue_description, lead.status, lead.requeue_count, lead.worker_id, lead.session_id, lead.last_seq, lead.branch, lead.mr_iid, lead.failure_reason, lead.plan_md, lead.iteration_count, lead.claimed_at, lead.started_at, lead.finished_at, lead.created_at, lead.updated_at, lead.origin_column, lead.board_column, lead.move_pending_since, lead.mr_state, lead.auto_approve, lead.autopilot_commented_at, lead.kind, lead.pipeline_id, lead.pipeline_ref, lead.failure_snapshot, lead.fix_verdict, lead.stop_kind, lead.agent_source, lead.agent_exclusions, lead.repo_agents, lead.title, lead.resume_of_run_id, lead.last_activity_at, lead.health, lead.health_reason, lead.health_since, lead.health_notified_at, lead.target_run_id, lead.mr_web_url, lead.prd_done_path, lead.prd_patch_settled_at, lead.anthropic_secret_id, lead.anthropic_secret_label, lead.anthropic_select_reason, lead.anthropic_headroom_pct, lead.wait_on_limit, lead.limit_resets_at, lead.retry_not_before, lead.limit_wait_count, lead.rate_limit_type, lead.open_question_id, lead.revise_count, lead.plan_source, lead.planned_base_commit, lead.require_base_match, lead.milestones_candidate, lead.milestones_frozen, lead.milestones_completed, lead.milestones_in_progress, lead.budget_max_iterations, lead.budget_wall_seconds, lead.schedule_id, lead.limit_dead_secret_id, lead.report_only, lead.report_md, lead.ci_config_paths, lead.model, lead.override_subagent_model, lead.fail_origin, lead.priority, lead.summary_intent, lead.summary_plan, lead.summary_deltas, lead.issue_comments, lead.base_branch, lead.open_mr, lead.dispatched_at, lead.review_target_run_id, lead.review_requested, lead.then_fix_requested, lead.then_fix_of_run_id, lead.preserved_patch, lead.required_capabilities, lead.stop_reason, lead.required_tools, lead.size_class, lead.interactive, lead.open_followup_id, lead.plan_changed_files, lead.scope_ceiling, lead.status_since, lead.review_comments, lead.budget_paused_seconds, lead.mr_rework_enabled, lead.trigger_source, lead.checkpoint_tip, lead.usage_refolded, lead.codex_secret_id, lead.codex_auth_mode, lead.codex_secret_label, lead.codex_account_key, lead.codex_material_revision, lead.codex_account_revision, lead.codex_claim_epoch, lead.codex_cap_hash, lead.pause_requested_at, lead.pause_mode, lead.pause_after_count, lead.checkpoint_tip_at, lead.recovery_wait_count, lead.recovery_retry_not_before, lead.completion_contract_version, lead.contract_revision, lead.completion_contract, lead.completion_attempts, lead.latest_completion_attempt, lead.milestones_agents, lead.hold_reason, lead.hold_captured_head, lead.completion_budget_exhausted_at, lead.completion_question_at, lead.budget_extension_seconds, lead.claim_generation, lead.harness, lead.recovery_wait_cause, lead.forge_park_count, lead.credential_override_mode, lead.credential_override_secret_id, lead.claim_released_at, lead.credential_switch_requested_at, lead.credential_switch_generation, lead.stale_requeue_generation, lead.budget_finalize_seconds, lead.released_worker_id, lead.released_worker_nonce, lead.gate_revision, lead.gate_presentation_id, lead.gate_presented_payload, lead.gate_payload_digest, lead.gate_refusal_count, lead.gate_refusal_generation, lead.disk_park_count, lead.checkpoint_contains_latest, lead.egress_profile_id, lead.egress_snapshot, lead.job_type, lead.finalize_resume_generation, lead.job_protocol, lead.first_started_at, lead.plan_cross_check_required, lead.plan_cross_check_gate_reason, lead.issue_raw_digest, lead.issue_saved_body, lead.issue_input_reason, lead.auto_approve_blocked_reasons, lead.plan_cross_check_diff_refusal, lead.worker_recovery_episode, lead.requeue_episode_baseline, lead.worker_recovery_evidence, lead.cross_check_lane, lead.cross_check_lane_generation, lead.completion_final_head, lead.code_cross_check_required, lead.provider_park_count, lead.provider_park_streak_started_at, lead.ci_config_guard, lead.memory_episode, lead.memory_intervention_count, lead.memory_policy, lead.completion_non_closing_reason, lead.ci_artifact_manifest, lead.checkpoint_attested_source, lead.source_publication_intent, lead.continued_issue_iid, lead.checkpoint_coordinates, lead.retained_park_count, lead.ignored_inferred_capabilities, lead.reserve_hold_reason, lead.reserve_exempt_until, lead.reserve_exempt_granted_at, lead.reserve_exempt_credential_id, lead.reserve_exempt_window_reset, lead.reserve_exempt_prior_pct, lead.hinted_capabilities, lead.capability_inference_evidence, lead.idle_stall_park_count, lead.forge_admission, lead.codex_select_reason, lead.recovery_wait_phase, lead.plan_cross_check_gated, lead.policy_preserve_required, lead.policy_pending_fresh, lead.policy_outcome_id, lead.policy_continuation_mode, lead.policy_resolved_at, lead.policy_applying_worker_id, lead.policy_applying_generation, lead.policy_source_generation, lead.policy_refusal_count, lead.policy_refusal_tag, lead.policy_refusal_phase, lead.policy_refusal_correlation_id, lead.policy_hold_published, lead.harness_preferred, lead.harness_decision_reason, lead.harness_preferred_score, lead.harness_other_score, lead.harness_preferred_measured, lead.harness_other_measured, lead.harness_preferred_held, lead.harness_other_held, lead.harness_preferred_weekly_reset_at, lead.harness_other_weekly_reset_at, lead.registration_evidence_generation, lead.registration_evidence_nonce, lead.registration_evidence_epoch, lead.snapshot_departed_generation, lead.snapshot_departed_nonce, lead.snapshot_departed_epoch, lead.repo_agent_source_commit, lead.repo_agent_source_required, lead.agent_source_requested, lead.agent_source_requested_basis, lead.plan_agent_source, lead.ci_fix_mr_iid, lead.policy_required_head, lead.policy_recovery_verified_generation, lead.policy_recovery_verified_head, lead.policy_hold_cause, lead.policy_fresh_consumed_generation, lead.policy_fresh_confirmed_generation FROM runs lead
+    SELECT lead.id, lead.user_id, lead.repo_id, lead.issue_iid, lead.issue_title, lead.issue_description, lead.status, lead.requeue_count, lead.worker_id, lead.session_id, lead.last_seq, lead.branch, lead.mr_iid, lead.failure_reason, lead.plan_md, lead.iteration_count, lead.claimed_at, lead.started_at, lead.finished_at, lead.created_at, lead.updated_at, lead.origin_column, lead.board_column, lead.move_pending_since, lead.mr_state, lead.auto_approve, lead.autopilot_commented_at, lead.kind, lead.pipeline_id, lead.pipeline_ref, lead.failure_snapshot, lead.fix_verdict, lead.stop_kind, lead.agent_source, lead.agent_exclusions, lead.repo_agents, lead.title, lead.resume_of_run_id, lead.last_activity_at, lead.health, lead.health_reason, lead.health_since, lead.health_notified_at, lead.target_run_id, lead.mr_web_url, lead.prd_done_path, lead.prd_patch_settled_at, lead.anthropic_secret_id, lead.anthropic_secret_label, lead.anthropic_select_reason, lead.anthropic_headroom_pct, lead.wait_on_limit, lead.limit_resets_at, lead.retry_not_before, lead.limit_wait_count, lead.rate_limit_type, lead.open_question_id, lead.revise_count, lead.plan_source, lead.planned_base_commit, lead.require_base_match, lead.milestones_candidate, lead.milestones_frozen, lead.milestones_completed, lead.milestones_in_progress, lead.budget_max_iterations, lead.budget_wall_seconds, lead.schedule_id, lead.limit_dead_secret_id, lead.report_only, lead.report_md, lead.ci_config_paths, lead.model, lead.override_subagent_model, lead.fail_origin, lead.priority, lead.summary_intent, lead.summary_plan, lead.summary_deltas, lead.issue_comments, lead.base_branch, lead.open_mr, lead.dispatched_at, lead.review_target_run_id, lead.review_requested, lead.then_fix_requested, lead.then_fix_of_run_id, lead.preserved_patch, lead.required_capabilities, lead.stop_reason, lead.required_tools, lead.size_class, lead.interactive, lead.open_followup_id, lead.plan_changed_files, lead.scope_ceiling, lead.status_since, lead.review_comments, lead.budget_paused_seconds, lead.mr_rework_enabled, lead.trigger_source, lead.checkpoint_tip, lead.usage_refolded, lead.codex_secret_id, lead.codex_auth_mode, lead.codex_secret_label, lead.codex_account_key, lead.codex_material_revision, lead.codex_account_revision, lead.codex_claim_epoch, lead.codex_cap_hash, lead.pause_requested_at, lead.pause_mode, lead.pause_after_count, lead.checkpoint_tip_at, lead.recovery_wait_count, lead.recovery_retry_not_before, lead.completion_contract_version, lead.contract_revision, lead.completion_contract, lead.completion_attempts, lead.latest_completion_attempt, lead.milestones_agents, lead.hold_reason, lead.hold_captured_head, lead.completion_budget_exhausted_at, lead.completion_question_at, lead.budget_extension_seconds, lead.claim_generation, lead.harness, lead.recovery_wait_cause, lead.forge_park_count, lead.credential_override_mode, lead.credential_override_secret_id, lead.claim_released_at, lead.credential_switch_requested_at, lead.credential_switch_generation, lead.stale_requeue_generation, lead.budget_finalize_seconds, lead.released_worker_id, lead.released_worker_nonce, lead.gate_revision, lead.gate_presentation_id, lead.gate_presented_payload, lead.gate_payload_digest, lead.gate_refusal_count, lead.gate_refusal_generation, lead.disk_park_count, lead.checkpoint_contains_latest, lead.egress_profile_id, lead.egress_snapshot, lead.job_type, lead.finalize_resume_generation, lead.job_protocol, lead.first_started_at, lead.plan_cross_check_required, lead.plan_cross_check_gate_reason, lead.issue_raw_digest, lead.issue_saved_body, lead.issue_input_reason, lead.auto_approve_blocked_reasons, lead.plan_cross_check_diff_refusal, lead.worker_recovery_episode, lead.requeue_episode_baseline, lead.worker_recovery_evidence, lead.cross_check_lane, lead.cross_check_lane_generation, lead.completion_final_head, lead.code_cross_check_required, lead.provider_park_count, lead.provider_park_streak_started_at, lead.ci_config_guard, lead.memory_episode, lead.memory_intervention_count, lead.memory_policy, lead.completion_non_closing_reason, lead.ci_artifact_manifest, lead.checkpoint_attested_source, lead.source_publication_intent, lead.continued_issue_iid, lead.checkpoint_coordinates, lead.retained_park_count, lead.ignored_inferred_capabilities, lead.reserve_hold_reason, lead.reserve_exempt_until, lead.reserve_exempt_granted_at, lead.reserve_exempt_credential_id, lead.reserve_exempt_window_reset, lead.reserve_exempt_prior_pct, lead.hinted_capabilities, lead.capability_inference_evidence, lead.idle_stall_park_count, lead.forge_admission, lead.codex_select_reason, lead.recovery_wait_phase, lead.plan_cross_check_gated, lead.policy_preserve_required, lead.policy_pending_fresh, lead.policy_outcome_id, lead.policy_continuation_mode, lead.policy_resolved_at, lead.policy_applying_worker_id, lead.policy_applying_generation, lead.policy_source_generation, lead.policy_refusal_count, lead.policy_refusal_tag, lead.policy_refusal_phase, lead.policy_refusal_correlation_id, lead.policy_hold_published, lead.harness_preferred, lead.harness_decision_reason, lead.harness_preferred_score, lead.harness_other_score, lead.harness_preferred_measured, lead.harness_other_measured, lead.harness_preferred_held, lead.harness_other_held, lead.harness_preferred_weekly_reset_at, lead.harness_other_weekly_reset_at, lead.registration_evidence_generation, lead.registration_evidence_nonce, lead.registration_evidence_epoch, lead.snapshot_departed_generation, lead.snapshot_departed_nonce, lead.snapshot_departed_epoch, lead.repo_agent_source_commit, lead.repo_agent_source_required, lead.agent_source_requested, lead.agent_source_requested_basis, lead.plan_agent_source, lead.ci_fix_mr_iid, lead.policy_required_head, lead.policy_recovery_verified_generation, lead.policy_recovery_verified_head, lead.policy_hold_cause, lead.policy_fresh_consumed_generation, lead.policy_fresh_confirmed_generation, lead.recovery_wait_detail, lead.credential_switch_op_id, lead.credential_switch_hold_op_id, lead.credential_switch_hold_generation, lead.credential_switch_hold_worker_id, lead.credential_switch_hold_register_nonce, lead.effort, lead.model_source, lead.effort_source, lead.checkpoint_withheld_since, lead.checkpoint_withheld_status_since, lead.checkpoint_withheld_worker_id, lead.checkpoint_withheld_generation, lead.checkpoint_withheld_nonce, lead.checkpoint_withheld_report_seq FROM runs lead
     WHERE lead.id IN (SELECT parent_id FROM parent_mapping)
       AND lead.kind <> 'cross_check'
     ORDER BY lead.id
@@ -414,7 +491,7 @@ WITH deletion_scope AS MATERIALIZED (
         THEN cc.lead_run_id ELSE candidates.id END
         AND parent.kind <> 'cross_check'
 ), locked_parents AS MATERIALIZED (
-    SELECT lead.id, lead.user_id, lead.repo_id, lead.issue_iid, lead.issue_title, lead.issue_description, lead.status, lead.requeue_count, lead.worker_id, lead.session_id, lead.last_seq, lead.branch, lead.mr_iid, lead.failure_reason, lead.plan_md, lead.iteration_count, lead.claimed_at, lead.started_at, lead.finished_at, lead.created_at, lead.updated_at, lead.origin_column, lead.board_column, lead.move_pending_since, lead.mr_state, lead.auto_approve, lead.autopilot_commented_at, lead.kind, lead.pipeline_id, lead.pipeline_ref, lead.failure_snapshot, lead.fix_verdict, lead.stop_kind, lead.agent_source, lead.agent_exclusions, lead.repo_agents, lead.title, lead.resume_of_run_id, lead.last_activity_at, lead.health, lead.health_reason, lead.health_since, lead.health_notified_at, lead.target_run_id, lead.mr_web_url, lead.prd_done_path, lead.prd_patch_settled_at, lead.anthropic_secret_id, lead.anthropic_secret_label, lead.anthropic_select_reason, lead.anthropic_headroom_pct, lead.wait_on_limit, lead.limit_resets_at, lead.retry_not_before, lead.limit_wait_count, lead.rate_limit_type, lead.open_question_id, lead.revise_count, lead.plan_source, lead.planned_base_commit, lead.require_base_match, lead.milestones_candidate, lead.milestones_frozen, lead.milestones_completed, lead.milestones_in_progress, lead.budget_max_iterations, lead.budget_wall_seconds, lead.schedule_id, lead.limit_dead_secret_id, lead.report_only, lead.report_md, lead.ci_config_paths, lead.model, lead.override_subagent_model, lead.fail_origin, lead.priority, lead.summary_intent, lead.summary_plan, lead.summary_deltas, lead.issue_comments, lead.base_branch, lead.open_mr, lead.dispatched_at, lead.review_target_run_id, lead.review_requested, lead.then_fix_requested, lead.then_fix_of_run_id, lead.preserved_patch, lead.required_capabilities, lead.stop_reason, lead.required_tools, lead.size_class, lead.interactive, lead.open_followup_id, lead.plan_changed_files, lead.scope_ceiling, lead.status_since, lead.review_comments, lead.budget_paused_seconds, lead.mr_rework_enabled, lead.trigger_source, lead.checkpoint_tip, lead.usage_refolded, lead.codex_secret_id, lead.codex_auth_mode, lead.codex_secret_label, lead.codex_account_key, lead.codex_material_revision, lead.codex_account_revision, lead.codex_claim_epoch, lead.codex_cap_hash, lead.pause_requested_at, lead.pause_mode, lead.pause_after_count, lead.checkpoint_tip_at, lead.recovery_wait_count, lead.recovery_retry_not_before, lead.completion_contract_version, lead.contract_revision, lead.completion_contract, lead.completion_attempts, lead.latest_completion_attempt, lead.milestones_agents, lead.hold_reason, lead.hold_captured_head, lead.completion_budget_exhausted_at, lead.completion_question_at, lead.budget_extension_seconds, lead.claim_generation, lead.harness, lead.recovery_wait_cause, lead.forge_park_count, lead.credential_override_mode, lead.credential_override_secret_id, lead.claim_released_at, lead.credential_switch_requested_at, lead.credential_switch_generation, lead.stale_requeue_generation, lead.budget_finalize_seconds, lead.released_worker_id, lead.released_worker_nonce, lead.gate_revision, lead.gate_presentation_id, lead.gate_presented_payload, lead.gate_payload_digest, lead.gate_refusal_count, lead.gate_refusal_generation, lead.disk_park_count, lead.checkpoint_contains_latest, lead.egress_profile_id, lead.egress_snapshot, lead.job_type, lead.finalize_resume_generation, lead.job_protocol, lead.first_started_at, lead.plan_cross_check_required, lead.plan_cross_check_gate_reason, lead.issue_raw_digest, lead.issue_saved_body, lead.issue_input_reason, lead.auto_approve_blocked_reasons, lead.plan_cross_check_diff_refusal, lead.worker_recovery_episode, lead.requeue_episode_baseline, lead.worker_recovery_evidence, lead.cross_check_lane, lead.cross_check_lane_generation, lead.completion_final_head, lead.code_cross_check_required, lead.provider_park_count, lead.provider_park_streak_started_at, lead.ci_config_guard, lead.memory_episode, lead.memory_intervention_count, lead.memory_policy, lead.completion_non_closing_reason, lead.ci_artifact_manifest, lead.checkpoint_attested_source, lead.source_publication_intent, lead.continued_issue_iid, lead.checkpoint_coordinates, lead.retained_park_count, lead.ignored_inferred_capabilities, lead.reserve_hold_reason, lead.reserve_exempt_until, lead.reserve_exempt_granted_at, lead.reserve_exempt_credential_id, lead.reserve_exempt_window_reset, lead.reserve_exempt_prior_pct, lead.hinted_capabilities, lead.capability_inference_evidence, lead.idle_stall_park_count, lead.forge_admission, lead.codex_select_reason, lead.recovery_wait_phase, lead.plan_cross_check_gated, lead.policy_preserve_required, lead.policy_pending_fresh, lead.policy_outcome_id, lead.policy_continuation_mode, lead.policy_resolved_at, lead.policy_applying_worker_id, lead.policy_applying_generation, lead.policy_source_generation, lead.policy_refusal_count, lead.policy_refusal_tag, lead.policy_refusal_phase, lead.policy_refusal_correlation_id, lead.policy_hold_published, lead.harness_preferred, lead.harness_decision_reason, lead.harness_preferred_score, lead.harness_other_score, lead.harness_preferred_measured, lead.harness_other_measured, lead.harness_preferred_held, lead.harness_other_held, lead.harness_preferred_weekly_reset_at, lead.harness_other_weekly_reset_at, lead.registration_evidence_generation, lead.registration_evidence_nonce, lead.registration_evidence_epoch, lead.snapshot_departed_generation, lead.snapshot_departed_nonce, lead.snapshot_departed_epoch, lead.repo_agent_source_commit, lead.repo_agent_source_required, lead.agent_source_requested, lead.agent_source_requested_basis, lead.plan_agent_source, lead.ci_fix_mr_iid, lead.policy_required_head, lead.policy_recovery_verified_generation, lead.policy_recovery_verified_head, lead.policy_hold_cause, lead.policy_fresh_consumed_generation, lead.policy_fresh_confirmed_generation FROM runs lead
+    SELECT lead.id, lead.user_id, lead.repo_id, lead.issue_iid, lead.issue_title, lead.issue_description, lead.status, lead.requeue_count, lead.worker_id, lead.session_id, lead.last_seq, lead.branch, lead.mr_iid, lead.failure_reason, lead.plan_md, lead.iteration_count, lead.claimed_at, lead.started_at, lead.finished_at, lead.created_at, lead.updated_at, lead.origin_column, lead.board_column, lead.move_pending_since, lead.mr_state, lead.auto_approve, lead.autopilot_commented_at, lead.kind, lead.pipeline_id, lead.pipeline_ref, lead.failure_snapshot, lead.fix_verdict, lead.stop_kind, lead.agent_source, lead.agent_exclusions, lead.repo_agents, lead.title, lead.resume_of_run_id, lead.last_activity_at, lead.health, lead.health_reason, lead.health_since, lead.health_notified_at, lead.target_run_id, lead.mr_web_url, lead.prd_done_path, lead.prd_patch_settled_at, lead.anthropic_secret_id, lead.anthropic_secret_label, lead.anthropic_select_reason, lead.anthropic_headroom_pct, lead.wait_on_limit, lead.limit_resets_at, lead.retry_not_before, lead.limit_wait_count, lead.rate_limit_type, lead.open_question_id, lead.revise_count, lead.plan_source, lead.planned_base_commit, lead.require_base_match, lead.milestones_candidate, lead.milestones_frozen, lead.milestones_completed, lead.milestones_in_progress, lead.budget_max_iterations, lead.budget_wall_seconds, lead.schedule_id, lead.limit_dead_secret_id, lead.report_only, lead.report_md, lead.ci_config_paths, lead.model, lead.override_subagent_model, lead.fail_origin, lead.priority, lead.summary_intent, lead.summary_plan, lead.summary_deltas, lead.issue_comments, lead.base_branch, lead.open_mr, lead.dispatched_at, lead.review_target_run_id, lead.review_requested, lead.then_fix_requested, lead.then_fix_of_run_id, lead.preserved_patch, lead.required_capabilities, lead.stop_reason, lead.required_tools, lead.size_class, lead.interactive, lead.open_followup_id, lead.plan_changed_files, lead.scope_ceiling, lead.status_since, lead.review_comments, lead.budget_paused_seconds, lead.mr_rework_enabled, lead.trigger_source, lead.checkpoint_tip, lead.usage_refolded, lead.codex_secret_id, lead.codex_auth_mode, lead.codex_secret_label, lead.codex_account_key, lead.codex_material_revision, lead.codex_account_revision, lead.codex_claim_epoch, lead.codex_cap_hash, lead.pause_requested_at, lead.pause_mode, lead.pause_after_count, lead.checkpoint_tip_at, lead.recovery_wait_count, lead.recovery_retry_not_before, lead.completion_contract_version, lead.contract_revision, lead.completion_contract, lead.completion_attempts, lead.latest_completion_attempt, lead.milestones_agents, lead.hold_reason, lead.hold_captured_head, lead.completion_budget_exhausted_at, lead.completion_question_at, lead.budget_extension_seconds, lead.claim_generation, lead.harness, lead.recovery_wait_cause, lead.forge_park_count, lead.credential_override_mode, lead.credential_override_secret_id, lead.claim_released_at, lead.credential_switch_requested_at, lead.credential_switch_generation, lead.stale_requeue_generation, lead.budget_finalize_seconds, lead.released_worker_id, lead.released_worker_nonce, lead.gate_revision, lead.gate_presentation_id, lead.gate_presented_payload, lead.gate_payload_digest, lead.gate_refusal_count, lead.gate_refusal_generation, lead.disk_park_count, lead.checkpoint_contains_latest, lead.egress_profile_id, lead.egress_snapshot, lead.job_type, lead.finalize_resume_generation, lead.job_protocol, lead.first_started_at, lead.plan_cross_check_required, lead.plan_cross_check_gate_reason, lead.issue_raw_digest, lead.issue_saved_body, lead.issue_input_reason, lead.auto_approve_blocked_reasons, lead.plan_cross_check_diff_refusal, lead.worker_recovery_episode, lead.requeue_episode_baseline, lead.worker_recovery_evidence, lead.cross_check_lane, lead.cross_check_lane_generation, lead.completion_final_head, lead.code_cross_check_required, lead.provider_park_count, lead.provider_park_streak_started_at, lead.ci_config_guard, lead.memory_episode, lead.memory_intervention_count, lead.memory_policy, lead.completion_non_closing_reason, lead.ci_artifact_manifest, lead.checkpoint_attested_source, lead.source_publication_intent, lead.continued_issue_iid, lead.checkpoint_coordinates, lead.retained_park_count, lead.ignored_inferred_capabilities, lead.reserve_hold_reason, lead.reserve_exempt_until, lead.reserve_exempt_granted_at, lead.reserve_exempt_credential_id, lead.reserve_exempt_window_reset, lead.reserve_exempt_prior_pct, lead.hinted_capabilities, lead.capability_inference_evidence, lead.idle_stall_park_count, lead.forge_admission, lead.codex_select_reason, lead.recovery_wait_phase, lead.plan_cross_check_gated, lead.policy_preserve_required, lead.policy_pending_fresh, lead.policy_outcome_id, lead.policy_continuation_mode, lead.policy_resolved_at, lead.policy_applying_worker_id, lead.policy_applying_generation, lead.policy_source_generation, lead.policy_refusal_count, lead.policy_refusal_tag, lead.policy_refusal_phase, lead.policy_refusal_correlation_id, lead.policy_hold_published, lead.harness_preferred, lead.harness_decision_reason, lead.harness_preferred_score, lead.harness_other_score, lead.harness_preferred_measured, lead.harness_other_measured, lead.harness_preferred_held, lead.harness_other_held, lead.harness_preferred_weekly_reset_at, lead.harness_other_weekly_reset_at, lead.registration_evidence_generation, lead.registration_evidence_nonce, lead.registration_evidence_epoch, lead.snapshot_departed_generation, lead.snapshot_departed_nonce, lead.snapshot_departed_epoch, lead.repo_agent_source_commit, lead.repo_agent_source_required, lead.agent_source_requested, lead.agent_source_requested_basis, lead.plan_agent_source, lead.ci_fix_mr_iid, lead.policy_required_head, lead.policy_recovery_verified_generation, lead.policy_recovery_verified_head, lead.policy_hold_cause, lead.policy_fresh_consumed_generation, lead.policy_fresh_confirmed_generation, lead.recovery_wait_detail, lead.credential_switch_op_id, lead.credential_switch_hold_op_id, lead.credential_switch_hold_generation, lead.credential_switch_hold_worker_id, lead.credential_switch_hold_register_nonce, lead.effort, lead.model_source, lead.effort_source, lead.checkpoint_withheld_since, lead.checkpoint_withheld_status_since, lead.checkpoint_withheld_worker_id, lead.checkpoint_withheld_generation, lead.checkpoint_withheld_nonce, lead.checkpoint_withheld_report_seq FROM runs lead
     WHERE lead.id IN (SELECT parent_id FROM parent_mapping)
       AND lead.kind <> 'cross_check'
     ORDER BY lead.id
@@ -446,6 +523,106 @@ type DeleteRepoForUserParams struct {
 // (runs, cached issues, board columns, ...) via existing FKs.
 func (q *Queries) DeleteRepoForUser(ctx context.Context, arg DeleteRepoForUserParams) (int64, error) {
 	result, err := q.db.Exec(ctx, deleteRepoForUser, arg.ID, arg.UserID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const enableRepoForUser = `-- name: EnableRepoForUser :one
+UPDATE repos SET
+  enabled = true,
+  initial_import_generation = CASE
+    WHEN NOT repos.enabled OR repos.initial_import_state IS DISTINCT FROM 'succeeded'
+    THEN repos.initial_import_generation + 1 ELSE repos.initial_import_generation END,
+  initial_import_state = CASE
+    WHEN NOT repos.enabled OR repos.initial_import_state IS DISTINCT FROM 'succeeded'
+    THEN 'waiting' ELSE repos.initial_import_state END,
+  initial_import_error_class = CASE
+    WHEN NOT repos.enabled OR repos.initial_import_state IS DISTINCT FROM 'succeeded'
+    THEN NULL ELSE repos.initial_import_error_class END,
+  initial_import_updated_at = CASE
+    WHEN NOT repos.enabled OR repos.initial_import_state IS DISTINCT FROM 'succeeded'
+    THEN now() ELSE repos.initial_import_updated_at END
+WHERE repos.id = $1
+  AND repos.connection_id IN (SELECT forge_connections.id FROM forge_connections WHERE forge_connections.user_id = $2)
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, initial_import_state, initial_import_generation, initial_import_error_class, initial_import_updated_at, awaiting_first_enable, issue_tracker_connection_id, issue_tracker_project_id, issue_tracker_project_short, eligibility_tag_id, eligibility_tag_name, issue_tracker_linked_at
+`
+
+type EnableRepoForUserParams struct {
+	ID     uuid.UUID `json:"id"`
+	UserID uuid.UUID `json:"user_id"`
+}
+
+// Owner-scoped enable that also records the first-import intent (issue #4399).
+// A newly enabled repo, or one whose import has not succeeded, gets a new
+// generation in state 'waiting' for the poller to run; re-enabling an already
+// enabled repo whose import succeeded changes nothing. The SET expressions read
+// the OLD row, so `repos.enabled` below is the pre-update value.
+func (q *Queries) EnableRepoForUser(ctx context.Context, arg EnableRepoForUserParams) (Repo, error) {
+	row := q.db.QueryRow(ctx, enableRepoForUser, arg.ID, arg.UserID)
+	var i Repo
+	err := row.Scan(
+		&i.ID,
+		&i.ConnectionID,
+		&i.ForgeProjectID,
+		&i.PathWithNamespace,
+		&i.WebUrl,
+		&i.DefaultBranch,
+		&i.Enabled,
+		&i.RepoSkillsEnabled,
+		&i.RepoDevboxOptIn,
+		&i.RepoClaudemdEnabled,
+		&i.GuardrailOverrideReason,
+		&i.GuardrailOverrideBy,
+		&i.GuardrailOverrideAt,
+		&i.RequiredCapabilities,
+		&i.FoldImproveUziBacklog,
+		&i.CodeCrossCheckGuidance,
+		&i.CrossCheckRepoInstructionsEnabled,
+		&i.IgnoredInferredCapabilities,
+		&i.AgentSourceDefault,
+		&i.InitialImportState,
+		&i.InitialImportGeneration,
+		&i.InitialImportErrorClass,
+		&i.InitialImportUpdatedAt,
+		&i.AwaitingFirstEnable,
+		&i.IssueTrackerConnectionID,
+		&i.IssueTrackerProjectID,
+		&i.IssueTrackerProjectShort,
+		&i.EligibilityTagID,
+		&i.EligibilityTagName,
+		&i.IssueTrackerLinkedAt,
+	)
+	return i, err
+}
+
+const finishRepoInitialImport = `-- name: FinishRepoInitialImport :execrows
+UPDATE repos SET
+  initial_import_state = $1::text,
+  initial_import_error_class = $2::text,
+  initial_import_updated_at = now()
+WHERE repos.id = $3
+  AND repos.initial_import_generation = $4
+  AND repos.initial_import_state = 'running'
+`
+
+type FinishRepoInitialImportParams struct {
+	State      string      `json:"state"`
+	ErrorClass pgtype.Text `json:"error_class"`
+	ID         uuid.UUID   `json:"id"`
+	Generation int64       `json:"generation"`
+}
+
+// Settles a claimed import: state 'succeeded' with a NULL class, or 'failed' with
+// a class. Generation- and state-guarded so a stale finisher writes zero rows.
+func (q *Queries) FinishRepoInitialImport(ctx context.Context, arg FinishRepoInitialImportParams) (int64, error) {
+	result, err := q.db.Exec(ctx, finishRepoInitialImport,
+		arg.State,
+		arg.ErrorClass,
+		arg.ID,
+		arg.Generation,
+	)
 	if err != nil {
 		return 0, err
 	}
@@ -754,6 +931,7 @@ const getRepoForUser = `-- name: GetRepoForUser :one
 SELECT r.id, r.connection_id, r.forge_project_id, r.path_with_namespace, r.web_url,
        r.default_branch, r.enabled, r.fold_improve_uzi_backlog,
        r.guardrail_override_reason, r.guardrail_override_by, r.guardrail_override_at,
+       r.initial_import_state, r.initial_import_error_class, r.initial_import_updated_at,
        r.issue_tracker_connection_id, r.issue_tracker_project_id, r.issue_tracker_project_short,
        r.eligibility_tag_id, r.eligibility_tag_name, r.issue_tracker_linked_at, r.awaiting_first_enable,
        c.forge_type, c.base_url, c.token_ciphertext, c.user_id, c.bot_forge_user_id
@@ -779,6 +957,9 @@ type GetRepoForUserRow struct {
 	GuardrailOverrideReason  pgtype.Text        `json:"guardrail_override_reason"`
 	GuardrailOverrideBy      pgtype.UUID        `json:"guardrail_override_by"`
 	GuardrailOverrideAt      pgtype.Timestamptz `json:"guardrail_override_at"`
+	InitialImportState       pgtype.Text        `json:"initial_import_state"`
+	InitialImportErrorClass  pgtype.Text        `json:"initial_import_error_class"`
+	InitialImportUpdatedAt   pgtype.Timestamptz `json:"initial_import_updated_at"`
 	IssueTrackerConnectionID pgtype.UUID        `json:"issue_tracker_connection_id"`
 	IssueTrackerProjectID    pgtype.Text        `json:"issue_tracker_project_id"`
 	IssueTrackerProjectShort pgtype.Text        `json:"issue_tracker_project_short"`
@@ -813,6 +994,9 @@ func (q *Queries) GetRepoForUser(ctx context.Context, arg GetRepoForUserParams) 
 		&i.GuardrailOverrideReason,
 		&i.GuardrailOverrideBy,
 		&i.GuardrailOverrideAt,
+		&i.InitialImportState,
+		&i.InitialImportErrorClass,
+		&i.InitialImportUpdatedAt,
 		&i.IssueTrackerConnectionID,
 		&i.IssueTrackerProjectID,
 		&i.IssueTrackerProjectShort,
@@ -1076,7 +1260,7 @@ func (q *Queries) ListEnabledRepoIDs(ctx context.Context) ([]uuid.UUID, error) {
 }
 
 const listEnabledReposByConnection = `-- name: ListEnabledReposByConnection :many
-SELECT id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, awaiting_first_enable, issue_tracker_connection_id, issue_tracker_project_id, issue_tracker_project_short, eligibility_tag_id, eligibility_tag_name, issue_tracker_linked_at FROM repos WHERE connection_id = $1 AND enabled = true
+SELECT id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, initial_import_state, initial_import_generation, initial_import_error_class, initial_import_updated_at, awaiting_first_enable, issue_tracker_connection_id, issue_tracker_project_id, issue_tracker_project_short, eligibility_tag_id, eligibility_tag_name, issue_tracker_linked_at FROM repos WHERE connection_id = $1 AND enabled = true
 ORDER BY path_with_namespace ASC
 `
 
@@ -1112,6 +1296,10 @@ func (q *Queries) ListEnabledReposByConnection(ctx context.Context, connectionID
 			&i.CrossCheckRepoInstructionsEnabled,
 			&i.IgnoredInferredCapabilities,
 			&i.AgentSourceDefault,
+			&i.InitialImportState,
+			&i.InitialImportGeneration,
+			&i.InitialImportErrorClass,
+			&i.InitialImportUpdatedAt,
 			&i.AwaitingFirstEnable,
 			&i.IssueTrackerConnectionID,
 			&i.IssueTrackerProjectID,
@@ -1131,7 +1319,7 @@ func (q *Queries) ListEnabledReposByConnection(ctx context.Context, connectionID
 }
 
 const listEnabledReposForUser = `-- name: ListEnabledReposForUser :many
-SELECT r.id, r.connection_id, r.forge_project_id, r.path_with_namespace, r.web_url, r.default_branch, r.enabled, r.repo_skills_enabled, r.repo_devbox_opt_in, r.repo_claudemd_enabled, r.guardrail_override_reason, r.guardrail_override_by, r.guardrail_override_at, r.required_capabilities, r.fold_improve_uzi_backlog, r.code_cross_check_guidance, r.cross_check_repo_instructions_enabled, r.ignored_inferred_capabilities, r.agent_source_default, r.awaiting_first_enable, r.issue_tracker_connection_id, r.issue_tracker_project_id, r.issue_tracker_project_short, r.eligibility_tag_id, r.eligibility_tag_name, r.issue_tracker_linked_at FROM repos r
+SELECT r.id, r.connection_id, r.forge_project_id, r.path_with_namespace, r.web_url, r.default_branch, r.enabled, r.repo_skills_enabled, r.repo_devbox_opt_in, r.repo_claudemd_enabled, r.guardrail_override_reason, r.guardrail_override_by, r.guardrail_override_at, r.required_capabilities, r.fold_improve_uzi_backlog, r.code_cross_check_guidance, r.cross_check_repo_instructions_enabled, r.ignored_inferred_capabilities, r.agent_source_default, r.initial_import_state, r.initial_import_generation, r.initial_import_error_class, r.initial_import_updated_at, r.awaiting_first_enable, r.issue_tracker_connection_id, r.issue_tracker_project_id, r.issue_tracker_project_short, r.eligibility_tag_id, r.eligibility_tag_name, r.issue_tracker_linked_at FROM repos r
 JOIN forge_connections c ON c.id = r.connection_id
 WHERE c.user_id = $1 AND r.enabled = true
 ORDER BY r.path_with_namespace ASC
@@ -1167,6 +1355,10 @@ func (q *Queries) ListEnabledReposForUser(ctx context.Context, userID uuid.UUID)
 			&i.CrossCheckRepoInstructionsEnabled,
 			&i.IgnoredInferredCapabilities,
 			&i.AgentSourceDefault,
+			&i.InitialImportState,
+			&i.InitialImportGeneration,
+			&i.InitialImportErrorClass,
+			&i.InitialImportUpdatedAt,
 			&i.AwaitingFirstEnable,
 			&i.IssueTrackerConnectionID,
 			&i.IssueTrackerProjectID,
@@ -1188,6 +1380,7 @@ func (q *Queries) ListEnabledReposForUser(ctx context.Context, userID uuid.UUID)
 const listEnabledReposWithConnections = `-- name: ListEnabledReposWithConnections :many
 SELECT r.id, r.connection_id, r.forge_project_id, r.path_with_namespace, r.web_url,
        r.default_branch, r.enabled,
+       r.initial_import_state, r.initial_import_generation,
        r.issue_tracker_connection_id, r.issue_tracker_project_id, r.issue_tracker_project_short,
        r.eligibility_tag_id, r.eligibility_tag_name, r.issue_tracker_linked_at, r.awaiting_first_enable,
        c.forge_type, c.base_url, c.token_ciphertext, c.user_id
@@ -1204,6 +1397,8 @@ type ListEnabledReposWithConnectionsRow struct {
 	WebUrl                   string             `json:"web_url"`
 	DefaultBranch            pgtype.Text        `json:"default_branch"`
 	Enabled                  bool               `json:"enabled"`
+	InitialImportState       pgtype.Text        `json:"initial_import_state"`
+	InitialImportGeneration  int64              `json:"initial_import_generation"`
 	IssueTrackerConnectionID pgtype.UUID        `json:"issue_tracker_connection_id"`
 	IssueTrackerProjectID    pgtype.Text        `json:"issue_tracker_project_id"`
 	IssueTrackerProjectShort pgtype.Text        `json:"issue_tracker_project_short"`
@@ -1236,6 +1431,8 @@ func (q *Queries) ListEnabledReposWithConnections(ctx context.Context) ([]ListEn
 			&i.WebUrl,
 			&i.DefaultBranch,
 			&i.Enabled,
+			&i.InitialImportState,
+			&i.InitialImportGeneration,
 			&i.IssueTrackerConnectionID,
 			&i.IssueTrackerProjectID,
 			&i.IssueTrackerProjectShort,
@@ -1766,7 +1963,7 @@ func (q *Queries) ListPRDLinkPatchCandidates(ctx context.Context, arg ListPRDLin
 }
 
 const listReposByConnectionForUser = `-- name: ListReposByConnectionForUser :many
-SELECT r.id, r.connection_id, r.forge_project_id, r.path_with_namespace, r.web_url, r.default_branch, r.enabled, r.repo_skills_enabled, r.repo_devbox_opt_in, r.repo_claudemd_enabled, r.guardrail_override_reason, r.guardrail_override_by, r.guardrail_override_at, r.required_capabilities, r.fold_improve_uzi_backlog, r.code_cross_check_guidance, r.cross_check_repo_instructions_enabled, r.ignored_inferred_capabilities, r.agent_source_default, r.awaiting_first_enable, r.issue_tracker_connection_id, r.issue_tracker_project_id, r.issue_tracker_project_short, r.eligibility_tag_id, r.eligibility_tag_name, r.issue_tracker_linked_at FROM repos r
+SELECT r.id, r.connection_id, r.forge_project_id, r.path_with_namespace, r.web_url, r.default_branch, r.enabled, r.repo_skills_enabled, r.repo_devbox_opt_in, r.repo_claudemd_enabled, r.guardrail_override_reason, r.guardrail_override_by, r.guardrail_override_at, r.required_capabilities, r.fold_improve_uzi_backlog, r.code_cross_check_guidance, r.cross_check_repo_instructions_enabled, r.ignored_inferred_capabilities, r.agent_source_default, r.initial_import_state, r.initial_import_generation, r.initial_import_error_class, r.initial_import_updated_at, r.awaiting_first_enable, r.issue_tracker_connection_id, r.issue_tracker_project_id, r.issue_tracker_project_short, r.eligibility_tag_id, r.eligibility_tag_name, r.issue_tracker_linked_at FROM repos r
 JOIN forge_connections c ON c.id = r.connection_id
 WHERE r.connection_id = $1 AND c.user_id = $2
 ORDER BY r.path_with_namespace ASC
@@ -1807,6 +2004,10 @@ func (q *Queries) ListReposByConnectionForUser(ctx context.Context, arg ListRepo
 			&i.CrossCheckRepoInstructionsEnabled,
 			&i.IgnoredInferredCapabilities,
 			&i.AgentSourceDefault,
+			&i.InitialImportState,
+			&i.InitialImportGeneration,
+			&i.InitialImportErrorClass,
+			&i.InitialImportUpdatedAt,
 			&i.AwaitingFirstEnable,
 			&i.IssueTrackerConnectionID,
 			&i.IssueTrackerProjectID,
@@ -1996,7 +2197,7 @@ const setRepoAgentSourceDefault = `-- name: SetRepoAgentSourceDefault :one
 UPDATE repos SET agent_source_default = $1::text
 WHERE repos.id = $2
   AND $1::text IS DISTINCT FROM 'repo'
-RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, awaiting_first_enable, issue_tracker_connection_id, issue_tracker_project_id, issue_tracker_project_short, eligibility_tag_id, eligibility_tag_name, issue_tracker_linked_at
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, initial_import_state, initial_import_generation, initial_import_error_class, initial_import_updated_at, awaiting_first_enable, issue_tracker_connection_id, issue_tracker_project_id, issue_tracker_project_short, eligibility_tag_id, eligibility_tag_name, issue_tracker_linked_at
 `
 
 type SetRepoAgentSourceDefaultParams struct {
@@ -2027,6 +2228,10 @@ func (q *Queries) SetRepoAgentSourceDefault(ctx context.Context, arg SetRepoAgen
 		&i.CrossCheckRepoInstructionsEnabled,
 		&i.IgnoredInferredCapabilities,
 		&i.AgentSourceDefault,
+		&i.InitialImportState,
+		&i.InitialImportGeneration,
+		&i.InitialImportErrorClass,
+		&i.InitialImportUpdatedAt,
 		&i.AwaitingFirstEnable,
 		&i.IssueTrackerConnectionID,
 		&i.IssueTrackerProjectID,
@@ -2042,7 +2247,7 @@ const setRepoAgentSourceDefaultForUser = `-- name: SetRepoAgentSourceDefaultForU
 UPDATE repos SET agent_source_default = $1::text
 WHERE repos.id = $2
   AND repos.connection_id IN (SELECT forge_connections.id FROM forge_connections WHERE forge_connections.user_id = $3)
-RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, awaiting_first_enable, issue_tracker_connection_id, issue_tracker_project_id, issue_tracker_project_short, eligibility_tag_id, eligibility_tag_name, issue_tracker_linked_at
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, initial_import_state, initial_import_generation, initial_import_error_class, initial_import_updated_at, awaiting_first_enable, issue_tracker_connection_id, issue_tracker_project_id, issue_tracker_project_short, eligibility_tag_id, eligibility_tag_name, issue_tracker_linked_at
 `
 
 type SetRepoAgentSourceDefaultForUserParams struct {
@@ -2074,6 +2279,10 @@ func (q *Queries) SetRepoAgentSourceDefaultForUser(ctx context.Context, arg SetR
 		&i.CrossCheckRepoInstructionsEnabled,
 		&i.IgnoredInferredCapabilities,
 		&i.AgentSourceDefault,
+		&i.InitialImportState,
+		&i.InitialImportGeneration,
+		&i.InitialImportErrorClass,
+		&i.InitialImportUpdatedAt,
 		&i.AwaitingFirstEnable,
 		&i.IssueTrackerConnectionID,
 		&i.IssueTrackerProjectID,
@@ -2086,7 +2295,7 @@ func (q *Queries) SetRepoAgentSourceDefaultForUser(ctx context.Context, arg SetR
 }
 
 const setRepoCapabilityPolicy = `-- name: SetRepoCapabilityPolicy :one
-UPDATE repos SET required_capabilities = $2, ignored_inferred_capabilities = $3 WHERE repos.id = $1 RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, awaiting_first_enable, issue_tracker_connection_id, issue_tracker_project_id, issue_tracker_project_short, eligibility_tag_id, eligibility_tag_name, issue_tracker_linked_at
+UPDATE repos SET required_capabilities = $2, ignored_inferred_capabilities = $3 WHERE repos.id = $1 RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, initial_import_state, initial_import_generation, initial_import_error_class, initial_import_updated_at, awaiting_first_enable, issue_tracker_connection_id, issue_tracker_project_id, issue_tracker_project_short, eligibility_tag_id, eligibility_tag_name, issue_tracker_linked_at
 `
 
 type SetRepoCapabilityPolicyParams struct {
@@ -2118,6 +2327,10 @@ func (q *Queries) SetRepoCapabilityPolicy(ctx context.Context, arg SetRepoCapabi
 		&i.CrossCheckRepoInstructionsEnabled,
 		&i.IgnoredInferredCapabilities,
 		&i.AgentSourceDefault,
+		&i.InitialImportState,
+		&i.InitialImportGeneration,
+		&i.InitialImportErrorClass,
+		&i.InitialImportUpdatedAt,
 		&i.AwaitingFirstEnable,
 		&i.IssueTrackerConnectionID,
 		&i.IssueTrackerProjectID,
@@ -2133,7 +2346,7 @@ const setRepoCapabilityPolicyForUser = `-- name: SetRepoCapabilityPolicyForUser 
 UPDATE repos SET required_capabilities = $2, ignored_inferred_capabilities = $3
 WHERE repos.id = $1
   AND repos.connection_id IN (SELECT forge_connections.id FROM forge_connections WHERE forge_connections.user_id = $4)
-RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, awaiting_first_enable, issue_tracker_connection_id, issue_tracker_project_id, issue_tracker_project_short, eligibility_tag_id, eligibility_tag_name, issue_tracker_linked_at
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, initial_import_state, initial_import_generation, initial_import_error_class, initial_import_updated_at, awaiting_first_enable, issue_tracker_connection_id, issue_tracker_project_id, issue_tracker_project_short, eligibility_tag_id, eligibility_tag_name, issue_tracker_linked_at
 `
 
 type SetRepoCapabilityPolicyForUserParams struct {
@@ -2171,6 +2384,10 @@ func (q *Queries) SetRepoCapabilityPolicyForUser(ctx context.Context, arg SetRep
 		&i.CrossCheckRepoInstructionsEnabled,
 		&i.IgnoredInferredCapabilities,
 		&i.AgentSourceDefault,
+		&i.InitialImportState,
+		&i.InitialImportGeneration,
+		&i.InitialImportErrorClass,
+		&i.InitialImportUpdatedAt,
 		&i.AwaitingFirstEnable,
 		&i.IssueTrackerConnectionID,
 		&i.IssueTrackerProjectID,
@@ -2186,7 +2403,7 @@ const setRepoCodeCrossCheckInputs = `-- name: SetRepoCodeCrossCheckInputs :one
 UPDATE repos SET
  code_cross_check_guidance = CASE WHEN $1::boolean THEN $2::text ELSE code_cross_check_guidance END,
  cross_check_repo_instructions_enabled = COALESCE($3::boolean, cross_check_repo_instructions_enabled)
-WHERE id = $4 RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, awaiting_first_enable, issue_tracker_connection_id, issue_tracker_project_id, issue_tracker_project_short, eligibility_tag_id, eligibility_tag_name, issue_tracker_linked_at
+WHERE id = $4 RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, initial_import_state, initial_import_generation, initial_import_error_class, initial_import_updated_at, awaiting_first_enable, issue_tracker_connection_id, issue_tracker_project_id, issue_tracker_project_short, eligibility_tag_id, eligibility_tag_name, issue_tracker_linked_at
 `
 
 type SetRepoCodeCrossCheckInputsParams struct {
@@ -2224,6 +2441,10 @@ func (q *Queries) SetRepoCodeCrossCheckInputs(ctx context.Context, arg SetRepoCo
 		&i.CrossCheckRepoInstructionsEnabled,
 		&i.IgnoredInferredCapabilities,
 		&i.AgentSourceDefault,
+		&i.InitialImportState,
+		&i.InitialImportGeneration,
+		&i.InitialImportErrorClass,
+		&i.InitialImportUpdatedAt,
 		&i.AwaitingFirstEnable,
 		&i.IssueTrackerConnectionID,
 		&i.IssueTrackerProjectID,
@@ -2240,7 +2461,7 @@ UPDATE repos SET
  code_cross_check_guidance = CASE WHEN $1::boolean THEN $2::text ELSE code_cross_check_guidance END,
  cross_check_repo_instructions_enabled = COALESCE($3::boolean, cross_check_repo_instructions_enabled)
 WHERE repos.id = $4 AND repos.connection_id IN (SELECT fc.id FROM forge_connections fc WHERE fc.user_id = $5)
-RETURNING repos.id, repos.connection_id, repos.forge_project_id, repos.path_with_namespace, repos.web_url, repos.default_branch, repos.enabled, repos.repo_skills_enabled, repos.repo_devbox_opt_in, repos.repo_claudemd_enabled, repos.guardrail_override_reason, repos.guardrail_override_by, repos.guardrail_override_at, repos.required_capabilities, repos.fold_improve_uzi_backlog, repos.code_cross_check_guidance, repos.cross_check_repo_instructions_enabled, repos.ignored_inferred_capabilities, repos.agent_source_default, repos.awaiting_first_enable, repos.issue_tracker_connection_id, repos.issue_tracker_project_id, repos.issue_tracker_project_short, repos.eligibility_tag_id, repos.eligibility_tag_name, repos.issue_tracker_linked_at
+RETURNING repos.id, repos.connection_id, repos.forge_project_id, repos.path_with_namespace, repos.web_url, repos.default_branch, repos.enabled, repos.repo_skills_enabled, repos.repo_devbox_opt_in, repos.repo_claudemd_enabled, repos.guardrail_override_reason, repos.guardrail_override_by, repos.guardrail_override_at, repos.required_capabilities, repos.fold_improve_uzi_backlog, repos.code_cross_check_guidance, repos.cross_check_repo_instructions_enabled, repos.ignored_inferred_capabilities, repos.agent_source_default, repos.initial_import_state, repos.initial_import_generation, repos.initial_import_error_class, repos.initial_import_updated_at, repos.awaiting_first_enable, repos.issue_tracker_connection_id, repos.issue_tracker_project_id, repos.issue_tracker_project_short, repos.eligibility_tag_id, repos.eligibility_tag_name, repos.issue_tracker_linked_at
 `
 
 type SetRepoCodeCrossCheckInputsForUserParams struct {
@@ -2280,6 +2501,10 @@ func (q *Queries) SetRepoCodeCrossCheckInputsForUser(ctx context.Context, arg Se
 		&i.CrossCheckRepoInstructionsEnabled,
 		&i.IgnoredInferredCapabilities,
 		&i.AgentSourceDefault,
+		&i.InitialImportState,
+		&i.InitialImportGeneration,
+		&i.InitialImportErrorClass,
+		&i.InitialImportUpdatedAt,
 		&i.AwaitingFirstEnable,
 		&i.IssueTrackerConnectionID,
 		&i.IssueTrackerProjectID,
@@ -2292,7 +2517,7 @@ func (q *Queries) SetRepoCodeCrossCheckInputsForUser(ctx context.Context, arg Se
 }
 
 const setRepoDevboxOptIn = `-- name: SetRepoDevboxOptIn :one
-UPDATE repos SET repo_devbox_opt_in = $2 WHERE repos.id = $1 RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, awaiting_first_enable, issue_tracker_connection_id, issue_tracker_project_id, issue_tracker_project_short, eligibility_tag_id, eligibility_tag_name, issue_tracker_linked_at
+UPDATE repos SET repo_devbox_opt_in = $2 WHERE repos.id = $1 RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, initial_import_state, initial_import_generation, initial_import_error_class, initial_import_updated_at, awaiting_first_enable, issue_tracker_connection_id, issue_tracker_project_id, issue_tracker_project_short, eligibility_tag_id, eligibility_tag_name, issue_tracker_linked_at
 `
 
 type SetRepoDevboxOptInParams struct {
@@ -2325,6 +2550,10 @@ func (q *Queries) SetRepoDevboxOptIn(ctx context.Context, arg SetRepoDevboxOptIn
 		&i.CrossCheckRepoInstructionsEnabled,
 		&i.IgnoredInferredCapabilities,
 		&i.AgentSourceDefault,
+		&i.InitialImportState,
+		&i.InitialImportGeneration,
+		&i.InitialImportErrorClass,
+		&i.InitialImportUpdatedAt,
 		&i.AwaitingFirstEnable,
 		&i.IssueTrackerConnectionID,
 		&i.IssueTrackerProjectID,
@@ -2340,7 +2569,7 @@ const setRepoDevboxOptInForUser = `-- name: SetRepoDevboxOptInForUser :one
 UPDATE repos SET repo_devbox_opt_in = $2
 WHERE repos.id = $1
   AND repos.connection_id IN (SELECT forge_connections.id FROM forge_connections WHERE forge_connections.user_id = $3)
-RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, awaiting_first_enable, issue_tracker_connection_id, issue_tracker_project_id, issue_tracker_project_short, eligibility_tag_id, eligibility_tag_name, issue_tracker_linked_at
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, initial_import_state, initial_import_generation, initial_import_error_class, initial_import_updated_at, awaiting_first_enable, issue_tracker_connection_id, issue_tracker_project_id, issue_tracker_project_short, eligibility_tag_id, eligibility_tag_name, issue_tracker_linked_at
 `
 
 type SetRepoDevboxOptInForUserParams struct {
@@ -2374,6 +2603,10 @@ func (q *Queries) SetRepoDevboxOptInForUser(ctx context.Context, arg SetRepoDevb
 		&i.CrossCheckRepoInstructionsEnabled,
 		&i.IgnoredInferredCapabilities,
 		&i.AgentSourceDefault,
+		&i.InitialImportState,
+		&i.InitialImportGeneration,
+		&i.InitialImportErrorClass,
+		&i.InitialImportUpdatedAt,
 		&i.AwaitingFirstEnable,
 		&i.IssueTrackerConnectionID,
 		&i.IssueTrackerProjectID,
@@ -2389,7 +2622,7 @@ const setRepoEnabledForUser = `-- name: SetRepoEnabledForUser :one
 UPDATE repos SET enabled = $2
 WHERE repos.id = $1
   AND repos.connection_id IN (SELECT forge_connections.id FROM forge_connections WHERE forge_connections.user_id = $3)
-RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, awaiting_first_enable, issue_tracker_connection_id, issue_tracker_project_id, issue_tracker_project_short, eligibility_tag_id, eligibility_tag_name, issue_tracker_linked_at
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, initial_import_state, initial_import_generation, initial_import_error_class, initial_import_updated_at, awaiting_first_enable, issue_tracker_connection_id, issue_tracker_project_id, issue_tracker_project_short, eligibility_tag_id, eligibility_tag_name, issue_tracker_linked_at
 `
 
 type SetRepoEnabledForUserParams struct {
@@ -2421,6 +2654,10 @@ func (q *Queries) SetRepoEnabledForUser(ctx context.Context, arg SetRepoEnabledF
 		&i.CrossCheckRepoInstructionsEnabled,
 		&i.IgnoredInferredCapabilities,
 		&i.AgentSourceDefault,
+		&i.InitialImportState,
+		&i.InitialImportGeneration,
+		&i.InitialImportErrorClass,
+		&i.InitialImportUpdatedAt,
 		&i.AwaitingFirstEnable,
 		&i.IssueTrackerConnectionID,
 		&i.IssueTrackerProjectID,
@@ -2433,7 +2670,7 @@ func (q *Queries) SetRepoEnabledForUser(ctx context.Context, arg SetRepoEnabledF
 }
 
 const setRepoFoldImproveUziBacklog = `-- name: SetRepoFoldImproveUziBacklog :one
-UPDATE repos SET fold_improve_uzi_backlog = $2 WHERE repos.id = $1 RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, awaiting_first_enable, issue_tracker_connection_id, issue_tracker_project_id, issue_tracker_project_short, eligibility_tag_id, eligibility_tag_name, issue_tracker_linked_at
+UPDATE repos SET fold_improve_uzi_backlog = $2 WHERE repos.id = $1 RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, initial_import_state, initial_import_generation, initial_import_error_class, initial_import_updated_at, awaiting_first_enable, issue_tracker_connection_id, issue_tracker_project_id, issue_tracker_project_short, eligibility_tag_id, eligibility_tag_name, issue_tracker_linked_at
 `
 
 type SetRepoFoldImproveUziBacklogParams struct {
@@ -2466,6 +2703,10 @@ func (q *Queries) SetRepoFoldImproveUziBacklog(ctx context.Context, arg SetRepoF
 		&i.CrossCheckRepoInstructionsEnabled,
 		&i.IgnoredInferredCapabilities,
 		&i.AgentSourceDefault,
+		&i.InitialImportState,
+		&i.InitialImportGeneration,
+		&i.InitialImportErrorClass,
+		&i.InitialImportUpdatedAt,
 		&i.AwaitingFirstEnable,
 		&i.IssueTrackerConnectionID,
 		&i.IssueTrackerProjectID,
@@ -2481,7 +2722,7 @@ const setRepoFoldImproveUziBacklogForUser = `-- name: SetRepoFoldImproveUziBackl
 UPDATE repos SET fold_improve_uzi_backlog = $2
 WHERE repos.id = $1
   AND repos.connection_id IN (SELECT forge_connections.id FROM forge_connections WHERE forge_connections.user_id = $3)
-RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, awaiting_first_enable, issue_tracker_connection_id, issue_tracker_project_id, issue_tracker_project_short, eligibility_tag_id, eligibility_tag_name, issue_tracker_linked_at
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, initial_import_state, initial_import_generation, initial_import_error_class, initial_import_updated_at, awaiting_first_enable, issue_tracker_connection_id, issue_tracker_project_id, issue_tracker_project_short, eligibility_tag_id, eligibility_tag_name, issue_tracker_linked_at
 `
 
 type SetRepoFoldImproveUziBacklogForUserParams struct {
@@ -2516,6 +2757,10 @@ func (q *Queries) SetRepoFoldImproveUziBacklogForUser(ctx context.Context, arg S
 		&i.CrossCheckRepoInstructionsEnabled,
 		&i.IgnoredInferredCapabilities,
 		&i.AgentSourceDefault,
+		&i.InitialImportState,
+		&i.InitialImportGeneration,
+		&i.InitialImportErrorClass,
+		&i.InitialImportUpdatedAt,
 		&i.AwaitingFirstEnable,
 		&i.IssueTrackerConnectionID,
 		&i.IssueTrackerProjectID,
@@ -2533,7 +2778,7 @@ SET guardrail_override_reason = $2,
     guardrail_override_by     = $3,
     guardrail_override_at     = $4
 WHERE id = $1
-RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, awaiting_first_enable, issue_tracker_connection_id, issue_tracker_project_id, issue_tracker_project_short, eligibility_tag_id, eligibility_tag_name, issue_tracker_linked_at
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, initial_import_state, initial_import_generation, initial_import_error_class, initial_import_updated_at, awaiting_first_enable, issue_tracker_connection_id, issue_tracker_project_id, issue_tracker_project_short, eligibility_tag_id, eligibility_tag_name, issue_tracker_linked_at
 `
 
 type SetRepoGuardrailOverrideParams struct {
@@ -2577,6 +2822,10 @@ func (q *Queries) SetRepoGuardrailOverride(ctx context.Context, arg SetRepoGuard
 		&i.CrossCheckRepoInstructionsEnabled,
 		&i.IgnoredInferredCapabilities,
 		&i.AgentSourceDefault,
+		&i.InitialImportState,
+		&i.InitialImportGeneration,
+		&i.InitialImportErrorClass,
+		&i.InitialImportUpdatedAt,
 		&i.AwaitingFirstEnable,
 		&i.IssueTrackerConnectionID,
 		&i.IssueTrackerProjectID,
@@ -2589,7 +2838,7 @@ func (q *Queries) SetRepoGuardrailOverride(ctx context.Context, arg SetRepoGuard
 }
 
 const setRepoIgnoredInferredCapabilities = `-- name: SetRepoIgnoredInferredCapabilities :one
-UPDATE repos SET ignored_inferred_capabilities = $2 WHERE repos.id = $1 RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, awaiting_first_enable, issue_tracker_connection_id, issue_tracker_project_id, issue_tracker_project_short, eligibility_tag_id, eligibility_tag_name, issue_tracker_linked_at
+UPDATE repos SET ignored_inferred_capabilities = $2 WHERE repos.id = $1 RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, initial_import_state, initial_import_generation, initial_import_error_class, initial_import_updated_at, awaiting_first_enable, issue_tracker_connection_id, issue_tracker_project_id, issue_tracker_project_short, eligibility_tag_id, eligibility_tag_name, issue_tracker_linked_at
 `
 
 type SetRepoIgnoredInferredCapabilitiesParams struct {
@@ -2620,6 +2869,10 @@ func (q *Queries) SetRepoIgnoredInferredCapabilities(ctx context.Context, arg Se
 		&i.CrossCheckRepoInstructionsEnabled,
 		&i.IgnoredInferredCapabilities,
 		&i.AgentSourceDefault,
+		&i.InitialImportState,
+		&i.InitialImportGeneration,
+		&i.InitialImportErrorClass,
+		&i.InitialImportUpdatedAt,
 		&i.AwaitingFirstEnable,
 		&i.IssueTrackerConnectionID,
 		&i.IssueTrackerProjectID,
@@ -2635,7 +2888,7 @@ const setRepoIgnoredInferredCapabilitiesForUser = `-- name: SetRepoIgnoredInferr
 UPDATE repos SET ignored_inferred_capabilities = $2
 WHERE repos.id = $1
   AND repos.connection_id IN (SELECT forge_connections.id FROM forge_connections WHERE forge_connections.user_id = $3)
-RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, awaiting_first_enable, issue_tracker_connection_id, issue_tracker_project_id, issue_tracker_project_short, eligibility_tag_id, eligibility_tag_name, issue_tracker_linked_at
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, initial_import_state, initial_import_generation, initial_import_error_class, initial_import_updated_at, awaiting_first_enable, issue_tracker_connection_id, issue_tracker_project_id, issue_tracker_project_short, eligibility_tag_id, eligibility_tag_name, issue_tracker_linked_at
 `
 
 type SetRepoIgnoredInferredCapabilitiesForUserParams struct {
@@ -2667,6 +2920,10 @@ func (q *Queries) SetRepoIgnoredInferredCapabilitiesForUser(ctx context.Context,
 		&i.CrossCheckRepoInstructionsEnabled,
 		&i.IgnoredInferredCapabilities,
 		&i.AgentSourceDefault,
+		&i.InitialImportState,
+		&i.InitialImportGeneration,
+		&i.InitialImportErrorClass,
+		&i.InitialImportUpdatedAt,
 		&i.AwaitingFirstEnable,
 		&i.IssueTrackerConnectionID,
 		&i.IssueTrackerProjectID,
@@ -2679,7 +2936,7 @@ func (q *Queries) SetRepoIgnoredInferredCapabilitiesForUser(ctx context.Context,
 }
 
 const setRepoRequiredCapabilities = `-- name: SetRepoRequiredCapabilities :one
-UPDATE repos SET required_capabilities = $2 WHERE repos.id = $1 RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, awaiting_first_enable, issue_tracker_connection_id, issue_tracker_project_id, issue_tracker_project_short, eligibility_tag_id, eligibility_tag_name, issue_tracker_linked_at
+UPDATE repos SET required_capabilities = $2 WHERE repos.id = $1 RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, initial_import_state, initial_import_generation, initial_import_error_class, initial_import_updated_at, awaiting_first_enable, issue_tracker_connection_id, issue_tracker_project_id, issue_tracker_project_short, eligibility_tag_id, eligibility_tag_name, issue_tracker_linked_at
 `
 
 type SetRepoRequiredCapabilitiesParams struct {
@@ -2713,6 +2970,10 @@ func (q *Queries) SetRepoRequiredCapabilities(ctx context.Context, arg SetRepoRe
 		&i.CrossCheckRepoInstructionsEnabled,
 		&i.IgnoredInferredCapabilities,
 		&i.AgentSourceDefault,
+		&i.InitialImportState,
+		&i.InitialImportGeneration,
+		&i.InitialImportErrorClass,
+		&i.InitialImportUpdatedAt,
 		&i.AwaitingFirstEnable,
 		&i.IssueTrackerConnectionID,
 		&i.IssueTrackerProjectID,
@@ -2728,7 +2989,7 @@ const setRepoRequiredCapabilitiesForUser = `-- name: SetRepoRequiredCapabilities
 UPDATE repos SET required_capabilities = $2
 WHERE repos.id = $1
   AND repos.connection_id IN (SELECT forge_connections.id FROM forge_connections WHERE forge_connections.user_id = $3)
-RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, awaiting_first_enable, issue_tracker_connection_id, issue_tracker_project_id, issue_tracker_project_short, eligibility_tag_id, eligibility_tag_name, issue_tracker_linked_at
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, initial_import_state, initial_import_generation, initial_import_error_class, initial_import_updated_at, awaiting_first_enable, issue_tracker_connection_id, issue_tracker_project_id, issue_tracker_project_short, eligibility_tag_id, eligibility_tag_name, issue_tracker_linked_at
 `
 
 type SetRepoRequiredCapabilitiesForUserParams struct {
@@ -2764,6 +3025,10 @@ func (q *Queries) SetRepoRequiredCapabilitiesForUser(ctx context.Context, arg Se
 		&i.CrossCheckRepoInstructionsEnabled,
 		&i.IgnoredInferredCapabilities,
 		&i.AgentSourceDefault,
+		&i.InitialImportState,
+		&i.InitialImportGeneration,
+		&i.InitialImportErrorClass,
+		&i.InitialImportUpdatedAt,
 		&i.AwaitingFirstEnable,
 		&i.IssueTrackerConnectionID,
 		&i.IssueTrackerProjectID,
@@ -2780,7 +3045,7 @@ UPDATE repos SET
   repo_skills_enabled   = COALESCE($1, repo_skills_enabled),
   repo_claudemd_enabled = COALESCE($2, repo_claudemd_enabled)
 WHERE repos.id = $3
-RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, awaiting_first_enable, issue_tracker_connection_id, issue_tracker_project_id, issue_tracker_project_short, eligibility_tag_id, eligibility_tag_name, issue_tracker_linked_at
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, initial_import_state, initial_import_generation, initial_import_error_class, initial_import_updated_at, awaiting_first_enable, issue_tracker_connection_id, issue_tracker_project_id, issue_tracker_project_short, eligibility_tag_id, eligibility_tag_name, issue_tracker_linked_at
 `
 
 type SetRepoTrustFlagsParams struct {
@@ -2816,6 +3081,10 @@ func (q *Queries) SetRepoTrustFlags(ctx context.Context, arg SetRepoTrustFlagsPa
 		&i.CrossCheckRepoInstructionsEnabled,
 		&i.IgnoredInferredCapabilities,
 		&i.AgentSourceDefault,
+		&i.InitialImportState,
+		&i.InitialImportGeneration,
+		&i.InitialImportErrorClass,
+		&i.InitialImportUpdatedAt,
 		&i.AwaitingFirstEnable,
 		&i.IssueTrackerConnectionID,
 		&i.IssueTrackerProjectID,
@@ -2833,7 +3102,7 @@ UPDATE repos SET
   repo_claudemd_enabled = COALESCE($2, repo_claudemd_enabled)
 WHERE repos.id = $3
   AND repos.connection_id IN (SELECT forge_connections.id FROM forge_connections WHERE forge_connections.user_id = $4)
-RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, awaiting_first_enable, issue_tracker_connection_id, issue_tracker_project_id, issue_tracker_project_short, eligibility_tag_id, eligibility_tag_name, issue_tracker_linked_at
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, initial_import_state, initial_import_generation, initial_import_error_class, initial_import_updated_at, awaiting_first_enable, issue_tracker_connection_id, issue_tracker_project_id, issue_tracker_project_short, eligibility_tag_id, eligibility_tag_name, issue_tracker_linked_at
 `
 
 type SetRepoTrustFlagsForUserParams struct {
@@ -2873,6 +3142,10 @@ func (q *Queries) SetRepoTrustFlagsForUser(ctx context.Context, arg SetRepoTrust
 		&i.CrossCheckRepoInstructionsEnabled,
 		&i.IgnoredInferredCapabilities,
 		&i.AgentSourceDefault,
+		&i.InitialImportState,
+		&i.InitialImportGeneration,
+		&i.InitialImportErrorClass,
+		&i.InitialImportUpdatedAt,
 		&i.AwaitingFirstEnable,
 		&i.IssueTrackerConnectionID,
 		&i.IssueTrackerProjectID,
@@ -3327,7 +3600,7 @@ ON CONFLICT (connection_id, forge_project_id) DO UPDATE
 SET path_with_namespace = EXCLUDED.path_with_namespace,
     web_url             = EXCLUDED.web_url,
     default_branch      = EXCLUDED.default_branch
-RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, awaiting_first_enable, issue_tracker_connection_id, issue_tracker_project_id, issue_tracker_project_short, eligibility_tag_id, eligibility_tag_name, issue_tracker_linked_at
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, initial_import_state, initial_import_generation, initial_import_error_class, initial_import_updated_at, awaiting_first_enable, issue_tracker_connection_id, issue_tracker_project_id, issue_tracker_project_short, eligibility_tag_id, eligibility_tag_name, issue_tracker_linked_at
 `
 
 type UpsertRepoParams struct {
@@ -3342,9 +3615,9 @@ type UpsertRepoParams struct {
 // Upserted whenever the membership list is fetched. Never touches `enabled`, so
 // a re-listing does not un-enable a repo the user already turned on. The insert
 // branch marks a newly discovered repo awaiting_first_enable (PRD #4173 D13), but the
-// repos trigger from 00427 clears it again when a removal marker says the project was
+// repos trigger from 00467 clears it again when a removal marker says the project was
 // enabled before it was removed; the conflict branch never touches it, and the repos
-// trigger from 00425 clears it on first enable.
+// trigger from 00466 clears it on first enable.
 func (q *Queries) UpsertRepo(ctx context.Context, arg UpsertRepoParams) (Repo, error) {
 	row := q.db.QueryRow(ctx, upsertRepo,
 		arg.ConnectionID,
@@ -3374,6 +3647,10 @@ func (q *Queries) UpsertRepo(ctx context.Context, arg UpsertRepoParams) (Repo, e
 		&i.CrossCheckRepoInstructionsEnabled,
 		&i.IgnoredInferredCapabilities,
 		&i.AgentSourceDefault,
+		&i.InitialImportState,
+		&i.InitialImportGeneration,
+		&i.InitialImportErrorClass,
+		&i.InitialImportUpdatedAt,
 		&i.AwaitingFirstEnable,
 		&i.IssueTrackerConnectionID,
 		&i.IssueTrackerProjectID,

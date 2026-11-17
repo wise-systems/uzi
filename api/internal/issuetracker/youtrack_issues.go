@@ -71,7 +71,7 @@ func (y *youTrack) ListIssues(ctx context.Context, projectID int64, opts forge.L
 	}
 	out := make([]forge.Issue, 0, len(matched))
 	for _, w := range matched {
-		issue, err := y.toIssue(w)
+		issue, err := y.toIssue(ctx, w)
 		if err != nil {
 			return nil, err
 		}
@@ -96,7 +96,7 @@ func (y *youTrack) GetIssue(ctx context.Context, projectID, issueIID int64) (for
 	if err != nil {
 		return forge.Issue{}, err
 	}
-	return y.toIssue(w)
+	return y.toIssue(ctx, w)
 }
 
 // CreateIssue implements forge.IssueTracker. The labels resolve to tag ids first
@@ -152,7 +152,7 @@ func (y *youTrack) CreateIssue(ctx context.Context, projectID int64, title, desc
 	if err != nil {
 		return forge.Issue{}, err
 	}
-	return y.toIssue(w)
+	return y.toIssue(ctx, w)
 }
 
 // UpdateIssueDescription implements forge.IssueTracker.

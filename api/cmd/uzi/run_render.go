@@ -145,6 +145,9 @@ func renderRunDetailAt(p *uzicli.Printer, r apitypes.RunDTO, now time.Time, orig
 	rows = append(rows, completionPendingRows(r)...)
 	rows = append(rows, semanticDriftRows(r)...)
 	rows = append(rows, planCrossCheckRows(r)...)
+	if label := crossCheckActiveLabel(r.CrossCheckActive); label != "" {
+		rows = append(rows, []string{"CROSS_CHECK", label})
+	}
 	rows = append(rows, codeCrossCheckRows(r)...)
 	rows = append(rows, workerExhaustionRows(r)...)
 	for _, line := range forgeRunLines(r) {
@@ -175,6 +178,9 @@ func renderRunDetailAt(p *uzicli.Printer, r apitypes.RunDTO, now time.Time, orig
 	if line := vaultParkLine(r); line != "" {
 		rows = append(rows, []string{"VAULT", line})
 	}
+	if line := spendLimitHoldLine(r); line != "" {
+		rows = append(rows, []string{"SPEND_LIMIT", line})
+	}
 	// DISK: current retry/hold timing and the lifetime disk-park count, only while parked.
 	if line := diskParkLine(r); line != "" {
 		rows = append(rows, []string{"DISK", line})
@@ -194,6 +200,9 @@ func renderRunDetailAt(p *uzicli.Printer, r apitypes.RunDTO, now time.Time, orig
 	}
 	if reason := runHealthReasonAt(r, now); reason != "" {
 		rows = append(rows, []string{"HEALTH_REASON", sanitizeTTY(reason)})
+	}
+	if hint := runHealthHint(r); hint != "" {
+		rows = append(rows, []string{"HEALTH_HINT", hint})
 	}
 	if reason := runQueueReason(r); reason != "" {
 		rows = append(rows, []string{"QUEUE_REASON", reason})
@@ -587,7 +596,8 @@ func holdRow(r apitypes.RunDTO, now time.Time) []string {
 	// Resume retains this marker through queued/claimed until the running report.
 	// Only the paused state is still an owner hold.
 	if (*r.HoldReason == holdProviderUnavailable && !isProviderUnavailableHold(r)) ||
-		(*r.HoldReason == holdIterationExhausted && !isIterationHold(r)) {
+		(*r.HoldReason == holdIterationExhausted && !isIterationHold(r)) ||
+		(*r.HoldReason == holdRunOverrideUnavailable && !isRunOverrideHold(r)) {
 		return nil
 	}
 	if *r.HoldReason == holdCodexPolicy && !isCodexPolicyHold(r) {
@@ -617,7 +627,9 @@ func holdRow(r apitypes.RunDTO, now time.Time) []string {
 	case holdBaseAttestation:
 		clauses = append(clauses, baseAttestationAction(r))
 	case holdRepoAgentSource:
-		clauses = append(clauses, "resume once the repository can be fetched: uzi run resume "+cellText(r.ID))
+		clauses = append(clauses, repoAgentSourceAction(r))
+	case holdRunOverrideUnavailable:
+		clauses = append(clauses, runOverrideAction(r))
 	case holdWeeklyReserve:
 		clauses = append(clauses, weeklyReserveAction(r))
 	}
@@ -650,6 +662,8 @@ func holdReasonLabel(reason string) string {
 		return "base not attested"
 	case holdRepoAgentSource:
 		return "repo agents unreadable"
+	case holdRunOverrideUnavailable:
+		return "model choice unavailable"
 	case holdWeeklyReserve:
 		return "weekly usage reserve"
 	default:
@@ -657,17 +671,29 @@ func holdReasonLabel(reason string) string {
 	}
 }
 
+// repoAgentSourceAction is the owner's next step for a repo_agent_source_unavailable hold.
+func repoAgentSourceAction(r apitypes.RunDTO) string {
+	return "resume once the repository can be fetched: uzi run resume " + cellText(r.ID)
+}
+
+// isRunOverrideHold reports whether r is paused on a run_override_unavailable hold. Resume keeps
+// the marker through queued/claimed until the run starts, so only paused is an owner hold.
+func isRunOverrideHold(r apitypes.RunDTO) bool {
+	return r.Status == statusPaused && strOr(r.HoldReason, "") == holdRunOverrideUnavailable
+}
+
+// runOverrideAction is the owner's next step for a run_override_unavailable hold (issue #3250).
+func runOverrideAction(r apitypes.RunDTO) string {
+	id := cellText(r.ID)
+	return "the run's chosen model or effort cannot run on its harness; Resume retries only if the choice has become available on that harness, otherwise Cancel and start a new run with a different choice; Resume: uzi run resume " +
+		id + "; Cancel: uzi run cancel " + id
+}
+
 // weeklyReserveAction is the owner's next step for a weekly_reserve hold (PRD #3522): the run resumes
 // by itself when usage falls below the threshold, and `uzi run resume` overrides the reserve until the
 // next weekly reset.
 func weeklyReserveAction(r apitypes.RunDTO) string {
 	return "resumes when usage drops below the threshold; override: uzi run resume " + cellText(r.ID)
-}
-
-// isBaseAttestationHold reports whether r is held because its kept work carries no
-// `--require-base` attestation (issue #3194: status paused, hold_reason base_attestation_missing).
-func isBaseAttestationHold(r apitypes.RunDTO) bool {
-	return r.Status == statusPaused && strOr(r.HoldReason, "") == holdBaseAttestation
 }
 
 // baseAttestationAction is the owner's next step for a base_attestation_missing hold (issue
@@ -760,6 +786,8 @@ func pausedHoldNotice(r apitypes.RunDTO, origin ...string) string {
 		return "held, credential switch unsettled; " + credentialSwitchAction(r)
 	case holdBaseAttestation:
 		return "held, its kept work is not attested against the planned base (--require-base); " + baseAttestationAction(r)
+	case holdRunOverrideUnavailable:
+		return "held, " + holdReasonLabel(reason) + "; " + runOverrideAction(r)
 	case holdWeeklyReserve:
 		return "held by the weekly usage reserve; " + weeklyReserveAction(r)
 	default:
@@ -1813,6 +1841,11 @@ func selectReasonText(reason autoselect.Reason, headroom *int) string {
 		// to the default (rendered "default").
 		return "run-default"
 	}
+	// A Codex claim's binding epoch (issue #4201). Not in autoselect's vocabulary: only the
+	// epoch journal records it, so it is matched on the wire string here.
+	if string(reason) == "codex_binding" {
+		return "Codex binding"
+	}
 	return string(reason)
 }
 
@@ -1902,10 +1935,30 @@ func credentialEpochRows(r apitypes.RunDTO) [][]string {
 	if !credentialHistoryHasSwitch(r.CredentialEpochs) {
 		return nil
 	}
-	rows := make([][]string, 0, len(r.CredentialEpochs)+1)
-	rows = append(rows, []string{"TOKEN_HISTORY", itoa(len(r.CredentialEpochs)) + " claims"})
+	// In-place switch epochs (ordinal >= 1) share their claim's generation, so "claims" counts
+	// distinct generations and the switches are tallied apart (issue #4201).
+	gens := make(map[int64]bool, len(r.CredentialEpochs))
+	switches := 0
 	for _, e := range r.CredentialEpochs {
-		rows = append(rows, []string{"  gen " + strconv.FormatInt(e.ClaimGeneration, 10), credentialEpochCell(e)})
+		gens[e.ClaimGeneration] = true
+		if e.Ordinal >= 1 {
+			switches++
+		}
+	}
+	summary := itoa(len(gens)) + " claims"
+	if switches == 1 {
+		summary += ", 1 in-place switch"
+	} else if switches > 1 {
+		summary += ", " + itoa(switches) + " in-place switches"
+	}
+	rows := make([][]string, 0, len(r.CredentialEpochs)+1)
+	rows = append(rows, []string{"TOKEN_HISTORY", summary})
+	for _, e := range r.CredentialEpochs {
+		gen := "  gen " + strconv.FormatInt(e.ClaimGeneration, 10)
+		if e.Ordinal >= 1 {
+			gen += "." + strconv.FormatInt(int64(e.Ordinal), 10)
+		}
+		rows = append(rows, []string{gen, credentialEpochCell(e)})
 	}
 	return rows
 }
@@ -1948,7 +2001,11 @@ func credentialEpochCell(e apitypes.CredentialEpochDTO) string {
 	if e.SelectReason != nil && *e.SelectReason != "" {
 		cell += " — " + selectReasonText(autoselect.Reason(*e.SelectReason), nil)
 	}
-	return cell + " · " + e.AppliedAt.UTC().Format(time.RFC3339)
+	cell += " · " + e.AppliedAt.UTC().Format(time.RFC3339)
+	if e.Usage != nil {
+		cell += " · $" + strconv.FormatFloat(e.Usage.CostUSD, 'f', 2, 64)
+	}
+	return cell
 }
 
 // renderMessage prints one run message, hiding accounting evidence in human mode.
@@ -1979,6 +2036,8 @@ func renderMessage(p *uzicli.Printer, m apitypes.MessageDTO) error {
 	// Diagnostics use that sanitizer too; other payloads keep the generic row.
 	if line, ok := activityMessageLine(m.Kind, m.Payload); ok {
 		payload = capCell(cellText(line), 200)
+	} else if line, ok := credentialSwitchMessageLine(m.Kind, m.Payload); ok {
+		payload = line
 	} else if m.Kind == "status" {
 		var diagnostic struct {
 			Event string  `json:"event"`
@@ -1992,6 +2051,33 @@ func renderMessage(p *uzicli.Printer, m apitypes.MessageDTO) error {
 	}
 	p.Printf("#%-4d %-16s %-*s %s\n", m.Seq, m.Kind, actorCellWidth, actorCell(m), payload)
 	return nil
+}
+
+// credentialSwitchMessageLine renders the two in-place credential-switch feed messages (issue #4201).
+// A `credential_switch` message carrying an ordinal is an applied in-place switch ("switched in place
+// to <label>"); one without it is the claim path's message and keeps the generic payload row. A
+// `credential_switch_uncertain` message is the owner pause for an outcome the worker could not prove.
+// The label is USER-AUTHORED, so it goes through the same capCell(cellText(...)) composition as every
+// other worker-bound cell; the uncertain text is fixed and reads nothing from the payload.
+func credentialSwitchMessageLine(kind string, raw json.RawMessage) (string, bool) {
+	switch kind {
+	case "credential_switch":
+		var p struct {
+			Label   *string `json:"label"`
+			Ordinal int32   `json:"ordinal"`
+		}
+		if json.Unmarshal(raw, &p) != nil || p.Ordinal <= 0 {
+			return "", false
+		}
+		label := "another token"
+		if p.Label != nil && cellText(*p.Label) != "" {
+			label = cellText(*p.Label)
+		}
+		return capCell("switched in place to "+label, 200), true
+	case "credential_switch_uncertain":
+		return "token switch outcome unknown; run paused; resume to retry", true
+	}
+	return "", false
 }
 
 // actorCellWidth bounds the human table's actor column. The payload column beside
@@ -2177,8 +2263,16 @@ func steerStateWithRun(in apitypes.SteerInputDTO, runStatus string, recoveryCaus
 	if len(recoveryCause) > 0 && (recoveryCause[0] == workerRequeueExhaustedCause || recoveryCause[0] == workerMemoryPressureCause || isAlwaysHeldRecoveryCause(recoveryCause[0])) {
 		recoveringSuffix = " (owner Resume/Cancel)"
 	}
+	// Issue #4177: the server refuses Resume for an active secret-scan remediation.
+	if run != nil && secretRemediationActiveDetail(*run) {
+		recoveringSuffix = " (owner Cancel)"
+	}
 	if len(recoveryCause) > 0 && recoveryCause[0] == forgeUnreachableCause {
 		recoveringSuffix = " (run waiting for the forge)"
+	}
+	// An Anthropic spend-limit hold is owner-held, never a transient interruption.
+	if len(recoveryCause) > 0 && recoveryCause[0] == anthropicSpendLimitCause {
+		recoveringSuffix = " (waiting for owner: spend limit)"
 	}
 	// PRD #1590: a run held on its Codex account names the account, not a transient
 	// interruption; the action detail lives on the run-get row and the TUI detail line.
@@ -2551,6 +2645,9 @@ func runStatusCellAt(r apitypes.RunListItemDTO, now time.Time) string {
 	if isOwnerRequiredWorkerHold(r.RunDTO) || isRecoveryDecisionPark(r.RunDTO) {
 		return workerExhaustionLine(r.RunDTO)
 	}
+	if isSpendLimitHold(r.RunDTO) {
+		return s + " (" + spendLimitHoldShort + ")"
+	}
 	if short := codexAccountActionShort(r.RunDTO); short != "" {
 		s += " (" + short + ")"
 	} else if isVaultLockedPark(r.RunDTO) {
@@ -2584,7 +2681,7 @@ func runStatusCellAt(r apitypes.RunListItemDTO, now time.Time) string {
 	}
 	if reason := runQueueReason(r.RunDTO); reason != "" {
 		s += " (" + reason + ")"
-	} else if reason := strOr(r.HealthReason, ""); r.Status == "queued" && (reason == "recovery custody capacity is full; retained holds still protect your work; resolve or discard a retained hold to free capacity" || reason == "your Codex account is unavailable (quarantined or being re-linked), so this run can't start" || (admission != "" && reason != "" && !apitypes.IsCodexAdmissionReason(reason))) {
+	} else if reason := strOr(r.HealthReason, ""); r.Status == "queued" && (reason == "recovery custody capacity is full; retained holds still protect your work; resolve or discard a retained hold to free capacity" || reason == apitypes.ReasonCustodyRunHoldBound || reason == "your Codex account is unavailable (quarantined or being re-linked), so this run can't start" || (admission != "" && reason != "" && !apitypes.IsCodexAdmissionReason(reason))) {
 		// The API keeps higher-priority queued blockers in HealthReason. Retain
 		// them after maintenance and before the independent admission details.
 		s += " (" + reason + ")"
@@ -2613,6 +2710,26 @@ func runHealthReasonAt(r apitypes.RunDTO, now time.Time) string {
 		return codexAdmissionLineAt(r, now)
 	}
 	return reason
+}
+
+// healthPublicationWithheld is the run health enum value for a running run whose checkpoint
+// publication is withheld by a secret-scan restriction (issue #4257).
+const healthPublicationWithheld = "publication_withheld"
+
+// isPublicationWithheld reports the withheld state from the closed health enum, or the fixed
+// server reason when a surface only carries that.
+func isPublicationWithheld(r apitypes.RunDTO) bool {
+	return r.Health == healthPublicationWithheld || strOr(r.HealthReason, "") == apitypes.ReasonCheckpointPublicationWithheld
+}
+
+// runHealthHint is the fixed, content-free owner hint for a withheld run. The hint is not on
+// the wire; it is this binary's own copy of apitypes.HintCheckpointPublicationWithheld, so no
+// server text reaches the row.
+func runHealthHint(r apitypes.RunDTO) string {
+	if isPublicationWithheld(r) {
+		return apitypes.HintCheckpointPublicationWithheld
+	}
+	return ""
 }
 
 func runQueueReason(r apitypes.RunDTO) string {

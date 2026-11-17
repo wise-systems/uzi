@@ -97,9 +97,16 @@
 # (read from the authenticated edit history, never the live body) or a head review object
 # when comments were added, bound to that run (lib/greptile-verdict.sh, greptile_paired_verdict).
 # The script errs toward timeout (exit 2) rather than a false "ready".
+# GitHub quota handback (all modes): exit 12, RESULT=gh_rate_limited,
+# GH_RATE_LIMIT_RESOURCE/RESET/RESET_AT and GH_RETRY_AT (reset + 5s).
+# Re-arm after GH_RETRY_AT; this is never readiness or unknown-streak exhaustion.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/cr-signal.sh
+. "$HERE/lib/cr-signal.sh"
+# shellcheck source=lib/gh-ratelimit.sh
+. "$HERE/lib/gh-ratelimit.sh"
 # shellcheck source=lib/review-threads.sh
 . "$HERE/lib/review-threads.sh"
 # shellcheck source=lib/greptile-verdict.sh
@@ -150,6 +157,7 @@ unk() {
 # exit 9 once MAX_UNKNOWN such polls run back to back.
 unk_streak=0
 unknown_streak() {
+  gh_rate_limit_stop
   case ",$unk_why," in
     ,greptile_pending,) unk_streak=0 ;;
     *) unk_streak=$((unk_streak + 1)) ;;
@@ -276,16 +284,18 @@ while [ "$i" -lt "$MAX" ]; do
     unk ci_checks
   fi
 
-  # CodeRabbit's commit STATUS on the head (context "CodeRabbit"): its description is the
-  # one place CR states why it did NOT review — "Review rate limited", "Review skipped:
+  # CodeRabbit's check-run title or legacy commit-status description on the head
+  # (lib/cr-signal.sh): the one place CR states why it did NOT review — "Review rate limited", "Review skipped:
   # reviews are disabled for this base branch" / "147 files exceed the limit of 100" /
   # "ignored keyword in the PR title" — and "Review in progress" while it works. The
   # `state` is `success` even when rate-limited, so only the description is read. Absent
   # (no context) = CR has not touched this head at all.
   cr_desc=""; cr_pending=0; cr_limited=0; cr_skipped=0; cr_absent=0; cr_status_at=""
-  if st=$(gh api "repos/$REPO/commits/$head/status" 2>/dev/null) && printf '%s' "$st" | jq -e 'has("statuses")' >/dev/null 2>&1; then
-    cr_desc=$(printf '%s' "$st" | jq -r '[.statuses[]|select(.context=="CodeRabbit")]|last|.description // empty' 2>/dev/null) || unk cr_status
-    cr_status_at=$(printf '%s' "$st" | jq -r '[.statuses[]|select(.context=="CodeRabbit")]|last|.updated_at // empty' 2>/dev/null || true)
+  # Since 2026-11 CR reports through its `coderabbitai` check-run, not the status
+  # (lib/cr-signal.sh reads both, newest wins).
+  if cr_sig=$(cr_head_signal "$REPO" "$head"); then
+    cr_status_at=${cr_sig%%$'\t'*}; cr_desc=${cr_sig#*$'\t'}
+    [ "$cr_desc" = "$cr_sig" ] && { cr_desc=""; cr_status_at=""; }
     case "$cr_desc" in
       "") cr_absent=1 ;;
       *"in progress"*) cr_pending=1 ;;

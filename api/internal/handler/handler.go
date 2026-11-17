@@ -134,7 +134,8 @@ type Handler struct {
 	productSkillsSyncing atomic.Bool
 	svc                  *forgesvc.Service
 	wsvc                 *workersvc.Service
-	heldSvc              heldPublisher // test seam for WorkerRunHeldPublication; nil = wsvc
+	heldSvc              heldPublisher     // test seam for WorkerRunHeldPublication; nil = wsvc
+	terminalSvc          terminalPublisher // test seam for WorkerRunTerminalPreservation; nil = wsvc
 	// catalogDefaults is the test seam for the settings cell's Codex catalog default read
 	// (issue #3251); nil = wsvc, and a nil wsvc reads unknown.
 	catalogDefaults codexCatalogReader
@@ -193,7 +194,8 @@ type Handler struct {
 	issueTrackers *issuetrackersvc.Service
 	// usagePoker pokes the rate-limit poller when a user saves/replaces their
 	// Anthropic token (PRD #53 D3b), so their meters appear within seconds instead
-	// of up to a full poll interval. Wired via SetUsagePoker; nil-safe (the poller
+	// of up to a full poll interval; a vault-ready transition pokes every enabled
+	// token of the user (#4406). Wired via SetUsagePoker; nil-safe (the poller
 	// disabled, or a test handler) — the token still lands, just polled on the next
 	// tick.
 	usagePoker UsagePoker
@@ -270,11 +272,15 @@ type Handler struct {
 	// healthCacheMu so a fleet of open admin tabs polling every 10 s cost one evaluation
 	// per window rather than one per request.
 	invalidateRepoSync func(uuid.UUID)
-	healthSvc          *healthsvc.Service
-	healthSvcOnce      sync.Once
-	healthCacheMu      sync.Mutex
-	healthCachedAt     time.Time
-	healthCached       *apitypes.HealthDocDTO
+	// requestInitialImport asks the poller to run a just-enabled repo's recorded
+	// first import now (issue #4399). Optional and nil-safe: without it the poller's
+	// regular ticks still run the owed import. It must not block.
+	requestInitialImport func(uuid.UUID)
+	healthSvc            *healthsvc.Service
+	healthSvcOnce        sync.Once
+	healthCacheMu        sync.Mutex
+	healthCachedAt       time.Time
+	healthCached         *apitypes.HealthDocDTO
 }
 
 // ReleaseCheckReconciler is the slice of *releasecheck.Reconciler the admin
@@ -374,6 +380,12 @@ func (h *Handler) SetRepoSyncInvalidator(invalidate func(uuid.UUID)) {
 	h.invalidateRepoSync = invalidate
 }
 
+// SetInitialImportRequester wires the non-blocking poller wake (poller.Engine.RequestImport)
+// that SetRepoEnabled calls after a committed enable. Call before serving requests.
+func (h *Handler) SetInitialImportRequester(request func(uuid.UUID)) {
+	h.requestInitialImport = request
+}
+
 // clock reads the classification clock seam, nil-safe.
 //
 // Nil-safe because many tests build a Handler as a struct literal rather than through
@@ -394,9 +406,11 @@ func (h *Handler) clock() time.Time {
 // UsagePoker is the slice of the rate-limit poller the token-save handler needs
 // (PRD #53 D3b): request an out-of-band poll for one user's default token, or for
 // one named token (PokeSecret, the re-enable path of PRD #1732 M3a, whose token is
-// usually not the default). *usagepoller.Engine satisfies it.
+// usually not the default), or for every enabled token of the user (PokeUserAll, the
+// vault-ready path, #4406). *usagepoller.Engine satisfies it.
 type UsagePoker interface {
 	Poke(userID uuid.UUID)
+	PokeUserAll(userID uuid.UUID)
 	PokeSecret(userID, secretID uuid.UUID)
 }
 
@@ -913,6 +927,12 @@ func (h *Handler) attachReleaseInfo(ctx context.Context, info *apitypes.BuildInf
 			Security:    releasecheck.Security(st.RCBody),
 		}
 	}
+	if st.FormulaStableTag != "" || st.FormulaRCTag != "" {
+		info.HomebrewFormulas = &apitypes.HomebrewFormulasDTO{
+			UziCLI:   st.FormulaStableTag,
+			UziCLIRC: st.FormulaRCTag,
+		}
+	}
 	ua := releasecheck.UpdateAvailable(h.version, st.LatestTag)
 	info.UpdateAvailable = &ua
 	fb := releasecheck.FarBehind(h.version, st.LatestTag, st.PublishedAt, h.clock())
@@ -1014,9 +1034,10 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				// CreateRunInput's auth — no token spend, no forge write.
 				r.Post("/{id}/dispatch", h.DispatchTaskRun)
 				// Steer queue (PRD #95): the run's follow_up inputs with delivery status.
-				// Owner-only (GetRunByIDForUser) — a non-owner, incl. admin_ro, gets 404,
-				// closing a leak (follow-ups are never in run_messages). RequireUser so
-				// `uzi run inputs` reads it from a CLI token.
+				// Owner-only (GetRunByIDForUser) — a non-owner gets 404, closing a leak
+				// (follow-ups are never in run_messages); the one exception is admin run
+				// debug (UZI_ADMIN_RUN_DEBUG: a live admin's admin_ro Bearer, audited).
+				// RequireUser so `uzi run inputs` reads it from a CLI token.
 				r.Get("/{id}/inputs", h.ListRunInputs)
 				// Judge surfacing (PRD #46 M4 / Decision 21): read the review, plus the
 				// active judge run for the target (PRD #119 M1) — owner-or-admin,
@@ -1100,13 +1121,15 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				// Durable recovery archive — owner side (PRD #1296 M2, D6/D7). RequireUser
 				// (browser cookie OR uzc_/uza_ Bearer) so both the web run page and the CLI
 				// reach it. Each handler resolves ownership through h.wsvc.GetRun (owner-only,
-				// admin refused) exactly like ListRunInputs — NOT GetRunForViewer — then the
-				// recovery service's own owner-scoped queries. Download streams decrypted bytes
+				// admin refused, except the audited admin run debug read on the list route)
+				// exactly like ListRunInputs — NOT GetRunForViewer — then the recovery
+				// service's own owner-scoped queries. Download streams decrypted bytes
 				// with private/no-store/nosniff + a server-generated filename and no redirect.
 				r.Get("/{id}/archives", h.ListRecoveryArchives)
 				// Source log of a profile-bound research run (PRD #1906 M3). Same RequireUser
 				// group and the same strict GetRun owner-or-404 gate as the archives above, so
-				// `uzi run fetches` reaches it from a uzc_ Bearer and an admin is refused.
+				// `uzi run fetches` reaches it from a uzc_ Bearer and an admin is refused
+				// unless the admin run debug predicate holds (admin_ro Bearer, flag on).
 				r.Get("/{id}/fetches", h.ListRunFetches)
 				r.Get("/{id}/archives/{captureID}/download", h.DownloadRecoveryArchive)
 				r.Delete("/{id}/archives/{captureID}", h.DiscardRecoveryArchive)
@@ -1160,8 +1183,9 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 		// Owner recovery custody holds — owner-wide list + aggregate (PRD #1349 M5, D7).
 		// RequireUser (session cookie OR uzc_/uza_ Bearer) so the web board/Workers surface
 		// and the `uzi run recovery` CLI both reach it, mirroring how the owner archive routes
-		// gate ownership. Owner-scoped in SQL by the caller's user id — NO run scope (this is
-		// the owner-wide list; the exact-hold DISCARD is the DELETE under /runs above).
+		// gate ownership. Owner-scoped in SQL by the caller's user id; an optional ?user= or
+		// ?run= names another owner or one run, served to other owners only under the admin
+		// run debug predicate (the exact-hold DISCARD is the DELETE under /runs above).
 		r.Group(func(r chi.Router) {
 			r.Use(h.requireUser())
 			r.Get("/recovery/holds", h.ListRecoveryHolds)
@@ -1233,12 +1257,20 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		r.Use(laneWorkerRouteGuard)
 		r.Post("/register", h.WorkerRegister)
 		r.Post("/heartbeat", h.WorkerHeartbeat)
+		// PRD #4208 M1: the volume inventory a preparing worker takes before scale-down, and its
+		// last exclusion report. Identity is the bearer worker; neither is lane-allowlisted.
+		r.Post("/hibernation/inventory", h.WorkerHibernationInventory)
+		r.Post("/hibernation/exclusion-final", h.WorkerHibernationExclusionFinal)
 		r.Post("/runs/claim", h.WorkerClaim)
 		r.Post("/runs/{id}/messages", h.WorkerRunMessages)
 		// Issue #2014: per-message usage for the estimated tail of an interrupted Claude session.
 		// NOT lane-allowlisted: an isolated-lane run is not a Claude run-lane flight that posts it.
 		r.Post("/runs/{id}/usage", h.WorkerRunUsage)
 		r.Post("/runs/{id}/state", h.WorkerRunState)
+		// Issue #4201: the in-place Claude credential switch apply. The response carries the
+		// plaintext token, the service resolves and decrypts a credential per call, and the worker
+		// retries on a lost response, so it rides the per-worker limiter.
+		r.With(proposalLimiter.PerWorkerMiddleware).Post("/runs/{id}/credential-switch/apply", h.WorkerCredentialSwitchApply)
 		// Bounded local lifecycle outcome, like /state and memory outcomes: no rate
 		// limiter or upstream I/O. Strict 17 KiB decoding and worker/run fences apply.
 		r.Post("/runs/{id}/policy-hold", h.WorkerRunPolicyHold)
@@ -1348,6 +1380,12 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		// at maxPackBytes. Eligibility is checked before the body is read.
 		r.With(h.refuseJobRuns).Post("/runs/{id}/held-publication", h.WorkerRunHeldPublication)
 		r.With(h.refuseJobRuns).Post("/runs/{id}/publication-context", h.WorkerRunPublicationContext)
+
+		// Terminal preservation (issue #4007): the worker of a terminal run publishes its final work
+		// to refs/uzi-terminal/<run-id>. Same deadlines, slot pool and pack cap as the route above;
+		// the route refuses unsupported, with no write, for a worker without
+		// recovery_terminal_preservation_v1.
+		r.With(h.refuseJobRuns).Post("/runs/{id}/terminal-preservation", h.WorkerRunTerminalPreservation)
 
 		// Agent memory (PRD #90): the worker's save_memory tool POSTs one bounded
 		// entry; the read half lists the run's (user, repo) memory the worker fences
@@ -1545,6 +1583,9 @@ func (h *Handler) mountControllerRoutes(r chi.Router) {
 		// drains before rolling; distinct from the display-only status report.
 		r.Post("/workers/{workerID}/drain", h.ControllerCordonWorker)
 		r.Post("/workers/{workerID}/dind-maintenance", h.ControllerDindMaintenance)
+		// Hibernation control-write (PRD #4205): the controller reports each step of a
+		// hibernate or wake operation, bound to the op id and validated by the state machine.
+		r.Post("/workers/{workerID}/hibernation", h.ControllerHibernation)
 		// Uncordon control-write (issue #458). Clears draining_since when drift was
 		// reverted so the worker resumes claiming; same path, different method.
 		r.Delete("/workers/{workerID}/drain", h.ControllerUncordonWorker)

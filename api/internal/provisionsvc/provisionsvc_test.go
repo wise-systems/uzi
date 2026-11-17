@@ -101,10 +101,10 @@ func (s *fakeStore) GetRepoForUser(context.Context, store.GetRepoForUserParams) 
 func (s *fakeStore) LockRepoForEnableForUser(context.Context, store.LockRepoForEnableForUserParams) (store.LockRepoForEnableForUserRow, error) {
 	return store.LockRepoForEnableForUserRow{IssueTrackerConnectionID: s.repoRow.IssueTrackerConnectionID}, s.repoErr
 }
-func (s *fakeStore) SetRepoEnabledForUser(_ context.Context, a store.SetRepoEnabledForUserParams) (store.Repo, error) {
+func (s *fakeStore) EnableRepoForUser(_ context.Context, a store.EnableRepoForUserParams) (store.Repo, error) {
 	s.flipCalls++
-	s.enabled = a.Enabled
-	return store.Repo{ID: a.ID, Enabled: a.Enabled}, nil
+	s.enabled = true
+	return store.Repo{ID: a.ID, Enabled: true}, nil
 }
 func (s *fakeStore) DeletePendingGuardrailOverrideRequestsForRepo(context.Context, uuid.UUID) error {
 	s.settled++

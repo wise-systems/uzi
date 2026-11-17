@@ -1,5 +1,5 @@
-// Pure helpers shared by the two Overview pages (Dashboard and the /overview/next
-// preview, PRD #3878). Nothing here fetches or renders.
+// Pure helpers shared by the default and classic Overview pages (PRD #3878, #3877).
+// Nothing here fetches or renders.
 
 import {
   isTerminalRun,
@@ -10,7 +10,7 @@ import {
   type Worker,
 } from "./api";
 import { custodyHoldView } from "./recovery";
-import { effectiveRunStatus, isAccountCooldownWaiting, isReserveHeldPause } from "./runBadge";
+import { effectiveRunStatus, isAccountCooldownWaiting, isReserveHeldPause, NON_COMPLETION_HOLD_REASONS } from "./runBadge";
 import { stripUnsafeChars } from "./safeText";
 
 // Exhaustive over the wire status union; a new status needs an explicit bucket.
@@ -39,8 +39,7 @@ export interface OverviewCounts {
 // Executing, queued and parked counts over the non-terminal runs. Buckets on the RAW
 // status, as Dashboard's tile always has, with an account cooldown counted as waiting;
 // feeding it effective statuses would drop runs. Runs that need the owner (the
-// needsYou bucket) are deliberately not counted here: the decision clause of the
-// status sentence covers them.
+// needsYou bucket) are deliberately not counted here: the decision card covers them.
 export function overviewCounts(runs: ReadonlyArray<Pick<RunSummaryItem, "status" | "health">>): OverviewCounts {
   const counts: OverviewCounts = { executing: 0, queued: 0, parked: 0 };
   for (const run of runs) {
@@ -122,15 +121,9 @@ const PARK_TABLE: Record<string, "automatic" | "owner"> = {
   retained_recovery_retrying: "automatic",
   codex_idle_stall_retrying: "automatic",
   paused: "owner",
-  codex_policy_hold: "owner",
-  iteration_budget_exhausted: "owner",
-  provider_unavailable: "owner",
-  credential_switch_settling: "owner",
-  credential_switch_unsettled: "owner",
-  base_attestation_missing: "owner",
   completion_blocked: "owner",
-  credential_disabled: "owner",
-  credentials_reset: "owner",
+  // Every non-completion hold (NON_COMPLETION_HOLDS) waits on the owner.
+  ...Object.fromEntries(NON_COMPLETION_HOLD_REASONS.map((r) => [r, "owner" as const])),
   retained_recovery_adoption_failed: "owner",
   retained_recovery_held: "owner",
   retained_recovery_unknown: "owner",
@@ -138,6 +131,7 @@ const PARK_TABLE: Record<string, "automatic" | "owner"> = {
   codex_idle_stall_unknown: "owner",
   worker_requeue_exhausted: "owner",
   worker_memory_pressure: "owner",
+  anthropic_spend_limit: "owner",
 };
 
 // Documented divergences from the server's needs_owner / progressing tag in
@@ -164,8 +158,11 @@ type PrRun = Pick<
   "status" | "kind" | "mr_iid" | "mr_state" | "repo_id" | "finished_at" | "created_at"
 >;
 
-// The viewer's completed issue runs whose MR is still open, one per (repo, MR): when several
-// runs share an MR the newest wins.
+// The viewer's completed issue runs whose MR is still open, one per (repo, MR). The newest
+// completed issue run per (repo, MR) is picked first and the MR state is read from that run
+// alone: the server's MR watcher (ListMRWatchCandidates) refreshes only the newest run per
+// issue, so an older run's stale "opened" must never count (#4167). A newest run whose state
+// is not yet observed (null) therefore hides the MR until the watcher syncs it.
 export function openPrs<T extends PrRun>(runs: ReadonlyArray<T>): T[] {
   const newest = (r: T) => {
     const t = Date.parse(r.finished_at ?? r.created_at);
@@ -173,12 +170,12 @@ export function openPrs<T extends PrRun>(runs: ReadonlyArray<T>): T[] {
   };
   const byMr = new Map<string, T>();
   for (const r of runs) {
-    if (r.status !== "completed" || r.kind !== "issue" || r.mr_iid == null || r.mr_state !== "opened") continue;
+    if (r.status !== "completed" || r.kind !== "issue" || r.mr_iid == null) continue;
     const key = `${r.repo_id}:${r.mr_iid}`;
     const prev = byMr.get(key);
     if (!prev || newest(r) > newest(prev)) byMr.set(key, r);
   }
-  return [...byMr.values()];
+  return [...byMr.values()].filter((r) => r.mr_state === "opened");
 }
 
 export type DecisionKind = "plan" | "question" | "park" | "pr";
@@ -352,7 +349,7 @@ function heldDecision(holds: RecoveryCustodyHolds | null | undefined): HeldDecis
   };
 }
 
-// The number of decisions the header sentence counts: the run items other than open pull
+// The number of owner decisions: the run items other than open pull
 // requests, plus the aggregate's held-work decisions.
 export function decisionCount(items: ReadonlyArray<DecisionItem>): number {
   let n = 0;
@@ -367,44 +364,22 @@ function plural(n: number, one: string, many: string): string {
   return `${n} ${n === 1 ? one : many}`;
 }
 
-// The page header's status sentence. Decisions and pull requests come from the viewer's own
-// items only (decisions excludes pull requests; prs is the open-PR count). `acrossFactory` is the admin's factory-wide scope;
-// when the admin list is unavailable the sentence counts only the viewer's runs, says so,
-// and never claims the factory.
-export function statusSentence(input: {
-  decisions: number;
-  prs: number;
+// The compact Runs-card line is the same all-kind population the former header sentence
+// counted. Null means the card's existing empty state is the only copy it needs.
+export function runTotalsLine(input: {
   counts: OverviewCounts;
   acrossFactory: boolean;
-  adminUnavailable: boolean;
-  // Distinct owners among the executing runs (executingPeople over the same rows as counts);
-  // shown only on the factory-wide sentence.
   executingPeople?: number;
-}): string {
-  const { decisions, prs, counts, adminUnavailable } = input;
-  const across = input.acrossFactory && !adminUnavailable;
-
-  const subject = [
-    decisions > 0 ? plural(decisions, "decision", "decisions") : null,
-    prs > 0 ? plural(prs, "pull request", "pull requests") : null,
-  ].filter((s): s is string => s !== null);
-  const waiting =
-    subject.length === 0
-      ? "Nothing needs you right now."
-      : `${subject.join(" and ")} ${decisions + prs === 1 ? "is" : "are"} waiting on you.`;
-
-  const rest = [
+}): string | null {
+  const { counts } = input;
+  const parts = [
+    counts.executing > 0
+      ? `${counts.executing} executing${input.acrossFactory && input.executingPeople && input.executingPeople > 0
+        ? ` for ${plural(input.executingPeople, "person", "people")}`
+        : ""}`
+      : null,
     counts.queued > 0 ? `${counts.queued} queued` : null,
     counts.parked > 0 ? `${counts.parked} parked` : null,
-  ].filter((s): s is string => s !== null);
-  const runs =
-    `${counts.executing} ${counts.executing === 1 ? "run is" : "runs are"} executing` +
-    (across ? " across the factory" : "") +
-    (across && counts.executing > 0 && input.executingPeople !== undefined && input.executingPeople > 0
-      ? ` for ${plural(input.executingPeople, "person", "people")}`
-      : "") +
-    (rest.length === 2 ? `, ${rest[0]} and ${rest[1]}` : rest.length === 1 ? ` and ${rest[0]}` : "") +
-    ".";
-
-  return `${waiting} ${runs}${adminUnavailable ? " Counting only your runs." : ""}`;
+  ].filter((part): part is string => part !== null);
+  return parts.length > 0 ? parts.join(" · ") : null;
 }

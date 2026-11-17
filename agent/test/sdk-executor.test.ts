@@ -14,10 +14,11 @@ import { commitDependencySlice, exerciseDependencyWaitRunner, exerciseExpiredWal
 
 const HAS_PROCFS = process.platform === "linux";
 import type { Options as SdkOptions, SDKMessage, HookInput } from "@anthropic-ai/claude-agent-sdk";
+import { providerErrorMessage } from "../src/sdk-messages.js";
 import { SdkExecutor, embedSeededPlan, TransientRecoveryError, ProviderTransientError, type SdkQueryFn, type SdkExecutorOptions, type ContextUsageReading } from "../src/sdk-executor.js";
 import { configureGoConcurrency } from "../src/go-concurrency.js";
 import { TrustedExecutionRefusal } from "../src/trusted-execution-refusal.js";
-import { LimitReachedError } from "../src/limit.js";
+import { LimitReachedError, SpendLimitHoldError } from "../src/limit.js";
 import { EnvProbeCleanupError } from "../src/env-probe.js";
 import { PlanRejectedError, PlanRevisionReplacedError, type EmittedMessage, type RunContext } from "../src/executor.js";
 import { PauseNowSignal, CredentialSwitchSignal, type PlanVerdict } from "../src/steering.js";
@@ -539,9 +540,9 @@ describe("SdkExecutor attribution opt-out (issue #916)", () => {
 
     assert.strictEqual(turns.length, 2);
     // Plan turn carries the suppression...
-    assert.deepEqual(turns[0]!.options.settings, { attribution: { commit: "", pr: "" } });
+    assert.deepEqual(turns[0]!.options.settings, { attribution: { commit: "", pr: "" }, enabledPlugins: { "cc-plugin-privacy@builtin": false } });
     // ...and it cascades into the implement turn via the baseOptions spread.
-    assert.deepEqual(turns[1]!.options.settings, { attribution: { commit: "", pr: "" } });
+    assert.deepEqual(turns[1]!.options.settings, { attribution: { commit: "", pr: "" }, enabledPlugins: { "cc-plugin-privacy@builtin": false } });
   });
 
   it("explicit true → sets nothing (SDK default preserved, no settings key)", async () => {
@@ -549,8 +550,8 @@ describe("SdkExecutor attribution opt-out (issue #916)", () => {
     const probe = makeCtx({ agents: [lead, coder, reviewer], config: { attribution_enabled: true } }, approve);
     await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
 
-    assert.equal(turns[0]!.options.settings, undefined);
-    assert.equal(turns[1]!.options.settings, undefined);
+    assert.deepEqual(turns[0]!.options.settings, { enabledPlugins: { "cc-plugin-privacy@builtin": false } });
+    assert.deepEqual(turns[1]!.options.settings, { enabledPlugins: { "cc-plugin-privacy@builtin": false } });
   });
 
   it("absent field (null config) → sets nothing (back-compat with an older server)", async () => {
@@ -558,8 +559,8 @@ describe("SdkExecutor attribution opt-out (issue #916)", () => {
     const probe = makeCtx({ agents: [lead, coder, reviewer], config: null }, approve);
     await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
 
-    assert.equal(turns[0]!.options.settings, undefined);
-    assert.equal(turns[1]!.options.settings, undefined);
+    assert.deepEqual(turns[0]!.options.settings, { enabledPlugins: { "cc-plugin-privacy@builtin": false } });
+    assert.deepEqual(turns[1]!.options.settings, { enabledPlugins: { "cc-plugin-privacy@builtin": false } });
   });
 });
 
@@ -3425,7 +3426,7 @@ describe("SdkExecutor lead-config reporting (PRD #3244)", () => {
       fs.readFileSync(path.join(import.meta.dirname, "..", "..", "fixtures", "lead-config", "contract.json"), "utf8"),
     ) as { request_cases: Array<{ id: string; harness: string; phase: "plan" | "implement"; config: ClaimConfig; templateModel?: string; agents?: Array<{ name: string; model?: string | null }>; expect: import("../src/lead-config-report.js").LeadRequest }> };
     const cases = contract.request_cases.filter((c) => c.harness === "claude");
-    assert.equal(cases.length, 13, "all Claude request cases loaded");
+    assert.equal(cases.length, 16, "all Claude request cases loaded");
     const visited: string[] = [];
     for (const c of cases) {
       const agents = leadRequestCaseAgents(c);
@@ -3471,7 +3472,7 @@ describe("SdkExecutor lead-config reporting (PRD #3244)", () => {
       visited.push(c.id);
     }
     assert.deepEqual(visited, cases.map((c) => c.id));
-    assert.equal(visited.length, 13);
+    assert.equal(visited.length, 16);
   });
 
   /** fakeTurns plus init frames carrying `effort`, and an optional getSettings on each instance. */
@@ -7442,7 +7443,8 @@ describe("SdkExecutor empty-turn limit routing (PRD #1349 M3)", () => {
 // `subtype:"success"` api-error frame. It must (a) retry with the existing bounded in-process
 // backoff and, on a sustained outage, PARK via TransientRecoveryError (recovery_wait) instead
 // of terminal-failing, and (b) never report the self-contradictory "agent run failed: success".
-// A PERMANENT api error (401/403/400) is NOT retried/parked — it fails, labelled with its status.
+// A PERMANENT api error (401/403/400) is NOT retried/parked — it fails, labelled with its status;
+// the one exception is a 403 Cloudflare edge block page (issue #4271), which is transient.
 describe("SdkExecutor provider-transient error handling (issue #1088)", () => {
   const OVERLOADED_529 = "API Error: 529 Overloaded. This is a server-side issue…";
   const fast = (queryFn: SdkQueryFn, maxRetries: number): SdkExecutorOptions => ({
@@ -7717,6 +7719,52 @@ describe("SdkExecutor provider-transient error handling (issue #1088)", () => {
     assert.ok(!(err instanceof TransientRecoveryError), "a status-less non-api_error failure is never parked");
     assert.ok(!(err instanceof ProviderTransientError), "nor classified provider-transient");
   });
+
+  // issue #4271: the Anthropic edge can briefly answer with a Cloudflare block page (HTTP 403).
+  // The bundled CLI shows that HTML page's <title>; only that exact title makes a 403 transient.
+  const CF_CHALLENGE = "Failed to authenticate. API Error: 403 Attention Required! | Cloudflare";
+  for (const withReason of [true, false]) {
+    it(`parks (providerOrigin) a sustained Cloudflare 403 block page after bounded retries (terminal_reason=${withReason}) (issue #4271)`, async () => {
+      const frame = (): SDKMessage => (withReason ? resultApiError(403, CF_CHALLENGE) : noReasonResult(403, CF_CHALLENGE));
+      const { queryFn, turns } = fakeTurns([[frame()], [frame()], [frame()]]);
+      const err = await rejection(new SdkExecutor(nullLogger(), homeDir, fast(queryFn, 2)).run(makeCtx().ctx));
+      assert.ok(err instanceof TransientRecoveryError, "a Cloudflare block page parks instead of failing");
+      assert.strictEqual(err.providerOrigin, true, "typed as a provider outage");
+      assert.strictEqual(turns.length, 3, "the initial drive plus 2 bounded retries");
+    });
+  }
+
+  it("retries a Cloudflare 403 block page and recovers on the next successful turn (issue #4271)", async () => {
+    const { queryFn, turns } = fakeTurns([
+      [resultApiError(403, CF_CHALLENGE)],
+      [submitPlan("# The Plan"), resultSuccess()],
+      [assistantText("impl"), signalDone(), resultSuccess()],
+    ]);
+    const probe = makeCtx({ agents: [lead, coder, reviewer] });
+    const result = await new SdkExecutor(nullLogger(), homeDir, fast(queryFn, 1)).run(probe.ctx);
+    assert.strictEqual(result.branch, "agent/issue-5");
+    assert.deepStrictEqual(probe.gated, ["# The Plan"]);
+    assert.strictEqual(turns.length, 3, "challenge turn + retried plan + implement");
+  });
+
+  for (const [status, text] of [
+    [403, 'API Error: 403 {"type":"error","error":{"type":"permission_error","message":"Your API key does not have permission"}}'],
+    [403, "Failed to authenticate. API Error: 403 Forbidden"],
+    [403, "Failed to authenticate. API Error: 403 Access denied | example.com used Cloudflare to restrict access"],
+    [403, "Failed to authenticate. API Error: 403 attention required! | cloudflare"],
+    [401, "Failed to authenticate. API Error: 401 Attention Required! | Cloudflare"],
+    [400, "API Error: 400 Attention Required! | Cloudflare"],
+  ] as const) {
+    it(`keeps ${status} "${text.slice(0, 60)}" permanent: fails at once, never parked (issue #4271)`, async () => {
+      const { queryFn, turns } = fakeTurns([[resultApiError(status, text)]]);
+      const err = await rejection(new SdkExecutor(nullLogger(), homeDir, fast(queryFn, 2)).run(makeCtx().ctx));
+      assert.ok(err instanceof Error);
+      assert.ok(!(err instanceof TransientRecoveryError), "never parked");
+      assert.ok(!(err instanceof ProviderTransientError), "not classified transient");
+      assert.match(err.message, new RegExp(String(status)), "the failure names the status");
+      assert.strictEqual(turns.length, 1, "no retries");
+    });
+  }
 
   it("pins limit-over-transient precedence: a limit-bearing transient 529 throws LimitReachedError, never a provider-transient park", async () => {
     // The `!limitFacts &&` guard in driveTurn is load-bearing HERE: this terminal is
@@ -10144,5 +10192,112 @@ describe("SdkExecutor no-progress stall owner decision (issue #3139)", () => {
       assert.match(r.fixture.holds[0]!, REASON_410, "held via the #281 no-progress reason, not the new stall reason");
       assert.match(r.result?.completionHeld?.reason ?? "", REASON_410);
     });
+  });
+});
+
+// Issue #3767: a lead terminal that is an Anthropic spend-limit 400 throws SpendLimitHoldError
+// (the runner decides park vs fail); everything else keeps today's behaviour.
+describe("SdkExecutor spend-limit terminal (issue #3767)", () => {
+  const SPEND_TEXT = "You have reached your specified API usage limits. You will regain access on 2026-12-01 at 00:00 UTC.";
+  const fast = (queryFn: SdkQueryFn): SdkExecutorOptions => ({ queryFn, emptyTurnBackoffBaseMs: 1, emptyTurnMaxRetries: 2 });
+  const rejection = async (p: Promise<unknown>): Promise<unknown> =>
+    p.then(() => { throw new Error("expected the run to reject"); }, (e: unknown) => e);
+
+  it("throws SpendLimitHoldError whose message is byte-equal to the provider failure message, with no retries", async () => {
+    const raw = `API Error: 400 ${SPEND_TEXT}`;
+    const { queryFn, turns } = fakeTurns([[resultApiError(400, raw)]]);
+    const err = await rejection(new SdkExecutor(nullLogger(), homeDir, fast(queryFn)).run(makeCtx().ctx));
+    assert.ok(err instanceof SpendLimitHoldError);
+    assert.strictEqual(err.message, providerErrorMessage(400, raw));
+    assert.match(err.message, /^provider error: 400 You have reached your specified API usage limits\./);
+    assert.ok(err.detail.startsWith("You have reached your specified API usage limits."));
+    assert.ok(!(err instanceof ProviderTransientError));
+    assert.strictEqual(turns.length, 1, "a spend limit never retries in process");
+  });
+
+  it("carries the failing turn's session id (B), not an earlier turn's (A), on the SpendLimitHoldError", async () => {
+    const init = (sid: string): SDKMessage =>
+      ({ type: "system", subtype: "init", session_id: sid, model: "m" }) as unknown as SDKMessage;
+    const { queryFn, turns } = fakeTurns([
+      [init("A"), resultApiError(529, "API Error: 529 Overloaded", "A")], // earlier turn: transient, retried in process
+      [init("B"), resultApiError(400, `API Error: 400 ${SPEND_TEXT}`, "B")], // failing turn: a fresh session
+    ]);
+    const err = await rejection(new SdkExecutor(nullLogger(), homeDir, fast(queryFn)).run(makeCtx().ctx));
+    assert.ok(err instanceof SpendLimitHoldError);
+    assert.strictEqual(turns.length, 2, "the retry turn is the one that hit the spend limit");
+    assert.strictEqual(err.sessionId, "B");
+  });
+
+  it("a different 400 text keeps today's plain failure", async () => {
+    const { queryFn } = fakeTurns([[resultApiError(400, "API Error: 400 messages: text content blocks must be non-empty")]]);
+    const err = await rejection(new SdkExecutor(nullLogger(), homeDir, fast(queryFn)).run(makeCtx().ctx));
+    assert.ok(err instanceof Error);
+    assert.ok(!(err instanceof SpendLimitHoldError));
+    assert.match(err.message, /provider error: 400/);
+  });
+
+  it("a spend-limit terminal wins over a rejected rate-limit event with a future reset: SpendLimitHoldError, not LimitReachedError", async () => {
+    const IN_5H = Date.now() + 5 * 60 * 60 * 1000;
+    const { queryFn } = fakeTurns([[
+      rateLimitEvent("rejected", { resetsAt: IN_5H, rateLimitType: "five_hour" }),
+      resultApiError(400, `API Error: 400 ${SPEND_TEXT}`),
+    ]]);
+    const err = await rejection(new SdkExecutor(nullLogger(), homeDir, fast(queryFn)).run(makeCtx().ctx));
+    assert.ok(err instanceof SpendLimitHoldError);
+    assert.ok(!(err instanceof LimitReachedError));
+    assert.ok(!(err instanceof ProviderTransientError));
+  });
+
+  it("a non-spend terminal with the same rejected rate-limit evidence still yields LimitReachedError", async () => {
+    const IN_5H = Date.now() + 5 * 60 * 60 * 1000;
+    const { queryFn } = fakeTurns([[
+      rateLimitEvent("rejected", { resetsAt: IN_5H, rateLimitType: "five_hour" }),
+      resultApiError(400, "API Error: 400 messages: text content blocks must be non-empty"),
+    ]]);
+    const err = await rejection(new SdkExecutor(nullLogger(), homeDir, fast(queryFn)).run(makeCtx().ctx));
+    assert.ok(err instanceof LimitReachedError);
+    assert.ok(!(err instanceof SpendLimitHoldError));
+  });
+
+  it("subagent frames carrying the text (assistant error and an is_error tool result) followed by a successful lead result complete", async () => {
+    const subagentAssistantError = {
+      ...(subagentText(`API Error: 400 ${SPEND_TEXT}`) as unknown as Record<string, unknown>),
+      error: "unknown",
+    } as unknown as SDKMessage;
+    const subagentToolError = {
+      type: "user",
+      session_id: "sess-1",
+      parent_tool_use_id: "p1",
+      message: {
+        content: [{ type: "tool_result", tool_use_id: "tu-sub", is_error: true, content: `API Error: 400 ${SPEND_TEXT}` }],
+      },
+    } as unknown as SDKMessage;
+    const { queryFn } = fakeTurns([
+      [submitPlan("plan"), resultSuccess()],
+      [subagentAssistantError, subagentToolError, assistantText("done"), signalDone(), resultSuccess()],
+    ]);
+    const result = await new SdkExecutor(nullLogger(), homeDir, fast(queryFn)).run(makeCtx().ctx);
+    assert.ok(result, "the run completed without throwing");
+  });
+
+  it("a subagent frame carrying the spend sentence while the lead fails on a different 400 is a plain failure", async () => {
+    const { queryFn } = fakeTurns([[
+      subagentText(`API Error: 400 ${SPEND_TEXT}`),
+      resultApiError(400, "API Error: 400 messages: text content blocks must be non-empty"),
+    ]]);
+    const err = await rejection(new SdkExecutor(nullLogger(), homeDir, fast(queryFn)).run(makeCtx().ctx));
+    assert.ok(err instanceof Error);
+    assert.ok(!(err instanceof SpendLimitHoldError));
+    assert.match(err.message, /provider error: 400/);
+  });
+
+  it("a subagent frame carrying the text followed by a successful lead result completes", async () => {
+    const { queryFn } = fakeTurns([
+      [submitPlan("plan"), resultSuccess()],
+      [subagentText(`API Error: 400 ${SPEND_TEXT}`), assistantText("done"), signalDone(), resultSuccess()],
+    ]);
+    const probe = makeCtx();
+    const result = await new SdkExecutor(nullLogger(), homeDir, fast(queryFn)).run(probe.ctx);
+    assert.ok(result, "the run completed without throwing");
   });
 });

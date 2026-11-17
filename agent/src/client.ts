@@ -23,6 +23,13 @@ import { MaintenanceResources } from "./recovery-maintenance.js";
 import { MaintenanceBudget } from "./maintenance-budget.js";
 import { readPlanCrossCheckReconciliation } from "./cross-check-reconciliation.js";
 import type { DindMeterSample } from "./dind-meter.js";
+import {
+  decodeHibernationInventory,
+  type ExclusionFinalRequest,
+  type HibernationExclusionReport,
+  type HibernationInventoryBody,
+  type HibernationInventoryMember,
+} from "./hibernation-inventory.js";
 import { isHarnessEffort } from "./harness.js";
 import type { Logger } from "./log.js";
 import type { ResidueQuarantineState } from "./residue-quarantine.js";
@@ -31,6 +38,10 @@ import {
   WORKER_API_PREFIX,
   CAPABILITY_INFERENCE_EVIDENCE_FEATURE,
   RUN_REGISTRATION_EVIDENCE_FEATURE,
+  CHECKPOINT_PUBLICATION_WITHHELD_FEATURE,
+  type CheckpointPublicationInput,
+  type CheckpointPublicationAck,
+  type CheckpointPublicationReport,
   type MemoryBinding,
   type MemoryPolicy,
   type MemoryOutcome,
@@ -78,6 +89,8 @@ import {
   type HeartbeatRequest,
   type DindMaintenance,
   type DindMaintenanceReadyACK,
+  type HibernationCachePrune,
+  type HibernationCachePruneReport,
   type MessagesRequest,
   type OutboxHeartbeatEntry,
   type OutgoingMessage,
@@ -87,6 +100,12 @@ import {
   type RunRegistrationEvidence,
   type CompletedPublicationReceipt,
   type CompletedPublicationReason,
+  TERMINAL_CONTRIBUTION_STATES,
+  TERMINAL_REASONS,
+  type TerminalPreservationRequest,
+  type TerminalPreservationResponse,
+  type TerminalWireReason,
+  type TerminalResponseDisposition,
   type PlanCrossCheckReconciliation,
   type StateRequest,
   type UserInput,
@@ -335,6 +354,8 @@ function decodePlanCrossCheckResponse(value: unknown, generation: number, round:
 }
 
 export type PlanCrossCheckStateRequest = StateRequest & {
+  /** Issue #4201: the credential-switch operation id a failed, held or uncertain report is fenced to. */
+  op_id?: string;
   plan_cross_check_gate_reason?: PlanCrossCheckGateReason | null;
   plan_cross_check_diff_refusal?: PlanCrossCheckDiffRefusal;
   plan_cross_check_refusal?: "candidate_too_large" | "candidate_invalid" | "envelope_too_large" | "submit_failed";
@@ -406,6 +427,17 @@ export class HeldFeatureUnavailableError extends Error {
   }
 }
 
+/** Issue #3767: a spend-limit park was requested but the client no longer supports it (the feature
+ *  left the negotiated set, or the generation is not positive). Thrown BEFORE anything is sent and
+ *  never retryable: the runner fails the run with the provider message instead of looping or sending
+ *  an untyped park. */
+export class SpendLimitParkUnsupportedError extends Error {
+  constructor() {
+    super("spend-limit park requires support and a positive generation");
+    this.name = "SpendLimitParkUnsupportedError";
+  }
+}
+
 /** The typed outcome of {@link WorkerClient.publishHeld}. `ok: true` only means the api answered 2xx
  *  with a well-formed body; the caller must still require `body.state === "created"`. */
 export type HeldPublishResult =
@@ -430,6 +462,14 @@ export type LeadConfigPostOutcome =
   | { kind: "ok" }
   | { kind: "http"; status: number; error?: string }
   | { kind: "transport"; error: unknown };
+
+/** Issue #4201: a state report refused locally, before any request, because its preconditions (an api
+ *  feature, the registration nonce, a claim generation, an op id) do not hold. Not retried by the in-place
+ *  report loops: a retry of the same flight's report cannot be relied on to change it, so the flight stops
+ *  unconfirmed with custody kept (fail closed). */
+export class ReportPreconditionError extends Error {
+  constructor(message: string) { super(message); this.name = "ReportPreconditionError"; }
+}
 
 export class RequestError extends Error {
   constructor(
@@ -473,7 +513,38 @@ function hasRevisionSourceFields(body: StateRequest): boolean {
 
 // Internal per-attempt evidence, minted only after reading the authenticated response through EOF.
 class StateDecodeRefusalError extends RequestError {}
-interface StateAttemptEvidence { ambiguous: boolean; refusals: number; refusedAfterAmbiguity?: boolean }
+
+/** Issue #4257: the same report without the checkpoint-publication diagnostic. */
+function withoutCheckpointPublication<T extends { checkpoint_publication?: unknown }>(b: T): T {
+  if (b.checkpoint_publication === undefined) return b;
+  const copy = { ...b };
+  delete copy.checkpoint_publication;
+  return copy;
+}
+interface StateAttemptEvidence {
+  ambiguous: boolean; refusals: number; refusedAfterAmbiguity?: boolean;
+  /** Any definite HTTP answer (any status) after an earlier ambiguous attempt. */
+  definiteAfterAmbiguity?: boolean;
+}
+
+// The api's generic invalid-state 400 body (worker_protocol.go state handler).
+// Both spellings are generic: the list an api without credential_switch_uncertain prints, and the
+// one a current api prints.
+const GENERIC_INVALID_STATE_ERRORS: ReadonlySet<string> = new Set([
+  "state must be one of running, awaiting_approval, awaiting_input, awaiting_followup, limit_wait, recovery_wait, paused, pause_failed, credential_switch, credential_switch_failed, credential_switch_held, credential_switch_hold_settled, clarification_settled, completed, failed",
+  "state must be one of running, awaiting_approval, awaiting_input, awaiting_followup, limit_wait, recovery_wait, paused, pause_failed, credential_switch, credential_switch_failed, credential_switch_held, credential_switch_hold_settled, credential_switch_uncertain, clarification_settled, completed, failed",
+]);
+
+/** True when a spend-limit park refusal means the server does not understand the cause: the strict
+ *  decode refusal, or a 400 whose body is exactly the generic invalid-state error. */
+function isUnsupportedSpendLimitRefusal(error: unknown): boolean {
+  if (error instanceof StateDecodeRefusalError) return true;
+  if (!(error instanceof RequestError) || error.status !== 400) return false;
+  try {
+    const decoded: unknown = JSON.parse(error.body);
+    return isRecord(decoded) && Object.keys(decoded).length === 1 && typeof decoded.error === "string" && GENERIC_INVALID_STATE_ERRORS.has(decoded.error);
+  } catch { return false; }
+}
 
 /** Match a small, complete 404 JSON object against exactly the expected keys and values. */
 export function isStrict404Body(err: unknown, expected: Readonly<Record<string, string>>): boolean {
@@ -758,6 +829,18 @@ export class SanitizedPrDescriptionFields {
 // level (the version, its fields and their list entries, the size and its buckets): the fields are
 // minted as a frozen SanitizedPrDescriptionFields instance and the size is rebuilt frozen. None is exported: minting from arbitrary input stays
 // inside this module, on HTTP response bodies only.
+
+/** Issue #4201: the credential_switch signal is `{generation, op_id?}`; v1 servers omit op_id. */
+function credentialSwitchSignal(cs: { generation: number; op_id?: unknown }): { generation: number; op_id?: string } {
+  return typeof cs.op_id === "string" && cs.op_id !== "" ? { generation: cs.generation, op_id: cs.op_id } : { generation: cs.generation };
+}
+
+function parseJSONRecord(text: string): Record<string, unknown> | undefined {
+  try {
+    const v: unknown = JSON.parse(text);
+    return isRecord(v) ? v : undefined;
+  } catch { return undefined; }
+}
 
 function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
@@ -1165,6 +1248,26 @@ function decodeDindMaintenance(value: unknown): DindMaintenance | null | undefin
   };
 }
 
+/** Strict, bounded decode of the heartbeat member `hibernation_cache_prune` (PRD #4206): null and an
+ *  absent member are "no attempt"; anything malformed is undefined (unknown, never a release). */
+function decodeHibernationCachePrune(value: unknown, present: boolean): HibernationCachePrune | null | undefined {
+  if (value === null || !present) return null;
+  if (!isRecord(value)) return undefined;
+  const nonce = value.register_nonce;
+  const seq = value.reconcile_seq;
+  if (!isDindUUID(value.op_id) || typeof nonce !== "string" || nonce.length === 0 || nonce.length > 128 ||
+      typeof value.cancel_requested !== "boolean" ||
+      typeof seq !== "number" || !Number.isSafeInteger(seq) || seq < 0 || seq > 2_147_483_647) return undefined;
+  switch (value.phase) {
+    case "requested": case "started": case "unknown": case "settled":
+      break;
+    default:
+      return undefined;
+  }
+  return { op_id: value.op_id, register_nonce: nonce, phase: value.phase,
+    cancel_requested: value.cancel_requested, reconcile_seq: seq };
+}
+
 function validDindSample(sample: DindMeterSample | null | undefined): sample is DindMeterSample {
   if (!sample || ![sample.epochS, sample.bytesUsed, sample.bytesTotal, sample.inodesUsed, sample.inodesTotal]
     .every((v) => Number.isSafeInteger(v) && v >= 0)) return false;
@@ -1299,6 +1402,34 @@ type CompletionReservation = { live: boolean; tickets: Set<CompletionTicket> };
 
 /** issue #3181: the registration feature that lets a worker hold a credential switch it cannot settle. */
 export const CREDENTIAL_SWITCH_HOLD_FEATURE = "credential_switch_hold";
+/** Issue #4201: the api serves the in-place credential switch apply route and op-fenced reports. */
+const CREDENTIAL_SWITCH_APPLY_FEATURE = "credential_switch_apply_v1";
+/** Issue #4201: the protocol capability a worker advertises to use the in-place apply route. */
+const CREDENTIAL_SWITCH_IN_PLACE_CAPABILITY = "credential_switch_in_place_v1";
+
+/** Issue #4201: the state report for an apply whose outcome the worker cannot establish. */
+const CREDENTIAL_SWITCH_UNCERTAIN_STATE = "credential_switch_uncertain";
+
+export interface CredentialSwitchApplyRequest {
+  claimGeneration: number;
+  registerNonce: string;
+  opId: string;
+  oldCumulative?: unknown;
+}
+
+/** Raw classification of one apply call. Never carries a response body; `detail` is a fixed label. */
+export type CredentialSwitchApplyResult =
+  | { kind: "applied"; token: string; ordinal: number; messageSeq: number; replay: boolean }
+  | { kind: "superseded" }
+  | { kind: "fenced" }
+  | { kind: "not_applied"; reason: string }
+  | { kind: "refused_committed"; reason: string }
+  | { kind: "uncertain"; detail: string }
+  | { kind: "route_absent" };
+
+const APPLY_TOKEN_MIN_LENGTH = 8;
+const APPLY_RESPONSE_MAX_BYTES = 16 * 1024;
+const APPLY_REASON_MAX = 128;
 /** Issue #3985: the server accepts `clarification_settled` after a human revise's clarification. */
 export const CLARIFICATION_REVISION_SETTLEMENT_FEATURE = "clarification_revision_settlement_v1";
 
@@ -1570,10 +1701,15 @@ export class WorkerClient {
    * optimistic so the next request self-recovers once the api rolls forward).
    */
   private hasCredentialSwitchCapability = false;
+  /** Issue #4201: whether THIS registration advertised credential_switch_in_place_v1. */
+  private hasInPlaceCredentialSwitchCapability = false;
   /** Issue #3859: set when this registration's api proved (strict-decode 400) it cannot decode
    *  `registration_evidence`. Sticky until the next register(); a heartbeat feature refresh does
    *  not reopen it, which is why it is not simply dropFeature(). */
   private registrationEvidenceDropped = false;
+  private readonly witnessedRunning = new Map<string, RunRegistrationEvidence>();
+  /** Issue #4257: same shape for `checkpoint_publication`; sticky until the next register(). */
+  private checkpointPublicationDropped = false;
 
   /**
    * The per-registration nonce the api minted on the last successful register (PRD #1390
@@ -1590,10 +1726,62 @@ export class WorkerClient {
   private registrationReport: Omit<NonNullable<HeartbeatRequest["protocol_refresh"]>, "register_nonce"> | undefined;
 
   private latestDindMaintenanceValue: DindMaintenance | null | undefined;
+  private latestHibernationInventoryValue: HibernationInventoryMember | null | undefined;
+  private hibernationExclusionReceipt?: { report: HibernationExclusionReport; opId: string; held: boolean };
+
+  /** Exact-input receipt: another concurrent heartbeat must not acknowledge this report.
+   *  A lost receipt can cause a harmless resend; an omitted/stripped report never gets one. */
+  hibernationExclusionDelivered(report: HibernationExclusionReport): boolean {
+    const receipt = this.hibernationExclusionReceipt;
+    return receipt?.report === report && receipt.opId === report.op_id && receipt.held === report.held;
+  }
+
+  /** Latest heartbeat's `hibernation_inventory` (PRD #4208): null = none, undefined = unknown or malformed. */
+  get latestHibernationInventory(): HibernationInventoryMember | null | undefined {
+    return this.latestHibernationInventoryValue;
+  }
+
+  /** The current registration's nonce (the original register response), or undefined before register. */
+  currentRegisterNonce(): string | undefined {
+    return this.registerNonce;
+  }
+
+  /** PRD #4208: report the inventory, or one of its refusal statuses. Needs `hibernation_inventory_v1`. */
+  async postHibernationInventory(body: HibernationInventoryBody, signal?: AbortSignal): Promise<void> {
+    if (!this.hasFeature("hibernation_inventory_v1")) throw new Error("hibernation inventory feature unavailable");
+    await this.postJSON(`${WORKER_API_PREFIX}/hibernation/inventory`, body, this.httpTimeoutMs, signal, 64 * 1024);
+  }
+
+  /** PRD #4208: the shutdown-time exclusion proof. A short bounded post; the caller sends nothing on failure. */
+  async postHibernationExclusionFinal(
+    body: ExclusionFinalRequest, opts: { timeoutMs?: number; signal?: AbortSignal } = {},
+  ): Promise<void> {
+    if (!this.hasFeature("hibernation_inventory_v1")) throw new Error("hibernation inventory feature unavailable");
+    await this.postJSON(`${WORKER_API_PREFIX}/hibernation/exclusion-final`, body,
+      opts.timeoutMs ?? this.httpTimeoutMs, opts.signal, 64 * 1024);
+  }
 
   /** Latest heartbeat observation: null means known none; undefined means unknown. */
   get latestDindMaintenance(): DindMaintenance | null | undefined {
     return this.latestDindMaintenanceValue;
+  }
+
+  /** PRD #4206: whether this registration advertised `hibernation_cache_prune_v1`; the response
+   *  member is decoded and the report sent only then (the api does not echo it as a feature). */
+  private hibernationPruneAdvertised = false;
+  private latestHibernationCachePruneValue: HibernationCachePrune | null | undefined;
+  private hibernationReportOutcomeValue: "none" | "sent" | "dropped" = "none";
+
+  /** Latest heartbeat's hibernation cache prune projection: null is known none, undefined unknown. */
+  get latestHibernationCachePrune(): HibernationCachePrune | null | undefined {
+    return this.latestHibernationCachePruneValue;
+  }
+
+  /** What the latest heartbeat did with the hibernation report it was handed: `sent` (accepted),
+   *  `dropped` (the api answered 409; the report was removed and the heartbeat resynced) or `none`
+   *  (not included, or the heartbeat failed). */
+  get hibernationReportOutcome(): "none" | "sent" | "dropped" {
+    return this.hibernationReportOutcomeValue;
   }
 
   /**
@@ -1852,8 +2040,14 @@ export class WorkerClient {
     this.hasExactHoldCapability = false;
     this.hasBindinglessHoldCapability = false;
     this.latestDindMaintenanceValue = undefined;
+    this.latestHibernationCachePruneValue = undefined;
+    this.hibernationReportOutcomeValue = "none";
+    this.hibernationExclusionReceipt = undefined;
+    this.hibernationPruneAdvertised = false;
     this.registerNonce = undefined;
     this.registrationEvidenceDropped = false;
+    this.witnessedRunning.clear();
+    this.checkpointPublicationDropped = false;
     this.registrationReport = undefined;
     const originalCapabilities = Array.isArray(protocolCapabilities) ? [...protocolCapabilities] : undefined;
     const body: RegisterRequest = { name, version: this.version };
@@ -1918,7 +2112,9 @@ export class WorkerClient {
     // PRD #1247 fix round: remember whether THIS image advertised the credential_switch_v1
     // capability, so the send-gate can stamp the claim generation optimistically (its runs
     // are fenced server-side) even when a one-shot register missed the negotiated feature.
+    this.hibernationPruneAdvertised = originalCapabilities?.includes("hibernation_cache_prune_v1") ?? false;
     this.hasCredentialSwitchCapability = originalCapabilities?.includes("credential_switch_v1") ?? false;
+    this.hasInPlaceCredentialSwitchCapability = originalCapabilities?.includes(CREDENTIAL_SWITCH_IN_PLACE_CAPABILITY) ?? false;
     this.hasExactHoldCapability = originalCapabilities?.includes("recovery_held_publication_v2") ?? false;
     this.hasBindinglessHoldCapability = originalCapabilities?.includes("recovery_bindingless_closed_v1") ?? false;
     this.hasMemoryAuthorityClaimCapability = originalCapabilities?.includes("worker_memory_authority_claim_v1") ?? false;
@@ -1957,6 +2153,82 @@ export class WorkerClient {
     return this.serverFeatures.has(f);
   }
 
+  /** Issue #4201: the nonce the most recent register response returned, for the apply route's fence. */
+  registrationNonce(): string | undefined {
+    return this.registerNonce;
+  }
+
+  /** Issue #4201: the in-place switch needs this registration's capability AND the server feature. */
+  supportsInPlaceCredentialSwitch(): boolean {
+    return this.hasInPlaceCredentialSwitchCapability && this.hasFeature(CREDENTIAL_SWITCH_APPLY_FEATURE);
+  }
+
+  /**
+   * POST /worker/runs/:id/credential-switch/apply (issue #4201). One attempt, never retried here.
+   * Classification is strict: `route_absent` only for chi's default text/plain `404 page not found`;
+   * the exact run-not-owned JSON 404 is `fenced`; everything unrecognised is `uncertain`, because the
+   * server may have committed. Never echoes a response body or the token. Callers must check
+   * supportsInPlaceCredentialSwitch() first; calling without it is a programming error.
+   */
+  async applyCredentialSwitch(runId: string, req: CredentialSwitchApplyRequest): Promise<CredentialSwitchApplyResult> {
+    if (!this.supportsInPlaceCredentialSwitch())
+      throw new Error("applyCredentialSwitch requires the credential_switch_in_place_v1 capability and the credential_switch_apply_v1 feature; check supportsInPlaceCredentialSwitch() first");
+    const body: Record<string, unknown> = {
+      claim_generation: req.claimGeneration, register_nonce: req.registerNonce, op_id: req.opId,
+    };
+    if (req.oldCumulative !== undefined) body.old_cumulative = req.oldCumulative;
+    const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/credential-switch/apply`;
+    const uncertain = (detail: string): CredentialSwitchApplyResult => ({ kind: "uncertain", detail });
+    let res: Response;
+    try {
+      res = await this.fetchRaw("POST", path, body);
+    } catch {
+      return uncertain("transport_error");
+    }
+    let raw: Buffer;
+    try {
+      raw = await readBoundedBytes(res, APPLY_RESPONSE_MAX_BYTES, true);
+    } catch {
+      return uncertain("response_unreadable");
+    }
+    const text = raw.toString("utf8");
+    if (res.status === 404) {
+      const contentType = (res.headers.get("content-type") ?? "").trim().toLowerCase();
+      if (contentType.startsWith("text/plain") && (text === "404 page not found" || text === "404 page not found\n"))
+        return { kind: "route_absent" };
+      const decoded = parseJSONRecord(text);
+      if (decoded && Object.keys(decoded).length === 1 && decoded.error === "run not found for this worker")
+        return { kind: "fenced" };
+      return uncertain("unrecognized_404");
+    }
+    if (res.status !== 200) return uncertain(`http_${res.status}`);
+    const out = parseJSONRecord(text);
+    if (!out) return uncertain("malformed_response");
+    switch (out.outcome) {
+      case "applied": {
+        const { ordinal, message_seq: messageSeq, replay } = out;
+        // Trim once here: rebindCredential writes the trimmed value into the env, so the secret set, the
+        // log registry and every other sink must see that same value.
+        const token = typeof out.token === "string" ? out.token.trim() : out.token;
+        if (typeof token !== "string" || token.length < APPLY_TOKEN_MIN_LENGTH ||
+            typeof ordinal !== "number" || !Number.isSafeInteger(ordinal) || ordinal < 1 ||
+            typeof messageSeq !== "number" || !Number.isSafeInteger(messageSeq) || messageSeq < 0)
+          return uncertain("malformed_applied");
+        return { kind: "applied", token, ordinal, messageSeq, replay: replay === true };
+      }
+      case "superseded": return { kind: "superseded" };
+      case "fenced": return { kind: "fenced" };
+      case "not_applied":
+      case "refused_committed": {
+        const reason = out.reason;
+        if (typeof reason !== "string" || reason.length === 0 || reason.length > APPLY_REASON_MAX)
+          return uncertain("malformed_reason");
+        return { kind: out.outcome, reason };
+      }
+      default: return uncertain("unknown_outcome");
+    }
+  }
+
   /** V2 publication requires both this registration's capability and the server feature. */
   hasHeldPublicationV2(): boolean {
     return this.hasExactHoldCapability && this.hasFeature("recovery_held_publication_v2");
@@ -1971,6 +2243,7 @@ export class WorkerClient {
     for (const owned of this.codexAdmission.values()) owned.reporter.seal();
     this.revokeMemoryAuthority();
     this.latestDindMaintenanceValue = undefined;
+    this.latestHibernationInventoryValue = undefined;
   }
 
   /** Drop ONE negotiated feature (PRD #1733), where {@link clearFeatures} drops the whole set:
@@ -1993,9 +2266,15 @@ export class WorkerClient {
     maintenance?: { sample?: DindMeterSample | null; ack?: DindMaintenanceReadyACK },
     quarantine?: ResidueQuarantineState,
     outboxRootUnusable?: "symlink" | "unreadable",
+    hibernationReport?: HibernationCachePruneReport,
+    hibernationExclusion?: HibernationExclusionReport,
   ): Promise<boolean | undefined> {
     this.latestDindMaintenanceValue = undefined;
-    const body: HeartbeatRequest = { version: this.version };
+    this.latestHibernationCachePruneValue = undefined;
+    this.hibernationReportOutcomeValue = "none";
+    this.hibernationExclusionReceipt = undefined;
+    this.latestHibernationInventoryValue = undefined;
+    const body: HeartbeatRequest & { hibernation_exclusion?: HibernationExclusionReport } = { version: this.version };
     if (this.hasFeature("heartbeat_outbox_root_unusable")) body.outbox_root_unusable = outboxRootUnusable ?? null;
     // Only attach stats when the collector produced a sample (PRD #49): an absent
     // field is the same wire shape as today, so a pre-#49 server ignores the extra
@@ -2026,6 +2305,16 @@ export class WorkerClient {
         body.dind_maintenance_ready_ack = { ...maintenance.ack, register_nonce: this.registerNonce };
       }
     }
+    // PRD #4206: the hibernation cache prune report rides only for a registration that advertised
+    // the capability, bound to the current nonce, and never beside a maintenance ACK (the ACK goes
+    // first; the report waits for the next heartbeat and the caller sees outcome "none").
+    if (hibernationReport && this.hibernationPruneAdvertised && this.registerNonce !== undefined &&
+        hibernationReport.register_nonce === this.registerNonce && body.dind_maintenance_ready_ack === undefined) {
+      body.hibernation_cache_prune_report = { ...hibernationReport };
+    }
+    // PRD #4208: the writer-exclusion report rides only when negotiated and the controller has one.
+    const includeHibernation = this.hasFeature("hibernation_inventory_v1") && hibernationExclusion !== undefined;
+    if (includeHibernation) body.hibernation_exclusion = { op_id: hibernationExclusion.op_id, held: hibernationExclusion.held };
     // issue #2213: the residue quarantine latch rides the heartbeat ONLY while latched and ONLY when
     // the api advertised `worker_residue_quarantine`, so an older api sees a byte-identical wire.
     const includeQuarantine = this.hasFeature("worker_residue_quarantine") && quarantine !== undefined;
@@ -2048,24 +2337,41 @@ export class WorkerClient {
         register_nonce: this.registerNonce,
       };
     }
+    const recordExclusionDelivery = (sent: HeartbeatRequest & { hibernation_exclusion?: HibernationExclusionReport }): void => {
+      const packet = sent.hibernation_exclusion;
+      this.hibernationExclusionReceipt = packet && hibernationExclusion
+        ? { report: hibernationExclusion, opId: packet.op_id, held: packet.held } : undefined;
+    };
     const includeExtension = body.protocol_refresh !== undefined || includeOutbox || includeSnapshot || body.dind_meter !== undefined ||
-      body.dind_maintenance_ready_ack !== undefined || includeQuarantine || body.outbox_root_unusable !== undefined;
+      body.dind_maintenance_ready_ack !== undefined || body.hibernation_cache_prune_report !== undefined || includeQuarantine || body.outbox_root_unusable !== undefined || includeHibernation;
     try {
       try {
-        return await this.postHeartbeat(body);
+        const sent = await this.postHeartbeat(body);
+        recordExclusionDelivery(body);
+        if (body.hibernation_cache_prune_report) this.hibernationReportOutcomeValue = "sent";
+        return sent;
       } catch (err) {
         // A diagnostic rejected after API rollback must not strip protection fields.
         if (body.outbox_root_unusable !== undefined && isStrictDecodeError(err)) {
           delete body.outbox_root_unusable;
           this.dropFeature("heartbeat_outbox_root_unusable");
-          return await this.postHeartbeat(body);
+          const sent = await this.postHeartbeat(body);
+          recordExclusionDelivery(body);
+          return sent;
         }
         // A stale ACK gets one ACK-free resync; sibling extensions remain intact.
         // Any failure of that request reaches the usual strict-decode fallback below.
-        if (!body.dind_maintenance_ready_ack || !(err instanceof RequestError) || err.status !== 409) throw err;
+        if ((!body.dind_maintenance_ready_ack && !body.hibernation_cache_prune_report) ||
+            !(err instanceof RequestError) || err.status !== 409) throw err;
         const resync = { ...body };
         delete resync.dind_maintenance_ready_ack;
-        return await this.postHeartbeat(resync);
+        // A stale or mismatched hibernation report is dropped for good (the caller never resends it).
+        const droppedReport = resync.hibernation_cache_prune_report !== undefined;
+        delete resync.hibernation_cache_prune_report;
+        const resynced = await this.postHeartbeat(resync);
+        recordExclusionDelivery(resync);
+        if (droppedReport) this.hibernationReportOutcomeValue = "dropped";
+        return resynced;
       }
     } catch (err) {
       // Rollback fallback (PRD #1391 M5, extended by #1390 M2a): a rolled-back api that no
@@ -2082,6 +2388,7 @@ export class WorkerClient {
       const stripped: HeartbeatRequest = { version: this.version };
       if (stats) stripped.stats = stats;
       const retaining = await this.postHeartbeat(stripped, false);
+      recordExclusionDelivery(stripped);
       this.clearFeatures();
       this.log.warn(
         "heartbeat extension rejected by a rolled-back api; retried stripped and cleared the negotiated feature set",
@@ -2105,6 +2412,8 @@ export class WorkerClient {
    */
   private async postHeartbeat(body: HeartbeatRequest, applyAdverts = true): Promise<boolean | undefined> {
     this.latestDindMaintenanceValue = undefined;
+    this.latestHibernationCachePruneValue = undefined;
+    this.latestHibernationInventoryValue = undefined;
     const path = `${WORKER_API_PREFIX}/heartbeat`;
     const res = await this.fetchRaw("POST", path, body);
     if (!res.ok) throw await this.toError("POST", path, res);
@@ -2137,6 +2446,17 @@ export class WorkerClient {
     if (this.hasFeature("dind_maintenance_v1")) {
       this.latestDindMaintenanceValue = decodeDindMaintenance(
         (decoded as { dind_maintenance?: unknown }).dind_maintenance,
+      );
+    }
+    if (this.hibernationPruneAdvertised) {
+      this.latestHibernationCachePruneValue = decodeHibernationCachePrune(
+        (decoded as { hibernation_cache_prune?: unknown }).hibernation_cache_prune,
+        "hibernation_cache_prune" in (decoded as object),
+      );
+    }
+    if (this.hasFeature("hibernation_inventory_v1")) {
+      this.latestHibernationInventoryValue = decodeHibernationInventory(
+        (decoded as { hibernation_inventory?: unknown }).hibernation_inventory,
       );
     }
     const worker = (decoded as { worker?: unknown }).worker;
@@ -2668,7 +2988,7 @@ export class WorkerClient {
    * fail on real runs.
    */
   async reportState(runId: string, body: PlanCrossCheckStateRequest, signal?: AbortSignal,
-    options?: { iterationCancellation?: true; registrationEpoch?: number }): Promise<StateAck> {
+    options?: { iterationCancellation?: true; registrationEpoch?: number; checkpointPublication?: CheckpointPublicationInput }): Promise<StateAck> {
     const path = `${WORKER_API_PREFIX}/runs/${runId}/state`;
     if (options?.iterationCancellation) {
       // Snapshot before any asynchronous work; only the iteration sink cancellation
@@ -2683,6 +3003,31 @@ export class WorkerClient {
       return this.reportStateOnce(runId, path, frozen, signal, CROSS_CHECK_RESPONSE_MAX_BYTES);
     }
     this.sealCodexAdmission(path, body);
+    if ((body.status as string) === CREDENTIAL_SWITCH_UNCERTAIN_STATE) {
+      // Issue #4201: fenced on the current registration and on the switch operation; never
+      // downgraded or retried unqualified, because an api without the feature cannot decode it.
+      const nonce = this.registerNonce;
+      if (!this.hasFeature(CREDENTIAL_SWITCH_APPLY_FEATURE) || !nonce ||
+          !Number.isSafeInteger(body.claim_generation) || (body.claim_generation ?? 0) <= 0 ||
+          typeof body.op_id !== "string" || body.op_id === "")
+        throw new ReportPreconditionError("credential switch uncertain report requires the credential_switch_apply_v1 feature, a registration nonce, a positive claim_generation and an op_id");
+      return this.reportStateOnce(runId, path, { ...body, register_nonce: nonce }, signal, CROSS_CHECK_RESPONSE_MAX_BYTES);
+    }
+    if (body.op_id !== undefined) {
+      if (body.status !== "credential_switch_failed" && body.status !== "credential_switch_held")
+        throw new Error("op_id is only valid on credential switch failed, held and uncertain reports");
+      // An api without the feature strict-decodes the report: keep the pre-#4201 shape for it.
+      if (!this.hasFeature(CREDENTIAL_SWITCH_APPLY_FEATURE)) {
+        const { op_id: _opId, ...withoutOp } = body;
+        body = withoutOp;
+      } else if (body.status === "credential_switch_failed") {
+        // The api fences an op-carrying failed report on the current registration: a missing or stale
+        // nonce is a not-applied 409 that changes nothing. The v1 shape above carries none.
+        const nonce = this.registerNonce;
+        if (!nonce) throw new ReportPreconditionError("credential switch failed report with an op_id requires a registration nonce");
+        body = { ...body, register_nonce: nonce };
+      }
+    }
     if (body.source_publication !== undefined) {
       // Snapshot nested proof once, before either transport retries or caller mutation.
       const outbound: PlanCrossCheckStateRequest = Object.freeze(structuredClone(body));
@@ -2744,12 +3089,36 @@ export class WorkerClient {
           body.status !== "recovery_wait" || !Number.isSafeInteger(body.claim_generation) ||
           (body.claim_generation ?? 0) < 1) throw new Error("retained recovery park requires support and a positive generation");
       // This contract cannot degrade to an unfenced or untyped recovery park on rollback.
+      if (body.recovery_detail === "source_end_declined" &&
+          (body.register_nonce !== this.sourceEndDeclinedRegistration(runId, body.claim_generation!) ||
+           !body.register_nonce)) throw new Error("source end hold requires current running witness");
       const evidence: StateAttemptEvidence = { ambiguous: false, refusals: 0 };
       try {
         return await this.reportStateOnce(runId, path, Object.freeze({ ...body }), signal, CROSS_CHECK_RESPONSE_MAX_BYTES, evidence);
       } catch (error) {
         // A later validation refusal says nothing about an earlier possibly applied send.
         if (evidence.refusedAfterAmbiguity) throw new Error("retained recovery park outcome uncertain", { cause: error });
+        throw error;
+      }
+    }
+    if (body.recovery_cause === "anthropic_spend_limit") {
+      // Issue #3767: an owner-held spend-limit park. Sent once, exactly as given, fenced: it never
+      // takes the generic generation fallback or an untyped resend (an untyped park would be
+      // auto-retried by the api against a limit that cannot clear). A definite 4xx refusal closes
+      // only this feature's gate and propagates so the runner fails the run with the provider message.
+      if (!this.hasFeature("recovery_cause_anthropic_spend_limit") || body.status !== "recovery_wait" ||
+          !Number.isSafeInteger(body.claim_generation) || (body.claim_generation ?? 0) < 1)
+        throw new SpendLimitParkUnsupportedError();
+      const evidence: StateAttemptEvidence = { ambiguous: false, refusals: 0 };
+      try {
+        return await this.reportStateOnce(runId, path, Object.freeze({ ...body }), signal, CROSS_CHECK_RESPONSE_MAX_BYTES, evidence);
+      } catch (error) {
+        if (evidence.refusedAfterAmbiguity || evidence.definiteAfterAmbiguity)
+          throw new Error("spend-limit park outcome uncertain", { cause: error });
+        // Only an unsupported-protocol signal closes the gate: an unknown or server-only
+        // recovery_cause reaches ErrInvalidState and the generic 400 (service.go, state-report
+        // cause validation). Any other 4xx (404, a distinct 400, 401, ...) is about this run.
+        if (isUnsupportedSpendLimitRefusal(error)) this.dropFeature("recovery_cause_anthropic_spend_limit");
         throw error;
       }
     }
@@ -2777,7 +3146,7 @@ export class WorkerClient {
       const nonce = this.registerNonce;
       if (!this.hasFeature(CREDENTIAL_SWITCH_HOLD_FEATURE) || !nonce ||
           !Number.isSafeInteger(body.claim_generation) || (body.claim_generation ?? 0) <= 0)
-        throw new Error("credential switch hold report requires the credential_switch_hold feature, a registration nonce and a positive claim_generation");
+        throw new ReportPreconditionError("credential switch hold report requires the credential_switch_hold feature, a registration nonce and a positive claim_generation");
       return this.reportStateOnce(runId, path, { ...body, register_nonce: nonce }, signal, CROSS_CHECK_RESPONSE_MAX_BYTES);
     }
     if (body.status === "clarification_settled") {
@@ -2832,6 +3201,11 @@ export class WorkerClient {
     delete outbound.registration_evidence;
     const witness = this.registrationEvidenceFor(body, included, options?.registrationEpoch);
     if (witness) outbound.registration_evidence = witness;
+    // Issue #4257: the checkpoint-publication diagnostic, same discipline: a caller-set copy in
+    // the body is discarded and the client alone stamps nonce and generation.
+    delete outbound.checkpoint_publication;
+    const publication = this.checkpointPublicationFor(body, included, options?.checkpointPublication);
+    if (publication) outbound.checkpoint_publication = publication;
     // PRD #1795 M3: the api refuses an id-bearing awaiting_approval report without
     // claim_generation (400 claim_generation_required), and the strict-decode fallback exists for
     // an api that rolled back past the fields. So whenever claim_generation is NOT on the wire, the
@@ -2839,7 +3213,7 @@ export class WorkerClient {
     // allocating api still answers with its revision and an older api accepts unchanged.
     const evidence: StateAttemptEvidence = { ambiguous: false, refusals: 0 };
     let ack: StateAck;
-    const sendWith = (b: PlanCrossCheckStateRequest) => (includeField: boolean) =>
+    const sendOne = (b: PlanCrossCheckStateRequest, includeField: boolean) =>
       this.reportStateOnce(
         runId,
         path,
@@ -2852,6 +3226,21 @@ export class WorkerClient {
         undefined,
         b.claim_generation,
       );
+    // Issue #4257: checkpoint_publication is the NEWEST field, so its rollback is resolved first,
+    // at the innermost send, ahead of every older-field fallback below: on the exact strict-decode
+    // refusal (StateDecodeRefusalError) strip ONLY it, remember that for this registration and
+    // resend this same variant once. Later variants of the same report never carry it again.
+    const sendWith = (b: PlanCrossCheckStateRequest) => async (includeField: boolean): Promise<StateAck> => {
+      const base = this.checkpointPublicationDropped ? withoutCheckpointPublication(b) : b;
+      try {
+        return await sendOne(base, includeField);
+      } catch (err) {
+        if (base.checkpoint_publication === undefined || !isStrictDecodeError(err) || !(err instanceof StateDecodeRefusalError)) throw err;
+        this.checkpointPublicationDropped = true;
+        this.log.warn("checkpoint publication diagnostic rejected by an api that cannot decode it; re-sent without it and stopped sending it for this registration", { run_id: runId });
+        return sendOne(withoutCheckpointPublication(base), includeField);
+      }
+    };
     try {
       if (outbound.registration_evidence !== undefined) {
         // Issue #3859. Ordering with the older claim_generation fallback: the evidence strip comes
@@ -2924,7 +3313,51 @@ export class WorkerClient {
       throw err;
     }
     if (body.completion_final_head !== undefined && !this.hasFeature("recovery_completed_publication_v1")) ack.completedPublicationReason = "unsupported_feature";
+    if (witness && (ack.status === "running" ||
+        (ack.status === "claimed" && !ack.applied && ack.runId === runId &&
+          ack.workerIdentityMatches === true && ack.sentClaimGeneration === witness.claim_generation &&
+          !ack.credentialSwitchReleased && !ack.credentialSwitchHeld && !ack.credentialSwitchUncertain)) &&
+        ack.registrationEvidence === "recorded" && !ack.staleClaim && !ack.credentialSwitch &&
+        !this.registrationEvidenceDropped && this.registerNonce === witness.register_nonce) {
+      // A refused running transition can still persist registration evidence on a claimed row.
+      // This capability only enables the exact source-end hold; it never changes the running ACK.
+      // Witnesses remain valid for this registration, including while a hold ACK is in flight.
+      // Keep one per run until re-registration clears witnessedRunning; unrelated ACKs must
+      // never revoke an active run's exact-generation capability. A delayed ACK from an older
+      // claim generation must not replace a newer generation's witness.
+      const held = this.witnessedRunning.get(runId);
+      if (!held || held.register_nonce !== witness.register_nonce || held.claim_generation <= witness.claim_generation) {
+        this.witnessedRunning.set(runId, witness);
+      }
+    }
     return ack;
+  }
+
+  /** Read-only capability: only an acknowledged running report of this exact registration and claim. */
+  sourceEndDeclinedRegistration(runId: string, generation: number): string | undefined {
+    const witness = this.witnessedRunning.get(runId);
+    if (this.registrationEvidenceDropped || !this.hasFeature("retained_source_end_hold_v1") ||
+        !this.hasFeature(RUN_REGISTRATION_EVIDENCE_FEATURE) || !this.registerNonce ||
+        witness?.register_nonce !== this.registerNonce || witness.claim_generation !== generation) return undefined;
+    return this.registerNonce;
+  }
+
+  /** Issue #4257: the stamped checkpoint-publication diagnostic for a `running` report, or
+   *  undefined. Every guard is required: negotiated and not dropped for this registration, a
+   *  known register nonce, a claim generation that is a safe integer >= 1 really on the wire,
+   *  and a caller input with a positive integer report_seq (and `since` for `withheld`). */
+  private checkpointPublicationFor(body: StateRequest, included: boolean, input: CheckpointPublicationInput | undefined): CheckpointPublicationReport | undefined {
+    const generation = body.claim_generation;
+    if (input === undefined || body.status !== "running" || !included || this.checkpointPublicationDropped ||
+        !this.hasFeature(CHECKPOINT_PUBLICATION_WITHHELD_FEATURE) || !this.registerNonce ||
+        generation === undefined || !Number.isSafeInteger(generation) || generation < 1 ||
+        !Number.isSafeInteger(input.report_seq) || input.report_seq < 1) return undefined;
+    if (input.state === "withheld") {
+      if (typeof input.since !== "string" || input.since === "") return undefined;
+      return { state: "withheld", since: input.since, claim_generation: generation, register_nonce: this.registerNonce, report_seq: input.report_seq };
+    }
+    if (input.state !== "cleared") return undefined;
+    return { state: "cleared", claim_generation: generation, register_nonce: this.registerNonce, report_seq: input.report_seq };
   }
 
   /** Issue #3859: the registration witness for a `running` report, or undefined. Every guard is
@@ -3076,6 +3509,7 @@ export class WorkerClient {
             applied: res.status === 200,
             status: fields.status,
             ...(fields.recoveryCause !== undefined ? { recoveryCause: fields.recoveryCause } : {}),
+            ...(fields.recoveryDetail !== undefined ? { recoveryDetail: fields.recoveryDetail } : {}),
           };
           // parkWorkerMemoryPressure returns 409 only for exact replay when these DTO fields
           // match and no decline/switch disposition is present. Generation/nonce stay in the
@@ -3170,6 +3604,7 @@ export class WorkerClient {
           if (fields.credentialSwitchReleased !== undefined)
             ack.credentialSwitchReleased = fields.credentialSwitchReleased;
           if (fields.credentialSwitchHeld !== undefined) ack.credentialSwitchHeld = fields.credentialSwitchHeld;
+          if (fields.credentialSwitchUncertain !== undefined) ack.credentialSwitchUncertain = fields.credentialSwitchUncertain;
           if (fields.credentialSwitchHoldSettled !== undefined)
             ack.credentialSwitchHoldSettled = fields.credentialSwitchHoldSettled;
           // Issue #3985: only a 200 can confirm a clarification settlement; a 409 is a refusal.
@@ -3188,6 +3623,10 @@ export class WorkerClient {
           if (body.registration_evidence !== undefined && fields.registrationEvidence !== undefined) {
             ack.registrationEvidence = fields.registrationEvidence;
             this.log.info("registration evidence answered", { run_id: runId, registration_evidence: fields.registrationEvidence });
+          }
+          if (body.checkpoint_publication !== undefined && fields.checkpointPublication !== undefined) {
+            ack.checkpointPublication = fields.checkpointPublication;
+            this.log.info("checkpoint publication answered", { run_id: runId, checkpoint_publication: fields.checkpointPublication });
           }
           if (!ack.applied) {
             this.log.info("state report not applied server-side", {
@@ -3220,6 +3659,7 @@ export class WorkerClient {
         if (evidence) {
           if (evidence.ambiguous && err instanceof RequestError && err.status === 400)
             evidence.refusedAfterAmbiguity = true;
+          if (evidence.ambiguous && err instanceof RequestError) evidence.definiteAfterAmbiguity = true;
           if (err instanceof StateDecodeRefusalError) evidence.refusals++;
           else evidence.ambiguous = true;
         }
@@ -3378,6 +3818,67 @@ export class WorkerClient {
       return { ok: false, httpStatus: res.status, reason: "malformed_response" };
     }
     return { ok: true, body: body as HeldPublicationResponse };
+  }
+
+  /**
+   * Issue #4007: ask the api to publish a terminal run's work to `refs/uzi-terminal/<run-id>`. Never throws
+   * for a transport, HTTP or decode outcome; see {@link TerminalPreservationResult}. Only a 200 whose strict
+   * decode passes and which proves the work published at `req.tip` (or durably recorded) is `final`. Sends
+   * nothing gate-related: the server refuses `unsupported` itself.
+   */
+  async publishTerminalPreservation(
+    runId: string,
+    req: TerminalPreservationRequest,
+    signal?: AbortSignal,
+  ): Promise<TerminalPreservationResult> {
+    const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/terminal-preservation`;
+    let res: Response;
+    let text: string;
+    try {
+      const timeout = maintenanceSignal(TERMINAL_PRESERVATION_TIMEOUT_MS);
+      const init: RequestInit = {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${this.token}`,
+          "X-Client-Version": this.version,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(req),
+        signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
+      };
+      res = await maintenanceFetch(this.transport ?? fetch, this.baseUrl + path, init);
+      try {
+        text = await readBoundedText(res, TERMINAL_PRESERVATION_RESPONSE_MAX_BYTES, true, init.signal ?? undefined);
+      } catch {
+        if (init.signal?.aborted) return { kind: "unknown", cause: "aborted", httpStatus: res.status };
+        return { kind: "unknown", cause: "malformed_response", httpStatus: res.status };
+      }
+    } catch (error) {
+      const aborted = (error instanceof Error && (error.name === "AbortError" || error.name === "TimeoutError")) ||
+        signal?.aborted === true;
+      return { kind: "unknown", cause: aborted ? "aborted" : "transport" };
+    }
+    let body: unknown;
+    try { body = JSON.parse(text); } catch { body = undefined; }
+    if (res.status !== 200) {
+      const reason = isRecord(body) && typeof body.reason === "string" ? terminalWireReason(body.reason) : undefined;
+      if (reason === undefined) return { kind: "unknown", cause: "http_status", httpStatus: res.status };
+      if (terminalReasonStatus(reason) !== res.status) return { kind: "unknown", cause: "malformed_response", httpStatus: res.status };
+      if (TERMINAL_RETRYABLE_REASONS.has(reason)) return { kind: "unknown", cause: "retryable", reason, httpStatus: res.status };
+      return { kind: "refused", reason, httpStatus: res.status };
+    }
+    const response = decodeTerminalPreservationResponse(body, runId);
+    if (!response) return { kind: "unknown", cause: "malformed_response", httpStatus: 200 };
+    if (response.state === "published" && response.tip === req.tip) return { kind: "final", outcome: "published", response };
+    if (response.state === "recorded") return { kind: "final", outcome: "recorded", response };
+    if (response.state === "refused") {
+      return response.reason
+        ? { kind: "refused", reason: response.reason, httpStatus: 200 }
+        : { kind: "unknown", cause: "malformed_response", httpStatus: 200 };
+    }
+    // published at a different tip is a contradiction, not a partial success.
+    if (response.state === "published") return { kind: "unknown", cause: "malformed_response", httpStatus: 200 };
+    return { kind: "unknown", cause: "not_final", httpStatus: 200 };
   }
 
   // ── Durable run recovery archive RPC (PRD #1296 M3, D3/D5) ─────────────────────
@@ -3958,7 +4459,7 @@ export class WorkerClient {
     )) as RecoverySettleResponse;
   }
 
-  async getInputs(runId: string, claimGeneration?: number, signal?: AbortSignal, maxResponseBytes?: number): Promise<{ inputs: UserInput[]; staleObservation?: true; terminalCancelled?: { run_id: string; generation: number }; credentialSwitch?: { generation: number }; receipts?: boolean; nowSummary?: boolean }> {
+  async getInputs(runId: string, claimGeneration?: number, signal?: AbortSignal, maxResponseBytes?: number): Promise<{ inputs: UserInput[]; staleObservation?: true; terminalCancelled?: { run_id: string; generation: number }; credentialSwitch?: { generation: number; op_id?: string }; receipts?: boolean; nowSummary?: boolean }> {
     const query = claimGeneration !== undefined && claimGeneration > 0
       ? `?claim_generation=${encodeURIComponent(claimGeneration)}` : "";
     const epoch = this.inputObservationEpoch;
@@ -3978,7 +4479,7 @@ export class WorkerClient {
     // (steering.maybeTripCredentialSwitch); a legacy caller that reads only `.inputs` is unaffected.
     // Issue #1673: `receipts` is the server's per-reply declaration of receipt mode.
     // PRD #2603: `now_summary` is the run's effective Now-summary setting; absent ⇒ off.
-    return { inputs: res.inputs ?? [], ...(terminalCancelled ? { terminalCancelled } : {}), credentialSwitch: res.credential_switch, receipts: res.receipts === true, nowSummary: res.now_summary === true };
+    return { inputs: res.inputs ?? [], ...(terminalCancelled ? { terminalCancelled } : {}), credentialSwitch: res.credential_switch ? credentialSwitchSignal(res.credential_switch) : undefined, receipts: res.receipts === true, nowSummary: res.now_summary === true };
   }
 
   async ackInputs(runId: string, ids: number[], claimGeneration: number): Promise<InputReceipt> {
@@ -5754,6 +6255,7 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
   runId?: unknown;
   workerId?: unknown;
   recoveryCause?: string;
+  recoveryDetail?: string;
   memoryEpisode?: number;
   memoryParkUndisposed?: boolean;
   status?: string;
@@ -5773,11 +6275,12 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
   budgetExhausted?: boolean;
   reason?: string;
   recoveryRetryNotBefore?: string | null;
-  credentialSwitch?: { generation: number };
+  credentialSwitch?: { generation: number; op_id?: string };
   staleClaim?: boolean;
   credentialSwitchReleased?: boolean;
   credentialSwitchHeld?: boolean;
   credentialSwitchHoldSettled?: boolean;
+  credentialSwitchUncertain?: boolean;
   clarificationSettled?: boolean;
   gateRevision?: number;
   revisionInputId?: number;
@@ -5785,6 +6288,7 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
   staleRevisionSource?: boolean;
   reconciliation?: PlanCrossCheckReconciliation;
   registrationEvidence?: "recorded" | "refused";
+  checkpointPublication?: CheckpointPublicationAck;
 }> {
   const pendingMarker = res.headers.get(COMPLETION_PENDING_HEADER);
   const ackCap = maxAckBytes === undefined ? undefined
@@ -5807,6 +6311,7 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
         worker_id?: unknown;
         status?: unknown;
         recovery_wait_cause?: unknown;
+        recovery_wait_detail?: unknown;
         memory_hold?: unknown;
         // PRD #1497 M2: the run's hold_reason on the RunDTO, read beside `status` to recognise a
         // SERVER-side wall park (paused + budget_exhausted) from a fenced stale-claim ACK.
@@ -5838,6 +6343,7 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
       superseded_revision_input_ids?: unknown;
       // Issue #3859: top-level answer to a report that carried registration_evidence.
       registration_evidence?: unknown;
+      checkpoint_publication?: unknown;
     };
     const run = parsed?.run;
     const out: {
@@ -5851,6 +6357,7 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
       runId?: unknown;
       workerId?: unknown;
       recoveryCause?: string;
+      recoveryDetail?: string;
       memoryEpisode?: number;
       memoryParkUndisposed?: boolean;
       status?: string;
@@ -5870,11 +6377,12 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
       budgetExhausted?: boolean;
       reason?: string;
       recoveryRetryNotBefore?: string | null;
-      credentialSwitch?: { generation: number };
+      credentialSwitch?: { generation: number; op_id?: string };
       staleClaim?: boolean;
       credentialSwitchReleased?: boolean;
       credentialSwitchHeld?: boolean;
       credentialSwitchHoldSettled?: boolean;
+      credentialSwitchUncertain?: boolean;
       clarificationSettled?: boolean;
       gateRevision?: number;
       revisionInputId?: number;
@@ -5882,6 +6390,7 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
       staleRevisionSource?: boolean;
       reconciliation?: PlanCrossCheckReconciliation;
       registrationEvidence?: "recorded" | "refused";
+      checkpointPublication?: CheckpointPublicationAck;
     } = {};
     if (isRecord(parsed) && (Object.hasOwn(parsed, "semantic_presentation") || Object.hasOwn(parsed, "semantic_approval"))) {
       try {
@@ -5907,6 +6416,7 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
     if (run?.worker_id !== undefined) out.workerId = run.worker_id;
     if (typeof run?.status === "string") out.status = run.status;
     if (typeof run?.recovery_wait_cause === "string") out.recoveryCause = run.recovery_wait_cause;
+    if (typeof run?.recovery_wait_detail === "string") out.recoveryDetail = run.recovery_wait_detail;
     if (isRecord(run?.memory_hold) && memoryNatural(run.memory_hold.episode))
       out.memoryEpisode = run.memory_hold.episode;
     // Presence, even malformed/null, blocks authority rather than degrading to absence.
@@ -6001,7 +6511,7 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
     // reportState closure throws StaleClaimError off staleClaim.
     const cs = parsed?.credential_switch;
     if (typeof cs === "object" && cs !== null && typeof (cs as { generation?: unknown }).generation === "number")
-      out.credentialSwitch = { generation: (cs as { generation: number }).generation };
+      out.credentialSwitch = credentialSwitchSignal(cs as { generation: number; op_id?: unknown });
     if (parsed?.disposition === "stale_claim") out.staleClaim = true;
     // PRD #1247 M5b (BLOCKING-2 rework): the held-state credential-switch RELEASE applied. The
     // server sets it on the 200 ack for BOTH a fresh requeue (status 'queued') and an idempotent
@@ -6012,6 +6522,8 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
     // acknowledgement applied (`hold_settled`). Read only off the 200 ack, like `released`.
     if (parsed?.disposition === "held") out.credentialSwitchHeld = true;
     if (parsed?.disposition === "hold_settled") out.credentialSwitchHoldSettled = true;
+    // Issue #4201: the credential-switch UNCERTAIN report applied (the run is an owner pause).
+    if (parsed?.disposition === "uncertain") out.credentialSwitchUncertain = true;
     // Issue #3985: the clarification settlement applied; read only off the 200 ack.
     if (parsed?.disposition === "clarification_settled") out.clarificationSettled = true;
     // PRD #1795 M1 (decision 5): the gate revision an awaiting_approval report was answered with. A
@@ -6030,6 +6542,9 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
     }
     if (parsed?.registration_evidence === "recorded" || parsed?.registration_evidence === "refused")
       out.registrationEvidence = parsed.registration_evidence;
+    if (parsed?.checkpoint_publication === "recorded" || parsed?.checkpoint_publication === "cleared" ||
+        parsed?.checkpoint_publication === "refused" || parsed?.checkpoint_publication === "unrecorded")
+      out.checkpointPublication = parsed.checkpoint_publication;
     const gateRev = parsed?.gate_revision;
     if (typeof gateRev === "number" && Number.isSafeInteger(gateRev) && gateRev >= 1) out.gateRevision = gateRev;
     const reconciliation = readPlanCrossCheckReconciliation(parsed);
@@ -6126,9 +6641,76 @@ function decodeCompletedPublicationReason(value: unknown): CompletedPublicationR
   switch (value) {
     case "completion_identity_missing": case "not_completed": case "identity_changed":
     case "mr_missing": case "branch_missing": case "branch_mismatch": case "head_mismatch":
-    case "not_ancestor": case "ancestry_unknown": case "forge_timeout": return value;
+    case "not_ancestor": case "ancestry_unknown": case "forge_timeout":
+    case "terminal_preservation_pending": case "terminal_preservation_refused": return value;
     default: return undefined;
   }
+}
+
+const TERMINAL_PRESERVATION_TIMEOUT_MS = 330_000;
+const TERMINAL_PRESERVATION_RESPONSE_MAX_BYTES = 16 * 1024;
+const TERMINAL_WIRE_ONLY_REASONS: ReadonlySet<string> =
+  new Set(["busy", "stale_claim", "missing_claim_generation", "invalid_request"]);
+// Reasons the worker may retry as is; they are publish_unknown, never a refusal of the work.
+const TERMINAL_RETRYABLE_REASONS: ReadonlySet<string> =
+  new Set(["busy", "forge_unavailable", "publication_in_flight", "authority_changed"]);
+// The statuses writeTerminalError (api handler) pairs with each reason; anything else is a contradiction.
+const TERMINAL_422_REASONS: ReadonlySet<string> = new Set(["unsupported", "manifest_invalid", "pack_invalid",
+  "tip_missing", "not_descendant", "root_unreachable", "tree_mismatch", "walk_too_large"]);
+function terminalReasonStatus(reason: TerminalWireReason): number {
+  if (TERMINAL_422_REASONS.has(reason)) return 422;
+  switch (reason) {
+    case "pack_too_large": return 413;
+    case "forge_unavailable": return 503;
+    case "busy": return 429;
+    case "invalid_request": return 400;
+    default: return 409;
+  }
+}
+function terminalWireReason(value: string): TerminalWireReason | undefined {
+  return TERMINAL_REASONS.find(r => r === value) ??
+    (TERMINAL_WIRE_ONLY_REASONS.has(value) ? value as TerminalWireReason : undefined);
+}
+// The run_terminal_contributions.disposition CHECK (migration 00449) and its pairing with state.
+const TERMINAL_RESPONSE_DISPOSITIONS: readonly TerminalResponseDisposition[] =
+  ["preserved", "closed_issue_abandoned", "closed_pr_abandoned"];
+// The refusal_reason CHECK: the only reasons a 200 can carry, and only on a refused state.
+const TERMINAL_STORED_REFUSAL_REASONS: ReadonlySet<string> =
+  new Set(["create_refused", "update_refused", "foreign_tip", "send_suppressed"]);
+const TERMINAL_RESPONSE_KEYS: ReadonlySet<string> = new Set([
+  "preservation_id", "contribution_id", "ref", "tip", "state", "preservation_state", "disposition", "reason",
+]);
+
+/** Outcome of {@link WorkerClient.publishTerminalPreservation}. Only `final` means the work is on the forge
+ *  (`published`) or the server durably recorded it as abandoned (`recorded`); everything ambiguous is `unknown`. */
+export type TerminalPreservationResult =
+  | { kind: "final"; outcome: "published" | "recorded"; response: TerminalPreservationResponse }
+  | { kind: "refused"; reason: TerminalWireReason; httpStatus: number }
+  | { kind: "unknown"; cause: "malformed_response" | "transport" | "aborted" | "http_status" | "not_final"; httpStatus?: number }
+  | { kind: "unknown"; cause: "retryable"; reason: TerminalWireReason; httpStatus: number };
+
+/** Strict decode of the 200 body; undefined on any defect (unknown field, state, reason, bad tip or ref). */
+// The run_terminal_preservations state CHECK (migration 00448): a value outside it is malformed.
+const TERMINAL_PRESERVATION_STATES: ReadonlySet<string> = new Set(
+  ["bound", "publishing", "live", "retiring", "deleted", "abandoned", "not_published"]);
+function decodeTerminalPreservationResponse(value: unknown, runId: string): TerminalPreservationResponse | undefined {
+  if (!isRecord(value) || Object.keys(value).some(k => !TERMINAL_RESPONSE_KEYS.has(k))) return undefined;
+  const str = (k: string) => typeof value[k] === "string" && (value[k] as string).length > 0 ? value[k] as string : undefined;
+  const state = TERMINAL_CONTRIBUTION_STATES.find(s => s === value.state);
+  const reason = value.reason === undefined ? undefined : TERMINAL_REASONS.find(r => r === value.reason);
+  if (!state || (value.reason !== undefined && !reason) || typeof value.tip !== "string" || !/^[0-9a-f]{40}$/.test(value.tip)) return undefined;
+  if (value.ref !== `refs/uzi-terminal/${runId}`) return undefined;
+  const disposition = TERMINAL_RESPONSE_DISPOSITIONS.find(d => d === value.disposition);
+  // recorded <=> an abandonment disposition (run_terminal_contributions_recorded_check).
+  if (!disposition || (state === "recorded") !== (disposition !== "preserved")) return undefined;
+  // A reason belongs to a refused state and is one of the stored refusal reasons.
+  if (reason !== undefined && (state !== "refused" || !TERMINAL_STORED_REFUSAL_REASONS.has(reason))) return undefined;
+  const preservation_id = str("preservation_id"), contribution_id = str("contribution_id"),
+    preservation_state = str("preservation_state");
+  if (!preservation_id || !contribution_id || !preservation_state ||
+      !TERMINAL_PRESERVATION_STATES.has(preservation_state)) return undefined;
+  return { preservation_id, contribution_id, ref: value.ref, tip: value.tip as string, state,
+    preservation_state, disposition, ...(reason ? { reason } : {}) };
 }
 
 const TERMINAL_REJECTION_RESPONSE_MAX_BYTES = 128 * 1024;

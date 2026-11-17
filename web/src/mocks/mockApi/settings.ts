@@ -113,6 +113,8 @@ const SEED_USER_SETTINGS: UserSettings = {
   now_summary_enabled: null,
   // PRD #1429 M1 (D3): per-user default harness; null = no preference (falls through D11).
   default_harness: null,
+  // PRD #3257: per-user "Judge runs on"; null = same as the run being reviewed.
+  judge_runs_on: null,
   harness_overflow_enabled: false,
   // Issue #3719: how a new Codex run chooses its login. Seeded "auto" so the demo shows the
   // pool at work (a pooled login sits in mocks/data/secrets.ts); the server's own default is
@@ -166,6 +168,11 @@ const SEED_APP_SETTINGS: AppSettings = {
   now_summary_enabled: "true",
   // PRD #529 / #649 M1: ephemeral worker auto-provisioning instance kill-switch, default OFF.
   ephemeral_workers_enabled: "false",
+  // PRD #4205: worker hibernation instance switch, default OFF.
+  worker_hibernation_enabled: "false",
+  // PRD #4207: automatic hibernation of idle workers, default OFF, 14-day threshold.
+  worker_hibernation_auto: "false",
+  worker_hibernation_idle_after: "336h",
   hosted_worker_quota: "2",
   custody_hold_limit: "8",
   // PRD #836: upstream release-check toggles, both default ON (the master air-gap
@@ -301,6 +308,8 @@ function isPersistedSettings(p: unknown): p is PersistedSettings {
     // PRD #1429 M1: optional so a pre-feature blob stays valid; absent/null reads as "no
     // preference" and the SEED fills default_harness=null on load (no key bump needed).
     (u.default_harness === undefined || u.default_harness === null || typeof u.default_harness === "string") &&
+    // PRD #3257: optional so a pre-feature blob stays valid; the SEED fills judge_runs_on=null.
+    (u.judge_runs_on === undefined || u.judge_runs_on === null || typeof u.judge_runs_on === "string") &&
     // Optional for older blobs; the seed fills the default-off overflow setting.
     (u.harness_overflow_enabled === undefined || typeof u.harness_overflow_enabled === "boolean") &&
     // Issue #3719: optional so a pre-feature blob stays valid; the SEED fills it on load.
@@ -779,10 +788,25 @@ function recordedEffectiveScenario(): RecordedEffectiveScenario {
   return found;
 }
 
-// Absent and null request members mean the same choice, so key on the normalized triple.
+// PRD #3257: the recordings are all taken with "Judge runs on" unset, so the stored choice is
+// applied at response time, exactly as effective_settings.go derives it: an explicit choice is a
+// user_default judge_harness, and the other lane's judge_model cell gains the not_used note.
+// With the setting unset the recording is served unchanged.
+function withJudgeRunsOn(view: EffectiveSettings, runsOn: Harness | null | undefined): EffectiveSettings {
+  if (!runsOn) return view;
+  view.judge_harness = { value: runsOn, source: "user_default", fixed_at: "create", notes: [] };
+  view.models = view.models.map(c =>
+    c.setting === "judge_model" && c.harness !== runsOn && !c.notes.includes("not_used")
+      ? { ...c, notes: [...c.notes, "not_used"] }
+      : c,
+  );
+  return view;
+}
+
+// Absent and null request members mean the same choice, so key on the normalized five members.
 function previewRequestKey(r: StartPreviewRequest): string {
   const o = r.credential_override;
-  return JSON.stringify([r.harness ?? null, o?.mode ?? null, o?.secret_id ?? null]);
+  return JSON.stringify([r.harness ?? null, o?.mode ?? null, o?.secret_id ?? null, r.model ?? null, r.effort ?? null]);
 }
 
 // A draft's absent and null harness and model mean the same choice, but an absent
@@ -1013,6 +1037,8 @@ export const settingsApi = {
         key === "judge_enabled" ||
         key === "judge_enforce_all" ||
         key === "ephemeral_workers_enabled" ||
+        key === "worker_hibernation_enabled" ||
+        key === "worker_hibernation_auto" ||
         key === "now_summary_enabled" ||
         key === "release_check_enabled" ||
         key === "release_check_banner_enabled" ||
@@ -1025,6 +1051,24 @@ export const settingsApi = {
           throw new ApiError(400, `${key}: must be "true" or "false"`);
         }
         (nonSecret as Record<string, string>)[key] = value;
+        continue;
+      }
+      if (key === "worker_hibernation_idle_after") {
+        // PRD #4207: mirrors the server's Go time.ParseDuration + 1h..2160h bound: an
+        // optional sign (after the server's TrimSpace), then "0" or unit-suffixed components (decimals allowed).
+        const units: Record<string, number> = { h: 3600, m: 60, s: 1, ms: 1e-3, us: 1e-6, "µs": 1e-6, ns: 1e-9 };
+        const comp = "(\\d+(?:\\.\\d*)?|\\.\\d+)(ns|us|µs|ms|h|m|s)";
+        const m0 = new RegExp(`^([-+]?)(0|(?:${comp})+)$`).exec(value.trim());
+        if (!m0) {
+          throw new ApiError(400, 'worker_hibernation_idle_after: must be a duration like "336h"');
+        }
+        let seconds = 0;
+        for (const m of m0[2].matchAll(new RegExp(comp, "g"))) seconds += Number(m[1]) * units[m[2]];
+        if (m0[1] === "-") seconds = -seconds;
+        if (seconds < 3600 || seconds > 2160 * 3600) {
+          throw new ApiError(400, "worker_hibernation_idle_after: must be between 1h and 2160h");
+        }
+        nonSecret.worker_hibernation_idle_after = value;
         continue;
       }
       if (key === "custody_hold_limit") {
@@ -1446,7 +1490,7 @@ export const settingsApi = {
   // overflowCodexDefault one (the recorded refused-alternative case); anything else the default.
   getEffectiveSettings: async (): Promise<EffectiveSettings> => {
     requireSession();
-    return delay(structuredClone(recordedEffectiveScenario().get), 60);
+    return delay(withJudgeRunsOn(structuredClone(recordedEffectiveScenario().get), userSettings.judge_runs_on), 60);
   },
   previewStartSettings: async (body: StartPreviewRequest): Promise<StartPreview> => {
     requireSession();
@@ -1692,6 +1736,14 @@ export const settingsApi = {
         throw new ApiError(400, "default_harness: must be one of claude, codex");
       }
       next = { ...next, default_harness: patch.default_harness };
+    }
+    if (patch.judge_runs_on !== undefined) {
+      // Tri-state like default_harness (PRD #3257): null clears to "same as the run"; anything
+      // but claude|codex is a 400, as the server's validateJudgeRunsOn.
+      if (patch.judge_runs_on !== null && patch.judge_runs_on !== "claude" && patch.judge_runs_on !== "codex") {
+        throw new ApiError(400, "invalid judge_runs_on");
+      }
+      next = { ...next, judge_runs_on: patch.judge_runs_on };
     }
     // Every field validated: commit the staged copy in one shot, then persist.
     userSettings = next;

@@ -44,11 +44,13 @@ func sampleStatusReport() StatusReport {
 		Kind: "fleet", ReportedAt: time.Date(2026, 7, 26, 10, 0, 0, 0, time.UTC),
 		PollIntervalSeconds: 10,
 		WorkerImageTag:      "0.11.7",
+		Hibernation:         2,
 		Workers: []WorkerStatus{
 			{
 				// The motivating incident, in fixture form: an init container wedged in
 				// CrashLoopBackOff reseeding the browser's nix closure.
 				Pacing:            &Pacing{State: "waiting_evidence", TargetImage: "harbor.example.com/uzi/agent-base:0.11.7", TargetVersion: "0.11.7", CanaryID: &canary, BlockingWorkerID: &canary, BlockingReason: &blockingReason, RetainedImage: &retained, RetainedVersion: &retained},
+				RollMarker:        &RollMarker{State: RollMarkerPresent, Canary: true, Completed: true, TargetVersion: "0.11.7", CoverageGroup: "0123456789abcdef", Reservation: true, Blocked: &blockingReason},
 				ID:                "11111111-1111-1111-1111-111111111111",
 				Phase:             PhaseStuck,
 				PhaseSince:        &phaseSince,

@@ -124,7 +124,7 @@ func (x linkedMappingFixture) thread(t *testing.T) issueinput.Thread {
 // is kept. The forge's membership lookup is never asked.
 func TestLinkedCommentFromAnUnmappedAuthorIsWithheldAndTheAccountsOwnKept(t *testing.T) {
 	x := newLinkedMappingFixture(t, youtracktest.BotLogin, nil)
-	if _, err := x.svc.CreateRun(context.Background(), uuid.New(), uuid.New(), x.issue, "", nil, nil, false, nil, nil, nil, nil); err != nil {
+	if _, err := x.svc.CreateRun(context.Background(), uuid.New(), uuid.New(), x.issue, "", nil, nil, false, nil, nil, nil, nil, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	raw := string(x.fs.createRunParams.IssueComments)
@@ -153,7 +153,7 @@ func TestLinkedUnmappedIssueAuthorManualStartProceedsAndScheduledIsNotAutoApprov
 
 	t.Run("manual start proceeds", func(t *testing.T) {
 		x := newLinkedMappingFixture(t, youtracktest.OtherLogin, nil)
-		if _, err := x.svc.CreateRun(ctx, uuid.New(), uuid.New(), x.issue, "", nil, nil, false, nil, nil, nil, nil); err != nil {
+		if _, err := x.svc.CreateRun(ctx, uuid.New(), uuid.New(), x.issue, "", nil, nil, false, nil, nil, nil, nil, nil, nil); err != nil {
 			t.Fatalf("a manual start of an unmapped author's issue was refused: %v", err)
 		}
 		p := x.fs.createRunParams

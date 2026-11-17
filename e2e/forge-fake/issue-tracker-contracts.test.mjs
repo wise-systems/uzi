@@ -44,13 +44,14 @@ async function stop(child) {
 
 // The only subtests that may skip: the forge subjects supply no MoveIssue seam,
 // so the moved-issue case runs on YouTrack only, and forge labels have no
-// owners, so the same-name tag case and the usable-labels case (Subject.SameName)
-// do too. ProjectGuard must pass on every forge.
-const ALLOWED_SKIPS = new Set(["MovedIssueIsRefused", "SameNameTagUsesEligibilityTag", "ListLabelsOnlyUsableTags"]);
+// owners, so the same-name tag case (Subject.SameName) does too, and so do the
+// renamed eligibility tag case and the usable-labels case, which use the same
+// seams. ProjectGuard must pass on every forge.
+const ALLOWED_SKIPS = new Set(["MovedIssueIsRefused", "SameNameTagUsesEligibilityTag", "RenamedEligibilityTagIsStillListed", "ListLabelsOnlyUsableTags"]);
 const CASES = [
   "EnsureLabelsIsIdempotent", "CreateIssueRoundTrips", "ListIssuesFilters", "UpdateLabelsAndDescription",
   "SetIssueStateClosesAndReopens", "CommentsOldestFirst", "LabelEventsOldestFirst", "MissingIssueIsNotFound", "MovedIssueIsRefused",
-  "ProjectGuard", "SameNameTagUsesEligibilityTag", "ListLabelsOnlyUsableTags",
+  "ProjectGuard", "SameNameTagUsesEligibilityTag", "RenamedEligibilityTagIsStillListed", "ListLabelsOnlyUsableTags",
 ];
 const DIALECTS = ["gitlab", "github", "forgejo"];
 
@@ -105,7 +106,12 @@ async function contracts(t) {
     let output = "";
     const started = performance.now();
     go = spawn(command[0], command.slice(1), { cwd: path.join(root, "api"),
-      env: { ...process.env, SSL_CERT_FILE: cert, HTTPS_PROXY: "", HTTP_PROXY: "", ALL_PROXY: "", NO_PROXY: "127.0.0.1",
+      // api/go.mod targets Go 1.26, whose x509sslcertoverrideplatform default (0) makes
+      // macOS ignore SSL_CERT_FILE; =1 makes the Go child trust the fake there too (#4238).
+      // Tied to that go line: drop this once api/go.mod says go 1.27 or later.
+      env: { ...process.env, SSL_CERT_FILE: cert,
+        GODEBUG: [process.env.GODEBUG, "x509sslcertoverrideplatform=1"].filter(Boolean).join(","),
+        HTTPS_PROXY: "", HTTP_PROXY: "", ALL_PROXY: "", NO_PROXY: "127.0.0.1",
         UZI_FORGE_FAKE_REQUIRED: "1", UZI_FORGE_FAKE_ENDPOINT: endpoint },
       stdio: ["ignore", "pipe", "pipe"] });
     for (const stream of [go.stdout, go.stderr]) stream.on("data", (data) => {

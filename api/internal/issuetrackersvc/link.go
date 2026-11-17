@@ -13,7 +13,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// Bounds the repos_issue_tracker_link_shape CHECK (migration 00425) enforces.
+// Bounds the repos_issue_tracker_link_shape CHECK (migration 00466) enforces.
 const (
 	maxProjectShortLen = 44
 	maxTagNameLen      = 256
@@ -158,7 +158,19 @@ func (s *Service) checkLinkTarget(ctx context.Context, userID, connID uuid.UUID,
 	if err != nil {
 		return noAccount, noProject, noTag, &Error{Kind: KindBadGateway, Message: "token verification failed: " + err.Error()}
 	}
-	if err := validateAccount(account); err != nil {
+	// The token is opened again only to refuse an account id or login that holds it
+	// (validateAccount); DriverFor opened its own copy to build the driver.
+	kind, ok := issuetracker.ParseKind(row.Kind)
+	if !ok {
+		s.log.Error("stored issue tracker connection has an unknown kind", "connection", connID.String(), "kind", row.Kind)
+		return noAccount, noProject, noTag, internal()
+	}
+	token, err := openToken(s.box, userID, kind, row.BaseUrl, row.TokenCiphertext)
+	if err != nil {
+		s.log.Error("open issue tracker token", "connection", connID.String(), "error", err)
+		return noAccount, noProject, noTag, internal()
+	}
+	if err := validateAccount(account, token); err != nil {
 		return noAccount, noProject, noTag, &Error{Kind: KindBadGateway, Message: err.Error()}
 	}
 	if account.ID != row.AccountID {

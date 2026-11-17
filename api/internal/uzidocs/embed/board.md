@@ -188,8 +188,10 @@ issue onto the board first if you need it to be findable.
 A column with more cards than its cap renders only the cap; the rest sit
 behind a **`Show N more · N left`** button at the bottom of the column.
 Each click reveals one more page (up to 50) of cards; the column grows to
-fit and the whole page scrolls, rather than the column scrolling inside a
-fixed box. **Collapse** puts it back to the cap. The cap applies to every column, including **Closed**.
+fit rather than scrolling inside a fixed box of its own. On a wide screen
+the board fills the window below the toolbar and scrolls in its own area,
+with every column's header pinned at the top; on a narrow screen the whole page
+scrolls. **Collapse** puts it back to the cap. The cap applies to every column, including **Closed**.
 Past a couple of pages of hidden remainder, a nudge suggests searching
 instead of paging through everything (the **Show more** button stays, so
 you can still page if you prefer).
@@ -306,8 +308,31 @@ than merging into one, so the banner always names the actual action owed.
 
 Click a card's title to open it in-app: full description, its column and
 labels, and its complete run history (start time, duration, worker, MR
-link). **Start run** is available there too. GitLab stays one click away via
-the small icon next to the card's issue number.
+link). **Start run** and **Options** are available there too. GitLab stays
+one click away via the small icon next to the card's issue number.
+
+## Starting a run with options
+
+**Start run** is one click: the run uses your Settings for everything. Next
+to it, on a card and on the issue page, **Options** opens the Run options
+dialog for that one run:
+
+- **Harness**, shown only when both Claude and Codex are usable for you.
+  Changing it puts **Model** back on Default, since the two harnesses have
+  different models.
+- **Anthropic token**, hidden when the run will start on Codex.
+- **Model**: the harness's curated models, plus a custom model ID on Claude.
+  A custom ID must be a single word; a Codex model is refused on Claude.
+- **Reasoning effort**: `low` to `max`.
+
+Anything left on **Default · your settings** follows your Settings when a
+worker picks the run up. A model or effort you choose is frozen on the run:
+requeues and resumes keep it (see [Worker model](./worker-model.md#a-model-chosen-when-starting-a-run)
+and [Reasoning effort](./worker-effort.md#a-run-level-effort)). If uzi refuses
+the choice, for example a model the resolved harness cannot run, the reason
+shows in the dialog and your choices stay so you can change one and start
+again. Wait-on-limit and MR rework are not in the dialog; set them on the run
+page after it starts.
 
 ## Staying in sync
 
@@ -318,6 +343,33 @@ seconds while the tab is visible), so run-driven moves and badges show up
 without a manual **Refresh** — a brief toast ("#42 → Human Review")
 announces each one. **Refresh** still triggers an immediate full sync if you
 don't want to wait.
+
+### First import after enabling a repo
+
+Turning a repo on (the web **Enable** button, `PUT /api/repos/<id>`, or
+`uzi server setup`) returns as soon as the enable is saved. The guardrail
+checks and the creation of the column labels still run before it returns, and
+a failure there refuses the enable. The first import of the repo's issues does
+not: uzi's background poller runs it right after a web or API enable (after
+`uzi server setup`, on the poller's next pass), so a large repo no longer
+holds the request open. Until it finishes, the board shows a banner and keeps
+showing any cards it already has:
+
+- **Waiting to import issues**: the import is queued.
+- **Importing issues…**: the poller is fetching the issues now.
+- **Issue import failed; retrying on the next poll**: the fetch failed (for
+  example a timeout or a forge error). The poller retries on its next pass, so
+  there is nothing to click.
+
+The banner goes away once the import succeeds, including for a repo with no
+issues. A repo turned on by an older release shows no banner until it is
+enabled again. If the server
+restarts mid-import, the poller picks it up again on its first pass. One pass
+is bounded by the poller's time budget, so a repo too large to import within
+it keeps showing the failed banner and retrying. The board's **Refresh**
+button and the first read of a board with no columns still sync inside their
+own request, and neither changes the banner: it updates on the poller's next
+pass.
 
 One exception, and it looks like a bug if you do not know about it. Issues
 without the `uzi` label are synced **open-only**, so closing one on the forge

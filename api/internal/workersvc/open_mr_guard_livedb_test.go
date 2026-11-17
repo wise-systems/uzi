@@ -49,7 +49,7 @@ func TestOpenMRGuardLiveDB(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open pool: %v", err)
 	}
-	defer pool.Close()
+	t.Cleanup(pool.Close) // before any track call: the tracked delete needs the pool open
 	q := store.New(pool)
 	// nil box + nil forge: the guard fires (or does not) BEFORE any forge round-trip, and
 	// guardDefaultBranch is a no-op with a nil guard — the same minimal wiring the sibling
@@ -74,6 +74,7 @@ func TestOpenMRGuardLiveDB(t *testing.T) {
 		}
 		exec(`INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`,
 			userID, fmt.Sprintf("omr-%s-%s@e2e", tag, userID))
+		trackLiveDBUser(t, pool, userID)
 		// PRD #1429 M2: CreateRun now resolves a real D11 harness at create time; give the
 		// user a usable Anthropic token (Claude, byte-identical) — orthogonal to the
 		// open-MR guard behaviour under test.
@@ -121,7 +122,7 @@ func TestOpenMRGuardLiveDB(t *testing.T) {
 					priorID, userID, repoID, issueIID, "uzi/task/"+uuid.NewString(), mrState); err != nil {
 					t.Fatal(err)
 				}
-				run, err := svc.CreateRun(ctx, userID, repoID, issueIID, "description", nil, nil, force, nil, nil, nil, nil)
+				run, err := svc.CreateRun(ctx, userID, repoID, issueIID, "description", nil, nil, force, nil, nil, nil, nil, nil, nil)
 				blocked := !force && state != "merged" && state != "closed"
 				if blocked {
 					if !errors.Is(err, ErrOpenMRExists) || !strings.Contains(err.Error(), "!4260") {
@@ -154,7 +155,7 @@ func TestOpenMRGuardLiveDB(t *testing.T) {
 					uuid.New(), userID, repoID, issueIID, "uzi/task/"+uuid.NewString(), status); err != nil {
 					t.Fatal(err)
 				}
-				_, err := svc.CreateRun(ctx, userID, repoID, issueIID, "description", nil, nil, force, nil, nil, nil, nil)
+				_, err := svc.CreateRun(ctx, userID, repoID, issueIID, "description", nil, nil, force, nil, nil, nil, nil, nil, nil)
 				if !errors.Is(err, ErrActiveRunExists) {
 					t.Fatalf("CreateRun error=%v want ErrActiveRunExists", err)
 				}
@@ -174,7 +175,7 @@ func TestOpenMRGuardLiveDB(t *testing.T) {
 		const mrIID int64 = 4210
 		seedPriorRun(t, userID, repoID, "issue", "opened", mrIID)
 
-		_, err := svc.CreateRun(ctx, userID, repoID, issueIID, "the description", nil, nil, false /*force*/, nil, nil, nil, nil)
+		_, err := svc.CreateRun(ctx, userID, repoID, issueIID, "the description", nil, nil, false /*force*/, nil, nil, nil, nil, nil, nil)
 		if !errors.Is(err, ErrOpenMRExists) {
 			t.Fatalf("CreateRun err = %v, want ErrOpenMRExists", err)
 		}
@@ -188,7 +189,7 @@ func TestOpenMRGuardLiveDB(t *testing.T) {
 		userID, repoID := seedRepoAndIssue(t, "merged")
 		seedPriorRun(t, userID, repoID, "issue", "merged", 4220)
 
-		run, err := svc.CreateRun(ctx, userID, repoID, issueIID, "the description", nil, nil, false /*force*/, nil, nil, nil, nil)
+		run, err := svc.CreateRun(ctx, userID, repoID, issueIID, "the description", nil, nil, false /*force*/, nil, nil, nil, nil, nil, nil)
 		if err != nil {
 			t.Fatalf("CreateRun with a merged prior MR err = %v, want success", err)
 		}
@@ -201,7 +202,7 @@ func TestOpenMRGuardLiveDB(t *testing.T) {
 		userID, repoID := seedRepoAndIssue(t, "force")
 		seedPriorRun(t, userID, repoID, "issue", "opened", 4230)
 
-		run, err := svc.CreateRun(ctx, userID, repoID, issueIID, "the description", nil, nil, true /*force*/, nil, nil, nil, nil)
+		run, err := svc.CreateRun(ctx, userID, repoID, issueIID, "the description", nil, nil, true /*force*/, nil, nil, nil, nil, nil, nil)
 		if err != nil {
 			t.Fatalf("CreateRun with force=true err = %v, want success even with an open MR", err)
 		}
@@ -216,7 +217,7 @@ func TestOpenMRGuardLiveDB(t *testing.T) {
 		// issue. GetOpenMRRunForIssue excludes self_improve, so it must not match.
 		seedPriorRun(t, userID, repoID, "self_improve", "opened", 4240)
 
-		run, err := svc.CreateRun(ctx, userID, repoID, issueIID, "the description", nil, nil, false /*force*/, nil, nil, nil, nil)
+		run, err := svc.CreateRun(ctx, userID, repoID, issueIID, "the description", nil, nil, false /*force*/, nil, nil, nil, nil, nil, nil)
 		if err != nil {
 			t.Fatalf("CreateRun with only a non-issue prior open-MR run err = %v, want success", err)
 		}
@@ -239,7 +240,7 @@ func TestOpenMRGuardLiveDB(t *testing.T) {
 			t.Fatalf("insert prior issue run with NULL mr_state: %v", err)
 		}
 
-		_, err := svc.CreateRun(ctx, userID, repoID, issueIID, "the description", nil, nil, false /*force*/, nil, nil, nil, nil)
+		_, err := svc.CreateRun(ctx, userID, repoID, issueIID, "the description", nil, nil, false /*force*/, nil, nil, nil, nil, nil, nil)
 		if !errors.Is(err, ErrOpenMRExists) {
 			t.Fatalf("CreateRun err = %v, want ErrOpenMRExists (NULL mr_state must block)", err)
 		}

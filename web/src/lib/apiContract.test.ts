@@ -95,6 +95,9 @@ import type {
   RecoveryCustodyAggregate,
   HeldPublication,
   HeldPublications,
+  AdminRunsDebug,
+  AdminRepoActivity,
+  RunInputsEnvelope,
   RecoveryCustodyHolds,
   GuardrailOverrideRequest,
   CodexAccountRateLimit,
@@ -243,6 +246,12 @@ import recoveryCustodyHoldZero from "../../../fixtures/api-contract/recovery_cus
 import recoveryCustodyHoldFull from "../../../fixtures/api-contract/recovery_custody_hold.full.json";
 import recoveryCustodyAggregateZero from "../../../fixtures/api-contract/recovery_custody_aggregate.zero.json";
 import recoveryCustodyAggregateFull from "../../../fixtures/api-contract/recovery_custody_aggregate.full.json";
+import adminRunsDebugZero from "../../../fixtures/api-contract/admin_runs_debug.zero.json";
+import adminRunsDebugFull from "../../../fixtures/api-contract/admin_runs_debug.full.json";
+import adminRepoActivityZero from "../../../fixtures/api-contract/admin_repo_activity.zero.json";
+import adminRepoActivityFull from "../../../fixtures/api-contract/admin_repo_activity.full.json";
+import runInputsEnvelopeZero from "../../../fixtures/api-contract/run_inputs_envelope.zero.json";
+import runInputsEnvelopeFull from "../../../fixtures/api-contract/run_inputs_envelope.full.json";
 import heldPublicationsZero from "../../../fixtures/api-contract/held_publications.zero.json";
 import heldPublicationsFull from "../../../fixtures/api-contract/held_publications.full.json";
 import recoveryCustodyHoldsZero from "../../../fixtures/api-contract/recovery_custody_holds.zero.json";
@@ -930,8 +939,11 @@ void _releaseCheckStatusFull;
 // whose zero marshals null (GET always emits them). The start-preview response omits
 // `alternatives` when empty (omitempty), so its zero fixture simply lacks the key.
 {
-  type SettingsZero = Omit<ZeroOf<EffectiveSettings, "harnesses" | "start" | "models" | "efforts">, "cross_check"> & {
+  // judge_harness (PRD #3257) is a value, not a pointer: its zero marshals notes as null (a Go
+  // nil slice) while every real GET builds []; the TS type is right to say never-null.
+  type SettingsZero = Omit<ZeroOf<EffectiveSettings, "harnesses" | "start" | "models" | "efforts">, "cross_check" | "judge_harness"> & {
     cross_check: { models: EffectiveModelCell[] | null; efforts: EffectiveEffortCell[] | null };
+    judge_harness: Omit<Widen<HarnessValue>, "notes"> & { notes: string[] | null };
   };
   const zero: SettingsZero = effectiveSettingsZero;
   const full: Widen<EffectiveSettings> = effectiveSettingsFull;
@@ -1614,6 +1626,45 @@ it("recovery held-publication fields match the Go contract and permit older serv
   void _heldPublicationsFull;
 }
 
+// ── AdminRunsDebug (issue #4198) ─────────────────────────────────────────────
+// runs is non-omitempty, so zero.json carries a null the handler normalizes to [].
+{
+  const _adminRunsDebugMissing: never = null as unknown as Exclude<keyof AdminRunsDebug, keyof typeof adminRunsDebugFull>;
+  const _adminRunsDebugExtra: never = null as unknown as Exclude<keyof typeof adminRunsDebugFull, keyof AdminRunsDebug>;
+  const _adminRunsDebugZero: ZeroOf<AdminRunsDebug, "runs"> = adminRunsDebugZero;
+  const _adminRunsDebugFull: Widen<AdminRunsDebug> = adminRunsDebugFull;
+  void _adminRunsDebugMissing;
+  void _adminRunsDebugExtra;
+  void _adminRunsDebugZero;
+  void _adminRunsDebugFull;
+}
+
+// ── AdminRepoActivity (issue #4334) ──────────────────────────────────────────
+// repos is non-omitempty, so zero.json carries a null the handler normalizes to [].
+{
+  const _adminRepoActivityMissing: never = null as unknown as Exclude<keyof AdminRepoActivity, keyof typeof adminRepoActivityFull>;
+  const _adminRepoActivityExtra: never = null as unknown as Exclude<keyof typeof adminRepoActivityFull, keyof AdminRepoActivity>;
+  const _adminRepoActivityZero: ZeroOf<AdminRepoActivity, "repos"> = adminRepoActivityZero;
+  const _adminRepoActivityFull: Widen<AdminRepoActivity> = adminRepoActivityFull;
+  void _adminRepoActivityMissing;
+  void _adminRepoActivityExtra;
+  void _adminRepoActivityZero;
+  void _adminRepoActivityFull;
+}
+
+// ── RunInputsEnvelope (issue #4198) ──────────────────────────────────────────
+// inputs is non-omitempty, so zero.json carries a null the handler normalizes to [].
+{
+  const _runInputsMissing: never = null as unknown as Exclude<keyof RunInputsEnvelope, keyof typeof runInputsEnvelopeFull>;
+  const _runInputsExtra: never = null as unknown as Exclude<keyof typeof runInputsEnvelopeFull, keyof RunInputsEnvelope>;
+  const _runInputsZero: ZeroOf<RunInputsEnvelope, "inputs"> = runInputsEnvelopeZero;
+  const _runInputsFull: Widen<RunInputsEnvelope> = runInputsEnvelopeFull;
+  void _runInputsMissing;
+  void _runInputsExtra;
+  void _runInputsZero;
+  void _runInputsFull;
+}
+
 it("held publication rows carry exactly the Go key set", () => {
   const row: HeldPublication = heldPublicationsFull.publications[0]!;
   expect(Object.keys(row).sort()).toEqual(
@@ -1940,6 +1991,8 @@ const dtos: { stem: string; nullable: boolean }[] = [
   { stem: "recovery_custody_holds", nullable: true },
   // issue #2545: held_publications' publications slice is non-omitempty (zero.json carries a null).
   { stem: "held_publications", nullable: true },
+  // issue #4334: admin_repo_activity's repos slice is non-omitempty (zero.json carries a null).
+  { stem: "admin_repo_activity", nullable: true },
   // issue #1432: the admin override-request queue row. findings is a non-omitempty
   // slice the handler normalizes to [], so its zero.json carries a null (the nil-slice
   // marshal) that the "findings" ZeroOf exemption above accounts for.

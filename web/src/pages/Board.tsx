@@ -8,7 +8,7 @@
 // meta, badges. Live behavior (latest_run badges, 10s visibility-gated polling,
 // auto-move toasts, the attention strip, in-app issue links) is PRD #12 M2/M3.
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { useParams, Link, useNavigate } from "react-router-dom";
 import {
   api,
@@ -21,9 +21,8 @@ import {
 import { errorMessage } from "../lib/apiError";
 import { hasAnthropicToken, hasAnyCodexCredential, isCodexUsable } from "../lib/hasToken";
 import { startRunGate } from "../lib/runStream";
-import { startRunWithCredential } from "../lib/startRun";
-import { INHERIT_SELECTION, type CredentialSelection } from "../lib/credentialOverride";
-import { bothHarnessesUsable, INHERIT_HARNESS, type HarnessSelection } from "../lib/harnessSelection";
+import { DEFAULT_RUN_START_OPTIONS, startRunWithOptions, type RunStartOptions } from "../lib/startRun";
+import type { HarnessSelection } from "../lib/harnessSelection";
 import {
   isAccountCooldownWaiting,
   effectiveRunStatus,
@@ -71,6 +70,7 @@ import { useDemoMode } from "../lib/demoMode";
 import { maskRepoPath } from "../lib/demoMask";
 import { COLUMN_ACCENTS } from "./board/shared";
 import { IssueCard } from "./board/IssueCard";
+import { RunOptionsDialog } from "../components/RunOptionsDialog";
 import { CreateIssueForm } from "./board/CreateIssueForm";
 import { IssuesFilter } from "./board/IssuesFilter";
 import { ColumnSettings } from "./board/ColumnSettings";
@@ -103,6 +103,21 @@ function columnLabel(card: CardData): string {
   if (card.closed) return "Closed";
   if (card.column === "") return "Backlog";
   return card.column;
+}
+
+// importBannerCopy is the banner text for a repo's first-import state (issue #4399);
+// undefined (no banner) for succeeded, null or an old api that omits the field.
+function importBannerCopy(state: string | undefined): string | undefined {
+  switch (state) {
+    case "waiting":
+      return "Waiting to import issues";
+    case "running":
+      return "Importing issues…";
+    case "failed":
+      return "Issue import failed; retrying on the next poll";
+    default:
+      return undefined;
+  }
 }
 
 export function Board() {
@@ -402,24 +417,19 @@ export function Board() {
   // PRD #1429 M4a, D3: harness-aware credential facts alongside hasToken.
   const [codexUsable, setCodexUsable] = useState(false);
   const [hasCodexCredential, setHasCodexCredential] = useState(false);
-  // PRD #1429 M4a review Fix 1: the viewer's own default_harness, so each card's
-  // effective-Codex gate can mirror D11 rule 2 (a usable default wins on an untouched
-  // "inherit" pick) exactly as IssueView's start dialog does.
+  // PRD #1429 M4a review Fix 1: the viewer's own default_harness, so the Run options
+  // dialog's effective-Codex gate can mirror D11 rule 2 (a usable default wins on an
+  // untouched "inherit" pick) exactly as on the issue page.
   const [defaultHarness, setDefaultHarness] = useState<Harness | null>(null);
-  // PRD #1247 M7: the viewer's Anthropic tokens (for the per-card token picker) and the
-  // per-card credential choice (keyed by issue iid). A card the user has not touched
-  // defaults to inherit — the run follows the worker binding.
+  // PRD #1247 M7: the viewer's Anthropic tokens, for the Run options dialog's token row.
   const [tokens, setTokens] = useState<SecretMeta[]>([]);
-  const [cardCredential, setCardCredential] = useState<Record<number, CredentialSelection>>({});
-  // PRD #1429 M4a: the per-card harness choice (keyed by issue iid), mirroring
-  // cardCredential above. A card the user has not touched defaults to inherit.
-  const [cardHarness, setCardHarness] = useState<Record<number, HarnessSelection>>({});
-  // PRD #1247: cardCredential is keyed only by issue iid, and the route swaps :id without
-  // remounting the component, so a per-card pin from repo A would otherwise reapply to a
-  // same-iid card in repo B. Clear it on a repo change (no-op at mount).
+  // PRD #3250 M2: the issue whose Run options dialog is open (null = closed). The board
+  // mounts ONE dialog, keyed by iid, never inside the draggable card (D9); the per-card
+  // harness and token maps it replaced are gone, so a choice lives only while its dialog
+  // is open. A repo change closes it (the route swaps :id without remounting).
+  const [optionsIid, setOptionsIid] = useState<number | null>(null);
   useEffect(() => {
-    setCardCredential({});
-    setCardHarness({});
+    setOptionsIid(null);
   }, [repoId]);
   // The viewer's runs on this repo blocked on their approval — drives the
   // attention strip above the columns.
@@ -553,8 +563,8 @@ export function Board() {
         api.listWorkers(),
         api.listSecrets(),
         api.listRuns({ repoId, view: "summary" }),
-        // PRD #1429 M4a review Fix 1: the viewer's own default_harness, mirroring
-        // IssueView's start dialog so a card's effective-Codex gate agrees with it.
+        // PRD #1429 M4a review Fix 1: the viewer's own default_harness, so the board's
+        // Run options dialog resolves the effective harness as the issue page does.
         api.getMySettings(),
       ]);
       if (sourceEpochRef.current !== sourceEpoch || repoIdRef.current !== repoId) return;
@@ -565,7 +575,7 @@ export function Board() {
       setCodexUsable(isCodexUsable(secrets, settings.codex_account_mode));
       setHasCodexCredential(hasAnyCodexCredential(secrets));
       setDefaultHarness(settings.default_harness);
-      // PRD #1247 M7: keep the Anthropic tokens for the per-card token picker.
+      // PRD #1247 M7: keep the Anthropic tokens for the Run options dialog's token row.
       setTokens(secrets.filter((s) => s.kind === "anthropic_token"));
       // issue #750: classify from the EFFECTIVE status, not the raw one. A run
       // re-planning after a revise keeps status === "awaiting_approval" server-side, but
@@ -652,24 +662,49 @@ export function Board() {
     return Promise.all([poll(), loadPreconditions()]);
   }, 10000, repoId);
 
-  const startRun = async (card: CardData) => {
+  // The board's harness-availability facts, shared by one-click Start run and the Run
+  // options dialog (the precondition poll keeps them live while the dialog is open).
+  const startFacts = { claudeUsable: hasToken, codexUsable, defaultHarness };
+  const cardGate = (card: CardData, harness: HarnessSelection) =>
+    startRunGate({
+      closed: card.closed,
+      hasWorker,
+      claudeUsable: hasToken,
+      codexUsable,
+      hasCodexCredential,
+      harness,
+      activeRunExists: hasActiveRun(card.latest_run),
+    });
+
+  // startRun creates a run for the card through the shared helper, which builds the body
+  // from the options once and preserves it across the open-MR force retry (issue #856).
+  // One-click Start run passes the defaults and surfaces errors on the board banner; the
+  // Run options dialog passes its choices and its own error/settle callbacks, so a refusal
+  // shows inside the dialog, which stays open. onSettled keeps Board's pre-#1247
+  // behaviour: clear the starting flag and re-read preconditions.
+  const startRun = async (
+    card: CardData,
+    options: RunStartOptions = DEFAULT_RUN_START_OPTIONS,
+    ui: { onError: (msg: string) => void; onSettled?: () => void } = { onError: (msg) => setError(msg) },
+  ) => {
     setError("");
     setStarting(card.iid);
-    // The shared helper carries this card's chosen credential override AND harness
-    // (both default inherit) and preserves them across the open-MR force retry (issue
-    // #856). onSettled keeps Board's pre-#1247 behaviour: clear the starting flag and
-    // re-read preconditions.
-    await startRunWithCredential(repoId, card.iid, cardCredential[card.iid] ?? INHERIT_SELECTION, {
+    await startRunWithOptions(repoId, card.iid, options, startFacts, {
       // encodeURIComponent the id: per-call-site open-redirect hardening (see
       // safeNextPath in Login.tsx). A no-op for today's UUID ids.
-      onCreated: (runId) => navigate(`/runs/${encodeURIComponent(runId)}`),
-      onError: (msg) => setError(msg),
+      onCreated: (runId) => {
+        setOptionsIid(null);
+        navigate(`/runs/${encodeURIComponent(runId)}`);
+      },
+      onError: ui.onError,
       onSettled: () => {
         setStarting(null);
         loadPreconditions();
+        ui.onSettled?.();
       },
-    }, cardHarness[card.iid] ?? INHERIT_HARNESS);
+    });
   };
+  const optionsCard = optionsIid == null ? undefined : board?.cards.find((c) => c.iid === optionsIid);
 
   // Fix CI (PRD #6): queue a plan-gated ci_fix run for a failed pipeline's ref.
   // The server enforces the "no active fix / branch free" preconditions and returns
@@ -1075,6 +1110,21 @@ export function Board() {
     [cardsByColumn, applyDrop, pushToast],
   );
 
+  const importBannerText = importBannerCopy(board?.initial_import?.state);
+
+  const toolbarRef = useRef<HTMLDivElement>(null);
+  const [toolbarH, setToolbarH] = useState(0);
+  useLayoutEffect(() => {
+    const el = toolbarRef.current;
+    if (!el) return;
+    const measure = () => setToolbarH(el.offsetHeight);
+    measure();
+    if (typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [loading]);
+
   if (loading) {
     return (
       <div className="space-y-5">
@@ -1127,7 +1177,7 @@ export function Board() {
           transparent). On mobile the shell's own bar is a 49px-tall sticky top-0 z-20
           strip, so offset below it; on lg the shell bar is hidden and we pin at 0.
           Verified in a browser pass. */}
-      <div className="sticky top-[49px] z-10 bg-ink lg:top-0">
+      <div ref={toolbarRef} className="sticky top-[49px] z-10 bg-ink lg:top-0">
       <PageHeader
         backTo="/repos"
         backLabel="Repos"
@@ -1296,6 +1346,24 @@ export function Board() {
 
       {error && <Alert message={error} />}
 
+      {/* Issue #4399: first-import status, driven only by the server's initial_import
+          state (never the card count), so cached cards keep rendering beneath it. Mounted
+          only while there is something to say, like the run banner below; the 10s board
+          poll swaps it out when the state moves on. */}
+      {importBannerText && (
+        <div
+          role="status"
+          aria-live="polite"
+          className={`rounded-lg border px-4 py-2.5 text-sm ${
+            board?.initial_import?.state === "failed"
+              ? "border-danger/40 bg-danger/10 text-danger"
+              : "border-warn/40 bg-warn/10 text-warn"
+          }`}
+        >
+          {importBannerText}
+        </div>
+      )}
+
       {(awaitingRuns.length > 0 ||
         questionRuns.length > 0 ||
         followupRuns.length > 0 ||
@@ -1304,7 +1372,7 @@ export function Board() {
         <div
           role="status"
           aria-live="polite"
-          className="flex flex-wrap items-center gap-x-2 gap-y-1 rounded-lg border border-warn/40 bg-warn/10 px-4 py-2.5 text-sm text-warn"
+          className="isolate flex flex-wrap items-center gap-x-2 gap-y-1 rounded-lg border border-warn/40 bg-warn/10 px-4 py-2.5 text-sm text-warn"
         >
           <span className="font-medium">
             {[
@@ -1386,11 +1454,10 @@ export function Board() {
         />
       )}
 
-      {/* Issue #367 → #373: columns scroll HORIZONTALLY in one row (overflow-x-auto)
-          again; the page still scrolls vertically for tall columns. Reverts the
-          flex-wrap of Decision 2 (Option A), which stacked columns onto new rows when
-          they exceeded the width and killed horizontal card scroll. */}
-      <div className="flex items-start gap-4 overflow-x-auto pb-4">
+      <div
+        style={{ "--board-toolbar-h": `${toolbarH}px` } as CSSProperties}
+        className="flex items-start gap-4 overflow-x-auto pb-4 lg:grid lg:max-h-[calc(100dvh-var(--board-toolbar-h)-2rem)] lg:auto-cols-[18rem] lg:grid-flow-col lg:items-stretch lg:overflow-y-auto lg:scroll-pt-12"
+      >
         {visible.map((col) => {
           const cards = cardsByColumn.get(col.key) ?? [];
           // Per-lane paging (PRD #304 M1/M2). `cards` stays FULL — it drives the count
@@ -1430,8 +1497,6 @@ export function Board() {
                 if (iid) applyDrop(iid, col.key, null);
               }}
               className={cx(
-                // Fixed-width, non-shrinking columns in one row; the row's overflow-x-auto
-                // gives back horizontal card scroll (#373, reverting Decision 2's grow-wrap).
                 "flex w-72 shrink-0 flex-col rounded-xl border p-2.5 transition-colors",
                 dragRevealed && "opacity-60",
                 isTarget
@@ -1441,11 +1506,15 @@ export function Board() {
                     : "border-edge bg-surface/60",
               )}
             >
-              {/* Static header (#373): sticky pinning is incompatible with the row's
-                  overflow-x-auto (a non-visible overflow-x forces overflow-y:auto, which
-                  makes the row — not the viewport — the sticky scroll context). We chose
-                  horizontal card scroll over pinned headers, so the header is plain again. */}
-              <div className="mb-2.5 flex items-center gap-2 px-1">
+              <div
+                className={cx(
+                  "mb-2.5 flex items-center gap-2 px-1",
+                  "lg:sticky lg:top-0 lg:z-[1] lg:-mx-2.5 lg:-mt-2.5 lg:mb-0 lg:rounded-t-xl lg:bg-ink lg:px-3.5 lg:py-2.5",
+                  isTarget
+                    ? "lg:bg-gradient-to-b lg:from-brand/5 lg:to-brand/5"
+                    : !closedCol && "lg:bg-gradient-to-b lg:from-surface/60 lg:to-surface/60",
+                )}
+              >
                 <span aria-hidden="true" className={cx("h-2 w-2 rounded-full", col.accent)} />
                 <span className={cx("text-sm font-semibold", closedCol ? "text-faint" : "text-fg")}>
                   {col.label}
@@ -1456,11 +1525,6 @@ export function Board() {
                   {paging.countLabel || String(cards.length)}
                 </span>
               </div>
-              {/* Issue #367 (Decision 1): the per-lane max-h/overflow box is gone —
-                  the lane grows to fit its cards and the page scrolls as one plane, so
-                  an expanded lane ("Show N more") grows the page rather than opening an
-                  inner scrollbar. `paging.canCollapse` still drives the Show-more/Collapse
-                  controls; it just no longer gates a scroll box. */}
               <div className="flex flex-col gap-2">
                 {shown.map((card, i) => {
                   // Runnability is the single `uzi` label (PRD #764): a card carrying it
@@ -1535,30 +1599,10 @@ export function Board() {
                           }
                         : undefined
                     }
-                    gate={startRunGate({
-                      closed: card.closed,
-                      hasWorker,
-                      claudeUsable: hasToken,
-                      codexUsable,
-                      hasCodexCredential,
-                      harness: cardHarness[card.iid] ?? INHERIT_HARNESS,
-                      activeRunExists: hasActiveRun(card.latest_run),
-                    })}
+                    gate={cardGate(card, "inherit")}
                     starting={starting === card.iid}
                     onStart={() => startRun(card)}
-                    tokens={tokens}
-                    credential={cardCredential[card.iid] ?? INHERIT_SELECTION}
-                    onCredentialChange={(sel) =>
-                      setCardCredential((prev) => ({ ...prev, [card.iid]: sel }))
-                    }
-                    showHarnessPicker={bothHarnessesUsable(hasToken, codexUsable)}
-                    harness={cardHarness[card.iid] ?? INHERIT_HARNESS}
-                    onHarnessChange={(h) =>
-                      setCardHarness((prev) => ({ ...prev, [card.iid]: h }))
-                    }
-                    claudeUsable={hasToken}
-                    codexUsable={codexUsable}
-                    defaultHarness={defaultHarness}
+                    onOptions={() => setOptionsIid(card.iid)}
                     fixCiBusy={card.pipeline != null && fixingRef === card.pipeline.ref}
                     onFixCi={() => card.pipeline && fixCi(card.pipeline.ref)}
                     uziLabel={uziLabel}
@@ -1657,6 +1701,21 @@ export function Board() {
           );
         })}
       </div>
+
+      {/* PRD #3250 M2: the board's ONE Run options dialog, keyed by iid so each issue
+          opens on defaults. It closes on its own if the card leaves the board. */}
+      {optionsCard && (
+        <RunOptionsDialog
+          key={optionsCard.iid}
+          issueIid={optionsCard.iid}
+          issueTitle={optionsCard.title}
+          facts={startFacts}
+          gate={(harness) => cardGate(optionsCard, harness)}
+          tokens={tokens}
+          onStart={(options, ui) => startRun(optionsCard, options, ui)}
+          onClose={() => setOptionsIid(null)}
+        />
+      )}
 
       {/* No role/aria-live here any more (S5): the always-mounted sr-only region above
           owns announcing, and leaving them on this one would announce every toast

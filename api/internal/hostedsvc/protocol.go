@@ -139,7 +139,116 @@ type DesiredWorker struct {
 	// recovery is a rotation. Both are the controller's cue to reconcile the worker
 	// WITHOUT touching its Secret, never to invent or clear one.
 	JoinToken *string `json:"join_token"`
+	// Hibernation is set only while the worker is preparing, hibernated, waking or
+	// cleaning (PRD #4205, #4206); omitted for an awake worker.
+	Hibernation *Hibernation `json:"hibernation,omitempty"`
 }
+
+// Hibernation is a worker's hibernation state as the controller sees it (PRD #4205).
+// State is one of preparing|hibernated|waking|cleaning; the api sends the field only when the
+// worker is not awake, so a nil Hibernation means "awake" and an old controller that
+// does not know the field behaves exactly as before.
+//
+// "cleaning" (PRD #4206) is sent while a hibernation cache prune attempt is unsettled, whether
+// the database state is preparing or waking. The controller must neither scale down nor reopen
+// claims for it, and an old controller fails closed on the unknown state. Cleanup is set exactly
+// when State is "cleaning".
+type Hibernation struct {
+	State   string              `json:"state"`
+	OpID    string              `json:"op_id"`
+	Cleanup *HibernationCleanup `json:"cleanup,omitempty"`
+	// InventoryGate is the api's volume-inventory instruction for a preparing worker
+	// (PRD #4208 M1): observe (report the identity, no inventory yet), await (the inventory is
+	// being taken or validated, do not scale down) or permit (scale-down may proceed). Absent
+	// from an api that predates the inventory; a controller that does not know it ignores it.
+	InventoryGate string `json:"inventory_gate,omitempty"`
+}
+
+// HibernationCleanup is the unsettled cache prune attempt as the controller sees it (PRD #4206).
+// StopProofPodUID is sent only while the attempt's settlement is unknown: it names the pod that
+// ran the attempt, and the controller reports a cleanup_stopped transition once, per ReconcileSeq,
+// when that exact pod is observed present and stopped. Pod absence is never evidence.
+type HibernationCleanup struct {
+	OpID            string `json:"op_id"`
+	StopProofPodUID string `json:"stop_proof_pod_uid,omitempty"`
+	ReconcileSeq    int32  `json:"reconcile_seq"`
+}
+
+// HibernationCleaning is the Hibernation.State sent while a cache prune attempt is unsettled.
+const HibernationCleaning = "cleaning"
+
+// Hibernation.InventoryGate values.
+const (
+	InventoryGateObserve = "observe"
+	InventoryGateAwait   = "await"
+	InventoryGatePermit  = "permit"
+)
+
+// HibernationTransition is the body the controller reports for one step of a
+// hibernation or wake operation (PRD #4205). The transition names are a closed set.
+type HibernationTransition struct {
+	OpID            string `json:"op_id"`
+	Transition      string `json:"transition"`
+	DeploymentUID   string `json:"deployment_uid"`
+	ResourceVersion string `json:"resource_version,omitempty"`
+	PodUID          string `json:"pod_uid,omitempty"`
+	Reason          string `json:"reason,omitempty"`
+	// CleanupOpID names the cache prune attempt a cleanup_stopped transition is about (PRD #4206).
+	CleanupOpID string `json:"cleanup_op_id,omitempty"`
+	// PVCs is the controller-observed identity of the worker's volumes, sent with the
+	// pre-mutation observed transition (PRD #4208 M1).
+	PVCs []HibernationPVC `json:"pvcs,omitempty"`
+	// PodUIDs, PVCUserPods, DeploymentGeneration, DeploymentReplicas and FenceGeneration
+	// are the controller's observation facts. The two slices are pointers so that a KNOWN-EMPTY
+	// set encodes as [] while an unobserved one is omitted: the api treats absence as
+	// "unproven" and an empty list as "proven none".
+	PodUIDs              *[]string `json:"pod_uids,omitempty"`
+	PVCUserPods          *[]string `json:"pvc_user_pods,omitempty"`
+	DeploymentGeneration *int64    `json:"deployment_generation,omitempty"`
+	DeploymentReplicas   *int32    `json:"deployment_replicas,omitempty"`
+	FenceGeneration      *int64    `json:"fence_generation,omitempty"`
+}
+
+// HibernationPVC is one volume the controller observed on the worker's pod. Role is data,
+// nix or dind_data. ClassReclaimPolicy is the storage class's reclaim policy (Retain, Delete,
+// Recycle) or unknown when it could not be read.
+type HibernationPVC struct {
+	Role               string `json:"role"`
+	Name               string `json:"name"`
+	UID                string `json:"uid"`
+	StorageClass       string `json:"storage_class,omitempty"`
+	ClassReclaimPolicy string `json:"class_reclaim_policy"`
+}
+
+// HibernationPVC.Role values.
+const (
+	PVCRoleData     = "data"
+	PVCRoleNix      = "nix"
+	PVCRoleDindData = "dind_data"
+)
+
+// HibernationPVC.ClassReclaimPolicy values.
+const (
+	ReclaimPolicyRetain  = "Retain"
+	ReclaimPolicyDelete  = "Delete"
+	ReclaimPolicyRecycle = "Recycle"
+	ReclaimPolicyUnknown = "unknown"
+)
+
+// HibernationTransition.Transition values.
+const (
+	TransitionRefused     = "refused"
+	TransitionScalingDown = "scaling_down"
+	TransitionScaledDown  = "scaled_down"
+	TransitionReady       = "ready"
+	// TransitionCleanupStopped reports that the pod of an unknown cache prune attempt was observed
+	// present and stopped (PRD #4206).
+	TransitionCleanupStopped = "cleanup_stopped"
+	// TransitionObserved is the pre-mutation identity report (PRD #4208 M1); TransitionHeld
+	// reports that the worker's writer exclusion is still held.
+	TransitionObserved = "observed"
+	TransitionHeld     = "held"
+)
 
 // ---------------------------------------------------------------------------
 // Status report (controller -> api), PRD #113 M4. The api's half of the wire.
@@ -170,6 +279,9 @@ type StatusReport struct {
 	PollIntervalSeconds int            `json:"poll_interval_seconds"`
 	WorkerImageTag      string         `json:"worker_image_tag"`
 	Workers             []WorkerStatus `json:"workers"`
+	// Hibernation is the highest hibernation protocol version this controller speaks
+	// (PRD #4205); omitted by a controller that predates the feature.
+	Hibernation int `json:"hibernation,omitempty"`
 }
 
 // WorkerStatus is one hosted worker's roll health as it arrives on the wire.
@@ -180,8 +292,10 @@ type StatusReport struct {
 // and "never terminated" are different facts.
 type WorkerStatus struct {
 	// Raw JSON keeps an optional, unrecognized cause from failing fleet decoding.
-	BlockingKind      json.RawMessage `json:"blocking_kind,omitempty"`
-	Pacing            *Pacing         `json:"pacing,omitempty"`
+	BlockingKind json.RawMessage `json:"blocking_kind,omitempty"`
+	Pacing       *Pacing         `json:"pacing,omitempty"`
+	// RollMarker stays raw so a mistyped display-only marker cannot fail the entry's decode.
+	RollMarker        json.RawMessage `json:"roll_marker,omitempty"`
 	ID                string          `json:"id"`
 	Phase             string          `json:"phase"`
 	PhaseSince        *time.Time      `json:"phase_since"`

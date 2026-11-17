@@ -214,15 +214,23 @@ func (p palette) state(s crewState) lipgloss.Style {
 	return p.faint
 }
 
-// displayHealth maps a health enum to its human DISPLAY word. Only `slow` is remapped:
-// PRD #1170 kept the enum value (D1) but relabels every human surface "near timeout", so
-// the token, the board strip and the CLI HEALTH row all read the same word through this one
-// map. Every other value (stalled, looping, ok, waiting_worker, …) passes through unchanged.
-// "near timeout" is 12 cells, tying the existing longest word ("rate-limited"), so no column
-// widens. Logic, filtering and sorting still key off the raw enum; this only changes display.
+// displayHealth maps a health enum to its human DISPLAY word. Two values are remapped:
+// `slow` (PRD #1170 kept the enum value (D1) but relabels every human surface "near
+// timeout") and `publication_withheld` (issue #4257, "publication withheld"), so the token,
+// the board strip and the CLI HEALTH row all read the same word through this one map. Every
+// other value (stalled, looping, ok, waiting_worker, …) passes through unchanged. "near
+// timeout" is 12 cells, tying the existing longest word ("rate-limited"); "publication
+// withheld" is 20 cells and is wider than that, so a surface sized to the old longest word
+// must allow for it. The CLI HEALTH row reads this long label; the run token and board strip go
+// through stateGlyphWord, which substitutes the compact "pub withheld" for publication_withheld
+// before reaching this map. Logic, filtering and sorting still key off the raw enum; this only
+// changes display.
 func displayHealth(health string) string {
 	if health == "slow" {
 		return "near timeout"
+	}
+	if health == healthPublicationWithheld {
+		return "publication withheld"
 	}
 	return health
 }
@@ -234,11 +242,13 @@ func displayHealth(health string) string {
 // sorting; this only changes what is shown.
 //
 // HEALTH OVERRIDE: except for human stops and recovery_wait, a WARN health flag
-// (stalled/looping/slow) replaces the status token entirely with ▲ + the health word,
-// because a run that needs attention is what the board
+// (stalled/looping/slow/publication_withheld) replaces the status token entirely with ▲ + the
+// health word, because a run that needs attention is what the board
 // is FOR. ok/empty health shows the status token. The word is the DISPLAY word from
 // displayHealth, so the `slow` enum PRD #1170 kept (D1) reads as "near timeout" here while
-// every logic path still keys off the raw enum.
+// every logic path still keys off the raw enum. The one exception is publication_withheld,
+// whose displayHealth label is too wide for the board status column, so it reads the compact
+// "pub withheld" here instead.
 //
 // PRD #1392 M5: cause is the optional RecoveryWaitCause of a recovery_wait run — a variadic
 // tail so the many existing call sites without it stay valid. When it is "forge_unreachable"
@@ -264,6 +274,10 @@ func stateGlyphWord(status, health string, isPlanning, isRevising bool, landingS
 	}
 	// Recovery does no work while parked; stale health must not hide its wait state.
 	if status != statusRecoveryWait && stalledHealth[health] {
+		if health == healthPublicationWithheld {
+			// displayHealth's 20-cell label overflows the board status column (boardStatusWordWidth).
+			return "▲", "pub withheld"
+		}
 		return "▲", displayHealth(health)
 	}
 	if health == "waiting_account_cooldown" && (status == "claimed" || status == "running" || status == "awaiting_approval") {
@@ -397,6 +411,60 @@ type runToken struct {
 	color color.Color
 }
 
+// checkRunState is the fixed display vocabulary added for the Overview's completion and
+// cross-check phases. The run's server-computed fields are the source of truth; the same
+// token feeds the board filter, row and detail header. Existing stop and health states win.
+func checkRunState(r apitypes.RunDTO, isRevising bool) (glyph, word, tone string) {
+	if runpresentation.HumanStopReason(r.Status, strOr(r.StopKind, "")) != "" ||
+		(r.Status != statusRecoveryWait && stalledHealth[r.Health]) ||
+		(r.Health == "waiting_account_cooldown" &&
+			(r.Status == "claimed" || r.Status == "running" || r.Status == "awaiting_approval")) {
+		return "", "", ""
+	}
+	if r.Status == "awaiting_approval" && !isRevising && (r.PlanCrossCheckRequired || r.PlanCrossCheckGated) && r.PlanCrossCheckGateReason != nil && *r.PlanCrossCheckGateReason != "" {
+		switch *r.PlanCrossCheckGateReason {
+		case "revise", "revisions_exhausted":
+			return "⚑", "xchk revise", "warn"
+		case "block":
+			return "⚑", "xchk blocked", "danger"
+		default:
+			return "⚑", "xchk n/a", "warn"
+		}
+	}
+	if isCompletionBlockedTUI(r) {
+		return "‖", "compl blocked", "danger"
+	}
+	if r.Status == "running" {
+		switch r.CompletionPhase {
+		case "checking":
+			return "◎", "checking", "check"
+		case "reworking":
+			return "⊕", "reworking", "warn"
+		}
+	}
+	if (r.Status == "claimed" || r.Status == "running") && r.CrossCheckActive != nil {
+		if *r.CrossCheckActive == "plan" || *r.CrossCheckActive == "code" {
+			return "◈", "xchecking", "check"
+		}
+	}
+	return "", "", ""
+}
+
+func (p palette) checkRunStateToken(r apitypes.RunDTO, isRevising bool) (runToken, bool) {
+	glyph, word, tone := checkRunState(r, isRevising)
+	if word == "" {
+		return runToken{}, false
+	}
+	color := p.indigo
+	switch tone {
+	case "warn":
+		color = p.amber
+	case "danger":
+		color = p.alarm
+	}
+	return runToken{glyph: glyph, word: word, color: color}, true
+}
+
 // stateToken shares a run's glyph, colour and compact word across the board row,
 // board strip and detail header. detailHeaderLines expands human stops to their full
 // HumanStopLabel while retaining the shared glyph and colour.
@@ -449,6 +517,9 @@ func (p palette) runStateToken(r apitypes.RunDTO, isRevising bool) runToken {
 	if isDiskOwnerHold(r) {
 		return runToken{glyph: "!", word: "disk held", color: p.amber}
 	}
+	if isSpendLimitHold(r) {
+		return runToken{glyph: "!", word: "spend limit", color: p.amber}
+	}
 	if isIterationHold(r) {
 		return runToken{glyph: "⊘", word: "iter limit", color: p.amber}
 	}
@@ -490,6 +561,9 @@ func (p palette) runStateToken(r apitypes.RunDTO, isRevising bool) runToken {
 	}
 	if isCredentialSwitchUnsettledHold(r) {
 		return runToken{glyph: credSwitchGlyph, word: credSwitchUnsettledWord, color: p.amber}
+	}
+	if token, ok := p.checkRunStateToken(r, isRevising); ok {
+		return token
 	}
 	return p.stateToken(r.Status, r.Health, r.IsPlanning, isRevising, r.LandingState, strOr(r.StopKind, ""), strOr(r.RecoveryWaitCause, ""))
 }

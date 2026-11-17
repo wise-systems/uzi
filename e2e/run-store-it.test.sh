@@ -45,6 +45,9 @@ chmod +x "$FAKEBIN/docker"
 
 PATH="$FAKEBIN:$PATH"
 export PATH
+# Every scenario before the group section below runs with the group UNSET (the full
+# sweep), whatever the calling environment carries.
+unset UZI_STORE_IT_GROUP
 
 fails=0
 
@@ -147,7 +150,7 @@ else
 fi
 
 # Issue #2665: a ready server exposes the public Docker/Go seams without waiting
-# for real LiveDB tests. Each scenario is bounded to eight package calls plus the
+# for real LiveDB tests. Each scenario is bounded to nine package calls plus the
 # optional handler call; a failed scenario is recorded without blocking siblings.
 READYBIN="$TMP/ready-bin"
 mkdir -p "$READYBIN"
@@ -262,7 +265,7 @@ assert_case() {
 }
 
 # Explicit expected order, independent of the runner's PKGS array.
-expected_pkgs=(store handler forgesvc schedsvc workersvc recovery poller issuetrackersvc)
+expected_pkgs=(store handler forgesvc schedsvc workersvc recovery poller hostedsvc issuetrackersvc)
 for scenario in success optional retained-missing-run retained-missing-closure-run retained-missing-pass retained-top-skip retained-sub-skip retained-go-fail go-fail no-tests missing-ok top-skip sub-skip; do
   case_dir="$TMP/$scenario"
   mkdir -p "$case_dir"
@@ -306,8 +309,8 @@ for scenario in success optional retained-missing-run retained-missing-closure-r
   case "$scenario" in
     success|optional)
       assert_case "successful sweep exits zero" test "$rc" -eq 0
-      assert_case "aggregate log contains all eight passes" \
-        grep -qF 'LiveDB: 8 passed, 0 skipped' "$case_dir/output"
+      assert_case "aggregate log contains all nine passes" \
+        grep -qF 'LiveDB: 9 passed, 0 skipped' "$case_dir/output"
       assert_case "success banner appears" grep -qF 'Store integration tests passed.' "$case_dir/output"
       assert_case "successful log files removed" \
         test -z "$(find "$case_dir" -name '*-log.*' -print)"
@@ -338,7 +341,7 @@ for scenario in success optional retained-missing-run retained-missing-closure-r
           ;;
         top-skip|sub-skip)
           assert_case "aggregate guard retains and rejects an early skip at any depth" \
-            grep -qF 'LiveDB: 8 passed, 1 skipped' "$case_dir/output"
+            grep -qF 'LiveDB: 9 passed, 1 skipped' "$case_dir/output"
           ;;
       esac
       ;;
@@ -428,16 +431,87 @@ for scenario in checkpoint-success checkpoint-disabled checkpoint-go-fail checkp
     fi
     calls="$(wc -l < "$case_dir/go.log")"
     if [ "$enabled" = 1 ]; then
-      assert_case "normal eight packages plus checkpoint leg" test "$calls" -eq 9
+      assert_case "normal nine packages plus checkpoint leg" test "$calls" -eq 10
       assert_case "checkpoint command bounded, uncached, serialized, race-enabled" \
         grep -Fq "$(printf '\ttest\t-buildvcs=false\t-count=1\t-v\t-race\t-p\t1\t-timeout\t15m\t-run\t^TestTaskCheckpointCrossWorkerRecoveryE2E$\t./internal/workersvc/...')" "$case_dir/go.log"
       proof_log="$(awk '/^Task checkpoint recovery proof log: / {print $NF}' "$case_dir/output")"
       assert_case "checkpoint log retained" test -f "$proof_log"
       case "$proof_log" in "$ROOT/.uzi/scratch/"*) rm -f "$proof_log" ;; esac
     else
-      assert_case "non-1 value leaves eight-package sweep unchanged" test "$calls" -eq 8
+      assert_case "non-1 value leaves nine-package sweep unchanged" test "$calls" -eq 9
     fi
   done
+done
+
+# Issue #4232: UZI_STORE_IT_GROUP splits the sweep across CI's two LiveDB jobs.
+# Unset (above, and the explicit `unset` case here) runs all nine packages; the two
+# named groups partition them; the empty string, any other value, and an opt-in proof
+# with the workersvc group refuse with exit 2 before Docker starts a database.
+group_line() { # $1 dsn, $2 package, $3 timeout
+  printf '%s\ttest\t-buildvcs=false\t-count=1\t-v\t-race\t-p\t1\t-timeout\t%s\t-run\tLiveDB$\t./internal/%s/...\n' "$1" "$3" "$2"
+}
+for scenario in group-unset group-workersvc group-rest group-rest-proof group-empty group-invalid group-workersvc-proof group-workersvc-checkpoint; do
+  case_dir="$TMP/$scenario"
+  mkdir -p "$case_dir"
+  group_env=(env -u UZI_STORE_IT_GROUP)
+  proof="" checkpoint=""
+  case "$scenario" in
+    group-workersvc) group_env=(env UZI_STORE_IT_GROUP=workersvc) ;;
+    group-rest) group_env=(env UZI_STORE_IT_GROUP=rest) ;;
+    group-rest-proof) group_env=(env UZI_STORE_IT_GROUP=rest); proof=1 ;;
+    group-empty) group_env=(env UZI_STORE_IT_GROUP=) ;;
+    group-invalid) group_env=(env UZI_STORE_IT_GROUP=a) ;;
+    group-workersvc-proof) group_env=(env UZI_STORE_IT_GROUP=workersvc); proof=1 ;;
+    group-workersvc-checkpoint) group_env=(env UZI_STORE_IT_GROUP=workersvc); checkpoint=1 ;;
+  esac
+  rc=0
+  "${group_env[@]}" PATH="$READYBIN:$PATH" CASE_DIR="$case_dir" SCENARIO="$scenario" TMPDIR="$case_dir" \
+    UZI_STORE_IT_PG_WAIT_SECS=1 UZI_CODEX_REFRESH_LOSTREPLY_E2E="$proof" UZI_HEARTBEAT_PROTOCOL_REFRESH_E2E="" \
+    UZI_CI_ARTIFACTS_E2E="" UZI_STALE_WORKER_CANCEL_E2E="" UZI_TASK_CHECKPOINT_RECOVERY_E2E="$checkpoint" \
+    bash "$SCRIPT" > "$case_dir/output" 2>&1 || rc=$?
+  case "$scenario" in
+    group-empty|group-invalid|group-workersvc-proof|group-workersvc-checkpoint)
+      assert_case "invalid group selection exits 2" test "$rc" -eq 2
+      assert_case "invalid group selection starts no database" \
+        bash -c '! grep -qs "^run " "$1"' _ "$case_dir/docker.log"
+      assert_case "invalid group selection runs no Go" test ! -e "$case_dir/go.log"
+      continue ;;
+  esac
+  assert_case "valid group selection exits zero" test "$rc" -eq 0
+  dsn="$(cut -f1 "$case_dir/go.log" | head -n 1)"
+  : > "$case_dir/expected"
+  case "$scenario" in
+    group-unset) want=(store:20m handler:20m forgesvc:10m schedsvc:10m workersvc:45m recovery:10m poller:10m hostedsvc:10m issuetrackersvc:10m) ;;
+    group-workersvc) want=(workersvc:45m) ;;
+    group-rest|group-rest-proof) want=(store:20m handler:20m forgesvc:10m schedsvc:10m recovery:10m poller:10m hostedsvc:10m issuetrackersvc:10m) ;;
+  esac
+  for entry in "${want[@]}"; do group_line "$dsn" "${entry%%:*}" "${entry#*:}" >> "$case_dir/expected"; done
+  if [ "$scenario" = group-rest-proof ]; then
+    printf '%s\ttest\t-buildvcs=false\t-count=1\t-v\t-race\t-p\t1\t-run\t^Test(Codex(RefreshLostReply|RetainedStop)|PrerequisiteClosureRelease|RecoveryRestoreWorkerClientSmall)E2E$\t./internal/handler/...\n' \
+      "$dsn" >> "$case_dir/expected"
+  fi
+  assert_case "group runs exactly its packages in order, then any proof, on one DSN" \
+    cmp -s "$case_dir/expected" "$case_dir/go.log"
+  assert_case "group aggregate guard counts only the selected packages" \
+    grep -qF "LiveDB: ${#want[@]} passed, 0 skipped" "$case_dir/output"
+done
+
+# The workersvc group is derived from ALL_PKGS, not a second list: a copy of the script
+# whose ALL_PKGS lost (or duplicated) the entry must refuse the group before Docker.
+for scenario in group-workersvc-missing group-workersvc-duplicate; do
+  case_dir="$TMP/$scenario"
+  mkdir -p "$case_dir/copy/e2e"
+  awk -v mode="$scenario" '
+    $0 == "  ./internal/workersvc/..." { n++; if (mode == "group-workersvc-missing") next; print; print; next }
+    { print }
+    END { if (n != 1) exit 1 }' "$SCRIPT" > "$case_dir/copy/e2e/run-store-it.sh"
+  rc=0
+  env UZI_STORE_IT_GROUP=workersvc PATH="$READYBIN:$PATH" CASE_DIR="$case_dir" SCENARIO="$scenario" \
+    TMPDIR="$case_dir" UZI_STORE_IT_PG_WAIT_SECS=1 bash "$case_dir/copy/e2e/run-store-it.sh" > "$case_dir/output" 2>&1 || rc=$?
+  assert_case "workersvc group without exactly one ALL_PKGS entry exits 2" test "$rc" -eq 2
+  assert_case "workersvc group names the ALL_PKGS mismatch" grep -qF 'ALL_PKGS entries (want exactly 1)' "$case_dir/output"
+  assert_case "workersvc ALL_PKGS mismatch starts no database" \
+    bash -c '! grep -qs "^run " "$1"' _ "$case_dir/docker.log"
 done
 
 if [ "$fails" -eq 0 ]; then

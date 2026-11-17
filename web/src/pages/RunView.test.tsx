@@ -1473,6 +1473,29 @@ it("HealthFlag renders manual attribution as escaped single-cell text", () => {
   expect(container.textContent).not.toContain("[object Object]");
 });
 
+describe("HealthFlag — publication withheld (issue #4257)", () => {
+  const reason = "checkpoint publication is withheld by a secret-scan restriction; new work stays on the worker until it is resolved";
+  const hint = "an eligible finding reaches the lead at its next work-turn boundary, subject to the existing safety checks and the shared attempt cap; the done-point fallback remains subject to its safety checks and the same cap; `uzi run follow-up` can give the agent owner guidance";
+  const withheld = { status: "running" as const, health: "publication_withheld" as const, health_reason: reason, health_since: "2026-11-14T09:10:00Z" };
+
+  it("shows the label, reason and fixed hint, and nothing else", () => {
+    const { container } = render(<HealthFlag run={run(withheld)} />);
+    const pill = container.querySelector(".text-warn")!;
+    expect(pill.textContent).toContain("⚠ publication withheld");
+    expect(pill.textContent).toContain(` — ${reason}`);
+    expect(container.querySelector("[data-health-hint]")!.textContent).toBe(hint);
+    // Only the fixed strings render: no path, rule or SHA can arrive through this flag.
+    const rest = (container.textContent ?? "").replace(reason, "").replace(hint, "")
+      .replace(/stuck for (\d+h )?\d+[smh]/, "").replace(/publication withheld/g, "").replace(/[\s—·⚠]/g, "");
+    expect(rest).toBe("");
+  });
+  it.each(["ok", "stalled", "looping", "slow", "approval_idle"] as const)("renders no hint for %s", (health) => {
+    const { container } = render(<HealthFlag run={run({ status: "running", health, health_reason: null })} />);
+    expect(container.querySelector("[data-health-hint]")).toBeNull();
+    expect(container.textContent).not.toContain("follow-up");
+  });
+});
+
 describe("HealthFlag — maintenance queue reason (PRD #3454)", () => {
   const held = { status: "queued" as const, queue_reason: "maintenance" as const, health: "waiting_worker" as const,
     health_since: "2026-10-25T12:00:00Z", health_reason: "waiting for a worker to pick up this run" };
@@ -2120,6 +2143,55 @@ describe("RunView — paused header: Resume + pending-pause chip (PRD #1190)", (
     expect(screen.queryByRole("button", { name: /resume/i })).toBeNull();
     expect(screen.queryByText(/the last checkpoint is pushed/i)).toBeNull();
     expect(screen.queryByRole("heading", { name: "Completion state" })).toBeNull();
+  });
+
+  // Issue #3250: the run's chosen model or effort cannot run on its harness. A non-completion
+  // owner hold: its own pill text and announcement, no Completion state panel, and the generic
+  // owner Resume (the retry) is offered.
+  it("a run-override hold renders its own hold text, not a completion panel, and offers owner Resume", async () => {
+    const { refreshRun } = renderPage({ ...PAUSED, hold_reason: "run_override_unavailable" }, true);
+    await screen.findByText("Add rate limiting");
+    expect(screen.getAllByText("model choice unavailable: owner hold").length).toBeGreaterThan(0);
+    expect(screen.queryByRole("heading", { name: "Completion state" })).toBeNull();
+    expect(screen.queryByText("Completion blocked")).toBeNull();
+    expect(screen.getAllByText(/cannot run on its harness/i).length).toBeGreaterThan(0);
+    const resume = screen.getAllByRole("button", { name: /resume/i });
+    expect(resume.length).toBeGreaterThan(0);
+    await act(async () => { fireEvent.click(resume[0]); });
+    await waitFor(() => expect(mockApi.resumeRun).toHaveBeenCalledWith("r1"));
+    await waitFor(() => expect(refreshRun).toHaveBeenCalled());
+  });
+
+  // Issue #3250 review: the hold has its own VISIBLE panel; the sr-only announcement is not the text.
+  it("a run-override hold shows a visible panel with Resume and Cancel, and no Stop or 'session continues' text", async () => {
+    const { refreshRun, submit, container } = renderPage({ ...PAUSED, hold_reason: "run_override_unavailable" }, true);
+    const heading = await screen.findByRole("heading", { name: "Model choice unavailable: waiting for owner" });
+    const panel = within(heading.parentElement!);
+    expect(panel.getByText(/cannot run on this harness/i)).toBeTruthy();
+    expect(panel.getByText(/Resume retries only if the choice has become available on that harness/i)).toBeTruthy();
+    expect(panel.getByText(/start a new run with a different choice/i)).toBeTruthy();
+    expect(panel.getByRole("button", { name: "Resume" })).toBeTruthy();
+    expect(panel.getByRole("button", { name: "Cancel" })).toBeTruthy();
+    expect(screen.getAllByRole("button", { name: /resume/i })).toHaveLength(1);
+    // The page-wide steer card keeps its own Stop run; the hold panel itself offers none.
+    expect(panel.queryByRole("button", { name: /stop/i })).toBeNull();
+    // Visible text only: the sr-only announcement region is excluded.
+    const visible = Array.from(container.querySelectorAll("*"))
+      .filter((el) => !el.closest(".sr-only") && el.children.length === 0)
+      .map((el) => el.textContent ?? "").join(" ");
+    expect(visible).not.toMatch(/session continues/i);
+    await act(async () => { fireEvent.click(panel.getByRole("button", { name: "Resume" })); });
+    await waitFor(() => expect(mockApi.resumeRun).toHaveBeenCalledWith("r1"));
+    await waitFor(() => expect(refreshRun).toHaveBeenCalled());
+    await act(async () => { fireEvent.click(panel.getByRole("button", { name: "Cancel" })); });
+    await waitFor(() => expect(submit).toHaveBeenCalledWith("cancel", "", undefined, undefined, false));
+  });
+
+  it("a run-override hold gives non-owners no Resume or Cancel controls", async () => {
+    renderPage({ ...PAUSED, hold_reason: "run_override_unavailable" }, false);
+    const heading = await screen.findByRole("heading", { name: "Model choice unavailable: waiting for owner" });
+    expect(within(heading.parentElement!).queryByRole("button")).toBeNull();
+    expect(screen.queryByRole("button", { name: /resume/i })).toBeNull();
   });
 
   it("clicking Resume calls api.resumeRun(id) then refreshRun", async () => {
@@ -6513,6 +6585,41 @@ describe("ProgressCountCard (done / in-progress / left, PRD #122)", () => {
 });
 
 describe("CompletionStatePanel — honest completion-interlock detail (PRD #1226 M5, D8)", () => {
+  // Issue #3250: the non-completion hold set must not change what the panel did for each
+  // pre-existing reason. The old sites disagreed on membership (an early return for two reasons,
+  // a "held" deny-list for five plus the paused-only token-switch holds), so pin each outcome.
+  it.each([
+    ["provider_unavailable", false],
+    ["iteration_budget_exhausted", false],
+    ["codex_policy_hold", false],
+    ["credential_disabled", true],
+    ["credentials_reset", true],
+    ["base_attestation_missing", true],
+    ["repo_agent_source_unavailable", true],
+    ["credential_switch_settling", true],
+    ["credential_switch_unsettled", true],
+    ["run_override_unavailable", false],
+  ] as const)("a paused run held on %s with a live completion phase shows the panel: %s", (hold, shown) => {
+    const { container } = render(<CompletionStatePanel run={run({ status: "paused", completion_phase: "checking", hold_reason: hold })} />);
+    expect(container.textContent?.includes("Completion state") ?? false).toBe(shown);
+  });
+
+  it.each([
+    ["provider_unavailable", false],
+    ["iteration_budget_exhausted", true],
+    ["codex_policy_hold", true],
+    ["credential_disabled", false],
+    ["credentials_reset", false],
+    ["base_attestation_missing", false],
+    ["repo_agent_source_unavailable", false],
+    ["credential_switch_settling", true],
+    ["credential_switch_unsettled", true],
+    ["run_override_unavailable", false],
+  ] as const)("a retained %s marker on a non-paused run with no phase shows the panel: %s", (hold, shown) => {
+    const { container } = render(<CompletionStatePanel run={run({ status: "queued", completion_phase: "", hold_reason: hold })} />);
+    expect(container.textContent?.includes("Completion state") ?? false).toBe(shown);
+  });
+
   it("renders unmet ids, the attempt count, and the same-worker-only hold context when blocked", () => {
     const { container } = render(
       <CompletionStatePanel
@@ -8034,6 +8141,7 @@ it.each([
   "your vault is locked, so this run can't start",
   "recovery custody capacity is full; retained holds still protect your work; resolve or discard a retained hold to free capacity",
   "new runs are paused: the custody hold limit setting could not be read; an admin should check Admin → Instance settings",
+  "this run has reached its own custody hold limit; retained holds still protect its work; resolve or discard this run's own retained holds to let it start",
   "your Codex account is unavailable (quarantined or being re-linked), so this run can't start",
 ])("HealthFlag Codex admission keeps %s primary", (reason) => {
   const now = vi.spyOn(Date, "now").mockReturnValue(0);

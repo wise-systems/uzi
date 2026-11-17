@@ -28,7 +28,7 @@ import { boundedCommandWait } from "../codex/memory-command.js";
 import { screenBashCommand } from "../guardrails.js";
 import type { Logger } from "../log.js";
 import type { WorkerMemoryPressureResult } from "../protocol.js";
-import { makeTextRedactor } from "../redact.js";
+import { SecretSet } from "../redact.js";
 import { sanitizeForLog } from "../run-quiescence.js";
 import { asText, type ToolTextResult } from "../tool-evidence.js";
 import type { RecordedRoot } from "../worker-spawn-mark.js";
@@ -104,8 +104,9 @@ export interface ClaudeCommandLaneOptions {
   readonly cliEnv: Readonly<Record<string, string | undefined>>;
   readonly secretPaths: readonly string[];
   readonly dockerWired: boolean;
-  /** Secrets redacted from the inline output. */
-  readonly secrets: readonly string[];
+  /** Secrets redacted from the inline output. A SecretSet is read live, so a secret added after
+   *  construction (an in-place credential switch) is scrubbed too. */
+  readonly secrets: readonly string[] | SecretSet;
   readonly log: Pick<Logger, "debug" | "info" | "warn">;
   /** Capture the worker-memory context for one turn (may throw the runner's retained stop). */
   readonly capturedMemory: () => CapturedMemoryContext;
@@ -192,6 +193,7 @@ export class ClaudeCommandLane {
   private readonly maxTimeoutMs: number;
   private readonly spillCapBytes: number;
   private readonly redact: (text: string) => string;
+  private readonly secretSet: SecretSet;
   /** The physical worktree the spill path is built from (see WRAPPER's parent check). */
   private readonly spillRoot: string;
   private readonly live = new Map<string, LiveCommand>();
@@ -216,7 +218,9 @@ export class ClaudeCommandLane {
     this.defaultTimeoutMs = opts.defaultTimeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS;
     this.maxTimeoutMs = opts.maxTimeoutMs ?? MAX_COMMAND_TIMEOUT_MS;
     this.spillCapBytes = opts.spillCapBytes ?? SPILL_CAP_BYTES;
-    this.redact = makeTextRedactor([...opts.secrets]);
+    this.secretSet = opts.secrets instanceof SecretSet ? opts.secrets : new SecretSet([...opts.secrets]);
+    const set = this.secretSet;
+    this.redact = (s) => set.text(s);
     // The wrapper only spills when the spill parent is physically where it is named, so the path
     // must be built from the resolved worktree. When it cannot be resolved, hand the wrapper a
     // path it rejects (the command still runs, unspilled).
@@ -434,7 +438,14 @@ export class ClaudeCommandLane {
         supervisorBin: SUPERVISOR_BIN,
         onSpawned: (root, child) => {
           live.child = child;
-          if (root.startTime !== undefined) this.roots.set(live.id, { pid: root.pid, startTime: root.startTime });
+          if (root.startTime !== undefined) {
+            this.roots.set(live.id, { pid: root.pid, startTime: root.startTime });
+            try {
+              this.opts.log.info("guarded command supervisor root recorded", {
+                run_id: captured.context.run_id, pid: root.pid, start_time: root.startTime,
+              });
+            } catch { /* Diagnostics must not turn a recorded launch into a failed launch. */ }
+          }
           // issue #3915: an unrecorded supervisor exempts nothing, so a peer run's quiescence
           // proof cannot attribute it. Say so where the pod log keeps it.
           else this.opts.log.warn("guarded command supervisor root not recorded: start time unreadable", { pid: root.pid });
@@ -473,7 +484,7 @@ export class ClaudeCommandLane {
   ): Promise<ToolTextResult> {
     const { handle } = launched;
     // (9) Drain the transport from the moment it exists, so the command never blocks on it.
-    const output = new BoundedOutput(this.opts.secrets);
+    const output = new BoundedOutput(this.secretSet.values());
     const streams = [handle.transport.stdout, handle.transport.stderr] as const;
     streams.forEach((stream, source) => {
       stream?.on("data", (chunk: Buffer | string) => { output.write(source as 0 | 1, chunk); });
@@ -551,7 +562,15 @@ export class ClaudeCommandLane {
         try { pressure = await boundedCommandWait(prepared, this.cleanupMs); } catch { pressureLost = true; }
       }
       enrolled?.unregister();
+      const recordedRoot = this.roots.get(live.id);
       this.roots.delete(live.id);
+      if (recordedRoot) {
+        try {
+          this.opts.log.info("guarded command supervisor root disposed", {
+            run_id: captured.context.run_id, pid: recordedRoot.pid, start_time: recordedRoot.startTime,
+          });
+        } catch { /* Diagnostics must not change the confirmed disposal outcome. */ }
+      }
 
       // (12) Result.
       if (pressure) return this.pressureResult(captured, enrolled, metadata.commandId, pressure);

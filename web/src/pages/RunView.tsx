@@ -2,7 +2,7 @@
 // states get a hero banner: the MR link is the run's entire output and must
 // not hide in chrome. The breadcrumb keeps PRD #12's in-app board / issue links.
 
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
 import { Link, useParams } from "react-router-dom";
 import {
   api,
@@ -43,6 +43,7 @@ import { ForgeOriginStatus } from "../components/ForgeOriginStatus";
 import { forgeWaitMode, forgeWaitLabel, forgeWaitPhase, publicationHoldCopy } from "../lib/forgeCooldown";
 import { diskWaitMode, diskWaitLabel, diskWaitDescription } from "../lib/diskRecovery";
 import { credentialSwitchHold } from "../lib/credentialSwitchHold";
+import { isCredentialSwitchRefusedLane } from "../lib/credentialOverride";
 import {
   effectiveRunStatus,
   parkLabel,
@@ -57,15 +58,20 @@ import {
   codexAdmissionText,
   accountCooldownText,
   displayHealthReason,
+  healthHint,
   queuedBlockerPrecedesCodexAdmission,
   isStoppedRun,
   isRejectedRun,
+  isNonCompletionHold,
+  completionPanelEarlyReturn,
+  completionPanelHeld,
   milestoneBadge,
   mrChipState,
   mrChipSuffix,
   mrChipTitle,
   shadowSignal,
   shouldShowHealthFlag,
+  sourceEndDeclinedCopy,
 } from "../lib/runBadge";
 import { latestActivity } from "../lib/runActivity";
 import { stageForMessages } from "../lib/runStage";
@@ -379,6 +385,7 @@ export function HealthFlag({ run }: { run: Run }) {
   const primaryAdmission = !maintenance && !reserve && !queuedBlockerPrecedesCodexAdmission(run) ? admission : null;
   const cooldown = accountCooldownText(run, now);
   const reason = displayHealthReason(run);
+  const hint = healthHint(run);
   const show = !maintenance && !reserve && !primaryAdmission && shouldShowHealthFlag(run.health, run.status);
   const queueAdvice = !maintenance && !reserve && !primaryAdmission && !show && run.status === "queued" ? reason : null;
   const since = run.health_since ? Date.parse(run.health_since) : NaN;
@@ -446,6 +453,8 @@ export function HealthFlag({ run }: { run: Run }) {
           {reason && <span className="font-normal"> — {reason}</span>}
         </span>
       )}
+      {/* Issue #4257: the fixed owner hint for a withheld run, from the web's own copy. */}
+      {show && hint && <span data-health-hint className="text-xs text-muted">{hint}</span>}
       {/* ALWAYS MOUNTED, empty until a flag arrives — mirrors RunView's parkAnnounce
           region and Board.tsx's S5 pattern. This is what actually announces the flag: a
           region that already exists narrates its next content change, where one mounted
@@ -470,12 +479,12 @@ function policyBlocksContinuation(run: Run): boolean {
 // never durability across workers. Policy cases have their own presentation.
 export function CompletionStatePanel({ run }: { run: Run }) {
   if (policyBlocksContinuation(run)) return null;
-  if (run.status === "paused" && (run.hold_reason === "provider_unavailable" || run.hold_reason === "iteration_budget_exhausted")) return null;
+  // A non-completion hold (NON_COMPLETION_HOLDS: credential, provider, token-switch,
+  // base-attestation, repo-agent source, iteration, run-override ...) is not a completion state;
+  // its own badge, panel and announcement cover it.
+  if (completionPanelEarlyReturn(run)) return null;
   const phase = run.completion_phase ?? "";
-  // PRD #1732: a credential_disabled hold is not a completion state; its own panel covers it.
-  // Token-switch, base-attestation and repo-agent source holds have their own panels.
-  const held = run.hold_reason != null && run.hold_reason !== "credential_disabled" && run.hold_reason !== "credentials_reset" && run.hold_reason !== "provider_unavailable" &&
-    run.hold_reason !== "base_attestation_missing" && run.hold_reason !== "repo_agent_source_unavailable" && credentialSwitchHold(run) === null;
+  const held = completionPanelHeld(run);
   if (phase === "" && !held) return null;
   const unmet = run.completion_unmet ?? [];
   const attempts = run.completion_attempts ?? 0;
@@ -953,14 +962,8 @@ export function PausedPanel({
     run.status !== "paused" ||
     policyBlocksContinuation(run) ||
     run.hold_reason === "completion_blocked" ||
-    run.hold_reason === "credential_disabled" ||
-    run.hold_reason === "credentials_reset" ||
-    run.hold_reason === "provider_unavailable" ||
-    run.hold_reason === "iteration_budget_exhausted" ||
-    // Issue #3181: the token-switch holds have their own panel and Resume gating.
-    credentialSwitchHold(run) !== null ||
-    run.hold_reason === "base_attestation_missing" ||
-    run.hold_reason === "repo_agent_source_unavailable"
+    // Every non-completion hold has its own panel or Resume gating (NON_COMPLETION_HOLDS).
+    isNonCompletionHold(run.hold_reason)
   )
     return null;
 
@@ -1443,6 +1446,14 @@ function codexHoldCopy(
   }
 }
 
+// Issue #4177: closed copy map for the adoption-failure detail classification.
+const ADOPTION_DETAIL_COPY = {
+  secret_remediation_active:
+    "Resume is unavailable: the retained source is held under an active secret-scan remediation, so Resume cannot succeed unchanged. To recover the work, either export an available recovery archive (uzi run export <run-id> --output <path>), which may omit later work kept on the worker, or ask an operator to recover the retained work from worker storage. Cancel ends the run.",
+  remediation_proof_unknown:
+    "The secret-scan remediation proof could not be verified, so a retry may help.",
+} as const;
+
 /**
  * Issue #1197: the transient-recovery park panel — the analogue of PoolWaitPanel for
  * `recovery_wait`, and deliberately COPY ONLY.
@@ -1477,6 +1488,7 @@ function codexHoldCopy(
  *
  * Exported like the sibling panels so its copy is reachable without mounting the page.
  */
+
 function WorkerDecisionPanel({ run, ownerProof, busy, onResume, onCancel }: {
   run: Run;
   ownerProof: boolean;
@@ -1485,6 +1497,13 @@ function WorkerDecisionPanel({ run, ownerProof, busy, onResume, onCancel }: {
   onCancel: () => void;
 }) {
   const adoptionFailed = run.recovery_wait_cause === "retained_recovery_adoption_failed";
+  // Closed set: only known values change anything; null, absent or any other value
+  // keeps the generic adoption-failure behaviour and the raw string is never rendered.
+  const adoptionDetail = adoptionFailed ? run.recovery_wait_detail : null;
+  const secretActive = adoptionDetail === "secret_remediation_active";
+  const sourceEndDeclined = adoptionDetail === "source_end_declined";
+  const proofUnknown = adoptionDetail === "remediation_proof_unknown";
+  const resumeReasonId = useId();
   const idleStall = run.recovery_wait_cause === "codex_idle_stall";
   // Owner-only, no timer, never an integrity refusal: the claimed continuation flight was
   // never witnessed, so the server released the claim. Always held, even if a malformed
@@ -1509,7 +1528,8 @@ function WorkerDecisionPanel({ run, ownerProof, busy, onResume, onCancel }: {
           {adoptionFailed && "Integrity hold: retained adoption failed, a predecessor needs remediation review, or this release does not support the predecessor. The agent did not start. Local work and its custody are preserved. "}
           {unwitnessed && "The continuation was never confirmed to start, so the claim was released. Local work and its custody are kept. "}
           {decisionHeld
-            ? "This hold has no scheduled retry. Only the run owner can Resume or Cancel."
+            ? secretActive ? "This hold has no scheduled retry. Only the run owner can Cancel."
+              : "This hold has no scheduled retry. Only the run owner can Resume or Cancel."
             : decisionRetrying
               ? idleStall ? `Automatic retry is scheduled not before ${new Date(retryMs).toLocaleString()}; it may still be pending when due. Only the run owner can Resume now or Cancel.`
                 : retryMs <= Date.now() ? "Automatic retry is due; the run will retry automatically. Only the run owner can Resume now or Cancel."
@@ -1517,12 +1537,17 @@ function WorkerDecisionPanel({ run, ownerProof, busy, onResume, onCancel }: {
               : "Retry timing is unavailable. This does not establish an owner hold or an automatic retry date."}
         </> : <>{memoryHeld
           ? "Memory interventions have stopped. Resume starts a fresh memory episode. Cancel ends this run."
-          : "Automatic worker recovery has stopped. Only the run owner can resume or cancel this run. Resume requests one explicit attempt, even when the automatic recovery limit is zero."}
+          : "Automatic worker recovery has stopped. Only the run owner can resume or cancel this run. Resume requests one explicit attempt, even when the automatic recovery limit is zero. Resume requeues the run, but a run at its own custody hold limit is not claimed and takes no new hold until enough of its own holds are discarded or settled."}
         {memoryHeld && " Only the run owner can resume or cancel this run."}{" "}
         This hold has no scheduled retry. Credential changes, messages and capture expiry do not release it.</>}
       </p>
-      {adoptionFailed && <p className="mt-1.5 text-xs text-warn">
+      {adoptionFailed && !secretActive && !sourceEndDeclined && <p className="mt-1.5 text-xs text-warn">
         Resume starts another recovery episode. If the underlying block persists, the run can hold again. Each new claim adds a custody hold. Resolve the cause before resuming.
+        {proofUnknown && ` ${ADOPTION_DETAIL_COPY.remediation_proof_unknown}`}
+      </p>}
+      {sourceEndDeclined && <p className="mt-1.5 text-xs text-warn">{sourceEndDeclinedCopy}</p>}
+      {secretActive && <p id={resumeReasonId} className="mt-1.5 text-xs text-warn">
+        {ADOPTION_DETAIL_COPY.secret_remediation_active}
       </p>}
       {idleStall && <p className="mt-1.5 text-xs text-muted">Resume starts a fresh wall and resets the idle-stall count. Cancel ends this run. Resume requests an attempt; success is not assured.</p>}
       {!retained && <p className="mt-1.5 text-xs text-muted">
@@ -1558,7 +1583,7 @@ function WorkerDecisionPanel({ run, ownerProof, busy, onResume, onCancel }: {
       ) : <p className="mt-1.5 text-xs text-muted">Server recovery evidence is unavailable.</p>}
       {ownerProof ? (
         <div className="mt-3 flex gap-2">
-          <Button size="sm" disabled={busy} onClick={onResume}>Resume</Button>
+          <Button size="sm" disabled={busy || secretActive} aria-describedby={secretActive ? resumeReasonId : undefined} onClick={onResume}>Resume</Button>
           <Button variant="ghost" size="sm" disabled={busy} onClick={onCancel}>Cancel</Button>
         </div>
       ) : <p className="mt-1.5 text-xs text-muted">Only the run owner can resume or cancel this hold.</p>}
@@ -1652,6 +1677,26 @@ function BaseAttestationHoldPanel({ run, ownerProof = false, busy = false, onCan
   </Card>;
 }
 
+// Issue #3250: the run's chosen model or effort cannot run on its harness, so the agent never
+// started. Resume re-checks at the next claim and parks again unless the choice has become
+// available on that harness (e.g. a narrowing release was rolled back); otherwise the owner
+// cancels and starts a new run with a different choice. No Stop (not a milestone issue run's
+// completed scope) and no "session continues" claim.
+function RunOverrideHoldPanel({ run, ownerProof, busy, onResume, onCancel }: {
+  run: Run; ownerProof: boolean; busy: boolean; onResume: () => void; onCancel: () => void;
+}) {
+  if (run.status !== "paused" || run.hold_reason !== "run_override_unavailable") return null;
+  return <Card className="p-4">
+    <h2 className="text-sm font-semibold text-warn">Model choice unavailable: waiting for owner</h2>
+    <p className="mt-1 text-xs text-muted">The model or effort chosen for this run cannot run on this harness. The agent was not started.</p>
+    <p className="mt-1 text-xs text-muted">Resume retries only if the choice has become available on that harness. Otherwise, Cancel and start a new run with a different choice. This run does not resume automatically.</p>
+    {ownerProof ? <div className="mt-3 flex gap-2">
+      <Button size="sm" disabled={busy} onClick={onResume}>Resume</Button>
+      <Button size="sm" variant="danger" disabled={busy} onClick={onCancel}>Cancel</Button>
+    </div> : <p className="mt-2 text-xs text-muted">Only the run owner can Resume or Cancel this hold.</p>}
+  </Card>;
+}
+
 // The screen-reader sentence for a `publication:<mode>:<reason>` park key (parkAnnounce).
 function publicationAnnounce(parkKey: string): string {
   const [, mode, ...rest] = parkKey.split(":");
@@ -1726,17 +1771,63 @@ function PublicationParkBody({ run, mode, retryAt, ownerProof, busy, onResume, o
   );
 }
 
-export function RecoveryWaitPanel({ run, ownerProof = false, busy = false, onResume = () => {}, onCancel = () => {} }: {
+// Issue #3767: a Claude run's Anthropic API key hit its spend limit. Owner-held, no timer, and
+// nothing resumes it automatically. Resume re-queues and the next claim re-selects the
+// credential through the run's own selection, which may pick the capped token again. Text
+// only: nothing here renders provider-supplied content.
+function SpendLimitPanel({ run, ownerProof, busy, onResume, onCancel, onSwitched }: {
+  run: Run;
+  ownerProof: boolean;
+  busy: boolean;
+  onResume: () => void;
+  onCancel: () => void;
+  onSwitched?: () => void;
+}) {
+  const canSwitch = !isCredentialSwitchRefusedLane(run) && run.harness !== "codex";
+  return (
+    <div className="rounded-xl border border-warn/40 bg-warn/10 p-4" data-testid="spend-limit-panel">
+      <p className="text-sm font-semibold text-warn">Anthropic API spend limit reached</p>
+      <p className="mt-1 text-sm text-fg">
+        Resume uses this run&apos;s current credential selection. If it still selects the capped token, raise the limit first.
+        {canSwitch && <> To choose another token now, use Switch token or <code>uzi run set-token</code>.</>}
+      </p>
+      <p className="mt-1.5 text-xs text-muted">This hold has no scheduled retry.</p>
+      {ownerProof ? (
+        <div className="mt-3 flex flex-wrap items-start gap-2">
+          <Button size="sm" disabled={busy} onClick={onResume}>Resume</Button>
+          {canSwitch && (
+            <SwitchTokenAction run={run} canSteer={ownerProof} onSwitched={onSwitched} triggerLabel="Run with another token" />
+          )}
+          {canSwitch && (
+            <Link
+              to="/settings"
+              className="inline-flex h-7 items-center rounded-lg px-2.5 text-xs font-medium text-muted hover:bg-raised hover:text-fg"
+            >
+              Manage tokens in Settings
+            </Link>
+          )}
+          <Button variant="ghost" size="sm" disabled={busy} onClick={onCancel}>Cancel</Button>
+        </div>
+      ) : <p className="mt-1.5 text-xs text-muted">Only the run owner can resume or cancel this hold.</p>}
+    </div>
+  );
+}
+
+export function RecoveryWaitPanel({ run, ownerProof = false, busy = false, onResume = () => {}, onCancel = () => {}, onSwitched }: {
   run: Run;
   ownerProof?: boolean;
   busy?: boolean;
   onResume?: () => void;
   onCancel?: () => void;
+  onSwitched?: () => void;
 }) {
   // Only for a run actually recovering. Every other status (including terminal and the
   // sibling parks) renders nothing — PoolWaitPanel owns pool_wait, LimitWaitPanel owns
   // limit_wait, and this self-hides on both so mounting all three side by side is safe.
   if (run.status !== "recovery_wait") return null;
+  if (run.recovery_wait_cause === "anthropic_spend_limit") {
+    return <SpendLimitPanel run={run} ownerProof={ownerProof} busy={busy} onResume={onResume} onCancel={onCancel} onSwitched={onSwitched} />;
+  }
   if (run.recovery_wait_cause === "worker_requeue_exhausted" || run.recovery_wait_cause === "worker_memory_pressure" || (run.recovery_wait_cause === "retained_recovery_exhausted" || run.recovery_wait_cause === "codex_idle_stall" || run.recovery_wait_cause === "retained_recovery_adoption_failed" || run.recovery_wait_cause === "retained_continuation_unwitnessed")) {
     return <WorkerDecisionPanel run={run} ownerProof={ownerProof} busy={busy} onResume={onResume} onCancel={onCancel} />;
   }
@@ -1828,7 +1919,7 @@ export function RecoveryWaitPanel({ run, ownerProof = false, busy = false, onRes
               {retryAt ? `Retry at ${retryAt}. ` : ""}Forge parks: {parkLabel}. The count and allowance are unchanged by Resume.
             </p>
             {forgeMode === "held" && <>
-              <p className="mt-1.5 text-xs text-muted">Resume permits one bounded ordinary attempt; it does not promise execution or reset counts, custody or grants. Origin cooldown, manual cordon, a custody limit of 1, or saturated capacity may still block admission.</p>
+              <p className="mt-1.5 text-xs text-muted">Resume permits one bounded ordinary attempt; it does not promise execution or reset counts, custody or grants. Origin cooldown, manual cordon, a custody limit of 1, saturated capacity, or this run being at its own custody hold limit (no claim, no hold) may still block admission. Resume requeues the run, but a run at its own custody hold limit is not claimed and takes no new hold until enough of its own holds are discarded or settled.</p>
               {run.health_reason && <p className="mt-1.5 text-xs text-muted">Admission: {displayHealthReason(run)}</p>}
               {ownerProof ? <div className="mt-3 flex flex-wrap gap-2">
                 <Button size="sm" disabled={busy} onClick={onResume}>Resume</Button>
@@ -2029,7 +2120,8 @@ export function RunView() {
   const forgeHeld = run != null && forgeWaitMode(run) === "held";
   const diskHeld = run != null && diskWaitMode(run) === "held";
   const iterationHeld = run?.status === "paused" && run.hold_reason === "iteration_budget_exhausted";
-  const ownerDecisionHold = policyBlocked || iterationHeld || forgeHeld || diskHeld || retainedRecovery || workerExhausted || memoryHeld || providerHeld || switchHeld;
+  const spendLimitHeld = run?.status === "recovery_wait" && run.recovery_wait_cause === "anthropic_spend_limit";
+  const ownerDecisionHold = policyBlocked || iterationHeld || forgeHeld || diskHeld || retainedRecovery || workerExhausted || memoryHeld || providerHeld || switchHeld || spendLimitHeld;
   const canSteer = optimisticCanSteer && (!ownerDecisionHold || confirmedOwner === true);
   const planCheckSeqs = useRef(new Map<string, number>());
   const planCheckRefresh = useRef<{ runId: string; busy: boolean; queued: boolean } | null>(null);
@@ -2136,7 +2228,7 @@ export function RunView() {
     setBusy(false);
   };
   const resumeWorkerHold = async () => {
-    if (!canSteer || !(forgeHeld || diskHeld || workerExhausted || memoryHeld || retainedRecovery) || run?.id !== id || (diskHeld && currentAction.current !== null)) return;
+    if (!canSteer || !(forgeHeld || diskHeld || workerExhausted || memoryHeld || retainedRecovery || spendLimitHeld) || run?.id !== id || (diskHeld && currentAction.current !== null)) return;
     const requestRunId = id;
     const isCurrent = startAction();
     try {
@@ -2460,12 +2552,18 @@ export function RunView() {
                       : `forge:${forgeWaitMode(run)}`
                   : run.recovery_wait_cause === "provider_outage"
                     ? "provider_outage"
-                  : (run.recovery_wait_cause === "retained_recovery_exhausted" || run.recovery_wait_cause === "codex_idle_stall" || run.recovery_wait_cause === "retained_recovery_adoption_failed" || run.recovery_wait_cause === "retained_continuation_unwitnessed")
+                  : run.recovery_wait_cause === "retained_recovery_adoption_failed"
+                    ? // Issue #4177: the closed-set detail is part of the key so a detail change at
+                      // the same cause re-announces; null or any other value adds no suffix.
+                      `retained_recovery_adoption_failed${run.recovery_wait_detail === "source_end_declined" || run.recovery_wait_detail === "secret_remediation_active" || run.recovery_wait_detail === "remediation_proof_unknown" ? `:${run.recovery_wait_detail}` : ""}`
+                  : (run.recovery_wait_cause === "retained_recovery_exhausted" || run.recovery_wait_cause === "codex_idle_stall" || run.recovery_wait_cause === "retained_continuation_unwitnessed")
                     ? effectiveRunStatus(run)
                   : run.recovery_wait_cause === "worker_requeue_exhausted"
                     ? "worker_requeue_exhausted"
                   : run.recovery_wait_cause === "worker_memory_pressure"
                     ? "worker_memory_pressure"
+                  : run.recovery_wait_cause === "anthropic_spend_limit"
+                    ? "anthropic_spend_limit"
                     : "recovery_wait"
             : run?.status === "paused" && run.hold_reason === "iteration_budget_exhausted"
               ? `iteration_budget_exhausted${extendBudgetView(run, Date.now())?.remainingSec === 0 ? ":spent" : ""}`
@@ -2483,6 +2581,8 @@ export function RunView() {
               ? "base_attestation_missing"
             : run?.status === "paused" && run.hold_reason === "repo_agent_source_unavailable"
               ? "repo_agent_source_unavailable"
+            : run?.status === "paused" && run.hold_reason === "run_override_unavailable"
+              ? "run_override_unavailable"
             : run?.status === "paused"
               ? "paused"
             : "";
@@ -2501,7 +2601,11 @@ export function RunView() {
         ? "The run is waiting for your next follow-up."
         : parkKey === "pool_wait"
           ? "The run is waiting for a pooled Anthropic token. Add a token to the pool and it resumes automatically."
-          : parkKey === "retained_recovery_adoption_failed"
+          : parkKey === "retained_recovery_adoption_failed:secret_remediation_active"
+            ? "Integrity hold: the retained source is held under an active secret-scan remediation. The agent did not start. Local work and its custody are preserved. Resume is unavailable. Only the run owner can Cancel. There is no scheduled retry."
+          : parkKey === "retained_recovery_adoption_failed:source_end_declined"
+            ? sourceEndDeclinedCopy
+          : parkKey.startsWith("retained_recovery_adoption_failed")
             ? "Integrity hold: retained adoption failed, a predecessor needs remediation review, or this release does not support the predecessor. The agent did not start. Local work and its custody are preserved. Only the run owner can Resume or Cancel. There is no scheduled retry."
           : parkKey === "retained_continuation_unwitnessed"
             ? "The continuation was never confirmed to start, so the claim was released. Local work and its custody are kept. Only the run owner can Resume or Cancel. There is no scheduled retry."
@@ -2521,6 +2625,8 @@ export function RunView() {
             ? "Worker recovery needs your decision. Only the run owner can resume or cancel this hold. There is no scheduled retry."
           : parkKey === "worker_memory_pressure"
             ? "Worker memory pressure. Only the run owner can resume or cancel this hold. Resume starts a fresh memory episode. There is no scheduled retry."
+          : parkKey === "anthropic_spend_limit"
+            ? "Anthropic API spend limit reached. Only the run owner can resume or cancel this hold. There is no scheduled retry. Resume uses this run's current credential selection."
           : parkKey === "provider_outage"
             ? "The provider is unavailable. Retries automatically. If a provider recovery bound is enabled and reached, the run enters an owner hold."
           : parkKey.startsWith("publication:")
@@ -2547,6 +2653,8 @@ export function RunView() {
               ? "The run is held because its retained work is not attested to the planned base commit. The agent was not started. Recover the work or start a successor run."
             : parkKey === "repo_agent_source_unavailable"
               ? "The repository's agent definitions could not be read. The agent was not started. Only the run owner can Resume when the revision is available, or Cancel. There is no automatic retry."
+            : parkKey === "run_override_unavailable"
+              ? "Model choice unavailable. The run's chosen model or effort cannot run on its harness. Resume retries only if the choice has become available on that harness; otherwise Cancel and start a new run with a different choice."
             : parkKey === "iteration_budget_exhausted:spent"
               ? "Iteration limit reached. The remaining wall budget is spent. Extend time, then explicitly Resume, or Cancel. Extend leaves the run paused."
             : parkKey === "iteration_budget_exhausted"
@@ -2744,20 +2852,10 @@ export function RunView() {
                   + the "Completion blocked" StatusPill cover it. */}
               {!policyBlocked && run.status === "paused" &&
                 run.hold_reason !== "completion_blocked" &&
-                // PRD #1732: a credential_disabled hold resumes on Enable (its panel), and a
-                // plain Resume would only park it again.
-                run.hold_reason !== "credential_disabled" &&
-                // PRD #3989 M3: the server refuses Resume (409) for a credentials_reset hold; it
-                // resumes on its own once a credential is added.
-                run.hold_reason !== "credentials_reset" &&
-                run.hold_reason !== "provider_unavailable" &&
-                run.hold_reason !== "iteration_budget_exhausted" &&
-                // Issue #3181: the token-switch holds offer Resume in their own panel, which
-                // shows the server's settling refusal inline.
-                credentialSwitchHold(run) === null &&
-                // Issue #3194: Resume is refused by the server for a base-attestation hold.
-                run.hold_reason !== "base_attestation_missing" &&
-                run.hold_reason !== "repo_agent_source_unavailable" &&
+                // The non-completion holds (NON_COMPLETION_HOLDS) have their own panel (an
+                // Enable, a credential add, the token-switch refusal inline) or are refused by
+                // the server; run_override_unavailable has RunOverrideHoldPanel.
+                !isNonCompletionHold(run.hold_reason) &&
                 (canSteer ? (
                   <Button
                     size="sm"
@@ -3166,6 +3264,12 @@ export function RunView() {
           if (isCurrent()) await refreshRun();
         }); }}
         onCancel={() => { void cancelRun(); }} />
+      <RunOverrideHoldPanel run={run} ownerProof={canSteer && run.id === id} busy={busy}
+        onResume={() => { void act(async (isCurrent) => {
+          await api.resumeRun(run.id);
+          if (isCurrent()) await refreshRun();
+        }); }}
+        onCancel={() => { void cancelRun(); }} />
       <PausedPanel
         run={run}
         origin={pauseOrigin(run, messages, pauseOriginReady)}
@@ -3199,6 +3303,7 @@ export function RunView() {
         busy={busy}
         onResume={() => { void resumeWorkerHold(); }}
         onCancel={() => { void cancelRun(); }}
+        onSwitched={refreshRun}
       />
 
 
@@ -3333,7 +3438,7 @@ export function RunView() {
 
       {/* PRD #88: ALWAYS MOUNTED, empty until a park announces itself — see the note at
           parkAnnounce for why the region cannot live inside QuestionPanel. sr-only
-          because the panel below already carries the message for everyone else. The
+          because the visible panels already carry the message for everyone else. The
           effect fires after mount, so the region exists before its content changes even
           on a page load that arrives at an already-parked run. */}
       <div className="sr-only" role="status" aria-live="polite">
