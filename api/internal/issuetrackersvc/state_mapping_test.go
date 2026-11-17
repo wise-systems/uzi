@@ -128,6 +128,8 @@ func TestSetStateMappingRefusals(t *testing.T) {
 		{"control character", edit(func(m *StateMapping) { m.Columns[0].LabelName = "a\nb" }), KindBadRequest, "control"},
 		{"zero-width label", edit(func(m *StateMapping) { m.Columns[0].LabelName = "In\u200bProgress" }), KindBadRequest, "control"},
 		{"bidi state", edit(func(m *StateMapping) { m.OpenState = "Op\u202een" }), KindBadRequest, "control"},
+		{"filler label", edit(func(m *StateMapping) { m.Columns[0].LabelName = "Review\u3164" }), KindBadRequest, "blank-filler"},
+		{"variation selector state", edit(func(m *StateMapping) { m.OpenState = "Open\uFE0F" }), KindBadRequest, "variation-selector"},
 		{"too long", edit(func(m *StateMapping) { m.ClosedState = strings.Repeat("x", 201) }), KindBadRequest, "200"},
 		{"too many columns", edit(func(m *StateMapping) { m.Columns = make([]ColumnState, 11) }), KindBadRequest, "too many"},
 	}
@@ -163,4 +165,17 @@ func TestStateMappingScopeAndLink(t *testing.T) {
 	wantMappingErr(t, err, KindConflict, "not linked")
 	_, err = h.svc.GetStateMapping(ctx, h.user, unlinked)
 	wantMappingErr(t, err, KindConflict, "not linked")
+}
+
+// A brace is refused in a column label (it is a tag-name rule) but not in a State name:
+// a State is written by id and never goes into a query, and ListStates lists it.
+func TestSetStateMappingAcceptsABracedState(t *testing.T) {
+	h := newYTHarness(t)
+	repo := linkedMappingRepo(t, h)
+	h.srv.SeedState("In {Review}", false)
+	m := validMapping()
+	m.Columns[1].State = "In {Review}"
+	if _, err := h.svc.SetStateMapping(context.Background(), h.user, repo, m); err != nil {
+		t.Fatalf("SetStateMapping with a braced State: %v", err)
+	}
 }

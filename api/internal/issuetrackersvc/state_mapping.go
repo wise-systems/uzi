@@ -24,7 +24,7 @@ const (
 	maxMappedColumns    = 10
 	stateMappingNoLink  = "this repo is not linked to an issue tracker project"
 	stateMappingNoConn  = "the repo's issue tracker connection is missing; it cannot be read"
-	stateMappingBadName = "a state or column name is empty, longer than 200 characters or holds a control or invisible character"
+	stateMappingBadName = "a state or column name is empty, too long (max 200), or holds a control, invisible, blank-filler or variation-selector character (or, in a column name, a brace)"
 )
 
 // ColumnState maps one board column, by its label name, to the State it stands for.
@@ -192,16 +192,20 @@ func (s *Service) SetStateMapping(ctx context.Context, userID, repoID uuid.UUID,
 	return in, nil
 }
 
-// validNameBounds holds a name to what migration 00468 checks (1 to 200 characters, no control
-// character) and also refuses what issuetracker.LabelNameProblem refuses (braces, invisible
-// characters, blank fillers, variation selectors), which the CHECKs cannot say.
-func validNameBounds(name string) bool {
+// validStateName holds a State name to what migration 00468 checks (1 to 200 characters, no
+// control character) and to the rule ListStates applies (issuetracker.StateNameProblem: no
+// invisible, blank-filler or variation-selector character). A brace is allowed: a State is
+// written by id and never goes into a query.
+func validStateName(name string) bool {
 	n := utf8.RuneCountInString(name)
-	if n < 1 || n > maxStateNameLen {
-		return false
-	}
-	return !issuetracker.LabelNameProblem(name)
+	return n >= 1 && n <= maxStateNameLen && !issuetracker.StateNameProblem(name)
 }
+
+// validColumnLabel holds a board column label to the rule a linked repo's ConfigureColumns
+// applies (issuetracker.LabelNameProblem: at most 200 bytes, no brace, no invisible,
+// blank-filler or variation-selector character), which is stricter than the 1 to 200
+// character CHECK of migration 00468.
+func validColumnLabel(name string) bool { return !issuetracker.LabelNameProblem(name) }
 
 // validateMappingShape is the part of the validation that needs no issue tracker read:
 // name bounds, the column cap, and distinct column labels and distinct States.
@@ -210,7 +214,7 @@ func validateMappingShape(in StateMapping) *Error {
 	if len(in.Columns) > maxMappedColumns {
 		return bad(fmt.Sprintf("too many mapped columns (max %d)", maxMappedColumns))
 	}
-	if !validNameBounds(in.OpenState) || !validNameBounds(in.ClosedState) {
+	if !validStateName(in.OpenState) || !validStateName(in.ClosedState) {
 		return bad(stateMappingBadName)
 	}
 	labels := map[string]bool{}
@@ -220,7 +224,7 @@ func validateMappingShape(in StateMapping) *Error {
 	}
 	used[in.ClosedState] = true
 	for _, c := range in.Columns {
-		if !validNameBounds(c.LabelName) || !validNameBounds(c.State) {
+		if !validColumnLabel(c.LabelName) || !validStateName(c.State) {
 			return bad(stateMappingBadName)
 		}
 		if labels[c.LabelName] {

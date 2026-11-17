@@ -809,7 +809,7 @@ func (h *Handler) ConfigureColumns(w http.ResponseWriter, r *http.Request) {
 		// variation-selector character, at most 200 bytes.
 		for _, n := range names {
 			if issuetracker.LabelNameProblem(n) {
-				httpx.Error(w, http.StatusBadRequest, "a column name is too long (max 200 bytes) or has a brace or an invisible character")
+				httpx.Error(w, http.StatusBadRequest, "a column name is too long (max 200 bytes) or has a brace or an invisible, blank-filler or variation-selector character")
 				return
 			}
 		}
