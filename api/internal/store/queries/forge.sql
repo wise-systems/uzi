@@ -541,11 +541,14 @@ RETURNING *;
 -- board_position omission, with the same reason), but a row whose cached values are all
 -- unchanged is left untouched, so a tick that finds nothing new rewrites nothing and
 -- issues.synced_at is not refreshed by it. Nothing reads issues.synced_at. issue_key is
--- compared as written (the linked sync always passes it).
+-- compared as written (the linked sync always passes it). It is also the one upsert that
+-- writes issues.issue_tracker_column (PRD #4173 M5), the card's board column read from its
+-- issue tracker State: NULL is the Open lane, and the column is part of the change check so
+-- a changed State mapping is cached again. UpsertIssue and UpsertIssueLabels never touch it.
 INSERT INTO issues (
     repo_id, forge_issue_iid, title, state, labels, assignee_ids, web_url, author,
-    has_prd_link, forge_updated_at, issue_key, synced_at
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, now())
+    has_prd_link, forge_updated_at, issue_key, issue_tracker_column, synced_at
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now())
 ON CONFLICT (repo_id, forge_issue_iid) DO UPDATE
 SET title            = EXCLUDED.title,
     state            = EXCLUDED.state,
@@ -556,12 +559,33 @@ SET title            = EXCLUDED.title,
     has_prd_link     = EXCLUDED.has_prd_link,
     forge_updated_at = EXCLUDED.forge_updated_at,
     issue_key        = EXCLUDED.issue_key,
+    issue_tracker_column = EXCLUDED.issue_tracker_column,
     synced_at        = now()
 WHERE (issues.title, issues.state, issues.labels, issues.assignee_ids, issues.web_url, issues.author,
-       issues.has_prd_link, issues.forge_updated_at, issues.issue_key)
+       issues.has_prd_link, issues.forge_updated_at, issues.issue_key, issues.issue_tracker_column)
       IS DISTINCT FROM
       (EXCLUDED.title, EXCLUDED.state, EXCLUDED.labels, EXCLUDED.assignee_ids, EXCLUDED.web_url, EXCLUDED.author,
-       EXCLUDED.has_prd_link, EXCLUDED.forge_updated_at, EXCLUDED.issue_key);
+       EXCLUDED.has_prd_link, EXCLUDED.forge_updated_at, EXCLUDED.issue_key, EXCLUDED.issue_tracker_column);
+
+-- name: SetIssueTrackerColumn :one
+-- The cached board column of a linked card after a successful move (PRD #4173 M5):
+-- writes ONLY issue_tracker_column (an empty column is the Open lane and is stored as
+-- NULL, because the table's CHECK refuses an empty string) and synced_at, never state, labels or
+-- board_position. Forge-first like every cache write here: the caller has already moved
+-- the issue in the issue tracker. RETURNING * for the single-card re-render.
+UPDATE issues
+SET issue_tracker_column = NULLIF(@issue_tracker_column::text, ''), synced_at = now()
+WHERE repo_id = @repo_id AND forge_issue_iid = @forge_issue_iid
+RETURNING *;
+
+-- name: ClearIssueTrackerColumnsNotIn :exec
+-- Clears the cached column of every issue of the repo whose column is no longer one of
+-- the board's columns (PRD #4173 M5), so a removed column puts its cards back in the Open
+-- lane instead of leaving a column no board shows. keep is never NULL (NULL would match
+-- nothing): an empty array clears every cached column.
+UPDATE issues
+SET issue_tracker_column = NULL
+WHERE repo_id = @repo_id AND issue_tracker_column <> ALL(@keep::text[]);
 
 -- name: UpsertIssueLabels :one
 -- Labels is the INSERT seed only. On conflict, remove from CURRENT issues.labels,

@@ -120,7 +120,9 @@ func (f *linkedHandlerFixture) assertNothingSent(t *testing.T) {
 	}
 }
 
-// Every issue write on a linked repo is a clear 409 and sends nothing anywhere.
+// Every issue write on a linked repo that no unit has lifted is a clear 409 and sends nothing
+// anywhere. The board move is not in the table: it is offered since PRD #4173 M5 (see
+// linked_board_livedb_test.go).
 func TestLinkedRepoIssueWritesAreRefusedWith409LiveDB(t *testing.T) {
 	f := newLinkedHandlerFixture(t, true)
 	cases := []struct {
@@ -129,9 +131,6 @@ func TestLinkedRepoIssueWritesAreRefusedWith409LiveDB(t *testing.T) {
 	}{
 		{"create issue", func() *httptest.ResponseRecorder {
 			return f.call(f.h.CreateIssue, http.MethodPost, map[string]string{"title": "t", "description": "d"})
-		}},
-		{"move issue", func() *httptest.ResponseRecorder {
-			return f.call(f.h.MoveIssue, http.MethodPost, map[string]string{"to_column": "In Progress"})
 		}},
 		{"promote issue", func() *httptest.ResponseRecorder {
 			return f.call(f.h.PromoteIssue, http.MethodPost, nil)
@@ -143,7 +142,7 @@ func TestLinkedRepoIssueWritesAreRefusedWith409LiveDB(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			rr := tc.do()
-			if rr.Code != http.StatusConflict || !strings.Contains(rr.Body.String(), "issue writes on a repo linked to an issue tracker are not offered yet") {
+			if rr.Code != http.StatusConflict || !strings.Contains(rr.Body.String(), "this issue write is not offered on a repo linked to an issue tracker") {
 				t.Fatalf("status = %d body = %s, want the 409 refusal", rr.Code, rr.Body.String())
 			}
 			f.assertNothingSent(t)

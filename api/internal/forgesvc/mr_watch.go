@@ -216,7 +216,7 @@ func (s *Service) guardedMRMove(ctx context.Context, repoID uuid.UUID, forgeProj
 	if err := json.Unmarshal(issue.Labels, &labels); err != nil {
 		labels = []string{}
 	}
-	current, _, _ := board.ResolveColumn(labels, issue.State, position)
+	current, _, _ := board.ResolveColumn(board.CardColumnLabels(isLinkedTracker(tr), labels, issue.IssueTrackerColumn.String), issue.State, position)
 	if current != wantSource {
 		// A human placed the card elsewhere since the run parked it — manual drags
 		// win (same baseline discipline as runlifecycle.apply). Consume the edge;

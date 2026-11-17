@@ -61,7 +61,7 @@ func TestLinkedRepoFilingRoutesAreRefusedAndReleaseTheirClaimLiveDB(t *testing.T
 		t.Run(tc.name, func(t *testing.T) {
 			rr := httptest.NewRecorder()
 			tc.call(rr)
-			if rr.Code != http.StatusConflict || !strings.Contains(rr.Body.String(), "not offered yet") {
+			if rr.Code != http.StatusConflict || !strings.Contains(rr.Body.String(), "is not offered on a repo linked to an issue tracker") {
 				t.Fatalf("status = %d body = %s, want the 409 refusal", rr.Code, rr.Body.String())
 			}
 			if n := f.hits.Load(); n != 0 {

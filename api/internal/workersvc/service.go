@@ -8369,7 +8369,7 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 	// two plain reads are kept out of the lock-holding window rather than acquiring a second
 	// connection inside it. (An explicit credential override is still validated in-closure, on the
 	// tx-bound q, so it takes no second connection either.)
-	originColumn := s.originColumn(ctx, repoID, issue)
+	originColumn := s.originColumn(ctx, repoID, issue, row.IssueTrackerConnectionID.Valid)
 	resolvedWaitOnLimit := s.resolveWaitOnLimit(ctx, userID, waitOnLimit)
 	run, err := s.createRunResolved(ctx, userID, explicit, func(q Store, resolved resolvedHarness) (store.Run, error) {
 		// Issue #1626: the authoritative cross-kind branch check, FIRST in the closure. The
@@ -8602,7 +8602,11 @@ func isAssignedToBot(assigneeIDsJSON []byte, botID int64) bool {
 // cannot be listed the origin is left NULL (unknown), NOT "" — the run is not
 // blocked, but a later restore must skip rather than confidently strip the card
 // to Open on a guess (spec invariant: NULL = unknown = never restore).
-func (s *Service) originColumn(ctx context.Context, repoID uuid.UUID, issue store.Issue) pgtype.Text {
+//
+// linked is the repo's linkage (PRD #4173 M5): a linked card's column is its cached
+// issue_tracker_column, never a label, so the origin is the card's real column and the
+// lifecycle's manual-drag guard compares like with like.
+func (s *Service) originColumn(ctx context.Context, repoID uuid.UUID, issue store.Issue, linked bool) pgtype.Text {
 	cols, err := s.q.ListBoardColumns(ctx, repoID)
 	if err != nil {
 		return pgtype.Text{} // NULL = unknown, never guess Open
@@ -8615,7 +8619,7 @@ func (s *Service) originColumn(ctx context.Context, repoID uuid.UUID, issue stor
 	if err := json.Unmarshal(issue.Labels, &labels); err != nil {
 		labels = []string{}
 	}
-	col, _, _ := board.ResolveColumn(labels, issue.State, position)
+	col, _, _ := board.ResolveColumn(board.CardColumnLabels(linked, labels, issue.IssueTrackerColumn.String), issue.State, position)
 	return pgconv.Text(col) // always valid: "" = the implicit Open column, never NULL
 }
 

@@ -3,6 +3,7 @@ package forgesvc
 import (
 	"context"
 	"errors"
+	"slices"
 	"testing"
 	"time"
 
@@ -12,6 +13,7 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/forge/forgetest"
+	"github.com/vtmocanu/uzi/api/internal/issuesource"
 	"github.com/vtmocanu/uzi/api/internal/issuetracker"
 	"github.com/vtmocanu/uzi/api/internal/secretbox"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -69,6 +71,14 @@ func (d *stubDriver) UpdateIssueLabels(context.Context, int64, int64, []string, 
 func (d *stubDriver) UpdateIssueDescription(context.Context, int64, int64, string) error {
 	d.writes = append(d.writes, "UpdateIssueDescription")
 	return nil
+}
+func (d *stubDriver) MoveToColumn(context.Context, int64, int64, forge.ColumnMove) error {
+	d.writes = append(d.writes, "MoveToColumn")
+	return nil
+}
+func (d *stubDriver) ListIssuesWithState(context.Context, int64, forge.ListIssuesOptions) ([]issuesource.StatedIssue, error) {
+	d.reads = append(d.reads, "ListIssuesWithState")
+	return []issuesource.StatedIssue{{Issue: forge.Issue{IID: 3}, State: "In Progress"}}, nil
 }
 func (d *stubDriver) SetIssueState(context.Context, int64, int64, forge.IssueState) error {
 	d.writes = append(d.writes, "SetIssueState")
@@ -171,6 +181,7 @@ func writeAll(ctx context.Context, tr forge.IssueTracker, projectID int64) (acce
 		func() error { _, err := tr.CreateIssueNote(ctx, projectID, 9, "note"); return err },
 		func() error { _, err := tr.CreateIssue(ctx, projectID, "t", "d", nil); return err },
 		func() error { return tr.SetIssueState(ctx, projectID, 9, forge.StateClosed) },
+		func() error { return tr.MoveToColumn(ctx, projectID, 9, forge.ColumnMove{Column: "In Progress"}) },
 		func() error { return tr.UpdateIssueDescription(ctx, projectID, 9, "d") },
 		func() error { return tr.EnsureLabels(ctx, projectID, []forge.Label{{Name: "x"}}) },
 	}
@@ -202,8 +213,13 @@ func TestIssueTrackerForRepoUnlinkedWritesReachTheForge(t *testing.T) {
 			t.Fatalf("an unlinked repo's write was refused by the guard: %v", e)
 		}
 	}
-	if got := len(h.rec.Calls()); got != 6 {
-		t.Fatalf("recorder saw %d calls, want 6 writes: %v", got, h.rec.Calls())
+	// The six other writes are one call each; the move is logged in Moves() and reaches
+	// the recorder as its one label call (forge.MoveByLabels), seven calls in all.
+	if got := len(h.rec.Calls()); got != 7 {
+		t.Fatalf("recorder saw %d calls, want 7: %v", got, h.rec.Calls())
+	}
+	if got := len(h.rec.Moves()); got != 1 {
+		t.Fatalf("recorder saw %d moves, want 1: %v", got, h.rec.Moves())
 	}
 	if h.drivers.calls != 0 {
 		t.Fatalf("the issue tracker driver source was used for an unlinked repo")
@@ -239,17 +255,19 @@ func TestIssueTrackerForRepoLinkedBuildsTheBoundDriverBehindTheGuard(t *testing.
 		t.Errorf("a linked repo's issue side must not build the forge driver")
 	}
 
+	// Only the move and the State write are offered so far (PRD #4173 M5); every other
+	// write is still refused before any request.
 	accepted, errs := writeAll(context.Background(), tr, 4242)
-	if accepted != 0 || len(errs) != 6 {
-		t.Fatalf("accepted %d writes with %d errors, want none accepted", accepted, len(errs))
+	if accepted != 2 || len(errs) != 5 {
+		t.Fatalf("accepted %d writes with %d errors, want 2 accepted and 5 refused", accepted, len(errs))
 	}
 	for _, e := range errs {
 		if !errors.Is(e, ErrIssueWriteNotOffered) || !IssueWriteSkippable(e) {
 			t.Errorf("write error = %v, want ErrIssueWriteNotOffered", e)
 		}
 	}
-	if len(d.driver.writes) != 0 {
-		t.Fatalf("writes reached the driver: %v", d.driver.writes)
+	if want := []string{"SetIssueState", "MoveToColumn"}; !slices.Equal(d.driver.writes, want) {
+		t.Fatalf("writes that reached the driver = %v, want only %v", d.driver.writes, want)
 	}
 	if _, err := tr.ListIssues(context.Background(), 4242, forge.ListIssuesOptions{}); err != nil {
 		t.Fatal(err)

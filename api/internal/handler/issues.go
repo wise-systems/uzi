@@ -132,7 +132,7 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 	for _, c := range cols {
 		position[c.LabelName] = int(c.Position)
 	}
-	httpx.JSON(w, http.StatusCreated, map[string]any{"card": issueToCard(upserted, position, repo.ForgeType)})
+	httpx.JSON(w, http.StatusCreated, map[string]any{"card": issueToCard(upserted, position, repo.ForgeType, repo.IssueTrackerConnectionID.Valid)})
 }
 
 // issueDetailDTO is the in-app issue view payload (PRD #12 §3): the board card

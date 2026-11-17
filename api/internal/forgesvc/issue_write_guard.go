@@ -8,6 +8,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/issueinput"
 	"github.com/vtmocanu/uzi/api/internal/issuesource"
+	"github.com/vtmocanu/uzi/api/internal/issuetracker"
 )
 
 // ErrIssueWriteNotOffered is returned by the write guard for every write to a
@@ -35,21 +36,40 @@ func IssueWriteSkippable(err error) bool {
 	if errors.Is(err, ErrIssueWriteNotOffered) {
 		return true
 	}
+	return LinkedIssueGone(err)
+}
+
+// LinkedIssueGone reports whether err says a linked repo's issue is no longer in
+// the linked project (D10), as opposed to the write not being offered.
+func LinkedIssueGone(err error) bool {
 	var marked *linkedIssueError
 	return errors.As(err, &marked)
 }
 
+// ColumnMoveRefused reports whether err is the issue tracker driver refusing a
+// card move or State write before any request: the column has no State mapped,
+// the mapping is unset, or the target State is not allowed (PRD #4173 M5). It is
+// deliberately not part of IssueWriteSkippable: a refused move may succeed once
+// the owner saves the mapping, so a caller keeps its retry marker for it.
+func ColumnMoveRefused(err error) bool {
+	return errors.Is(err, issuetracker.ErrColumnNotMapped) ||
+		errors.Is(err, issuetracker.ErrStateMappingUnset) ||
+		errors.Is(err, issuetracker.ErrStateNotAllowed)
+}
+
 // issueWriteGuard wraps a linked repo's issue tracker driver. Reads pass
-// through; every write is refused before any request.
+// through, as do the move and State writes (PRD #4173 M5); every other write is
+// refused before any request until its own unit lifts it.
 type issueWriteGuard struct {
 	inner forge.IssueTracker
 }
 
 var (
-	_ forge.IssueTracker         = (*issueWriteGuard)(nil)
-	_ issueinput.AuthorMapper    = (*issueWriteGuard)(nil)
-	_ issueinput.IssueTextMapper = (*issueWriteGuard)(nil)
-	_ issueinput.LinkedIssueSide = (*issueWriteGuard)(nil)
+	_ forge.IssueTracker           = (*issueWriteGuard)(nil)
+	_ issueinput.AuthorMapper      = (*issueWriteGuard)(nil)
+	_ issueinput.IssueTextMapper   = (*issueWriteGuard)(nil)
+	_ issueinput.LinkedIssueSide   = (*issueWriteGuard)(nil)
+	_ issuesource.IssueStateLister = (*issueWriteGuard)(nil)
 )
 
 func markNotFound(err error) error {
@@ -67,6 +87,21 @@ func (g *issueWriteGuard) ListLabels(ctx context.Context, projectID int64) ([]fo
 func (g *issueWriteGuard) ListIssues(ctx context.Context, projectID int64, opts forge.ListIssuesOptions) ([]forge.Issue, error) {
 	return g.inner.ListIssues(ctx, projectID, opts)
 }
+
+// ListIssuesWithState forwards the listing with State values when the inner
+// driver offers it. A driver that cannot (unavailableIssueTracker) is an error,
+// never an empty result, because the linked full sync evicts every cached issue
+// the listing does not return.
+func (g *issueWriteGuard) ListIssuesWithState(ctx context.Context, projectID int64, opts forge.ListIssuesOptions) ([]issuesource.StatedIssue, error) {
+	l, ok := g.inner.(issuesource.IssueStateLister)
+	if !ok {
+		return nil, fmt.Errorf("list issues with state: the issue tracker driver cannot list State values: %w", errNoStateListing)
+	}
+	return l.ListIssuesWithState(ctx, projectID, opts)
+}
+
+// errNoStateListing marks an inner driver that has no ListIssuesWithState.
+var errNoStateListing = errors.New("listing with issue tracker States is unavailable")
 
 func (g *issueWriteGuard) GetIssue(ctx context.Context, projectID, issueIID int64) (forge.Issue, error) {
 	iss, err := g.inner.GetIssue(ctx, projectID, issueIID)
@@ -118,17 +153,21 @@ func (g *issueWriteGuard) UpdateIssueLabels(context.Context, int64, int64, []str
 	return g.refuse("update issue labels")
 }
 
-// MoveToColumn is refused for now; a later unit of PRD #4173 M5 offers it.
-func (g *issueWriteGuard) MoveToColumn(context.Context, int64, int64, forge.ColumnMove) error {
-	return g.refuse("move to column")
+// MoveToColumn passes through to the issue tracker driver (PRD #4173 M5). The
+// driver refuses an unmapped column or a State it may not write before any
+// request; a moved-away issue is marked so IssueWriteSkippable stays true (D10).
+func (g *issueWriteGuard) MoveToColumn(ctx context.Context, projectID, issueIID int64, move forge.ColumnMove) error {
+	return markNotFound(g.inner.MoveToColumn(ctx, projectID, issueIID, move))
 }
 
 func (g *issueWriteGuard) UpdateIssueDescription(context.Context, int64, int64, string) error {
 	return g.refuse("update issue description")
 }
 
-func (g *issueWriteGuard) SetIssueState(context.Context, int64, int64, forge.IssueState) error {
-	return g.refuse("set issue state")
+// SetIssueState passes through to the issue tracker driver, which writes the
+// stored closed or open State (PRD #4173 M5); a moved-away issue is marked.
+func (g *issueWriteGuard) SetIssueState(ctx context.Context, projectID, issueIID int64, state forge.IssueState) error {
+	return markNotFound(g.inner.SetIssueState(ctx, projectID, issueIID, state))
 }
 
 func (g *issueWriteGuard) CreateIssueNote(context.Context, int64, int64, string) (forge.IssueNote, error) {
@@ -137,9 +176,9 @@ func (g *issueWriteGuard) CreateIssueNote(context.Context, int64, int64, string)
 
 // UnavailableIssueTracker is the issue side handed to a linked repo whose resolver
 // failed (for example a connection removed from the allowlist): every read returns
-// cause, which is NOT skippable so no marker is settled over an outage, and every
-// write is refused by the write guard. It lets the poller's issue-side steps fail
-// or skip per candidate while the code-host steps carry on, instead of dereferencing
+// cause, which is NOT skippable so no marker is settled over an outage, as does a
+// move or State write; every other write is refused by the write guard. It lets
+// the poller's issue-side steps fail or skip per candidate while the code-host steps carry on, instead of dereferencing
 // a nil tracker.
 func UnavailableIssueTracker(cause error) forge.IssueTracker {
 	return &issueWriteGuard{inner: unavailableIssueTracker{cause: cause}}
@@ -154,6 +193,9 @@ func (u unavailableIssueTracker) EnsureLabels(context.Context, int64, []forge.La
 	return u.cause
 }
 func (u unavailableIssueTracker) ListIssues(context.Context, int64, forge.ListIssuesOptions) ([]forge.Issue, error) {
+	return nil, u.cause
+}
+func (u unavailableIssueTracker) ListIssuesWithState(context.Context, int64, forge.ListIssuesOptions) ([]issuesource.StatedIssue, error) {
 	return nil, u.cause
 }
 func (u unavailableIssueTracker) GetIssue(context.Context, int64, int64) (forge.Issue, error) {

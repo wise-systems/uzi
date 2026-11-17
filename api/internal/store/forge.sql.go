@@ -241,6 +241,26 @@ func (q *Queries) ClearBoardOrderExcept(ctx context.Context, arg ClearBoardOrder
 	return err
 }
 
+const clearIssueTrackerColumnsNotIn = `-- name: ClearIssueTrackerColumnsNotIn :exec
+UPDATE issues
+SET issue_tracker_column = NULL
+WHERE repo_id = $1 AND issue_tracker_column <> ALL($2::text[])
+`
+
+type ClearIssueTrackerColumnsNotInParams struct {
+	RepoID uuid.UUID `json:"repo_id"`
+	Keep   []string  `json:"keep"`
+}
+
+// Clears the cached column of every issue of the repo whose column is no longer one of
+// the board's columns (PRD #4173 M5), so a removed column puts its cards back in the Open
+// lane instead of leaving a column no board shows. keep is never NULL (NULL would match
+// nothing): an empty array clears every cached column.
+func (q *Queries) ClearIssueTrackerColumnsNotIn(ctx context.Context, arg ClearIssueTrackerColumnsNotInParams) error {
+	_, err := q.db.Exec(ctx, clearIssueTrackerColumnsNotIn, arg.RepoID, arg.Keep)
+	return err
+}
+
 const clearRepoGuardrailOverride = `-- name: ClearRepoGuardrailOverride :one
 UPDATE repos
 SET guardrail_override_reason = NULL,
@@ -2197,6 +2217,47 @@ func (q *Queries) SetForgeConnectionHumanUsername(ctx context.Context, arg SetFo
 	return i, err
 }
 
+const setIssueTrackerColumn = `-- name: SetIssueTrackerColumn :one
+UPDATE issues
+SET issue_tracker_column = NULLIF($1::text, ''), synced_at = now()
+WHERE repo_id = $2 AND forge_issue_iid = $3
+RETURNING id, repo_id, forge_issue_iid, title, state, labels, web_url, author, has_prd_link, forge_updated_at, synced_at, board_position, assignee_ids, issue_key, issue_tracker_column
+`
+
+type SetIssueTrackerColumnParams struct {
+	IssueTrackerColumn string    `json:"issue_tracker_column"`
+	RepoID             uuid.UUID `json:"repo_id"`
+	ForgeIssueIid      int64     `json:"forge_issue_iid"`
+}
+
+// The cached board column of a linked card after a successful move (PRD #4173 M5):
+// writes ONLY issue_tracker_column (an empty column is the Open lane and is stored as
+// NULL, because the table's CHECK refuses an empty string) and synced_at, never state, labels or
+// board_position. Forge-first like every cache write here: the caller has already moved
+// the issue in the issue tracker. RETURNING * for the single-card re-render.
+func (q *Queries) SetIssueTrackerColumn(ctx context.Context, arg SetIssueTrackerColumnParams) (Issue, error) {
+	row := q.db.QueryRow(ctx, setIssueTrackerColumn, arg.IssueTrackerColumn, arg.RepoID, arg.ForgeIssueIid)
+	var i Issue
+	err := row.Scan(
+		&i.ID,
+		&i.RepoID,
+		&i.ForgeIssueIid,
+		&i.Title,
+		&i.State,
+		&i.Labels,
+		&i.WebUrl,
+		&i.Author,
+		&i.HasPrdLink,
+		&i.ForgeUpdatedAt,
+		&i.SyncedAt,
+		&i.BoardPosition,
+		&i.AssigneeIds,
+		&i.IssueKey,
+		&i.IssueTrackerColumn,
+	)
+	return i, err
+}
+
 const setRepoAgentSourceDefault = `-- name: SetRepoAgentSourceDefault :one
 UPDATE repos SET agent_source_default = $1::text
 WHERE repos.id = $2
@@ -3440,8 +3501,8 @@ func (q *Queries) UpsertIssue(ctx context.Context, arg UpsertIssueParams) (Issue
 const upsertIssueIfChanged = `-- name: UpsertIssueIfChanged :exec
 INSERT INTO issues (
     repo_id, forge_issue_iid, title, state, labels, assignee_ids, web_url, author,
-    has_prd_link, forge_updated_at, issue_key, synced_at
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, now())
+    has_prd_link, forge_updated_at, issue_key, issue_tracker_column, synced_at
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now())
 ON CONFLICT (repo_id, forge_issue_iid) DO UPDATE
 SET title            = EXCLUDED.title,
     state            = EXCLUDED.state,
@@ -3452,33 +3513,38 @@ SET title            = EXCLUDED.title,
     has_prd_link     = EXCLUDED.has_prd_link,
     forge_updated_at = EXCLUDED.forge_updated_at,
     issue_key        = EXCLUDED.issue_key,
+    issue_tracker_column = EXCLUDED.issue_tracker_column,
     synced_at        = now()
 WHERE (issues.title, issues.state, issues.labels, issues.assignee_ids, issues.web_url, issues.author,
-       issues.has_prd_link, issues.forge_updated_at, issues.issue_key)
+       issues.has_prd_link, issues.forge_updated_at, issues.issue_key, issues.issue_tracker_column)
       IS DISTINCT FROM
       (EXCLUDED.title, EXCLUDED.state, EXCLUDED.labels, EXCLUDED.assignee_ids, EXCLUDED.web_url, EXCLUDED.author,
-       EXCLUDED.has_prd_link, EXCLUDED.forge_updated_at, EXCLUDED.issue_key)
+       EXCLUDED.has_prd_link, EXCLUDED.forge_updated_at, EXCLUDED.issue_key, EXCLUDED.issue_tracker_column)
 `
 
 type UpsertIssueIfChangedParams struct {
-	RepoID         uuid.UUID          `json:"repo_id"`
-	ForgeIssueIid  int64              `json:"forge_issue_iid"`
-	Title          string             `json:"title"`
-	State          string             `json:"state"`
-	Labels         []byte             `json:"labels"`
-	AssigneeIds    []byte             `json:"assignee_ids"`
-	WebUrl         string             `json:"web_url"`
-	Author         pgtype.Text        `json:"author"`
-	HasPrdLink     bool               `json:"has_prd_link"`
-	ForgeUpdatedAt pgtype.Timestamptz `json:"forge_updated_at"`
-	IssueKey       pgtype.Text        `json:"issue_key"`
+	RepoID             uuid.UUID          `json:"repo_id"`
+	ForgeIssueIid      int64              `json:"forge_issue_iid"`
+	Title              string             `json:"title"`
+	State              string             `json:"state"`
+	Labels             []byte             `json:"labels"`
+	AssigneeIds        []byte             `json:"assignee_ids"`
+	WebUrl             string             `json:"web_url"`
+	Author             pgtype.Text        `json:"author"`
+	HasPrdLink         bool               `json:"has_prd_link"`
+	ForgeUpdatedAt     pgtype.Timestamptz `json:"forge_updated_at"`
+	IssueKey           pgtype.Text        `json:"issue_key"`
+	IssueTrackerColumn pgtype.Text        `json:"issue_tracker_column"`
 }
 
 // The linked issue sync's write (PRD #4173): the same columns as UpsertIssue (and the same
 // board_position omission, with the same reason), but a row whose cached values are all
 // unchanged is left untouched, so a tick that finds nothing new rewrites nothing and
 // issues.synced_at is not refreshed by it. Nothing reads issues.synced_at. issue_key is
-// compared as written (the linked sync always passes it).
+// compared as written (the linked sync always passes it). It is also the one upsert that
+// writes issues.issue_tracker_column (PRD #4173 M5), the card's board column read from its
+// issue tracker State: NULL is the Open lane, and the column is part of the change check so
+// a changed State mapping is cached again. UpsertIssue and UpsertIssueLabels never touch it.
 func (q *Queries) UpsertIssueIfChanged(ctx context.Context, arg UpsertIssueIfChangedParams) error {
 	_, err := q.db.Exec(ctx, upsertIssueIfChanged,
 		arg.RepoID,
@@ -3492,6 +3558,7 @@ func (q *Queries) UpsertIssueIfChanged(ctx context.Context, arg UpsertIssueIfCha
 		arg.HasPrdLink,
 		arg.ForgeUpdatedAt,
 		arg.IssueKey,
+		arg.IssueTrackerColumn,
 	)
 	return err
 }

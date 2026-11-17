@@ -14,6 +14,7 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/forge/forgetest"
+	"github.com/vtmocanu/uzi/api/internal/issuesource"
 	"github.com/vtmocanu/uzi/api/internal/settings"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -27,6 +28,9 @@ type fakeForge struct {
 	issues    []forge.Issue
 	listErr   error
 	listCalls []forge.ListIssuesOptions
+	// states scripts the issue tracker State name ListIssuesWithState reports per issue
+	// iid (PRD #4173 M5); a missing iid reports "" (no readable State).
+	states map[int64]string
 
 	// PRD #102 M6 Decision 9 made both sync paths issue TWO ListIssues calls: the
 	// PRD-labelled one (state=all) and an additive open, no-label one. openIssues /
@@ -274,6 +278,17 @@ func (f *fakeForge) UpdateIssueLabels(_ context.Context, _, _ int64, add, remove
 
 // MoveToColumn performs the label-backed move over this fake's own label
 // methods; the embedded BaseFake cannot dispatch to them.
+func (f *fakeForge) ListIssuesWithState(ctx context.Context, p int64, opts forge.ListIssuesOptions) ([]issuesource.StatedIssue, error) {
+	issues, err := f.ListIssues(ctx, p, opts)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]issuesource.StatedIssue, 0, len(issues))
+	for _, is := range issues {
+		out = append(out, issuesource.StatedIssue{Issue: is, State: f.states[is.IID]})
+	}
+	return out, nil
+}
 func (f *fakeForge) MoveToColumn(ctx context.Context, p, i int64, m forge.ColumnMove) error {
 	return forge.MoveByLabels(ctx, f, p, i, m)
 }
@@ -322,8 +337,12 @@ type fakeStore struct {
 	upserts       []store.UpsertIssueParams
 	// changedUpserts counts the UpsertIssueIfChanged calls (the linked sync's write); they also land in upserts.
 	changedUpserts int
-	labelUpserts   []store.UpsertIssueLabelsParams // AutoMove / SetIssueLabel writes (PRD #767)
-	deleteCalls    []store.DeleteIssuesNotInParams
+	// changedColumns is the issue_tracker_column each UpsertIssueIfChanged call carried (PRD #4173 M5).
+	changedColumns []pgtype.Text
+	// columnWrites records SetIssueTrackerColumn calls (a linked move's cache write).
+	columnWrites []store.SetIssueTrackerColumnParams
+	labelUpserts []store.UpsertIssueLabelsParams // AutoMove / SetIssueLabel writes (PRD #767)
+	deleteCalls  []store.DeleteIssuesNotInParams
 
 	// Close/reopen state flips (PRD #1034 M2). stateUpdates records UpdateIssueState
 	// (bare close) calls, reopens records ReopenIssueState calls — each by identity so a
@@ -398,7 +417,12 @@ func (s *fakeStore) UpsertIssue(_ context.Context, arg store.UpsertIssueParams) 
 	return store.Issue{RepoID: arg.RepoID, ForgeIssueIid: arg.ForgeIssueIid, State: arg.State, Labels: arg.Labels}, nil
 }
 func (s *fakeStore) UpsertIssueIfChanged(_ context.Context, arg store.UpsertIssueIfChangedParams) error {
-	s.upserts = append(s.upserts, store.UpsertIssueParams(arg))
+	s.upserts = append(s.upserts, store.UpsertIssueParams{
+		RepoID: arg.RepoID, ForgeIssueIid: arg.ForgeIssueIid, Title: arg.Title, State: arg.State,
+		Labels: arg.Labels, AssigneeIds: arg.AssigneeIds, WebUrl: arg.WebUrl, Author: arg.Author,
+		HasPrdLink: arg.HasPrdLink, ForgeUpdatedAt: arg.ForgeUpdatedAt, IssueKey: arg.IssueKey,
+	})
+	s.changedColumns = append(s.changedColumns, arg.IssueTrackerColumn)
 	s.changedUpserts++
 	return nil
 }
@@ -453,6 +477,13 @@ func (s *fakeStore) ReopenIssueState(_ context.Context, arg store.ReopenIssueSta
 	// this being the row the service threads into AutoMove. Labels come from reopenLabels
 	// (the real query leaves them untouched); default empty mimics a card with no column.
 	return store.Issue{RepoID: arg.RepoID, ForgeIssueIid: arg.ForgeIssueIid, State: string(forge.StateOpened), Labels: s.reopenLabels}, nil
+}
+func (s *fakeStore) SetIssueTrackerColumn(_ context.Context, arg store.SetIssueTrackerColumnParams) (store.Issue, error) {
+	s.columnWrites = append(s.columnWrites, arg)
+	row := s.issue
+	row.RepoID, row.ForgeIssueIid = arg.RepoID, arg.ForgeIssueIid
+	row.IssueTrackerColumn = pgtype.Text{String: arg.IssueTrackerColumn, Valid: arg.IssueTrackerColumn != ""}
+	return row, nil
 }
 func (s *fakeStore) DeleteIssuesNotIn(_ context.Context, arg store.DeleteIssuesNotInParams) (int64, error) {
 	s.deleteCalls = append(s.deleteCalls, arg)

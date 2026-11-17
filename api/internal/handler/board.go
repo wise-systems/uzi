@@ -549,7 +549,7 @@ func (h *Handler) buildBoard(w http.ResponseWriter, r *http.Request, repo store.
 	// repo.UserID is the board viewer (the connection owner); IsMine gates the
 	// owner-only run-view link. repo.ForgeType stamps every card's forge for the
 	// per-card MR/PR noun (all cards on one board share the repo's connection).
-	cards := assembleCards(issues, runRows, cardPipelines, autofixHalts, position, repo.UserID, repo.ForgeType, revising, h.cfg.RunTimeout)
+	cards := assembleCards(issues, runRows, cardPipelines, autofixHalts, position, repo.UserID, repo.ForgeType, repo.IssueTrackerConnectionID.Valid, revising, h.cfg.RunTimeout)
 
 	return boardDTO{
 		RepoID:         repo.ID.String(),
@@ -697,7 +697,7 @@ func nonNilAssigneeIDs(ids []int64) []int64 {
 // ids whose latest plan-ish message is a plan_revising (issue #750); a nil map leaves
 // every IsRevising false. autofixHalts is cardAutofixHalts' iid -> attempts map (PRD
 // #1650 D3a); a nil map leaves every card un-halted.
-func assembleCards(issues []store.Issue, runRows []store.ListLatestRunsForRepoRow, cardPipelines map[int64]*apitypes.PipelineDTO, autofixHalts map[int64]int32, position map[string]int, viewerID uuid.UUID, forgeType string, revising map[uuid.UUID]bool, globalTimeout time.Duration) []cardDTO {
+func assembleCards(issues []store.Issue, runRows []store.ListLatestRunsForRepoRow, cardPipelines map[int64]*apitypes.PipelineDTO, autofixHalts map[int64]int32, position map[string]int, viewerID uuid.UUID, forgeType string, linked bool, revising map[uuid.UUID]bool, globalTimeout time.Duration) []cardDTO {
 	latestByIID := make(map[int64]*latestRunDTO, len(runRows))
 	for _, rr := range runRows {
 		dto := mapLatestRun(rr.ID, rr.UserID, rr.Status, rr.Kind, rr.IterationCount, rr.HasPlanMd.Bool, rr.MrIid, rr.MrWebUrl,
@@ -714,7 +714,7 @@ func assembleCards(issues []store.Issue, runRows []store.ListLatestRunsForRepoRo
 	cards := make([]cardDTO, 0, len(issues))
 	for _, is := range issues {
 		labels := decodeLabels(is.Labels)
-		col, closed, conflict := board.ResolveColumn(labels, is.State, position)
+		col, closed, conflict := board.ResolveColumn(board.CardColumnLabels(linked, labels, is.IssueTrackerColumn.String), is.State, position)
 		card := cardDTO{
 			IID:         is.ForgeIssueIid,
 			Title:       is.Title,
@@ -869,7 +869,7 @@ func (h *Handler) ConfigureColumns(w http.ResponseWriter, r *http.Request) {
 }
 
 // replaceLinkedBoardColumns replaces the board_columns rows of a linked repo and prunes the
-// state mapping rows of every column that is gone, in one transaction that first takes the repo
+// state mapping rows and cached card columns of every column that is gone, in one transaction that first takes the repo
 // row lock the state mapping route takes, so a mapping save and a reconfigure serialise. It
 // writes the response itself on failure and reports whether it succeeded.
 func (h *Handler) replaceLinkedBoardColumns(w http.ResponseWriter, r *http.Request, repo store.GetRepoForUserRow, names []string) bool {
@@ -905,6 +905,11 @@ func (h *Handler) replaceLinkedBoardColumns(w http.ResponseWriter, r *http.Reque
 	keep := append([]string{}, names...)
 	if err := qtx.PruneRepoIssueTrackerColumnStates(ctx, store.PruneRepoIssueTrackerColumnStatesParams{RepoID: repo.ID, Keep: keep}); err != nil {
 		return fail("prune issue tracker column states", err)
+	}
+	// A cached card whose column is gone returns to the Open lane in the same transaction,
+	// or its cached column would name a column no board shows (PRD #4173 M5).
+	if err := qtx.ClearIssueTrackerColumnsNotIn(ctx, store.ClearIssueTrackerColumnsNotInParams{RepoID: repo.ID, Keep: keep}); err != nil {
+		return fail("clear cached columns of removed board columns", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return fail("commit linked board columns tx", err)
@@ -1154,6 +1159,11 @@ func (h *Handler) MoveIssue(w http.ResponseWriter, r *http.Request) {
 		if writeIssueWriteNotOffered(w, err) {
 			return
 		}
+		// On a linked repo a refused move (409) or a moved-away issue (404) leaves the
+		// cache unchanged, so the card snaps back; any other failure is a 502.
+		if repo.IssueTrackerConnectionID.Valid && writeLinkedMoveError(w, err) {
+			return
+		}
 		httpx.Error(w, http.StatusBadGateway, "could not update the issue on the forge: "+err.Error())
 		return
 	}
@@ -1182,7 +1192,7 @@ func (h *Handler) MoveIssue(w http.ResponseWriter, r *http.Request) {
 	for _, c := range cols {
 		position[c.LabelName] = int(c.Position)
 	}
-	card := issueToCard(updated, position, repo.ForgeType)
+	card := issueToCard(updated, position, repo.ForgeType, repo.IssueTrackerConnectionID.Valid)
 	// Carry the issue's latest run on the single-card response too, so a drag never
 	// blanks the run badge the board is showing (the client replaces the card).
 	if lr, err := h.q.GetLatestRunForIssue(r.Context(), store.GetLatestRunForIssueParams{RepoID: repo.ID, IssueIid: pgtype.Int8{Int64: iid, Valid: true}}); err == nil {
@@ -1298,7 +1308,7 @@ func (h *Handler) PromoteIssue(w http.ResponseWriter, r *http.Request) {
 	for _, c := range cols {
 		position[c.LabelName] = int(c.Position)
 	}
-	card := issueToCard(updated, position, repo.ForgeType)
+	card := issueToCard(updated, position, repo.ForgeType, repo.IssueTrackerConnectionID.Valid)
 	if lr, err := h.q.GetLatestRunForIssue(r.Context(), store.GetLatestRunForIssueParams{RepoID: repo.ID, IssueIid: pgtype.Int8{Int64: iid, Valid: true}}); err == nil {
 		card.LatestRun = mapLatestRun(lr.ID, lr.UserID, lr.Status, lr.Kind, lr.IterationCount, lr.HasPlanMd.Bool, lr.MrIid, lr.MrWebUrl,
 			lr.MrState, lr.FailureReason, lr.StopKind, lr.StopReason, lr.Health, lr.HealthReason, lr.HealthSince, lr.HoldReason,
@@ -1319,9 +1329,9 @@ func (h *Handler) PromoteIssue(w http.ResponseWriter, r *http.Request) {
 // issueToCard resolves a cached issue row into a card DTO. forgeType stamps the
 // card's forge for the per-card MR/PR noun (PRD #65 D2), from the repo's connection.
 // Three production callers: MoveIssue, PromoteIssue and CreateIssue (issues.go).
-func issueToCard(is store.Issue, position map[string]int, forgeType string) cardDTO {
+func issueToCard(is store.Issue, position map[string]int, forgeType string, linked bool) cardDTO {
 	labels := decodeLabels(is.Labels)
-	col, closed, conflict := board.ResolveColumn(labels, is.State, position)
+	col, closed, conflict := board.ResolveColumn(board.CardColumnLabels(linked, labels, is.IssueTrackerColumn.String), is.State, position)
 	card := cardDTO{
 		IID:         is.ForgeIssueIid,
 		Title:       is.Title,

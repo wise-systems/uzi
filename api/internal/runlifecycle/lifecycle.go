@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -162,7 +163,8 @@ func (l *Lifecycle) Interval() time.Duration { return l.interval }
 type moveContext struct {
 	repoID          uuid.UUID
 	userID          uuid.UUID
-	linked          bool // the repo's issue_tracker_connection_id is set (PRD #4173)
+	linked          bool   // the repo's issue_tracker_connection_id is set (PRD #4173)
+	eligibilityName string // the link's eligibility tag name; "" on an unlinked repo
 	issueIID        int64
 	forgeProjectID  int64
 	forgeType       string
@@ -323,6 +325,7 @@ func contextFromRow(mc store.GetRunMoveContextRow) moveContext {
 		repoID:          uuid.UUID(mc.RepoID.Bytes),
 		userID:          mc.UserID,
 		linked:          mc.IssueTrackerConnectionID.Valid,
+		eligibilityName: mc.EligibilityTagName.String,
 		issueIID:        mc.IssueIid.Int64, // valid: notifyOnce and reconcileOne skip card-less runs (NULL issue_iid)
 		forgeProjectID:  mc.ForgeProjectID,
 		forgeType:       mc.ForgeType,
@@ -340,7 +343,9 @@ func contextFromRow(mc store.GetRunMoveContextRow) moveContext {
 //   - forge move succeeds → record board_column and clear the marker;
 //   - manual drag / closed issue / unknown baseline → clear the marker (a
 //     definitive skip that retrying cannot fix);
-//   - forge error → leave the marker for a later reconcile retry.
+//   - forge error, or a move the linked issue tracker refused (no State mapped for
+//     the column) → leave the marker for a later reconcile retry;
+//   - a linked issue missing from the cache → probeUncachedLinkedIssue decides.
 func (l *Lifecycle) apply(ctx context.Context, runID uuid.UUID, mc moveContext, dec decision) {
 	if !dec.act {
 		if dec.clear {
@@ -354,10 +359,10 @@ func (l *Lifecycle) apply(ctx context.Context, runID uuid.UUID, mc moveContext, 
 		if !errors.Is(err, pgx.ErrNoRows) {
 			slog.Warn("run lifecycle: load issue for move", "run", runID, "error", err)
 		} else if mc.linked {
-			// PRD #4173 D10: a linked issue that moved to another project is evicted from
-			// the cache; it will never be found again, so the move is a permanent skip.
-			slog.Info("run lifecycle: linked issue is no longer cached (moved or removed), skipping move", "run", runID, "issue", mc.issueIID)
-			l.clearPending(ctx, runID)
+			// The cache has no row for this linked issue. It may be gone (moved to another
+			// project, D10), never eligible (it will never be cached), or only not cached
+			// yet; the issue tracker itself says which (PRD #4173 M5).
+			l.probeUncachedLinkedIssue(ctx, runID, mc)
 			return
 		}
 		// No cached card to move (evicted/de-labeled forge-side): leave the marker;
@@ -385,7 +390,8 @@ func (l *Lifecycle) apply(ctx context.Context, runID uuid.UUID, mc moveContext, 
 	if err := json.Unmarshal(issue.Labels, &labels); err != nil {
 		labels = []string{}
 	}
-	current, _, _ := board.ResolveColumn(labels, issue.State, position)
+	// A linked repo's card sits in its cached State column, never in a label (PRD #4173 M5).
+	current, _, _ := board.ResolveColumn(board.CardColumnLabels(mc.linked, labels, issue.IssueTrackerColumn.String), issue.State, position)
 
 	baseline, haveBaseline := coalesceColumn(mc.boardColumn, mc.originColumn)
 	if !haveBaseline {
@@ -403,18 +409,8 @@ func (l *Lifecycle) apply(ctx context.Context, runID uuid.UUID, mc moveContext, 
 		return
 	}
 
-	f, err := l.mover.ForgeForConnection(mc.forgeType, mc.baseURL, mc.tokenCiphertext)
-	if err != nil {
-		// Likely an undecryptable token; leave the marker (reconcile will retry,
-		// then give up — visible drift).
-		slog.Warn("run lifecycle: build forge client for move", "run", runID, "error", err)
-		return
-	}
-	tr, err := issuesource.For(ctx, l.issueSources, mc.linked, mc.userID, mc.repoID, f)
-	if err != nil {
-		// A linked repo with no resolver, or one that cannot be built: never the forge.
-		// Left for the reconcile loop like any other outage.
-		slog.Warn("run lifecycle: resolve issue tracker for move", "run", runID, "error", err)
+	tr, ok := l.issueSide(ctx, runID, mc)
+	if !ok {
 		return
 	}
 	if _, err := l.mover.AutoMove(ctx, tr, mc.forgeProjectID, issue, cols, dec.target); err != nil {
@@ -425,6 +421,14 @@ func (l *Lifecycle) apply(ctx context.Context, runID uuid.UUID, mc moveContext, 
 			// code-host side is unaffected.
 			slog.Info("run lifecycle: issue move skipped on linked repo", "run", runID, "target", dec.target, "reason", err)
 			l.clearPending(ctx, runID)
+			return
+		}
+		if forgesvc.ColumnMoveRefused(err) {
+			// The issue tracker refused the move before any request: the column has no State
+			// mapped (or the target State is not allowed). Unlike a skip this can heal when
+			// the owner saves the mapping, so the marker stays and reconciliation retries
+			// inside its window (PRD #4173 M5; specs/human.md, failed column moves retry).
+			slog.Warn("run lifecycle: issue tracker refused the column move, will retry", "run", runID, "target", dec.target, "error", err)
 			return
 		}
 		// Forge error: the transition already succeeded; leave the marker so the
@@ -448,6 +452,58 @@ func (l *Lifecycle) apply(ctx context.Context, runID uuid.UUID, mc moveContext, 
 		if err := l.projector.ForwardMove(ctx, mc.repoID, mc.issueIID, dec.target); err != nil {
 			slog.Warn("run lifecycle: forward project sync", "run", runID, "repo", mc.repoID, "issue", mc.issueIID, "error", err)
 		}
+	}
+}
+
+// issueSide builds the forge client and resolves the repo's issue side for a move or a
+// probe. On failure it logs and reports false, leaving the marker for the reconcile
+// loop like any other outage.
+func (l *Lifecycle) issueSide(ctx context.Context, runID uuid.UUID, mc moveContext) (forge.IssueTracker, bool) {
+	f, err := l.mover.ForgeForConnection(mc.forgeType, mc.baseURL, mc.tokenCiphertext)
+	if err != nil {
+		// Likely an undecryptable token; leave the marker (reconcile will retry,
+		// then give up — visible drift).
+		slog.Warn("run lifecycle: build forge client for move", "run", runID, "error", err)
+		return nil, false
+	}
+	tr, err := issuesource.For(ctx, l.issueSources, mc.linked, mc.userID, mc.repoID, f)
+	if err != nil {
+		// A linked repo with no resolver, or one that cannot be built: never the forge.
+		// Left for the reconcile loop like any other outage.
+		slog.Warn("run lifecycle: resolve issue tracker for move", "run", runID, "error", err)
+		return nil, false
+	}
+	return tr, true
+}
+
+// probeUncachedLinkedIssue settles the pending move of a linked run whose issue is not
+// in the cache (PRD #4173 M5). It reads the issue from the linked project:
+//   - not found (moved away, D10): clear the marker, the move can never happen;
+//   - found but without the link's eligibility tag: it will never be cached (a
+//     self-improve tracking issue, for example), so clear the marker;
+//   - found and eligible, or any read error: leave the marker, so reconciliation moves
+//     the card once the next sync caches it, as on an unlinked repo.
+func (l *Lifecycle) probeUncachedLinkedIssue(ctx context.Context, runID uuid.UUID, mc moveContext) {
+	tr, ok := l.issueSide(ctx, runID, mc)
+	if !ok {
+		return
+	}
+	issue, err := tr.GetIssue(ctx, mc.forgeProjectID, mc.issueIID)
+	if err != nil {
+		if forgesvc.LinkedIssueGone(err) {
+			slog.Info("run lifecycle: linked issue is no longer in the linked project, skipping move", "run", runID, "issue", mc.issueIID)
+			l.clearPending(ctx, runID)
+			return
+		}
+		slog.Warn("run lifecycle: probe uncached linked issue", "run", runID, "issue", mc.issueIID, "error", err)
+		return
+	}
+	if mc.eligibilityName == "" {
+		return
+	}
+	if !slices.Contains(issue.Labels, mc.eligibilityName) {
+		slog.Info("run lifecycle: linked issue does not carry the eligibility tag and will never be cached, skipping move", "run", runID, "issue", mc.issueIID)
+		l.clearPending(ctx, runID)
 	}
 }
 
