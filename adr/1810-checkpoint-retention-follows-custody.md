@@ -430,6 +430,29 @@ above.
   practice meet — the PRD's D3 test expecting the live-settle reader to
   accept a recovery ref was dropped as dormant rather than implemented.
 
+## Amendment (2026-11-13, #4007)
+
+Terminal preservation is independent of checkpoint retention.
+Its `refs/uzi-terminal/<run-id>` namespace and tables are separate;
+`SettleRetainedCheckpoint` and supersession never touch them. It touches custody in three
+narrow ways: a contribution may take its authority from (and reference, with a
+RESTRICT foreign key) an open guarded custody hold; an open custody hold of the
+run blocks the retire decision; and a scoped precondition on the
+completed-publication release: the
+branch-only completion release is refused (`terminal_preservation_pending` or
+`terminal_preservation_refused`) while a terminal contribution for exactly the
+completing generation is unfinished or refused. With no such row, behavior is
+unchanged, and the owner's discard is never gated. Slice A is dark. See
+[ADR-4007](4007-terminal-preservation.md).
+
+## Amendment (2026-11-14, #4007 slice B)
+
+The worker-local refs `refs/uzi-terminal-local/<run>/g<gen>` (transient in the
+clone, private in the bare) and the `refs/uzi-incoming/<uuid>` staging refs are
+neither checkpoint retention nor custody retention. Settlement never deletes
+them, and incomplete ones are retained until slice C. The producer that creates
+them is production-dark. See [ADR-4007](4007-terminal-preservation.md).
+
 ## References
 
 - [PRD #1810](../prds/done/1810-retain-failed-run-checkpoint-ref.md)

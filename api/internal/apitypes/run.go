@@ -318,6 +318,10 @@ type RunDTO struct {
 	// An older api omits it, and clients then render nothing for it.
 	PlanCrossCheckGated      bool    `json:"plan_cross_check_gated,omitempty"`
 	PlanCrossCheckGateReason *string `json:"plan_cross_check_gate_reason"`
+	// CrossCheckActive reports the currently live plan or advisory code cross-check.
+	// GetRun and the run lists compute it with the same live semantics and closed
+	// vocabulary: "plan", "code", or null. Other RunDTO responses leave it null.
+	CrossCheckActive *string `json:"cross_check_active"`
 	// PlanCrossCheckDiffRefusal is the planning-diff refusal sub-code. It is set only
 	// while PlanCrossCheckGateReason is planning_diff_refused; otherwise nil.
 	PlanCrossCheckDiffRefusal *string `json:"plan_cross_check_diff_refusal"`
@@ -919,6 +923,9 @@ type RunDTO struct {
 	// vault is unlocked) and "data_volume_full" (PRD #1809 M5, the worker's data volume was full
 	// or about to fill; timed retries become owner holds with NULL retry at the cap, see DiskParkCount);
 	// "provider_outage" is active: a typed provider-transient retry park (PRD #1733).
+	// "anthropic_spend_limit" (issue #3767) is an owner-held hold: the Anthropic API refused for a
+	// spend limit. It never retries on a timer; raise the limit and Resume, switch token with
+	// set-token, or Cancel.
 	// "worker_requeue_exhausted" and "worker_memory_pressure" require owner action.
 	// "retained_recovery_exhausted" can be timed or owner-held; see RecoveryRetryNotBefore.
 	// "retained_recovery_adoption_failed" is an integrity hold: retained adoption or a
@@ -937,6 +944,15 @@ type RunDTO struct {
 	// honestly (a newer server may ship a cause this client has not heard of), the same rule
 	// as RateLimitType.
 	RecoveryWaitCause *string `json:"recovery_wait_cause"`
+	// RecoveryWaitDetail is the closed-set sub-cause of a retained_recovery_adoption_failed park
+	// (issue #4177): "secret_remediation_active" (retrying unchanged cannot help; Resume is
+	// refused with a 409), "remediation_proof_unknown" (a retry may help), or
+	// "source_end_declined" (Resume requires a different nonempty worker registration). The server sets it
+	// only when status is recovery_wait, the cause is retained_recovery_adoption_failed and the
+	// stored value is in that set; it is omitted otherwise. Absent means unclassified and only
+	// selects the generic text; it never permits anything new. Clients render only a known value
+	// and never print the raw string.
+	RecoveryWaitDetail *string `json:"recovery_wait_detail,omitempty"`
 	// RecoveryWaitPhase (issue #1324) says which part of the run the 'recovery_wait' park
 	// interrupted. "publication" is a forge outage met while publishing: the run keeps its
 	// publication intent and resumes publication only. Null for every other park (the pre-clone
@@ -990,7 +1006,8 @@ type RunDTO struct {
 	// RecoveryRetryNotBefore is the earliest scheduled recovery promotion time, not
 	// a promise of immediate execution. It is separate from the usage-limit RetryNotBefore.
 	// Null means no scheduled recovery retry, including an owner-held codex_idle_stall
-	// or retained_recovery_exhausted or capped data_volume_full park. An omitted key in a partial client read means
+	// or retained_recovery_exhausted or capped data_volume_full park, and every
+	// anthropic_spend_limit hold. An omitted key in a partial client read means
 	// timing is unknown; consult RecoveryRetryNotBeforePresent before inferring a hold.
 	// retained_continuation_unwitnessed is likewise always owner-held.
 	// retained_recovery_adoption_failed is always owner-held, even if a malformed
@@ -1050,10 +1067,19 @@ type RunDTO struct {
 	// SINGLE-RUN READ ONLY, best-effort: set by GET /api/runs/{id} for lead-lane runs (leadcfg.LeadLane)
 	// and absent on every list row and on runs that have no lead agent. Display-only.
 	LeadConfig *RunLeadConfigDTO `json:"lead_config,omitempty"`
-	// Model is the model frozen onto the run at fire time by the schedule that created it
-	// (PRD #300): nil means the run inherited the owner's per-user Worker default. Surfaced
-	// read-only so a scheduled run's model is confirmable.
+	// Model is the model frozen onto the run at create time, either chosen when the run was started
+	// (ModelSource run_override, PRD #3250) or pinned by the schedule that created it (schedule_pin,
+	// PRD #300): nil means the run inherits the owner's per-user Worker default at claim. Surfaced
+	// read-only so the run's model is confirmable.
 	Model *string `json:"model"`
+	// Effort is the reasoning effort chosen when the run was started (PRD #3250), frozen at create:
+	// nil means the claim-time setting applies.
+	Effort *string `json:"effort"`
+	// ModelSource names the writer of Model: run_override or schedule_pin; nil when Model is nil and for
+	// a legacy row an older binary wrote (display treats a model with no source as schedule_pin).
+	ModelSource *string `json:"model_source"`
+	// EffortSource names the writer of Effort: run_override; nil when Effort is nil.
+	EffortSource *string `json:"effort_source"`
 	// OverrideSubagentModel is the "apply model also to agents" flag frozen onto the run
 	// at fire time by the schedule that created it (PRD #305): true means the run's model
 	// was applied to every subagent (overriding pins), false is today's default. Surfaced
@@ -1161,12 +1187,32 @@ type CredentialOverrideDTO struct {
 // Nullable — the FK nulls it when the token is deleted, exactly as RunDTO.AnthropicSecretID
 // does, so a historical epoch legitimately carries a label with no id. Owner-or-admin scoped
 // like the rest of this DTO, so exposing the per-epoch id here is consistent with that field.
+//
+// Issue #4201 adds the in-generation epochs an in-place token switch opens. Ordinal is 0 for the
+// claim's base epoch (one per generation) and n >= 1 for the nth switch applied inside that
+// generation; a consumer orders epochs by (claim_generation, ordinal). MessageSeq is the seq of the
+// run's credential_switch message for an applied switch (null for a base epoch). Usage is the
+// epoch's own spend, computed by telescoping the run's usage legs, and is omitted when the run has
+// recorded none.
 type CredentialEpochDTO struct {
-	ClaimGeneration int64     `json:"claim_generation"`
-	SecretID        *string   `json:"secret_id"`
-	Label           *string   `json:"label"`
-	SelectReason    *string   `json:"select_reason"`
-	AppliedAt       time.Time `json:"applied_at"`
+	ClaimGeneration int64                    `json:"claim_generation"`
+	Ordinal         int32                    `json:"ordinal"`
+	SecretID        *string                  `json:"secret_id"`
+	Label           *string                  `json:"label"`
+	SelectReason    *string                  `json:"select_reason"`
+	AppliedAt       time.Time                `json:"applied_at"`
+	MessageSeq      *int32                   `json:"message_seq,omitempty"`
+	Usage           *CredentialEpochUsageDTO `json:"usage,omitempty"`
+}
+
+// CredentialEpochUsageDTO is one credential epoch's spend (issue #4201). The fields mean what the
+// run's usage totals mean (tokens by kind, cost in USD), restricted to the legs the epoch opened.
+type CredentialEpochUsageDTO struct {
+	InputTokens         int64   `json:"input_tokens"`
+	OutputTokens        int64   `json:"output_tokens"`
+	CacheReadTokens     int64   `json:"cache_read_tokens"`
+	CacheCreationTokens int64   `json:"cache_creation_tokens"`
+	CostUSD             float64 `json:"cost_usd"`
 }
 
 // RunSummaryItemDTO is the compact run row served by GET /api/runs?view=summary and
@@ -1827,6 +1873,9 @@ type RunSummaryItemDTO struct {
 	// vault is unlocked) and "data_volume_full" (PRD #1809 M5, the worker's data volume was full
 	// or about to fill; timed retries become owner holds with NULL retry at the cap, see DiskParkCount);
 	// "provider_outage" is active: a typed provider-transient retry park (PRD #1733).
+	// "anthropic_spend_limit" (issue #3767) is an owner-held hold: the Anthropic API refused for a
+	// spend limit. It never retries on a timer; raise the limit and Resume, switch token with
+	// set-token, or Cancel.
 	// "worker_requeue_exhausted" and "worker_memory_pressure" require owner action.
 	// "retained_recovery_exhausted" can be timed or owner-held; see RecoveryRetryNotBefore.
 	// "retained_recovery_adoption_failed" is an integrity hold: retained adoption or a
@@ -1845,6 +1894,15 @@ type RunSummaryItemDTO struct {
 	// honestly (a newer server may ship a cause this client has not heard of), the same rule
 	// as RateLimitType.
 	RecoveryWaitCause *string `json:"recovery_wait_cause"`
+	// RecoveryWaitDetail is the closed-set sub-cause of a retained_recovery_adoption_failed park
+	// (issue #4177): "secret_remediation_active" (retrying unchanged cannot help; Resume is
+	// refused with a 409), "remediation_proof_unknown" (a retry may help), or
+	// "source_end_declined" (Resume requires a different nonempty worker registration). The server sets it
+	// only when status is recovery_wait, the cause is retained_recovery_adoption_failed and the
+	// stored value is in that set; it is omitted otherwise. Absent means unclassified and only
+	// selects the generic text; it never permits anything new. Clients render only a known value
+	// and never print the raw string.
+	RecoveryWaitDetail *string `json:"recovery_wait_detail,omitempty"`
 	// RecoveryWaitPhase (issue #1324) says which part of the run the 'recovery_wait' park
 	// interrupted. "publication" is a forge outage met while publishing: the run keeps its
 	// publication intent and resumes publication only. Null for every other park (the pre-clone
@@ -1898,7 +1956,8 @@ type RunSummaryItemDTO struct {
 	// RecoveryRetryNotBefore is the earliest scheduled recovery promotion time, not
 	// a promise of immediate execution. It is separate from the usage-limit RetryNotBefore.
 	// Null means no scheduled recovery retry, including an owner-held codex_idle_stall
-	// or retained_recovery_exhausted or capped data_volume_full park. An omitted key in a partial client read means
+	// or retained_recovery_exhausted or capped data_volume_full park, and every
+	// anthropic_spend_limit hold. An omitted key in a partial client read means
 	// timing is unknown; consult RecoveryRetryNotBeforePresent before inferring a hold.
 	// retained_continuation_unwitnessed is likewise always owner-held.
 	// retained_recovery_adoption_failed is always owner-held, even if a malformed
@@ -1954,9 +2013,10 @@ type RunSummaryItemDTO struct {
 	HomeBytes     *int64 `json:"home_bytes,omitempty"`
 	CacheBytes    *int64 `json:"cache_bytes,omitempty"`
 	DiskTruncated bool   `json:"disk_truncated,omitempty"`
-	// Model is the model frozen onto the run at fire time by the schedule that created it
-	// (PRD #300): nil means the run inherited the owner's per-user Worker default. Surfaced
-	// read-only so a scheduled run's model is confirmable.
+	// Model is the model frozen onto the run at create time, either chosen when the run was started
+	// (ModelSource run_override, PRD #3250) or pinned by the schedule that created it (schedule_pin,
+	// PRD #300): nil means the run inherits the owner's per-user Worker default at claim. Surfaced
+	// read-only so the run's model is confirmable.
 	Model *string `json:"model"`
 	// OverrideSubagentModel is the "apply model also to agents" flag frozen onto the run
 	// at fire time by the schedule that created it (PRD #305): true means the run's model
@@ -2184,6 +2244,7 @@ func RunSummaryOf(item RunListItemDTO) RunSummaryItemDTO {
 		LimitWaitCount:                item.LimitWaitCount,
 		RateLimitType:                 item.RateLimitType,
 		RecoveryWaitCause:             item.RecoveryWaitCause,
+		RecoveryWaitDetail:            item.RecoveryWaitDetail,
 		RecoveryWaitPhase:             item.RecoveryWaitPhase,
 		PublicationWaitStartedAt:      item.PublicationWaitStartedAt,
 		PublicationWaitLimitSeconds:   item.PublicationWaitLimitSeconds,
@@ -2377,6 +2438,7 @@ func (s RunSummaryItemDTO) ListItem() RunListItemDTO {
 			LimitWaitCount:                s.LimitWaitCount,
 			RateLimitType:                 s.RateLimitType,
 			RecoveryWaitCause:             s.RecoveryWaitCause,
+			RecoveryWaitDetail:            s.RecoveryWaitDetail,
 			RecoveryWaitPhase:             s.RecoveryWaitPhase,
 			PublicationWaitStartedAt:      s.PublicationWaitStartedAt,
 			PublicationWaitLimitSeconds:   s.PublicationWaitLimitSeconds,
@@ -2417,16 +2479,16 @@ func (s RunSummaryItemDTO) ListItem() RunListItemDTO {
 			IsRevising:                    s.IsRevising,
 			CodeCrossCheckRequired:        s.CodeCrossCheckRequired,
 			CodeCrossCheckSummary:         s.CodeCrossCheckSummary,
+			CrossCheckActive:              s.CrossCheckActive,
 			AccountCooldownClass:          s.AccountCooldownClass,
 			AccountCooldownEligibleAt:     s.AccountCooldownEligibleAt,
 		},
-		RepoPath:         s.RepoPath,
-		WorkerName:       s.WorkerName,
-		OwnerEmail:       s.OwnerEmail,
-		JudgeVerdict:     s.JudgeVerdict,
-		JudgeTodoCount:   s.JudgeTodoCount,
-		PendingQuestion:  s.PendingQuestion,
-		CrossCheckActive: s.CrossCheckActive,
+		RepoPath:        s.RepoPath,
+		WorkerName:      s.WorkerName,
+		OwnerEmail:      s.OwnerEmail,
+		JudgeVerdict:    s.JudgeVerdict,
+		JudgeTodoCount:  s.JudgeTodoCount,
+		PendingQuestion: s.PendingQuestion,
 	}
 }
 
@@ -2462,10 +2524,7 @@ type RunListItemDTO struct {
 	// #4040), runquestion.Excerpt of the question message. Owner-only: ListRuns sets it for
 	// awaiting_input rows; the admin list never carries it. Omitted when absent.
 	PendingQuestion string `json:"pending_question,omitempty"`
-	// CrossCheckActive is "plan" while a plan cross-check is live for the run, "code" while a
-	// code cross-check is live, and null otherwise (issue #4082). List-only presence flag: it
-	// carries no findings, verdict, model or deadline. Always sent (null when none).
-	CrossCheckActive *string `json:"cross_check_active"`
+	// CrossCheckActive is embedded from RunDTO; the list overlays it from its live SQL flags.
 }
 
 // MessageDTO is one persisted run message (the replay source a reconnecting
@@ -2579,6 +2638,15 @@ type SteerInputDTO struct {
 	AppliedAt         *time.Time `json:"applied_at"`
 	IncludedAt        *time.Time `json:"included_at"`
 	InclusionReported bool       `json:"inclusion_reported"`
+}
+
+// RunInputsEnvelopeDTO is the GET /api/runs/{id}/inputs response: the steer queue under
+// "inputs" (always a JSON array, never null on the real wire) and, only on an admin run debug
+// read of another user's run (issue #4198), admin_debug_read=true so a client can mark the
+// view read-only. The marker is omitted otherwise, so an owner's response is unchanged.
+type RunInputsEnvelopeDTO struct {
+	Inputs         []SteerInputDTO `json:"inputs"`
+	AdminDebugRead bool            `json:"admin_debug_read,omitempty"`
 }
 
 // RunEventDTO is one /api/ws frame: the live-channel counterpart to the REST
@@ -2703,20 +2771,19 @@ func (r *RunListItemDTO) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	var context struct {
-		RepoPath         string  `json:"repo_path"`
-		WorkerName       *string `json:"worker_name"`
-		OwnerEmail       *string `json:"owner_email"`
-		JudgeVerdict     *string `json:"judge_verdict"`
-		JudgeTodoCount   int     `json:"judge_todo_count"`
-		PendingQuestion  string  `json:"pending_question"`
-		CrossCheckActive *string `json:"cross_check_active"`
+		RepoPath        string  `json:"repo_path"`
+		WorkerName      *string `json:"worker_name"`
+		OwnerEmail      *string `json:"owner_email"`
+		JudgeVerdict    *string `json:"judge_verdict"`
+		JudgeTodoCount  int     `json:"judge_todo_count"`
+		PendingQuestion string  `json:"pending_question"`
 	}
 	if err := json.Unmarshal(data, &context); err != nil {
 		return err
 	}
 	*r = RunListItemDTO{RunDTO: run, RepoPath: context.RepoPath, WorkerName: context.WorkerName,
 		OwnerEmail: context.OwnerEmail, JudgeVerdict: context.JudgeVerdict, JudgeTodoCount: context.JudgeTodoCount,
-		PendingQuestion: context.PendingQuestion, CrossCheckActive: context.CrossCheckActive}
+		PendingQuestion: context.PendingQuestion}
 	return nil
 }
 
@@ -2736,4 +2803,12 @@ func (r *RunSummaryItemDTO) UnmarshalJSON(data []byte) error {
 	wire.RecoveryRetryNotBeforePresent = len(timing.Retry) > 0
 	*r = RunSummaryItemDTO(wire)
 	return nil
+}
+
+// AdminRunsDebugDTO is the GET /api/admin/runs?state=all response (issue #4198 admin run
+// debug listing): the summary rows of every status, newest first, and whether more matching
+// runs existed than the server's row cap. Runs is always a JSON array, never null.
+type AdminRunsDebugDTO struct {
+	Runs      []RunSummaryItemDTO `json:"runs"`
+	Truncated bool                `json:"truncated"`
 }

@@ -58,6 +58,7 @@ type FakeClient struct {
 	LeadConfigHistoryByID map[string]apitypes.LeadConfigHistoryDTO
 	Reviews               map[string]*apitypes.ReviewDTO
 	PendingJudges         map[string]*apitypes.PendingJudgeDTO
+	JudgeSkips            map[string]*apitypes.JudgeSkipDTO
 	Workers               []apitypes.WorkerDTO
 	CordonWorkerResult    apitypes.WorkerDTO
 	UncordonWorkerResult  apitypes.WorkerDTO
@@ -187,7 +188,11 @@ type FakeClient struct {
 	// LastCreateHarness captures PRD #1429 M5's create-time explicit harness selection (""
 	// when --harness was omitted), so a test can assert the CLI forwarded the validated
 	// claude|codex value (or sent none at all).
-	LastCreateHarness  string
+	LastCreateHarness string
+	// LastCreateModel and LastCreateEffort capture PRD #3250's start-time model and effort
+	// ("" when --model / --effort was omitted).
+	LastCreateModel    string
+	LastCreateEffort   string
 	InputResp          apitypes.RunInputResponse
 	LastInputRunID     string
 	LastInputKind      string
@@ -739,6 +744,20 @@ type FakeClient struct {
 	DiscardHoldCalls    []DiscardHoldCall
 	DiscardHoldErr      error
 
+	// Admin run debug (issue #4198). RecoveryHoldsScopedResult/Err back RecoveryHoldsScoped and
+	// RecoveryHoldsScopedCalls records each selector; AdminRunsDebugResult/Err back
+	// AdminListRunsDebug and AdminListRunsDebugCalls records each filter pair;
+	// RunInputsAdminDebug[id]=true makes RunInputsMeta report the admin_debug_read marker and
+	// RunInputsMetaCalls counts calls.
+	RecoveryHoldsScopedResult apitypes.RecoveryCustodyHoldsDTO
+	RecoveryHoldsScopedErr    error
+	RecoveryHoldsScopedCalls  []RecoveryHoldsScopedCall
+	AdminRunsDebugResult      apitypes.AdminRunsDebugDTO
+	AdminRunsDebugErr         error
+	AdminListRunsDebugCalls   []AdminListRunsDebugCall
+	RunInputsAdminDebug       map[string]bool
+	RunInputsMetaCalls        int
+
 	// Owner held-publication list + early expiry (issue #2545). HeldPublicationsResult backs
 	// HeldPublications and HeldExpireResult backs ExpireHeldPublications; HeldErr wins over the
 	// blanket Err. HeldExpireCalls records each run id expired IN ORDER, so a CLI test proves NO
@@ -768,6 +787,18 @@ type LabelCall struct {
 }
 
 var _ Client = (*FakeClient)(nil)
+
+// RecoveryHoldsScopedCall is one RecoveryHoldsScoped selector.
+type RecoveryHoldsScopedCall struct {
+	UserID string
+	RunID  string
+}
+
+// AdminListRunsDebugCall is one AdminListRunsDebug filter pair.
+type AdminListRunsDebugCall struct {
+	UserID string
+	Since  string
+}
 
 // FindingIssueDraft records the evidence id and returns its canned draft, or a not-found exit
 // when FindingDrafts has no entry for it.

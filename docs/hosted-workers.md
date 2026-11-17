@@ -123,6 +123,379 @@ when the scheduler reports a verified CPU/memory shortage. Capacity blockage
 requires waiting, a smaller worker, or added capacity; Pending claims alone do
 not establish storage health. See [Worker versions and upgrades](worker-upgrades.md).
 
+## Hibernation
+
+An admin can put an idle persistent hosted worker to sleep. **Hibernating** scales
+the worker's Deployment to 0 replicas and frees its CPU and memory. The worker
+row, its join-token Secret and all its volumes are kept, so waking it brings back
+the same worker with its cache and data. Ephemeral, compose and local workers are
+never hibernated.
+
+Hibernation is off by default. An admin turns it on with
+[`worker_hibernation_enabled`](./admin-settings.md#worker-hibernation).
+
+Admins hibernate and wake a worker with the **Hibernate** and **Wake** buttons in
+**Admin → Health**, in the **Fleet, all users** table (see
+[Admin health](admin-health.md)). Both are web-only (cookie session plus CSRF);
+the CLI's admin tokens are read-only, so there is no CLI verb to hibernate or
+wake. Waking is never gated by the setting.
+
+A worker passes through these states:
+
+| State | Meaning |
+|---|---|
+| `hibernating` | Preparing: the controller is checking the worker is safe to scale down. |
+| `hibernated` | The Deployment is at 0 replicas. |
+| `waking` | A wake was requested; the Deployment is scaling back up. |
+
+Hibernate is refused, with a reason, when the worker:
+
+- has any assigned run that is not terminal;
+- has an open recovery custody hold;
+- is under a manual or controller cordon, or in a maintenance or DinD phase;
+- has no registered pod identity;
+- is named by the wake of a queued run that is still waiting for it (code
+  `pending_wake_demand`; the wake row is kept until the run leaves the queue, so a
+  run is never stranded);
+- or the controller has not advertised hibernation support recently.
+
+The controller can still refuse after the request is accepted (an open, unreadable
+or retained-claim roll reservation (`roll_reservation`), a finished roll while
+another worker in the namespace that is not positively attributed to a different
+owner carries, or cannot be shown not to carry, roll metadata
+(`roll_cohort_cleanup_pending`; a desired worker the controller cannot render
+counts, and one whose placement fails counts in every namespace), a
+disk-pressure recycle, DinD maintenance, a busy
+worker, or a layout migration). Completed roll history from a finished roll is
+retired before sleep, so it does not block hibernation by itself; with
+`roll_cohort_cleanup_pending` the roll history is left in place and the hibernation
+can be retried later (the automatic pass retries after its cooldown, or an admin
+retries). Known limit: peer evidence is not filtered by coverage pool, so when one
+owner has two or more coverage pools (different capability sets) in a namespace,
+each finished roll leaves every pool's canary with a completed marker, and those
+canaries keep refusing each other with `roll_cohort_cleanup_pending` until the owner's
+next image roll in that namespace retires it; retries alone do not clear it.
+Likewise, a non-ephemeral desired worker that cannot be rendered keeps refusing
+every finished-roll canary in its namespace (in every namespace when its placement
+fails) until it renders again or is removed (fix its template, size, or the Docker
+or isolated namespace configuration). If
+nothing was scaled down, a refusal returns the worker to normal.
+Preparation that does not finish within 10 minutes is withdrawn into a wake.
+
+A wake completes only when the new pod registers (or the original pod is still
+alive). A wake not confirmed within 15 minutes records `wake_error` on the worker
+("wake not confirmed within 15m"), shown as a wake error. The worker stays waking, and the error clears once
+the wake settles.
+
+A wake from zero replicas waits until the old pod has fully stopped, meaning every
+container (init and ephemeral included) has terminated. A pod whose containers are
+still running or stopping holds the wake, including a `Failed` (evicted) pod that is
+still being killed and a pod that is still terminating. A `Succeeded` or `Failed` pod
+kept only by a finalizer, with every container terminated, does not hold it. A container
+whose end Kubernetes could not confirm (terminated with reason `ContainerStatusUnknown`,
+which does not prove the process died) or that is still waiting, for example one that
+never left init, counts as not stopped. Such a pod, typically eviction residue, holds
+the wake: after 15 minutes the worker records `wake_error`, and the wake keeps waiting
+until the pod is removed. Another stuck case is a pod on an unreachable node: it keeps its last running
+container statuses, so it holds the wake, and the wake may not recover until the node
+or the pod object is removed.
+
+Force-deleting such a pod removes the API object but does not prove its containers
+stopped. They may still hold the worker's ReadWriteOnce data volume, and the wake would
+then start a new pod beside them. Before force-deleting, confirm the node is really down
+(powered off or fenced from its storage); otherwise recover the node so kubelet can
+finish the shutdown. The wake proceeds on the first controller tick after the pod is
+gone.
+
+A hibernated worker wakes when an admin presses **Wake**, when the setting is turned
+off (every hibernated or still-hibernating worker, ten per sweep), or on demand. On
+demand means a queued run of any kind, chat, judge and cross-check included, that no
+online worker of its owner can claim but that a hibernated or still-hibernating worker of
+the same owner could claim once awake. The sweeper wakes one such worker per run, the one
+asleep longest, and a worker already waking is preferred, so one woken worker serves every
+run it is eligible for and no sibling is woken. A still-hibernating worker with demand is
+withdrawn into a wake. A queued run that only a full (saturated) online worker could take
+waits as before and does not wake anything. Demand wakes work whether
+`worker_hibernation_enabled` and `ephemeral_workers_enabled` are on or off, and run before
+ephemeral provisioning on the same sweep, so sleeping capacity is used first. While the
+wake is not older than 15 minutes (counted from the first wake of that run) no ephemeral
+worker is provisioned for that run; a run the woken worker cannot serve is unaffected, and
+after 15 minutes provisioning proceeds as today.
+
+**Health.** While a run waits for a waking worker, its owner sees the reason "your
+worker is waking from hibernation". The `fleet.capacity` check treats a wake younger
+than 15 minutes as transient. Admins get an instance-scoped **Admin → Health** check,
+`fleet.hibernation_wake`, that warns when a wake failed or is not confirmed within 15
+minutes (it lists up to 10 workers); see [Admin health](admin-health.md).
+
+Status shows in `uzi worker list` and `uzi admin workers`; see
+[CLI](./cli.md#hibernated-workers). The design is in
+[PRD #4205](../prds/4205-worker-hibernation-sleep-wake.md).
+
+### Automatic hibernation
+
+With `worker_hibernation_auto` on (and `worker_hibernation_enabled` on), the api
+hibernates idle workers itself; see
+[Admin settings](./admin-settings.md#worker-hibernation). Enable it only once the
+[cache cleanup before sleep](#cache-cleanup-before-sleep) ([PRD #4206](../prds/4206-worker-hibernation-cache-cleanup.md))
+is deployed, including the worker support it needs: a worker image that advertises
+the `hibernation_cache_prune_v1` capability. Otherwise workers sleep without their
+Docker cache pruned.
+
+**Idle.** A worker is idle when no run of any kind is assigned to it and nothing has
+finished on it for `worker_hibernation_idle_after` (default `336h`, between `1h` and
+`2160h`). The idle clock starts from the latest of the worker's last finished run,
+its last completed wake, and its creation. Logins and heartbeats do not count. A
+user's last or only worker is included, and there is no per-user opt-out.
+
+**The pass.** The sweeper runs the pass at most once per minute and hibernates at
+most 10 workers per pass, oldest idle first. Each worker goes through the same
+admission checks as a manual hibernation (see the refusal list above) and the same
+[cache cleanup](#cache-cleanup-before-sleep). The idleness is re-checked on the
+locked worker row, so a run assigned or finished in the meantime wins. At that
+point the pass also re-reads the automatic-mode switch: off ends the pass, and a
+read failure prevents that candidate from being admitted.
+
+**Refusals.** A worker the pass could not admit is recorded with a reason and moves
+to the back of the queue for an hour (`HibernationAutoRefusalCooldown`; the order
+puts workers refused in the last hour after the rest), so blocked workers do not
+starve clean ones. When the controller refuses before scaling down, the worker is
+not tried again for at least 1 hour. Admin health's `fleet.hibernation` check names
+idle workers that are blocked this way and runs that have been parked past the
+threshold; see [Admin health](./admin-health.md).
+
+**Waking.** Every completed wake restarts the idle clock: a manual wake, a demand
+wake, turning the setting off, or a withdrawn hibernation. A woken worker gets a full
+threshold before it is considered again.
+
+**Record.** Automatic hibernations write no hibernation audit event. The worker's
+hibernation reason reads "automatic: no run activity for ..." (for example
+"automatic: no run activity for 14d").
+
+#### Diagnosing a blocked hibernation or a stuck roll
+
+The worker JSON carries the pass's last recorded blocker and, for a hosted
+worker, the controller's retained image-roll marker. Both are evidence for an
+admin to read; neither changes behavior, and the controller stays the authority
+for refusing hibernation and for rolls.
+
+```sh
+uzi admin workers --json
+```
+
+Per worker, `uzi admin workers --json` (and `uzi worker list --json` / `uzi worker get --json`
+for the owner's own workers) carries:
+
+- `hibernation_blocked_reason`: the workersvc code of the last recorded blocker of the
+  automatic pass (for example `controller_refused`), or null. For
+  `controller_refused`, `hibernation_reason` holds the controller's refusal code.
+- `hibernation_blocked_since`: when this reason started holding. It restarts only when the
+  reason changes.
+- `hibernation_blocked_at`: when the pass last observed it.
+
+These are the **last recorded** blocker, not the current state: they are not cleared when
+the worker returns to work, so read them with the worker's status and
+`hibernation_state`.
+
+- `roll_marker` (hosted workers only; display-only): `state`, `canary`, `completed`,
+  `target_version`, `coverage_group` (an opaque 16-hex id that tells coverage groups apart
+  and never carries the raw annotation or nonce), `reservation` (whether the controller sees
+  a roll reservation, the fact that makes it refuse hibernation with `roll_reservation`),
+  `blocked` (the controller's roll blocker) and `observed_at` (when the api received the
+  report). `canary`, `completed`, `target_version` and `coverage_group` are set only when
+  `state` is `present`; `reservation` and `blocked` only when the report is fresh.
+
+`roll_marker.state` tells apart what the controller could and could not see:
+
+| State | Meaning |
+|---|---|
+| `present` | a roll marker exists and was decoded |
+| `unreadable` | a roll annotation exists but could not be decoded |
+| `absent` | positively no marker |
+| `unavailable` | the controller's cluster snapshot failed or was incomplete, so it cannot say whether a marker exists |
+| `unknown` | no fresh report: an older controller, evidence older than the 60 second receipt TTL, an invalid value, or a worker not reported while preparing, hibernated or cleaning |
+
+Read `absent` as a fact and `unavailable` and `unknown` as missing evidence: neither
+shows that no roll is held. `roll_pacing` is unchanged; completed history now shows
+through `roll_marker`.
+
+`uzi worker list`, `uzi worker get` and `uzi admin workers` print the same facts after
+the table as `Hibernation blocker (last recorded)` and `Roll marker` lines, see
+[CLI](./cli.md#hibernated-workers). The web **Admin → Health** Fleet card shows a
+"Hibernation blocker (last recorded)" line and a "Roll marker:" line per worker. The
+`fleet.hibernation` evidence names the same refusal; see
+[Admin health](./admin-health.md).
+
+### Cache cleanup before sleep
+
+A [Docker-capable](worker-docker.md) worker runs one cache prune while it is
+`hibernating`, before the Deployment scales to 0. It removes only what the daemon
+can rebuild: `docker image prune -f` (dangling images) and `docker builder prune -f`
+(build cache). It never removes containers, volumes, `/data` content or run
+directories, and it has no disk-pressure precondition. It is separate from the
+[pressure prune and DinD maintenance](worker-docker.md#hibernation-cache-prune).
+
+The cleanup needs a worker that advertises the `hibernation_cache_prune_v1`
+capability. A worker without it (an older image, or `workers.diskRecycleEnabled:
+false`, which also turns off the pressure prune) is not pruned and shows
+"cleanup skipped: this worker cannot prune its Docker cache"; it still hibernates. Workers that are not
+Docker-capable have no cleanup and show nothing.
+
+**Start fence.** The worker runs a command only after the api confirms the attempt
+has started. The api confirms only while the worker is `hibernating`, no
+cancellation is pending, and both the api (no non-terminal run, no open custody
+hold, no pending wake demand) and the worker's own fresh report (no local claims or
+executions, custody clear, the claim gate held exclusively) show it idle. Claims stay
+fenced until the attempt settles, however the hibernation ends.
+
+**Outcomes.** The Workers row shows a short phrase; the raw reason code is in
+`uzi worker list --json` and `uzi admin workers --json` as
+`hibernation_cleanup.reason`.
+
+| Shows | Meaning |
+|---|---|
+| `cleaning up` | The attempt is requested or running. |
+| `cache pruned` | At least one of the two prune commands exited 0 and none ended in an unknown state. A cancel between the two commands still reads `cache pruned`. |
+| `cleanup skipped: <reason>` | The prune did not run (or no command ran). The reason is one of: "this worker cannot prune its Docker cache", "Docker was not reachable", "work custody could not be confirmed", "the worker had active work", "a run was being claimed", "the worker was not idle", "hibernation was cancelled", "the worker restarted", "the worker was interrupted", "the worker holds unpublished work", "a queued run needed the worker", "Docker maintenance was running". An unrecognised code from a newer api shows as its own text. |
+| `cleanup interrupted` | The controller observed that the attempt's pod stopped before a result arrived. |
+| `cleanup settlement unknown` | A command may have run, and nothing yet shows how it ended. |
+
+A refusal for any of seven safety reasons (custody could not be confirmed, active
+work, a run being claimed, a claim gate that was not exclusive, an open custody
+hold, pending wake demand, or Docker maintenance running), or a failed re-check of
+those at settlement, withdraws the hibernation into a wake, with the reason
+recorded. A refusal because the Docker daemon was unreachable, or a
+cancelled attempt, does not: the worker hibernates and shows the reason. An admin
+wake, demand for the worker, or the preparing deadline only requests cancellation of
+an unsettled attempt; they never reopen claims. A cancelled attempt that never
+started settles at once as skipped; a started one stops before its next command.
+
+**Unknown settlement.** An attempt becomes unknown when its result is not reported
+within 10 minutes of starting, a command's end could not be confirmed, or the worker
+re-registers while the attempt was started. The worker stays fenced (`hibernating`,
+or `waking` after an admin wake, a demand wake or the setting being turned off) and an admin sees the
+`fleet.hibernation_cleanup` check in [Admin health](admin-health.md). The api asks
+for reconciliation at most every 5 minutes. Only two things clear it:
+
+- a late result from the same worker process that was told to start (the same
+  attempt id and registration);
+- the controller observing the attempt's own pod still present and fully stopped
+  (the Workers row then shows `cleanup interrupted`).
+
+A pod that has disappeared, a new pod or registration, a later prune, or a
+daemon error response is not evidence. **Accepted residual:** if neither arrives,
+the fence and the blocker stay. There is no acknowledge or override route, and the
+worker cannot be deleted (409) while an attempt is unsettled.
+
+If a cleaning worker's pod disappears before the controller observed it terminated,
+the fence holds indefinitely: pod absence is never evidence (the same residual as a
+`ContainerStatusUnknown` pod). A deleted Deployment alone does not: while the stopped
+pod is still listed, the controller reports it and the attempt settles.
+
+**Preparing deadline.** The 10 minutes are counted from when the cleanup settles
+(or from the request, if later), and do not run while an attempt is started or
+unknown; a worker whose attempt is only requested is still withdrawn at the
+deadline.
+
+The Codex command cache (`/var/cache/uzi-codex-cmd`) is an `emptyDir`, so it is
+freed when the pod stops and needs no cleanup step.
+
+The design is in [PRD #4206](../prds/4206-worker-hibernation-cache-cleanup.md).
+
+### Volume retirement dry run (M1)
+
+A hibernated worker keeps its volumes. [PRD #4208](../prds/4208-worker-hibernation-volume-retirement.md)
+will let uzi delete the volumes of a worker that has been hibernated for 21 days
+(504 hours) when it can prove they hold nothing protected. This release ships only the
+first step, a **dry run**: **no volume is deleted**, and no setting turns deletion on.
+
+- **Inventory at hibernation.** Cache cleanup settles before inventory starts, so
+  cleanup cannot change the inventoried state or compete for its writer exclusion.
+  On the Docker lane, while a worker prepares to
+  hibernate, the controller reports the identity of the pod and its volumes, and
+  the worker reports what its volumes hold: attempt trees, clones, journals and
+  tracking refs with their classification, plus any Docker container (stopped
+  included), volume (named or anonymous) or other state. The api stores the
+  inventory only when it matches that identity and the worker's current
+  registration, and the worker must keep writers excluded until the pod is gone.
+  Workers hibernated before this release, workers without the capability, and
+  the plain and isolated lanes have no usable inventory, so they are blocked
+  once past the retirement period (until then they are not yet eligible), and
+  their volumes are retained.
+- **Heartbeat failures.** A transient inventory-heartbeat error keeps the worker's
+  writer exclusion in place. Reports that exclusion was lost are retried until
+  acknowledged; compatibility retries that omit the report do not acknowledge it.
+- **What blocks.** An incomplete, invalid or unproven inventory; a protected,
+  unknown or unrecoverable source; a source that needs a receipt (for example a
+  failed run's tracking ref) without a valid, unexpired capture of its latest
+  bytes; unproven working-tree bytes; any Docker container or volume; and the
+  worker-level refusals (non-terminal runs, an open custody hold, a recovery
+  capture replicated on the worker, an active publication-resume custodian, a
+  manual cordon, draining, maintenance). A terminal run or a released hold is
+  not a receipt.
+- **Pressure-only builder leg.** When this leg is configured, the inventory reports
+  the uncovered writer `dind_builder` and is incomplete. This includes the default
+  Docker prune configuration. Its client can close before the daemon has finished
+  pruning, so local child settlement cannot prove writer exclusion. Pressure
+  cleanup continues with its existing behavior; the volumes remain protected.
+- **Idle cache prune.** Every Docker worker's inventory also reports the uncovered
+  writer `dind_prune` (the idle cache prune) and is incomplete, whether or not the
+  prune is enabled. A Docker worker whose daemon socket never came up, or whose
+  pod-epoch lock mode is unsupported, answers `unsupported` naming it. The prune
+  client can close before the daemon finishes, so retirement stays blocked.
+- **Conditional only.** A worker that nothing blocks is reported as "would retire
+  only after M2 verifies": the volumes' actual PV reclaim policy, and that no
+  other pod mounted them between the controller's observations (only sampled in
+  M1). The StorageClass reclaim policy is shown as a proxy on every row that is not
+  cancelled, when the inventory recorded the claims (blocked and not-yet-eligible rows say "actual PV unverified"), and
+  `Retain` is flagged, because deleting a claim whose PV is `Retain` frees nothing. M2 must
+  verify both before it may delete anything.
+- **Where it shows.** The instance-scoped `fleet.hibernation_retirement` check in
+  **Admin → Health** lists at most 10 workers and evaluates at most 50 per
+  refresh, oldest first; see [Admin health](admin-health.md). A wake after the
+  inventory was taken cancels it ("cancelled: wake requested").
+
+### Downgrading
+
+Operators rolling back past this feature, in order:
+
+1. Turn `worker_hibernation_enabled` off.
+2. Wait until no worker is `hibernating`, `hibernated` or `waking`. The sweeper
+   wakes at most 10 workers per pass.
+3. Stop the api. Rolling back 00441 is a no-op and 00440 drops `fn_placement_admitting_workers`, which
+   this api's ephemeral provisioning and demand-wake queries call, so this api
+   cannot keep serving once 00440 is down. Expect a brief outage window.
+4. Roll back migrations 00441, then 00440, then 00439, then 00438. Down of 00438 refuses
+   while any worker is not awake; Down of 00439 drops the wake records, which
+   are transient demand memory, without refusing. The rollbacks
+   briefly take exclusive locks (00438 on the workers table; 00439 on the runs
+   and workers tables), so do them in a quiet window.
+5. Start the older api. An older api cannot claim runs on the new schema, so it
+   only runs once all four migrations are rolled back.
+
+If the controller is rolled back mid-operation, affected workers stay fenced in
+`waking` until a hibernation-capable controller returns.
+
+The [cache cleanup](#cache-cleanup-before-sleep) adds a further ordering. The api is a
+hard singleton (`Recreate`), so there is no old and new api side by side. To roll
+back past the hibernation cache-cleanup migrations (the cache-cleanup migration and
+the validate migration that follows it):
+
+1. Turn `worker_hibernation_enabled` off.
+2. Wait for every cleanup attempt to settle, not only for the workers to wake: an
+   unknown attempt keeps its worker fenced and blocks this step until it clears.
+3. Stop the api. It must stay up until step 2 completes, because it receives the
+   settlement reports, but it queries the columns the cache-cleanup migration's Down
+   drops, so it cannot keep serving during the rollback.
+4. Run goose down past both migrations. The validate migration's Down is a no-op;
+   the cache-cleanup migration's Down refuses while any attempt is unsettled.
+5. Start the older image.
+
+Starting an older image outside this procedure is unsupported: it does not know the
+attempt, and could scale a worker down in the middle of a prune. CHECK constraints
+on the worker row refuse an old-code write that would reopen claims during an
+unsettled attempt, so such a write fails instead of silently dropping the fence.
+
 ## Pod shutdown grace
 
 Worker pods render `terminationGracePeriodSeconds: 40`. On a stop, the worker joins its own already-authorized authority settlements and logs one `worker_shutdown_result` line within 35 s of the first signal; the extra 5 s is margin (the result is described in [Configuration](./configuration.md)). The field is part of the pod spec, so upgrading the controller changes the pod spec hash once and every hosted worker rolls once through the existing paced roll ([ADR-1470](../adr/1470-paced-hosted-worker-rolls.md)). If a worker stops on its own and its shutdown is `incomplete` (exit 1), the container restarts in the live pod, and the roll health view may briefly name that terminated container (exit 1) as the blocking one; a pod being deleted by the roll is normally not shown. An `incomplete` result never certifies anything: any unresolved record keeps its protections (a successor still refuses it), while a write already started may still complete after the diagnostic. Hosted end-to-end acceptance is pending.
@@ -370,8 +743,8 @@ volume before a cold move is allowed.
 ## Disk self-heal
 
 A hosted worker also reports its disk usage now — the same CPU/memory gauges
-in **Settings → Workers** and the Dashboard's "Worker load" card gain a Disk
-bar per volume (`/nix`, `/data`); see [Resource stats and
+on the **Workers** page, the new Overview's Capacity rail, and the classic
+Overview's "Worker load" card gain a Disk bar per volume (`/nix`, `/data`); see [Resource stats and
 sizing](./worker-setup.md#resource-stats-and-sizing).
 
 Automatic recycle handles these cases:
@@ -420,15 +793,27 @@ work while letting this worker's own parked runs and pinned plan checkers
 finish; maintenance fencing still closes claims. It then fences claims and
 requires fresh custody clearance and zero local activity before gated
 anonymous-volume pruning or stop. No timer, forced park, or force-roll
-override bypasses this DinD gate. The one exception is a separate
-pressure-only anonymous-volume prune (#3891): after two fresh samples at or above
+override bypasses this DinD gate. There are two pressure-only exceptions. The
+first is a separate anonymous-volume prune (#3891): after two fresh samples at or above
 85% of bytes or inodes it runs `docker volume prune -f` on a busy or custody-held
 persistent Docker worker without closing claims or waiting for idle, terminal
 runs or custody. It is not recycle, touches no PVC, and is enabled by the same
 default-on flag, so already-enabled workers get it once the fixed worker deploys;
-`workers.diskRecycleEnabled: false` opts out of it, but also of PVC recycle and
-the cache prune, and rolls non-ephemeral Docker worker pods. See
+`workers.diskRecycleEnabled: false` opts out of it, but also of PVC recycle,
+the cache prune and the builder-cache leg below, and rolls non-ephemeral Docker
+worker pods. See
 [Pressure-only anonymous-volume prune](./worker-docker.md#pressure-only-anonymous-volume-prune).
+A second, separate pressure-only leg (#4291) runs
+`docker builder prune -f --filter type=regular --filter until=24h --max-used-space 4GiB`
+on busy or custody-held persistent Docker workers under the same pressure rule,
+again without closing claims or consulting idle, terminal runs or custody. It
+needs the master flag and its own default-on chart value
+`workers.dindBuilderPruneEnabled: true` (a strict boolean); `false` opts out of
+this leg only. Adding the env rolls every Docker worker pod once after the
+controller upgrade, through the normal drift roll that waits for idle unless the
+global `workers.forceRoll` is set. Below 4 GiB of total cache it frees nothing,
+and records shared with a local image are never pruned. See
+[Pressure-only builder-cache prune](./worker-docker.md#pressure-only-builder-cache-prune).
 Legacy recycle (plain nix/data; Docker Nix-only) associated with
 spec-hash/generation drift also waits indefinitely for idle. Only independent
 nondrifted pressure/nix-size maintenance retains the compatible deadline; global
@@ -605,7 +990,7 @@ gauges, same [concurrency](./worker-setup.md#concurrent-runs) rules.
 
 ## Current Codex worker baseline
 
-The current Codex worker uses runtime 0.166.0 and defaults to `gpt-6.1-sol`
+The current Codex worker uses runtime 0.167.0 and defaults to `gpt-6.1-sol`
 when no worker-model override is set. Explicit model preferences remain
 unchanged. Both harnesses inherit medium reasoning effort; Claude and Codex
 keep separate overrides, and each can instead be set to **Runtime default**,

@@ -1,4 +1,4 @@
-// Pure model for the Overview preview's People chip (admins, issue #4042). Nothing here
+// Pure model for the default Overview's People chip (admins, issue #4042). Nothing here
 // fetches or renders. The roster is a "who is doing what" read over the admin run list, the
 // user list and the usage aggregate; every source can fail on its own, so each part of the
 // model degrades independently instead of guessing.
@@ -91,8 +91,8 @@ export function peopleRows(
   return rows;
 }
 
-// Distinct owners with a run the status sentence counts as executing. Feed it the SAME rows
-// the sentence counts (mergeOverviewRows output), never peopleRows, so "for N people" can
+// Distinct owners with a run the Runs-card line counts as executing. Feed it the SAME rows
+// the line counts (mergeOverviewRows output), never peopleRows, so "for N people" can
 // never exceed the executing count beside it. A row without owner_email is a personal row
 // (only the admin list carries it), so it is the viewer's.
 export function executingPeople(rows: ReadonlyArray<RunSummaryItem>, viewerEmail: string): number {
@@ -280,7 +280,14 @@ export function peopleModel(input: {
 
   let week: number | null = null;
   if (adminUsage != null && adminUsage.users.every((u) => typeof u.last7_run_count === "number")) {
-    week = adminUsage.users.filter((u) => (u.last7_run_count ?? 0) > 0).length;
+    // Issue #4209: last7_run_count counts primary work only, so a user whose only seven-day
+    // activity is helper runs (judge, cross-check, PR rework, CI fix) still counts when they spent.
+    week = adminUsage.users.filter((u) => {
+      if ((u.last7_run_count ?? 0) > 0) return true;
+      const w = u.last_7_days;
+      const spent = w != null && (w.input_tokens !== 0 || w.cache_read_tokens !== 0 || w.cache_creation_tokens !== 0 || w.output_tokens !== 0 || w.cost_usd !== 0);
+      return spent || (u.last7_subscription_run_count ?? 0) > 0 || (u.last7_unreported_run_count ?? 0) > 0;
+    }).length;
   }
 
   return {

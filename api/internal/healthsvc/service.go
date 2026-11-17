@@ -105,6 +105,9 @@ type Store interface {
 	// eligible branch), compared to CIWatchMaxRefs. finishedAfter = now - CIWatchRunWindow.
 	CountEligibleCIWatchRefsPerRepo(ctx context.Context, finishedAfter pgtype.Timestamptz) ([]store.CountEligibleCIWatchRefsPerRepoRow, error)
 	ListRecentUnpricedCodexModels(context.Context, store.ListRecentUnpricedCodexModelsParams) ([]store.ListRecentUnpricedCodexModelsRow, error)
+	// fleet.hibernation (issue #4207): idle workers the automatic pass could not hibernate, and
+	// workers whose only runs are parked; each row carries the exact window total.
+	ListAutoHibernationBlockers(context.Context, store.ListAutoHibernationBlockersParams) ([]store.ListAutoHibernationBlockersRow, error)
 }
 
 // Settings is the slice of the settings cache healthsvc reads: the run-health kill switch
@@ -121,6 +124,11 @@ type Settings interface {
 	AgentSourceRepoURL(context.Context) (string, error)
 	AgentSourceRef(context.Context) (string, error)
 	AgentSourceStatus(context.Context) (settings.AgentSourceStatus, error)
+	// fleet.hibernation (issue #4207): the check is live only while hibernation and its
+	// automatic pass are both on; idleAfter is the threshold a blocker is measured against.
+	WorkerHibernationEnabled(context.Context) (bool, error)
+	WorkerHibernationAuto(context.Context) (bool, error)
+	WorkerHibernationIdleAfter(context.Context) (time.Duration, error)
 }
 
 // dbStat is the db check's raw probe result. Separating it from the severity logic is what
@@ -150,7 +158,11 @@ type Config struct {
 	// memory authority (issue #3142); workersvc.Service.MemoryAuthorityLostFor satisfies it.
 	// nil reads as "nobody gated", so fleet.memory_authority is ok.
 	MemoryAuthorityLost func(workerID uuid.UUID) (time.Time, bool)
-	Store               Store
+	// HibernationRetirement is the PRD #4208 M1 dry-run retirement evaluator;
+	// workersvc.Service.EvaluateHibernationRetirement satisfies it. nil reads as "no hibernated
+	// worker", so fleet.hibernation_retirement is `na`.
+	HibernationRetirement func(context.Context) (workersvc.RetirementReport, error)
+	Store                 Store
 	// MaintenanceReadout reads the maintenance drain readout (PRD #3454), called only while
 	// maintenance is active; wired to store.ReadMaintenanceReadout over the pool. nil leaves
 	// the counts out of maintenance.active's evidence.
@@ -310,6 +322,10 @@ func (s *Service) Evaluate(ctx context.Context) (Doc, error) {
 		s.checkFleetRunDisk(ctx, now, workers),
 		s.checkFleetQuarantine(now, workers),
 		s.checkFleetMemoryAuthority(now, workers),
+		s.checkFleetHibernationWake(now, workers),
+		s.checkFleetHibernationCleanup(workers),
+		s.checkFleetHibernation(ctx, now, workers),
+		s.checkFleetHibernationRetirement(ctx),
 		waiting,
 		s.checkQueueUndispatched(ctx, now),
 		controllerReport,

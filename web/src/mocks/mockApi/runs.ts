@@ -10,6 +10,7 @@ import {
   type RecoveryCustodyHolds,
   type Run,
   type RunPriority,
+  type RunStartBody,
   type RunInputKind,
   type RunListItem,
   type RunSummaryItem,
@@ -21,6 +22,7 @@ import { isCredentialSwitchRefusedLane } from "../../lib/credentialOverride";
 import { credentialSwitchHold } from "../../lib/credentialSwitchHold";
 import { diskWaitMode } from "../../lib/diskRecovery";
 import { isTerminalRun } from "../../lib/runStatus";
+import { CODEX_CURATED_MODELS, CODEX_ROLE_MODELS } from "../../lib/codexModels";
 import {
   LIVE_RUN_ID,
   mockAdminCodexRateLimits,
@@ -102,6 +104,9 @@ function seedCustodyHolds(): RecoveryCustodyHold[] {
     // Its published checkpoint was superseded by a newer run on the same branch (PRD #1810):
     // the work now lives at the run's recovery ref.
     mk({ id: "hold-a1", run_id: "run-a1", worker_id: "wkr-base-m", worker_name: "base (M)", generation: 1, attention: "source_only", checkpoint_ref: "refs/uzi-recovery/run-a1", checkpoint_tip: "3f9c2a7d41be08e6c5a9f1d27b4e3c8a90d6f512", checkpoint_state: "superseded", counts_toward_admission: true, admission_reason: "decision_needed" }),
+    // A second open hold of run-a4 on the same worker: one admission unit covers both, so this
+    // non-representative hold is grouped and never counts toward the limit.
+    mk({ id: "hold-a4-grouped", run_id: "run-a4", worker_id: "wkr-base-m", worker_name: "base (M)", generation: 5, attention: "active", counts_toward_admission: false, admission_reason: "same_run_group" }),
     // Worker B — jvm-worker: an actionable capture failure + a source-only hold.
     // Still at its branch checkpoint slot (PRD #1810); the long branch exercises phone wrapping.
     mk({ id: "hold-b2", run_id: "run-b2", worker_id: "wkr-jvm", worker_name: "jvm-worker", generation: 2, attention: "needs_action", capture_state: "needs_action", checkpoint_ref: "refs/uzi-checkpoints/agent/issue-1810-retain-published-checkpoints-across-supersession", checkpoint_tip: "b41e7d09a2c3f58e61d4a7b90c2e5f3a1d8b6c47", checkpoint_state: "retained", counts_toward_admission: true, admission_reason: "decision_needed" }),
@@ -140,11 +145,49 @@ function seedOverviewNextHolds(): RecoveryCustodyHold[] {
   ];
 }
 
+// The `?mock=custody-run-bound` scenario: nine open, active holds of ONE run from one original
+// worker. The server counts them as one admission unit (the rest are same_run_group), so the owner
+// is far below the limit while the run's own open holds exceed it: the per-run bound.
+function seedRunBoundHolds(): RecoveryCustodyHold[] {
+  const t = (minsAgo: number) => new Date(Date.now() - minsAgo * 60_000).toISOString();
+  return Array.from({ length: 9 }, (_, i): RecoveryCustodyHold => ({
+    id: `hold-rb-${i + 1}`,
+    run_id: "run-custody-run-bound",
+    worker_id: "wkr-base-m",
+    worker_name: "base (M)",
+    generation: i + 1,
+    state: "open",
+    attention: "active",
+    inventory_guarded: false,
+    has_available_capture: false,
+    created_at: t(180 - i),
+    updated_at: t(20),
+    counts_toward_admission: i === 0,
+    admission_reason: i === 0 ? "earlier_generation" : "same_run_group",
+  }));
+}
+
 function currentCustodyHolds(): RecoveryCustodyHold[] {
   const scenario = mockScenario();
   const seeds =
-    scenario === "overview-next" ? seedOverviewNextHolds() : scenario === "custody" ? seedCustodyHolds() : [];
-  return seeds.filter((h) => !discardedHolds.has(h.id));
+    scenario === "overview-next" ? seedOverviewNextHolds() : scenario === "custody" ? seedCustodyHolds() : scenario === "custody-run-bound" ? seedRunBoundHolds() : [];
+  const survivors = seeds.filter((h) => !discardedHolds.has(h.id));
+  // The server counts a run's group as one unit while any member survives, represented by the
+  // oldest survivor (created_at, then id). Discarding the seeded representative promotes it.
+  const result = survivors.map((h) => ({ ...h }));
+  const runIds = new Set(seeds.map((h) => h.run_id));
+  for (const runId of runIds) {
+    const rep = seeds.find((h) => h.run_id === runId && h.counts_toward_admission === true);
+    if (!rep) continue;
+    const members = result.filter((h) => h.run_id === runId);
+    if (members.length === 0 || members.some((h) => h.counts_toward_admission === true)) continue;
+    const oldest = members.reduce((a, b) =>
+      a.created_at < b.created_at || (a.created_at === b.created_at && a.id < b.id) ? a : b,
+    );
+    oldest.counts_toward_admission = true;
+    oldest.admission_reason = rep.admission_reason;
+  }
+  return result;
 }
 
 function custodyResponse(): RecoveryCustodyHolds {
@@ -155,14 +198,23 @@ function custodyResponse(): RecoveryCustodyHolds {
   const decisionNeeded = open.filter(
     (h) => h.attention === "source_only" || h.attention === "needs_action",
   ).length;
+  // Admission counts units (a grouped hold is uncounted), so the aggregate follows the counted holds.
+  const counted = open.filter((h) => h.counts_toward_admission === true).length;
   return {
     aggregate: {
       open_holds: open.length,
-      admission_counted_holds: open.filter((h) => h.counts_toward_admission === true).length,
+      admission_counted_holds: counted,
       custody_hold_limit: custodyLimit,
       decision_needed: decisionNeeded,
       // Two queued code runs are wedged behind the owner limit in this scenario.
-      blocked_runs: open.length >= custodyLimit ? 2 : 0,
+      // In custody-run-bound the one run is blocked while its own remaining open holds reach the limit.
+      blocked_runs:
+        counted >= custodyLimit
+          ? 2
+          : mockScenario() === "custody-run-bound" &&
+              open.filter((h) => h.run_id === "run-custody-run-bound").length >= custodyLimit
+            ? 1
+            : 0,
     },
     holds,
   };
@@ -180,6 +232,20 @@ const credentialSwitched = new Set<string>();
 // Issue #3181: the server's ErrRunHoldSettling text, verbatim (api/internal/workersvc/credential_switch.go).
 const CREDENTIAL_SWITCH_SETTLING_REFUSAL =
   "the worker is still finishing its own operations for this run; try Resume again shortly, or Cancel the run";
+
+// Issue #4231: the server's ErrRunOwnerHeld text and runOwnerHeldLabels, verbatim
+// (api/internal/workersvc/run_credential.go). The mock seeds no policy-held recovery_wait run,
+// so only the recovery causes are mirrored.
+const OWNER_HELD_REFUSAL =
+  "this owner hold prevents switching the token; inspect the run's recovery options: Resume may re-hold it, Cancel ends the run";
+const OWNER_HOLD_LABELS: Record<string, string> = {
+  codex_account_unavailable: "codex account unavailable",
+  worker_requeue_exhausted: "worker requeue exhausted",
+  worker_memory_pressure: "worker memory pressure",
+  retained_recovery_adoption_failed: "retained recovery adoption failed",
+  retained_continuation_unwitnessed: "retained continuation unwitnessed",
+  retained_recovery_exhausted: "retained recovery exhausted",
+};
 
 // One applied epoch, so the history list renders with a token label + reason + time.
 const appliedEpochs = (): CredentialEpoch[] => [
@@ -379,6 +445,40 @@ function mockAdminListRuns(params?: {
   return delay({ runs: params?.view === "summary" ? items.map(toSummary) : items });
 }
 
+// PRD #3250: the mock's half of the create-time start-option checks, mirroring the Go
+// handler's validateRunStartOptions and runOverrideModelHonorable (workersvc). Both halves
+// iterate fixtures/run-start-options/cases.json (mockApi.runStartOptions.test.ts here), so
+// the demo refuses exactly what the server refuses. Values are NOT trimmed.
+const RUN_START_EFFORTS = ["low", "medium", "high", "xhigh", "max"];
+const RUN_START_MODEL_MAX_BYTES = 100;
+
+function runStartShapeError(start: RunStartBody): string {
+  const { model, effort } = start;
+  if (model !== undefined) {
+    if (model === "" || /\s/u.test(model)) return "model must not contain whitespace; omit it to use your default";
+    if (new TextEncoder().encode(model).length > RUN_START_MODEL_MAX_BYTES) {
+      return `model must be at most ${RUN_START_MODEL_MAX_BYTES} characters`;
+    }
+    if (/[\p{Cc}\p{Cf}\uFFFD]/u.test(model)) return "model must not contain newlines or control characters";
+  }
+  if (effort !== undefined && !RUN_START_EFFORTS.includes(effort)) {
+    return "effort must be one of low, medium, high, xhigh, max";
+  }
+  return "";
+}
+
+function runOverrideModelHonorable(harness: Harness, model: string): boolean {
+  return harness === "codex" ? CODEX_CURATED_MODELS.includes(model) : !CODEX_ROLE_MODELS.includes(model);
+}
+
+function runStartModelRefusal(harness: Harness, model: string): string {
+  if (harness === "codex") {
+    const list = [...CODEX_CURATED_MODELS].sort().join(", ");
+    return `${model} is not a model a Codex run can start with, and this run resolved to the codex harness; start it on the Claude harness or choose one of: ${list}`;
+  }
+  return `${model} cannot run on the Claude harness, and this run resolved to the claude harness; start it on the Codex harness or choose a Claude model`;
+}
+
 export const runsApi = {
   // ── Runs ────────────────────────────────────────────────────────────────────
   // Runs-in-progress count for the Runs nav badge (PRD #239). Counted LIVE from the
@@ -401,17 +501,25 @@ export const runsApi = {
   createRun: async (
     repoId: string,
     issueIid: number,
+    // PRD #3250 M2: mirror the real client's start-option object (lib/startRun.ts's
+    // runStartBody). An explicit harness is stamped verbatim (never overridden by the
+    // scenario: D2's "explicit never falls back" holds even in the mock); omitted falls
+    // through to the scenario's implicit resolution, mirroring D11 (the "codex-only"
+    // scenario has no usable Claude, so it implicitly resolves codex, same as the real
+    // server would). The credential override is stamped read-side ({mode,label}) so a demo
+    // start-with-token is visible; model and effort are checked against the shared
+    // fixtures/run-start-options cases and stamped with run_override sources.
+    start: RunStartBody = {},
     force?: boolean,
-    // PRD #1247 M7: mirror the real client's optional override arg. The mock stamps the
-    // read-side {mode,label} onto the created run so a demo start-with-token is visible.
-    credentialOverride?: { mode: string; secret_id?: string },
-    // PRD #1429 M4a: mirror the real client's optional harness arg. An explicit pick is
-    // stamped verbatim (never overridden by the scenario — D2's "explicit never falls
-    // back" holds even in the mock); omitted falls through to the scenario's implicit
-    // resolution, mirroring D11 (the "codex-only" scenario has no usable Claude, so it
-    // implicitly resolves codex, same as the real server would).
-    harness?: Harness,
   ) => {
+    // The pre-forge shape step answers before any issue lookup, like the handler.
+    const shapeError = runStartShapeError(start);
+    if (shapeError) throw new ApiError(400, shapeError);
+    const { credential_override: credentialOverride, harness: explicitHarness, model, effort } = start;
+    const harness: Harness = explicitHarness ?? (mockScenario() === "codex-only" ? "codex" : "claude");
+    if (model !== undefined && !runOverrideModelHonorable(harness, model)) {
+      throw new ApiError(422, runStartModelRefusal(harness, model), { code: "model_incompatible_with_harness", harness });
+    }
     const b = state.boards.get(repoId);
     const card = b?.cards.find((c) => c.iid === issueIid);
     if (!b || !card) throw new ApiError(404, "issue not found");
@@ -451,7 +559,7 @@ export const runsApi = {
       issue_iid: issueIid,
       issue_title: card.title,
       issue_description: "See the linked PRD.",
-      harness: harness ?? (mockScenario() === "codex-only" ? "codex" : "claude"),
+      harness,
       title: null,
       resume_of_run_id: null,
       status: "queued",
@@ -463,7 +571,11 @@ export const runsApi = {
       plan_cross_check_required: false,
       worker_id: null,
       branch: null,
-      model: null,
+      // PRD #3250: stamp only the supplied values; an absent setting leaves its pair null.
+      model: model ?? null,
+      model_source: model !== undefined ? "run_override" : null,
+      effort: effort ?? null,
+      effort_source: effort !== undefined ? "run_override" : null,
       override_subagent_model: false,
       mr_iid: null,
       mr_state: null,
@@ -626,7 +738,7 @@ export const runsApi = {
       // PRD #1293 failed-run outcomes. Internally consistent: finished === completed +
       // cancelled + plan_rejected + base_diverged + failed, and sum(fail_origins) === failed. finished is a
       // different population from run_count (D2) — infra failures spend no tokens, so it sits
-      // a little above the 23 usage-bearing runs. Mirrors the u-vlad row below ("you").
+      // a little above the 23 primary work runs with usage. Mirrors the u-vlad row below ("you").
       // needs_landing (issue #1418) is the sub-cut of failed whose committed work is
       // human-landable (here the workflow-scope + push-secret failures); needs_landing <= failed.
       outcomes: {
@@ -844,6 +956,11 @@ export const runsApi = {
     if (switchHold === "settling") throw new ApiError(409, CREDENTIAL_SWITCH_SETTLING_REFUSAL);
     if (diskWaitMode(run) === "held")
       throw new ApiError(409, "data_volume_full held: use Resume before switching its token");
+    // Issue #4231: mirrors the server's ErrRunOwnerHeld / RunOwnerHeldError for the
+    // recovery_wait causes PromoteRecoveryWaitRunNow never promotes. Refuse, write nothing.
+    const ownerHoldLabel = run.status === "recovery_wait" && run.recovery_wait_cause
+      ? OWNER_HOLD_LABELS[run.recovery_wait_cause] : undefined;
+    if (ownerHoldLabel) throw new ApiError(409, `${OWNER_HELD_REFUSAL} (hold: ${ownerHoldLabel})`);
     credentialSwitched.add(id);
     patchRun(id, {
       credential_override: overrideToRead(body),
@@ -1090,8 +1207,9 @@ export const runsApi = {
       throw new ApiError(404, "run not found");
     const forgeHeld = run.status === "recovery_wait" && run.recovery_wait_cause === "forge_unreachable" && run.recovery_retry_not_before === null;
     const memoryHeld = run.status === "recovery_wait" && run.recovery_wait_cause === "worker_memory_pressure";
+    const spendLimitHeld = run.status === "recovery_wait" && run.recovery_wait_cause === "anthropic_spend_limit";
     const diskHeld = diskWaitMode(run) === "held";
-    if (run.status !== "paused" && run.status !== "pool_wait" && !memoryHeld && !forgeHeld && !diskHeld)
+    if (run.status !== "paused" && run.status !== "pool_wait" && !memoryHeld && !forgeHeld && !diskHeld && !spendLimitHeld)
       throw new ApiError(409, `run is ${run.status}`);
     const iterationHeld = run.status === "paused" && run.hold_reason === "iteration_budget_exhausted";
     const diskWallLimited = diskHeld && run.kind !== "chat" && run.kind !== "judge" &&
@@ -1119,6 +1237,7 @@ export const runsApi = {
         health_reason: "Owner resumed one bounded forge attempt; origin cooldown and other admission limits may still block execution.",
       } : {}),
       ...(memoryHeld ? { memory_hold: undefined, recovery_wait_cause: null, recovery_retry_not_before: null } : {}),
+      ...(spendLimitHeld ? { recovery_wait_cause: null, recovery_retry_not_before: null } : {}),
       ...(diskHeld ? { recovery_wait_cause: null, recovery_retry_not_before: null,
         recovery_wait_phase: null, health: "ok", health_reason: null, health_since: null } : {}),
       ...(switchHold === "unsettled" ? { hold_reason: null, status_since: new Date().toISOString() } : {}),

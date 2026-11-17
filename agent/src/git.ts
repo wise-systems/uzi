@@ -9,7 +9,8 @@ import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { promisify } from "node:util";
 import fs from "node:fs/promises";
-import { lstatSync, constants as fsConstants, createReadStream, createWriteStream, type Stats } from "node:fs";
+import { lstatSync, constants as fsConstants, createReadStream, createWriteStream, type BigIntStats, type Stats } from "node:fs";
+import type { FileHandle } from "node:fs/promises";
 import os from "node:os";
 import { isUtf8 } from "node:buffer";
 import path from "node:path";
@@ -205,6 +206,12 @@ interface RecoveryPhysicalWarningScope {
 }
 const codeGeneration = (value: number): boolean => Number.isSafeInteger(value) && value >= 0;
 const codeTerminal = (value: string): boolean => ["completed", "failed", "cancelled"].includes(value);
+
+/** Outcome of {@link GitCache.terminalDefaultBranch}: a positively read branch, a proven absence, or an unknowable state. */
+export type TerminalDefaultBranch =
+  | { kind: "resolved"; name: string }
+  | { kind: "absent" }
+  | { kind: "unknown"; detail: string };
 
 export interface CodeSnapshotReaderProof {
   childId: string;
@@ -487,9 +494,20 @@ const RETAINED_SUCCESSOR_REASONS = new Set([
   "wrapper_marker_parent", "wrapper_lineage_ancestry", "wrapper_source_parent",
   "final_head", "final_tree", "final_marker_restoration", "final_dirty_diff", "final_ancestry",
   "attempt_invalid", "iteration_before", "episode_pin_changed", "identity_used", "seed_failed",
-  "iteration_after", "post_adoption_check",
+  "iteration_after", "post_adoption_check", "remediation_active", "remediation_proof_unknown",
 ]);
 const retainedSuccessorDiagnostics = new WeakMap<Error, string>();
+
+/** Closed wire values the api accepts as `recovery_detail` on an adoption-failure park. */
+export type RetainedAdoptionRefusal = "secret_remediation_active" | "remediation_proof_unknown";
+
+/** The single map from a refusal's annotation to its wire value. Only the two remediation reasons map; every other
+ * refusal (and every unannotated error) is unclassified, which selects generic text and never permits adoption. */
+export function retainedAdoptionRefusal(error: unknown): RetainedAdoptionRefusal | undefined {
+  const reason = error instanceof Error ? retainedSuccessorDiagnostics.get(error) : undefined;
+  return reason === "remediation_active" ? "secret_remediation_active"
+    : reason === "remediation_proof_unknown" ? "remediation_proof_unknown" : undefined;
+}
 
 /** Attach only a fixed successor reason, without changing the thrown value's public surface.
  * Callers retain responsibility for excluding their abort and control-flow sentinels. */
@@ -964,7 +982,7 @@ function splitNulRecords(buf: Buffer): Buffer[] | undefined {
 }
 /** Wall-clock ceiling on the preserved_patch scan (the patch is already byte-capped by
  *  REVIEW_DIFF_MAX_BYTES, so gitleaks stdin finishes in well under a second in practice). */
-const PATCH_SCAN_TIMEOUT_MS = 2 * 60_000;
+export const PATCH_SCAN_TIMEOUT_MS = 2 * 60_000;
 
 export type BoundaryProcessSpawner = (request: BoundaryProcessRequest) => Promise<BoundaryProcessHandle>;
 
@@ -1065,6 +1083,8 @@ export interface GitCacheOptions {
     closeWaitMs?: number;
     lstat?: (p: string) => Promise<Stats>;
   };
+  /** Test-only: the clock and timers of cleanupArchivedRecoveryPin (issue #4091). Production never passes it. */
+  archivedPinClockForTest?: { now(): number; schedule(fn: () => void, ms: number): () => void };
   /** issue #1783 M3 — test-only fs seam for the canonical-path free (freeCanonicalClonePath):
    *  `lstat` replaces the validation lstat of the repo dir and the canonical path, `rename` the
    *  quarantine rename, `residueUuid` the residue name's uuid. Production never passes it. */
@@ -1244,6 +1264,14 @@ export const RECOVERY_CHUNK_BYTES = 1024 * 1024;
 // checks out on `git clone recovered.bundle`, and that can never collide with a real run
 // branch or a stale bare mirror ref (it is created and deleted under the bare lock).
 export const RECOVERY_BUNDLE_REF = "refs/heads/recovered-source";
+// Node script (run as `node -e SCRIPT <path>`) that prints the sha256 hex of a file, streaming it so a large
+// `.git/index` is never held in memory whole. Prints "absent" for ENOENT and "error" for any other failure; it
+// writes only once, never writes to stderr and never throws.
+export const TERMINAL_INDEX_HASH_SCRIPT =
+  `const fs=require("fs"),c=require("crypto");let done=false;const out=(s)=>{if(!done){done=true;process.stdout.write(s)}};` +
+  `try{const h=c.createHash("sha256");const s=fs.createReadStream(process.argv[1]);` +
+  `s.on("data",(d)=>h.update(d));s.on("end",()=>out(h.digest("hex")));` +
+  `s.on("error",(e)=>out(e&&e.code==="ENOENT"?"absent":"error"))}catch(e){out(e&&e.code==="ENOENT"?"absent":"error")}`;
 
 /** Inspect at most 16 KiB of retained bytes; never load the pack to parse its header. */
 export async function readRecoveryBundleHeader(bundlePath: string, sourceSha: string): Promise<{
@@ -1763,11 +1791,11 @@ class AuthorityRefusedError extends Error {
 
 /** The retained journal does not carry the exact fence an install or retirement expected. */
 class CompletionSourceFenceError extends Error {
-  constructor(message: string) { super(message); this.name = "CompletionSourceFenceError"; }
+  constructor(message: string, readonly kind?: "fence_conflict") { super(message); this.name = "CompletionSourceFenceError"; }
 }
 
 /** issue #3645: true for the refusal a non-certified retirement raises on a fenced journal. The class stays private. */
-export function isCompletionSourceFenceError(e: unknown): boolean {
+export function isCompletionSourceFenceError(e: unknown): e is CompletionSourceFenceError {
   return e instanceof CompletionSourceFenceError;
 }
 
@@ -1892,6 +1920,16 @@ export interface RemediationRecovery {
   excludedRoots?: string[];
   active?: RemediationGrant;
   edges: Array<{ from: string; to: string; grant: RemediationGrant; context: string; phase: "prepared" | "committed" }>;
+}
+
+/** Worker-owned, per-query diagnostics; never carries journal bytes or exception text. */
+export interface RemediationRestrictionProgress {
+  started?: boolean;
+  /** Set when withLock enters its locked section; any later failure is post-acquisition and sticky (#4191). */
+  acquired?: boolean;
+  cause?: "pre_read_unavailable" | "enrolled_observed" | "blocked" | "integrity" | "identity" |
+    "changed_facts" | "post_read_expiry" | "unknown";
+  observe?: (facts: RemediationRestrictionFacts) => void;
 }
 
 /** Negative evidence only; neither the data nor its fingerprint grants source use. */
@@ -2067,6 +2105,19 @@ export interface AttemptLedgerEntry {
   clonePath: string;
   state: AttemptLedgerState;
 }
+
+/** issue #4007 M3: {@link GitCache.readTerminalAttribution}'s result. */
+export type TerminalAttribution =
+  | { kind: "verified";
+      attempts: Array<{ attemptId: string; clonePath: string; branch: string; state: AttemptLedgerState }>;
+      journal: Array<{ branch: string; clonePath: string; attemptId?: string }>;
+      stoppedMarkers: Array<{ branch: string; clonePath: string }>;
+      protected: Array<{ branch: string; key: string; clonePaths: string[] }>;
+      owedRoots: string[] }
+  | { kind: "unknown"; cause: string };
+
+/** issue #4007 M3: why {@link GitCache.readTerminalCloneLocalRefs} refused. */
+export type TerminalLocalRefReason = "stash" | "linked_worktree" | "not_ancestor" | "stderr" | "cap" | "unreadable";
 
 // ---- issue #3638: the cooperative memory-park record (strict v1 parser) ---------------------------------------
 
@@ -2657,7 +2708,23 @@ export interface EpochRetainedLimits {
   maxObjectStoreBytes?: number;
 }
 
+/**
+ * Diagnostic-only counters of retained-source work; no decision may read them. ms values are rounded per call.
+ * A `work` sink counts everything its public call does, including GitCache calls made from the call's own
+ * callbacks, except a nested retained inspect/discover call, which installs its own (possibly absent) sink.
+ * None of the pod-epoch callbacks call git today.
+ */
+export type RetainedWorkCounters = {
+  gathers: number; gather_ms: number; tree_walks: number; tree_entries: number; tree_ms: number;
+};
+
+export function newRetainedWorkCounters(): RetainedWorkCounters {
+  return { gathers: 0, gather_ms: 0, tree_walks: 0, tree_entries: 0, tree_ms: 0 };
+}
+
 export interface EpochRetainedDiscoveryOptions {
+  /** Optional diagnostic sink for gather and tree-walk work performed by this call. */
+  work?: RetainedWorkCounters;
   signal?: AbortSignal;
   /** Absolute wall-clock deadline. */
   deadline?: number;
@@ -2677,6 +2744,8 @@ export interface EpochRetainedDiscoveryResult {
 }
 
 export interface RetainedInspectOptions {
+  /** Optional diagnostic sink for gather and tree-walk work performed by this call, including GitCache calls its callbacks make (a nested retained inspect/discover call uses its own sink). */
+  work?: RetainedWorkCounters;
   signal?: AbortSignal;
   /** Absolute wall-clock deadline, also covering measurement and queued locks. */
   deadline?: number;
@@ -2701,6 +2770,50 @@ export interface RetainedInspectOptions {
   budgetMs?: number;
   /** Test seam: smaller caps on the measurement walk than the defaults. */
   measureCaps?: RetainedMeasureCaps;
+}
+
+/** One epoch group of {@link GitCache.inspectEpochRetainedGroups}; each field behaves as in {@link RetainedInspectOptions}. */
+export interface EpochInspectGroupRequest {
+  selector: RetainedSourceSelector;
+  holds: RetainedHoldsSnapshot;
+  lifecycle: RetainedLifecycleSnapshot;
+  maxPhysicalPaths: number;
+  beforeTree?: (clonePath: string) => void;
+  measureCaps?: RetainedMeasureCaps;
+}
+
+export interface EpochInspectGroupsOptions {
+  /** Optional diagnostic sink for gather and tree-walk work performed by this call. */
+  work?: RetainedWorkCounters;
+  signal?: AbortSignal;
+  deadline?: number;
+  barePath: string;
+  requests: EpochInspectGroupRequest[];
+  maxDescriptors?: number;
+  epochLimits?: EpochRetainedLimits;
+  isLivePath: (clonePath: string) => boolean;
+  now?: () => number;
+  budgetMs?: number;
+}
+
+interface InspectBatchCommon {
+  epoch: boolean;
+  barePath: string | undefined;
+  maxDescriptors: number | undefined;
+  signal: AbortSignal | undefined;
+  deadline: number | undefined;
+  budgetMs: number | undefined;
+  now: (() => number) | undefined;
+  isLivePath: (clonePath: string) => boolean;
+}
+
+interface InspectBatchRequest {
+  selector: RetainedSourceSelector | undefined;
+  holds: RetainedHoldsSnapshot | undefined;
+  lifecycle: RetainedLifecycleSnapshot | undefined;
+  maxPhysicalPaths: number | undefined;
+  beforeTree: ((clonePath: string) => void) | undefined;
+  measureCaps: RetainedMeasureCaps | undefined;
 }
 
 export interface RetainedInspectResult {
@@ -3083,6 +3196,164 @@ const RESIDUE_ENUMERATION_BUDGET = 4096;
 const RETENTION_WARNING_KEYS = 128;
 const RETIRE_SCRATCH_ENUMERATION_BUDGET = 4096;
 const RETIRE_SCRATCH_REPORTED_PATHS = 10;
+const RETIRE_SCRATCH_OUTCOME_BUDGET_MS = 30_000;
+const RETIRE_SCRATCH_WALK_MAX_ENTRIES = 200_000;
+/** Each directory level holds one descriptor open; deeper trees are reported partial, not followed. */
+const RETIRE_SCRATCH_WALK_MAX_DEPTH = 64;
+
+/** Reads `UZI_RETIRE_SCRATCH_OUTCOMES`: whether startup adds the read-only per-parent observation
+ *  records after the `runner retire scratch retained` warning. On by default; `0` restores the
+ *  warning-only behavior. Anything else refuses startup. */
+export function readRetireScratchOutcomesActivation(env: NodeJS.ProcessEnv): boolean {
+  const raw = env.UZI_RETIRE_SCRATCH_OUTCOMES;
+  if (raw === undefined || raw === "" || raw === "1") return true;
+  if (raw === "0") return false;
+  throw new Error("UZI_RETIRE_SCRATCH_OUTCOMES must be unset, empty, 0 or 1");
+}
+
+type RetireScratchWalkReason = "entry_cap" | "time_cap" | "unreadable" | "cross_device" | "changed" | "vanished";
+type RetireScratchBytesState = "measured" | "partial" | "unknown";
+type RetireScratchSources = { state: "read"; paths: string[] } | { state: "unknown" } | { state: "not_attempted" };
+
+interface RetireScratchWalkCtx {
+  now: () => number;
+  deadline: number;
+  signal?: AbortSignal;
+  /** Directory entries listed so far, across every parent. */
+  entries: number;
+  maxEntries: number;
+  /** dev:ino of every non-directory inode with nlink > 1 already counted. */
+  seen: Set<string>;
+  beforeEntry?: (dirPath: string, name: string) => Promise<void>;
+  /** Test hook: runs after lstat reported `dirPath` as a directory and before it is opened. */
+  beforeOpen?: (dirPath: string) => Promise<void>;
+}
+
+interface RetireScratchWalkAcc {
+  bytes: bigint;
+  /** Something (at least one lstat or fstat) was measured. */
+  measured: boolean;
+  reasons: Set<RetireScratchWalkReason>;
+}
+
+interface RetireScratchParentResult {
+  name: string;
+  recent: boolean;
+  kind: "dir" | "symlink" | "other";
+  bytes: bigint;
+  bytesState: RetireScratchBytesState;
+  reasons: RetireScratchWalkReason[];
+  empty: boolean;
+}
+
+function retireWalkErrorReason(err: unknown): RetireScratchWalkReason {
+  switch ((err as NodeJS.ErrnoException | undefined)?.code) {
+    case "ENOENT": return "vanished";
+    case "ELOOP": case "ENOTDIR": return "changed";
+    default: return "unreadable";
+  }
+}
+
+function retireWalkSpent(ctx: RetireScratchWalkCtx): "time_cap" | undefined {
+  return ctx.signal?.aborted || ctx.now() >= ctx.deadline ? "time_cap" : undefined;
+}
+
+function retireWalkAddBlocks(ctx: RetireScratchWalkCtx, acc: RetireScratchWalkAcc, st: BigIntStats, dedupe: boolean): void {
+  if (dedupe && st.nlink > 1n) {
+    const key = `${st.dev}:${st.ino}`;
+    if (ctx.seen.has(key)) return;
+    ctx.seen.add(key);
+  }
+  acc.bytes += st.blocks * 512n;
+  acc.measured = true;
+}
+
+const RETIRE_WALK_OPEN_FLAGS = fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK;
+
+/** Measure one directory that lstat reported as a directory, descriptor-relative and read-only. Returns
+ *  the number of names listed when the listing completed, undefined otherwise. Every handle is closed
+ *  in finally; descent goes through `/proc/self/fd/<fd>`, so a later swap of any ancestor name cannot
+ *  redirect it. */
+async function retireWalkDirectory(ctx: RetireScratchWalkCtx, acc: RetireScratchWalkAcc, openPath: string, display: string,
+  lst: BigIntStats, dev: bigint, depth: number): Promise<number | undefined> {
+  retireWalkAddBlocks(ctx, acc, lst, false);
+  if (depth > RETIRE_SCRATCH_WALK_MAX_DEPTH) { acc.reasons.add("entry_cap"); return undefined; }
+  let handle: FileHandle | undefined;
+  try {
+    await ctx.beforeOpen?.(display);
+    handle = await fs.open(openPath, RETIRE_WALK_OPEN_FLAGS);
+    const before = await handle.stat({ bigint: true });
+    if (before.dev !== lst.dev || before.ino !== lst.ino) { acc.reasons.add("changed"); return undefined; }
+    if (before.dev !== dev) { acc.reasons.add("cross_device"); return undefined; }
+    const base = `/proc/self/fd/${handle.fd}`;
+    const names: string[] = [];
+    let complete = true;
+    const list = await fs.opendir(base);
+    try {
+      for (;;) {
+        const spent = retireWalkSpent(ctx);
+        if (spent) { acc.reasons.add(spent); complete = false; break; }
+        const entry = await list.read();
+        if (!entry) break;
+        if (ctx.entries >= ctx.maxEntries) { acc.reasons.add("entry_cap"); complete = false; break; }
+        ctx.entries++;
+        names.push(entry.name);
+      }
+    } finally {
+      await list.close().catch(() => undefined);
+    }
+    for (const name of names) {
+      const spent = retireWalkSpent(ctx);
+      if (spent) { acc.reasons.add(spent); complete = false; break; }
+      await ctx.beforeEntry?.(display, name);
+      const child = `${base}/${name}`;
+      let cst: BigIntStats;
+      try { cst = await fs.lstat(child, { bigint: true }); }
+      catch (err) { acc.reasons.add(retireWalkErrorReason(err)); continue; }
+      if (cst.isDirectory()) await retireWalkDirectory(ctx, acc, child, path.join(display, name), cst, dev, depth + 1);
+      else retireWalkAddBlocks(ctx, acc, cst, true);
+    }
+    const after = await handle.stat({ bigint: true });
+    if (after.mtimeNs !== before.mtimeNs || after.ctimeNs !== before.ctimeNs || after.nlink !== before.nlink)
+      acc.reasons.add("changed");
+    return complete ? names.length : undefined;
+  } catch (err) {
+    acc.reasons.add(retireWalkErrorReason(err));
+    return undefined;
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
+}
+
+async function retireWalkParent(ctx: RetireScratchWalkCtx, rootFd: number, rootDev: bigint, root: string,
+  parent: { name: string; recent: boolean; kind: "dir" | "symlink" | "other" }): Promise<RetireScratchParentResult> {
+  const acc: RetireScratchWalkAcc = { bytes: 0n, measured: false, reasons: new Set() };
+  let kind = parent.kind;
+  let empty = false;
+  const spent = retireWalkSpent(ctx);
+  if (spent) acc.reasons.add(spent);
+  else {
+    try {
+      await ctx.beforeEntry?.(root, parent.name);
+      const openPath = `/proc/self/fd/${rootFd}/${parent.name}`;
+      const lst = await fs.lstat(openPath, { bigint: true });
+      if (lst.isSymbolicLink()) { kind = "symlink"; retireWalkAddBlocks(ctx, acc, lst, true); }
+      else if (!lst.isDirectory()) { kind = "other"; retireWalkAddBlocks(ctx, acc, lst, true); }
+      else {
+        kind = "dir";
+        const listed = await retireWalkDirectory(ctx, acc, openPath, path.join(root, parent.name), lst, rootDev, 0);
+        empty = listed === 0 && acc.reasons.size === 0;
+      }
+    } catch (err) {
+      acc.reasons.add(retireWalkErrorReason(err));
+    }
+  }
+  const reasons = [...acc.reasons].sort();
+  return {
+    name: parent.name, recent: parent.recent, kind, bytes: acc.bytes, reasons, empty,
+    bytesState: reasons.length === 0 ? "measured" : acc.measured ? "partial" : "unknown",
+  };
+}
 /** issue #3153 — `<dataDir>/runner` (and the TMPDIR under it) now lives on the persistent data
  *  volume, so bytes that cannot be deleted accumulate across pod replacements instead of vanishing
  *  with an emptyDir. This per-process counter counts FAILED REMOVAL ATTEMPTS (not distinct paths:
@@ -3119,7 +3390,7 @@ const RETENTION_RM_CLOSE_WAIT_MS = 10_000;
 export type JoinedEpochChild =
   | { joined: true; spawned: true; ticket: { settle(): void }; code: number | null; signal: NodeJS.Signals | null;
       stdout: string; stderr: string; stdoutBytes?: Buffer; stderrBytes?: Buffer; failure: unknown }
-  | { joined: true; spawned: false; ticket: { settle(): void }; failure: unknown };
+  | { joined: true; spawned: false; provenance?: "not-spawned"; ticket: { settle(): void }; failure: unknown };
 
 /** Issue #4043: one admitted scratch leaf to delete (see {@link GitCache.discardEpochScratchLeaf}). */
 export interface EpochScratchDiscardInput {
@@ -3649,6 +3920,10 @@ export class GitCache {
   readonly recoveryArchiveRoot: string;
   /** Per-bare-path serialization: git's lockfiles can't take parallel mutations. */
   private readonly locks = new Map<string, Promise<unknown>>();
+  /** The current holder of each `locks` key, keyed the same way: an identity token whose `since`
+   *  (performance.now()) is when that holder acquired the lock. Diagnostic only: a waiter that aborts
+   *  before acquisition logs how long the holder had held it. Set and cleared inside withLock's `run`. */
+  private readonly lockHolders = new Map<string, { since: number }>();
   /** Per-key warning timestamps, bounded by LRU eviction and reset on restart.
    * These throttle diagnostics only and confer no deletion authority. */
   private readonly retentionWarnings = new Map<string, number>();
@@ -3692,6 +3967,9 @@ export class GitCache {
     signal: AbortSignal; deadline: number; budget?: MaintenanceBudget; closureBudget: ClosureBudget;
     closureCache: { identities: Map<string, Map<string, ClosureObject>>; entries: number };
   }>();
+
+  // Diagnostic-only work sink for the active public retained call (undefined when the caller passed none).
+  private readonly retainedWorkScope = new AsyncLocalStorage<RetainedWorkCounters | undefined>();
 
   // Each public invocation owns its sidecars, including concurrent calls on this cache.
   private readonly retainedCauseScope = new AsyncLocalStorage<{
@@ -3929,7 +4207,17 @@ export class GitCache {
       bytes: options.bytes, encoding: options.encoding, identity,
       signals: [state.signal, ...(signal ? [signal] : [])], deadline: state.deadline,
     });
-    if (!joined.spawned) { state.scope.stop(); throw joined.failure; }
+    if (!joined.spawned) {
+      if (joined.provenance === "not-spawned" && !state.scope.stopped()) {
+        joined.ticket.settle();
+        throw Object.assign(new Error("epoch native executable not spawned", { cause: joined.failure }), {
+          epochNativeNotSpawned: true,
+          ...(joined.failure && typeof joined.failure === "object" && "code" in joined.failure
+            ? { code: joined.failure.code } : {}),
+        });
+      }
+      state.scope.stop(); throw joined.failure;
+    }
     if (state.scope.stopped()) throw new Error("epoch native scope stopped");
     joined.ticket.settle();
     const { failure, code } = joined;
@@ -3952,6 +4240,9 @@ export class GitCache {
    * Any joined outcome (a non-zero exit, a signal, an abort, a timeout that was killed and joined)
    * returns `{ joined: true, spawned: true }`; a spawn that throws before a child exists returns
    * `{ joined: true, spawned: false }` and the caller decides whether that stops the scope. An
+   * asynchronous exec error observed before close, with no spawn, PID or exit evidence, returns the additional
+   * `provenance: "not-spawned"` only after close and successful output joins. Callers may
+   * settle that refusal without treating it as a generic joined process error. An
    * unconfirmed join stops the scope and throws with `epochProcessJoined: false`.
    */
   private async spawnJoinedEpochChild(
@@ -3970,12 +4261,22 @@ export class GitCache {
         env: options.env, cwd: options.cwd, detached: true, stdio,
       });
     } catch (error) { return { joined: true, spawned: false, ticket, failure: error }; }
-    const pid = child.pid;
+    let sawSpawn = false, sawExit = false, errorBeforeSpawn = false, noChildJoined = false;
+    let sawPid = child.pid !== undefined;
+    const noChild = () => {
+      sawPid ||= child.pid !== undefined;
+      return errorBeforeSpawn && !sawSpawn && !sawExit && !sawPid &&
+        child.pid === undefined &&
+        // Node records the negative exec errno in exitCode even though no exit event fires.
+        (child.exitCode === null || child.exitCode < 0) && child.signalCode === null;
+    };
     const alive = () => {
+      const pid = child.pid;
       if (!Number.isSafeInteger(pid) || pid! <= 0) throw new Error("epoch process group unknown");
       return deps ? deps.alive(pid!, identity) : processGroupAlive(pid!, identity, true);
     };
     const kill = () => {
+      const pid = child.pid;
       if (deps) { deps.kill(pid!, identity); return; }
       if (identity === "command") {
         if (!killRunnerGroupOnly(pid!, true) && alive()) throw new Error("epoch group signal unconfirmed");
@@ -3996,6 +4297,13 @@ export class GitCache {
       try {
         // Normal exit permits one bounded grace; errors cancel immediately. Only
         // positive group absence plus direct and IO joins can settle this ticket.
+        // A confirmed exec failure has no group to probe. Close and both output
+        // joins are still mandatory, and every await rechecks contradictory evidence.
+        while (noChild()) {
+          if (closed && ioJoined) { noChildJoined = true; return; }
+          if (Date.now() >= until) throw new Error("epoch native group unknown: no-child IO join unconfirmed");
+          await new Promise<void>(resolve => setTimeout(resolve, 10));
+        }
         const grace = Date.now() + (failure ? 0 : joinMs);
         while (alive() && Date.now() < grace && !failure)
           await new Promise<void>(resolve => setTimeout(resolve, 10));
@@ -4045,8 +4353,12 @@ export class GitCache {
       catch (error) { scope.stop(); fail(error); }
     }
     void Promise.all(io).then(() => { ioJoined = io.length >= 2; }, fail);
-    child.once("exit", value => { direct = true; code = value; clean(); });
-    child.once("error", error => { direct = true; fail(error); });
+    child.on("spawn", () => { sawSpawn = true; sawPid ||= child.pid !== undefined; });
+    child.on("exit", value => { sawExit = true; direct = true; code = value; clean(); });
+    child.on("error", error => {
+      errorBeforeSpawn ||= !closed && !sawSpawn && !sawExit && child.pid === undefined;
+      direct = true; fail(error);
+    });
     child.once("close", () => { closed = true; });
     const abortSignal = AbortSignal.any([...options.signals]);
     const abort = () => fail(abortSignal.reason ?? new Error(GIT_OUTPUT_ABORT_MESSAGE));
@@ -4060,6 +4372,18 @@ export class GitCache {
       catch (error) {
         if (error !== null && typeof error === "object") Object.assign(error, { epochProcessJoined: false });
         throw error;
+      }
+      if (noChild() && closed && ioJoined && !scope.stopped())
+        return { joined: true, spawned: false, provenance: "not-spawned", ticket, failure };
+      if (noChildJoined) {
+        scope.stop();
+        throw Object.assign(new Error("epoch no-child lifecycle changed"), { epochProcessJoined: false });
+      }
+      // Revalidate after the cleanup await: late lifecycle evidence cannot inherit
+      // a no-child join that skipped process-group proof.
+      if (!Number.isSafeInteger(child.pid) || child.pid! <= 0) {
+        scope.stop();
+        throw Object.assign(new Error("epoch process group unknown"), { epochProcessJoined: false });
       }
       const stdoutBytes = Buffer.concat(chunks.stdout);
       const stderrBytes = Buffer.concat(chunks.stderr);
@@ -4093,7 +4417,8 @@ export class GitCache {
             { env: { PATH: "/usr/bin:/bin" }, cwd: "/", timeout: RETENTION_RM_TIMEOUT_MS }, "command");
           joined = true;
         } catch (error) {
-          joined = (error as { epochProcessJoined?: boolean }).epochProcessJoined === true;
+          joined = (error as { epochProcessJoined?: boolean }).epochProcessJoined === true ||
+            (error as { epochNativeNotSpawned?: boolean }).epochNativeNotSpawned === true;
           throw error;
         }
       } else {
@@ -4114,7 +4439,8 @@ export class GitCache {
       if (!joined || state.scope.stopped()) { state.scope.stop(); throw error; }
       try { await settlement?.settle({ ok: false, residue: [target] }); }
       catch { state.scope.stop(); throw error; }
-      if (undeletableCode(error) !== undefined)
+      if (undeletableCode(error) !== undefined ||
+          (error as { epochNativeNotSpawned?: boolean }).epochNativeNotSpawned === true)
         throw Object.assign(error as object, { epochDeleteJoined: true });
       throw error;
     } finally {
@@ -4411,8 +4737,8 @@ export class GitCache {
    * One streaming pass, no retries: a failed bare or exhausted cap stops sibling discovery and
    * makes every reported count a lower bound. All started filesystem work is awaited. */
   async discoverEpochRetainedSources(opts: EpochRetainedDiscoveryOptions = {}): Promise<EpochRetainedDiscoveryResult> {
-    return this.retainedCauseScope.run({ prefix: "census", errors: new WeakMap(), counted: new Set() },
-      () => this.discoverEpochRetainedSourcesScoped(opts));
+    return this.retainedWorkScope.run(opts.work, () => this.retainedCauseScope.run({ prefix: "census", errors: new WeakMap(), counted: new Set() },
+      () => this.discoverEpochRetainedSourcesScoped(opts)));
   }
 
   private async discoverEpochRetainedSourcesScoped(opts: EpochRetainedDiscoveryOptions): Promise<EpochRetainedDiscoveryResult> {
@@ -4558,7 +4884,7 @@ export class GitCache {
 
   /** Local recovery clocks, including queued locks and actual child settlement. */
   async withRecoveryOperation<T>(signal: AbortSignal, deadline: number, action: (signal: AbortSignal) => Promise<T>, budget?: MaintenanceBudget,
-    opts?: { closureBudget?: { delivered: number; limit: number } }): Promise<T> {
+    opts?: { closureBudget?: { delivered: number; limit: number }; restrictionProgress?: RemediationRestrictionProgress }): Promise<T> {
     // A caller-shared decoded-byte account is used by identity, but never above this cache's own ceiling.
     if (opts?.closureBudget) {
       // A NaN or negative limit is a refusal (0 admits nothing); anything else is capped at the ceiling.
@@ -4577,8 +4903,14 @@ export class GitCache {
       : undefined;
     if (Date.now() >= deadline) timeout.abort(new RecoveryDeadlineExhaustedError());
     const run = async (): Promise<T> => {
-      combined.throwIfAborted();
-      budget?.check();
+      try {
+        combined.throwIfAborted();
+        budget?.check();
+      } catch (error) {
+        if (opts?.restrictionProgress && !opts.restrictionProgress.started && !opts.restrictionProgress.acquired)
+          opts.restrictionProgress.cause = "pre_read_unavailable";
+        throw error;
+      }
       return this.recoveryOperations.run({ signal: combined, deadline, budget,
         // An explicit closureBudget is used by identity (never copied): the caller shares one mutable decoded-byte
         // account across several operations, independent of the ambient parent's.
@@ -4586,12 +4918,29 @@ export class GitCache {
         closureCache: parent?.closureCache ?? { identities: new Map(), entries: 0 },
       }, async () => {
         const result = await action(combined);
-        this.checkRecoveryInterruption();
+        try { this.checkRecoveryInterruption(); }
+        catch (error) {
+          if (opts?.restrictionProgress) opts.restrictionProgress.cause = "post_read_expiry";
+          throw error;
+        }
         return result;
       });
     };
     try { return await (budget ? MaintenanceBudget.run(budget, run) : run()); }
+    catch (error) {
+      // MaintenanceBudget.run checks the budget before entering `run`; classify that entry expiry only when it is
+      // positively the budget's own and no read has started.
+      if (opts?.restrictionProgress && !opts.restrictionProgress.started && !opts.restrictionProgress.acquired &&
+        this.isBudgetExpiry(error, budget))
+        opts.restrictionProgress.cause = "pre_read_unavailable";
+      throw error;
+    }
     finally { if (timer) clearTimeout(timer); }
+  }
+
+  /** Positive identity only: the error is a deadline expiry raised by one of these budgets (or the ambient one). */
+  private isBudgetExpiry(error: unknown, ...budgets: Array<MaintenanceBudget | undefined>): boolean {
+    return [...budgets, MaintenanceBudget.current()].some(b => b?.ownsExpiry(error) === true);
   }
 
   /** Central helpers also honor a budget scoped before any explicit recovery wrapper. */
@@ -4644,6 +4993,7 @@ export class GitCache {
   private readonly scratchProvisioner: ((clonePath: string) => Promise<void>) | undefined;
   /** See {@link GitCacheOptions.retentionDelete}; undefined in production. */
   private readonly retentionDeleteSeam: GitCacheOptions["retentionDelete"];
+  private readonly archivedPinClock: NonNullable<GitCacheOptions["archivedPinClockForTest"]>;
   private readonly terminalRecordProtection: GitCacheOptions["terminalRecordProtection"];
   /** See {@link GitCacheOptions.canonicalFree}; undefined in production. */
   private readonly canonicalFreeSeam: GitCacheOptions["canonicalFree"];
@@ -4687,6 +5037,10 @@ export class GitCache {
     this.chainMaxDiffBytes = opts.checkpointChainBounds?.maxDiffBytes ?? CHECKPOINT_CHAIN_MAX_DIFF_BYTES;
     this.scratchProvisioner = opts.scratchProvisioner;
     this.retentionDeleteSeam = opts.retentionDelete;
+    this.archivedPinClock = opts.archivedPinClockForTest ?? {
+      now: () => Date.now(),
+      schedule: (fn, ms) => { const handle = setTimeout(fn, ms); return () => clearTimeout(handle); },
+    };
     this.canonicalFreeSeam = opts.canonicalFree;
     this.wipCaptureSeam = opts.wipCapture;
     this.reposRoot = path.join(dataDir, "repos");
@@ -5410,6 +5764,152 @@ export class GitCache {
     const ref = await this.defaultBranchRef(barePath).catch(() => undefined);
     if (!ref) return undefined;
     return ref.replace(/^refs\/remotes\/origin\//, "").replace(/^refs\/heads\//, "") || undefined;
+  }
+
+  /**
+   * The terminal-preservation lane's default-branch lookup. Unlike {@link defaultBranchName} (which collapses every
+   * failed read into "absent"), it separates three answers: `resolved` (a commit-bearing default ref was positively
+   * read), `absent` (every read completed normally and proved there is no default ref at all) and `unknown` (any read
+   * failed, was cut short, or met a shape it cannot classify: a dangling or broken ref, a detached HEAD, a throw).
+   * Only `absent` may fall back to "main"; `unknown` must keep the output. Because git treats a dangling symlink or an
+   * empty directory at a loose ref path as a missing ref, the loose storage of origin/HEAD and every candidate is
+   * lstat'ed too: a symlink, directory or other non-regular entry, an unreadable path, or a loose file git did not
+   * account for makes the answer `unknown`.
+   */
+  async terminalDefaultBranch(barePath: string): Promise<TerminalDefaultBranch> {
+    const unknown = (detail: string): TerminalDefaultBranch => ({ kind: "unknown", detail });
+    const originHead = await this.strictGitRead(barePath, ["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"]);
+    if (!originHead.ok) return unknown(`origin/HEAD read failed: ${originHead.detail}`);
+    const originTarget = originHead.code === 0 ? originHead.stdout.trim() : undefined;
+    if (originHead.code === 0 && !originTarget?.startsWith("refs/")) return unknown("origin/HEAD target is not a ref");
+    const head = await this.strictGitRead(barePath, ["symbolic-ref", "--quiet", "HEAD"]);
+    if (!head.ok) return unknown(`HEAD read failed: ${head.detail}`);
+    const headTarget = head.code === 0 ? head.stdout.trim() : undefined;
+    if (head.code === 0 && !headTarget?.startsWith("refs/")) return unknown("HEAD target is not a ref");
+
+    const candidates: { ref: string; headRung: boolean }[] = [];
+    const add = (ref: string | undefined, headRung = false): void => {
+      if (ref && !candidates.some(c => c.ref === ref)) candidates.push({ ref, headRung });
+    };
+    add(originTarget);
+    for (const ref of ["refs/remotes/origin/main", "refs/remotes/origin/master", "refs/heads/main", "refs/heads/master"]) add(ref);
+    add(headTarget, true);
+
+    const symbolic = new Set<string>();
+    for (const { ref } of candidates) {
+      const sym = await this.strictGitRead(barePath, ["symbolic-ref", "--quiet", ref]);
+      if (!sym.ok) return unknown(`symbolic-ref ${ref} failed: ${sym.detail}`);
+      if (sym.code === 0) symbolic.add(ref);
+    }
+
+    const listing = await this.strictGitRead(barePath, ["for-each-ref",
+      "--format=%(refname)%00%(objecttype)%00%(*objecttype)", "refs/remotes/origin/HEAD", ...candidates.map(c => c.ref)]);
+    if (!listing.ok) return unknown(`for-each-ref failed: ${listing.detail}`);
+    if (listing.code !== 0 || listing.stderr.trim() !== "") return unknown("for-each-ref reported a problem");
+    // for-each-ref prefix-matches a pattern (refs/heads/main also lists refs/heads/main/x): keep exact names only.
+    const counted = new Set<string>();
+    const listed = new Set<string>();
+    for (const row of listing.stdout.split("\n")) {
+      if (row === "") continue;
+      const [refname, type, peeled] = row.split("\0");
+      // origin/HEAD is listed only to catch a non-symbolic one (loose or packed) that the symbolic-ref read missed.
+      if (refname === "refs/remotes/origin/HEAD") {
+        if (originHead.code === 1) return unknown("refs/remotes/origin/HEAD exists but is not a symbolic ref");
+        continue;
+      }
+      if (refname === undefined || !candidates.some(c => c.ref === refname)) continue;
+      listed.add(refname);
+      if (type === "commit" || (type === "tag" && peeled === "commit")) counted.add(refname);
+      else return unknown(`${refname} does not name a commit`);
+    }
+
+    // git reads a dangling symlink or an empty directory at a loose ref path as a missing ref without any error, so
+    // check the loose storage ourselves before any resolved/absent decision.
+    for (const ref of ["refs/remotes/origin/HEAD", ...candidates.map(c => c.ref)]) {
+      const state = await this.terminalLooseRefState(barePath, ref);
+      if (state.kind === "unknown") return unknown(state.detail);
+      if (state.kind !== "regular") continue;
+      if (ref === "refs/remotes/origin/HEAD") {
+        if (originHead.code === 1) return unknown("refs/remotes/origin/HEAD is a loose file git did not read as a symbolic ref");
+      } else if (!symbolic.has(ref) && !listed.has(ref)) {
+        return unknown(`${ref} is a loose ref file git did not list`);
+      }
+    }
+
+    if (originTarget && !counted.has(originTarget)) return unknown(`origin/HEAD target ${originTarget} is not a readable commit ref`);
+    for (const ref of symbolic) if (!listed.has(ref)) return unknown(`${ref} is a dangling symbolic ref`);
+    const first = candidates.find(c => counted.has(c.ref));
+    if (first) {
+      if (first.headRung) return { kind: "resolved", name: "HEAD" };
+      const name = first.ref.replace(/^refs\/remotes\/origin\//, "").replace(/^refs\/heads\//, "");
+      return name ? { kind: "resolved", name } : unknown(`${first.ref} has no short name`);
+    }
+    if (originHead.code === 1 && head.code === 0 && symbolic.size === 0 && listed.size === 0) return { kind: "absent" };
+    return unknown("no default branch could be proven absent");
+  }
+
+  /** Terminal-local lstat of a loose ref path: none (ENOENT/ENOTDIR), a regular file, or unknown (anything else). */
+  private async terminalLooseRefState(barePath: string, ref: string):
+    Promise<{ kind: "none" | "regular" } | { kind: "unknown"; detail: string }> {
+    if (!ref.startsWith("refs/") || ref.split("/").some(seg => seg === ".." || seg === "." || seg === "")) {
+      return { kind: "unknown", detail: `${ref} is not a safe ref path` };
+    }
+    try {
+      // This lstat does not observe the report-proof signal or window; the lane's post-lookup window check covers it.
+      const st = await fs.lstat(path.join(barePath, ref));
+      if (st.isFile()) return { kind: "regular" };
+      // A directory holding entries is a namespace (refs/heads/main/x), which can never be this ref; an empty one is
+      // read by git as a missing ref, so it proves nothing.
+      if (st.isDirectory() && (await fs.readdir(path.join(barePath, ref))).length > 0) return { kind: "none" };
+      return { kind: "unknown", detail: `${ref} is not a regular loose ref file` };
+    } catch (err) {
+      const code = (err as { code?: unknown }).code;
+      if (code !== "ENOENT" && code !== "ENOTDIR") return { kind: "unknown", detail: `lstat ${ref} failed: ${String(code ?? err)}` };
+    }
+    // The path is missing. git also reads a dangling symlink at an ANCESTOR as a missing ref, so walk the ancestors.
+    const segs = ref.split("/");
+    for (let i = 1; i < segs.length; i++) {
+      const anc = segs.slice(0, i).join("/");
+      try {
+        const st = await fs.lstat(path.join(barePath, anc));
+        if (st.isDirectory()) continue;
+        // The reftable layout keeps a stub regular file at refs/heads; it is accepted only in a repository that actually
+        // stores its refs in a reftable/ directory. Nothing else non-directory is acceptable.
+        if (st.isFile() && anc === "refs/heads" &&
+            (await fs.lstat(path.join(barePath, "reftable")).then(r => r.isDirectory(), () => false))) return { kind: "none" };
+        return { kind: "unknown", detail: `ancestor ${anc} of ${ref} is not a directory` };
+      } catch (err) {
+        const code = (err as { code?: unknown }).code;
+        if (code === "ENOENT") return { kind: "none" };
+        return { kind: "unknown", detail: `lstat ancestor ${anc} failed: ${String(code ?? err)}` };
+      }
+    }
+    return { kind: "none" };
+  }
+
+  /**
+   * A git read whose exit status is trusted only when it is a genuine, in-window, ordinary exit: 0, or exactly 1 (the
+   * "no such symref / nothing" answer). A timeout, kill, signal, output overrun, spawn failure, a lapsed or aborted
+   * report-proof window, or any other exit is `ok: false`. Residue and boundary aborts rethrow, as in tryGitExit.
+   */
+  private async strictGitRead(cwd: string, args: string[]):
+    Promise<{ ok: true; code: 0 | 1; stdout: string; stderr: string } | { ok: false; detail: string }> {
+    try {
+      const out = await this.execScoped("git", withDir(cwd, args), { env: gitEnv(), timeout: GIT_TIMEOUT_MS });
+      return { ok: true, code: 0, stdout: out.stdout, stderr: out.stderr };
+    } catch (err) {
+      if (err instanceof RunResidueBlockedError) throw err;
+      const abort = this.boundaryAbortError(err);
+      if (abort) throw abort;
+      const e = err as { code?: unknown; killed?: unknown; signal?: unknown; outputExceeded?: unknown; stderr?: unknown };
+      const budget = this.reportProofs.getStore();
+      const windowOpen = !budget || (!budget.signal.aborted && Date.now() < budget.deadline);
+      if (windowOpen && e.code === 1 && e.killed !== true && (e.signal === null || e.signal === undefined) && e.outputExceeded !== true) {
+        return { ok: true, code: 1, stdout: "", stderr: typeof e.stderr === "string" ? e.stderr : "" };
+      }
+      const why = windowOpen ? `exit ${String(e.code)}${e.killed === true ? " (killed)" : ""}` : "report-proof window ended";
+      return { ok: false, detail: why };
+    }
   }
 
   /**
@@ -8465,15 +8965,16 @@ export class GitCache {
         (input.deadline !== undefined && !Number.isFinite(input.deadline))) {
       return { state: "retained", reason: "invalid_identity" };
     }
-    const deadline = Math.min(Date.now() + 30_000, input.deadline ?? Infinity);
+    const clock = this.archivedPinClock;
+    const deadline = Math.min(clock.now() + 30_000, input.deadline ?? Infinity);
     const stop = new AbortController();
     const abort = () => stop.abort();
     input.signal?.addEventListener("abort", abort, { once: true });
     if (input.signal?.aborted) abort();
-    const timer = setTimeout(abort, Math.max(0, deadline - Date.now()));
+    const cancelTimer = clock.schedule(abort, Math.max(0, deadline - clock.now()));
     const check = (): void => {
       if (input.signal?.aborted) refuse("cancelled");
-      if (Date.now() >= deadline || stop.signal.aborted) refuse("deadline");
+      if (clock.now() >= deadline || stop.signal.aborted) refuse("deadline");
     };
     // Racing only bounds the caller's wait. Every continuation checks again, so a late filesystem
     // completion cannot enter a Git mutation. Locks remain held until that continuation settles.
@@ -8550,7 +9051,7 @@ export class GitCache {
       const isBareProbe = cwd !== root;
       const child = await this.spawnGit(cwd,
         [...(isBareProbe ? ["--git-dir", cwd] : []), "--no-replace-objects", ...args], stdin, {
-        timeoutMs: deadline - Date.now(), stderrMaxBytes: 65536, cancelOnAbandon: true,
+        timeoutMs: deadline - clock.now(), stderrMaxBytes: 65536, cancelOnAbandon: true,
         env: { GIT_CONFIG_GLOBAL: "/dev/null", ...(isBareProbe && pinCommonDir ? { GIT_COMMON_DIR: cwd } : {}) },
       });
       activeChildren.add(child.exited);
@@ -8744,7 +9245,7 @@ export class GitCache {
             `option no-deref\ndelete ${ref} ${input.sourceSha}\nprepare\n`, {
               // The native timeout is only a backstop past the caller deadline: the teardown below gets
               // PREPARED_ABORT_GRACE_MS to let Git exit on its own before anything sends SIGTERM.
-              keepStdinOpen: true, timeoutMs: Math.max(1, deadline - Date.now()) + PREPARED_ABORT_GRACE_MS,
+              keepStdinOpen: true, timeoutMs: Math.max(1, deadline - clock.now()) + PREPARED_ABORT_GRACE_MS,
               stderrMaxBytes: 65536, cancelOnAbandon: true,
               env: { GIT_CONFIG_GLOBAL: "/dev/null", GIT_COMMON_DIR: chosen.bare },
             }).catch(async (): Promise<never> => {
@@ -8842,12 +9343,12 @@ export class GitCache {
             if (committed) child.cancel();
             else {
               sendAbort();
-              let graceTimer: ReturnType<typeof setTimeout> | undefined;
+              let cancelGrace: (() => void) | undefined;
               const exitedInGrace = await Promise.race([
                 child.exited.then(() => true, () => true),
-                new Promise<boolean>(resolve => { graceTimer = setTimeout(() => resolve(false), PREPARED_ABORT_GRACE_MS); }),
+                new Promise<boolean>(resolve => { cancelGrace = clock.schedule(() => resolve(false), PREPARED_ABORT_GRACE_MS); }),
               ]);
-              clearTimeout(graceTimer);
+              cancelGrace?.();
               if (!exitedInGrace) child.cancel();
             }
             const code = await child.exited;
@@ -8889,10 +9390,10 @@ export class GitCache {
       const reasons: Reason[] = ["invalid_identity", "unsafe_metadata", "ambiguous", "scan_limit",
         "target_changed", "ineligible", "cancelled", "deadline", "git_failure"];
       return { state: "retained", reason: input.signal?.aborted ? "cancelled" :
-        Date.now() >= deadline ? "deadline" : reasons.includes(message as Reason) ? message as Reason : "unsafe_metadata" };
+        clock.now() >= deadline ? "deadline" : reasons.includes(message as Reason) ? message as Reason : "unsafe_metadata" };
     } finally {
       if (!attemptSettled) { continuationCounted = true; this.abandonedPinContinuations += 1; }
-      clearTimeout(timer);
+      cancelTimer();
       input.signal?.removeEventListener("abort", abort);
       await Promise.all(activeChildren);
     }
@@ -9188,8 +9689,9 @@ export class GitCache {
    * throws. This never creates pins, opens a grant, or admits execution/publication of tracking. */
   async readRuntimeRemediationRecovery(barePath: string, branch: string,
     expectedSource: { runId: string; clonePath: string; attemptId?: string },
-    durability: MemoryParkDurability = {}): Promise<RemediationRecovery | undefined> {
+    durability: MemoryParkDurability = {}, progress?: RemediationRestrictionProgress): Promise<RemediationRecovery | undefined> {
     return this.withLock(barePath, async () => {
+      if (progress) progress.started = true;
       // This read has no discovery/normalization effects. Legacy unenrolled sources need no
       // attempt identity; enrollment still requires the independently selected exact attempt.
       const stored = await this.readRecoveryCaptureWithRaw(barePath, branch);
@@ -9197,7 +9699,7 @@ export class GitCache {
       if (!expectedSource.attemptId) throw new Error("remediation source identity unavailable");
       return this.readRemediationUnderLock(barePath, branch,
         { ...expectedSource, attemptId: expectedSource.attemptId }, durability, "runtime-restrictions");
-    });
+    }, undefined, progress);
   }
 
   /**
@@ -9206,11 +9708,19 @@ export class GitCache {
    * One two-read pass, no retries or writes; any unavailable evidence holds by throwing.
    * The fingerprint coordinates transient changes only, never eligibility or preservation.
    */
+  private readonly restrictionProgress = new AsyncLocalStorage<RemediationRestrictionProgress>();
+
+  /** Read-local context preserves the legacy three-argument custody reader seam. */
+  withRemediationRestrictionProgress<T>(progress: RemediationRestrictionProgress, action: () => Promise<T>): Promise<T> {
+    return this.restrictionProgress.run(progress, action);
+  }
+
   async readRemediationRestrictionFacts(barePath: string, branch: string, exactRunId: string,
     workerSelectedSource?: { runId: string; clonePath: string; attemptId: string },
-    durability: MemoryParkDurability = {}): Promise<RemediationRestrictionFacts> {
+    durability: MemoryParkDurability = {}, progress?: RemediationRestrictionProgress): Promise<RemediationRestrictionFacts> {
+    progress ??= this.restrictionProgress.getStore();
     return this.withRemediationRestrictionFacts(barePath, branch, exactRunId,
-      async facts => facts, workerSelectedSource, durability);
+      async facts => { progress?.observe?.(facts); return facts; }, workerSelectedSource, durability, progress);
   }
 
   /** Consume negative evidence while retaining B through awaited consumer completion.
@@ -9221,15 +9731,16 @@ export class GitCache {
   async withRemediationRestrictionFacts<T>(barePath: string, branch: string, exactRunId: string,
     consume: (facts: RemediationRestrictionFacts) => Promise<T>,
     workerSelectedSource?: { runId: string; clonePath: string; attemptId: string },
-    durability: MemoryParkDurability = {}): Promise<T> {
+    durability: MemoryParkDurability = {}, progress?: RemediationRestrictionProgress): Promise<T> {
     // A caller-owned options object cannot redirect the identity while waiting for B.
     const source = workerSelectedSource && { runId: workerSelectedSource.runId,
       clonePath: workerSelectedSource.clonePath, attemptId: workerSelectedSource.attemptId };
     return this.withLock(barePath, async () => {
+      if (progress) progress.started = true;
       const facts = await this.remediationRestrictionFactsUnderLock(
-        barePath, branch, exactRunId, source, durability);
+        barePath, branch, exactRunId, source, durability, progress);
       return await consume(facts);
-    });
+    }, undefined, progress);
   }
 
   /** Admission consumes fresh negative evidence under B; false blocked is never a grant. */
@@ -9250,14 +9761,27 @@ export class GitCache {
   /** Shared by worker callbacks that already own B; never reacquire B here. */
   private async remediationRestrictionFactsUnderLock(barePath: string, branch: string, exactRunId: string,
     workerSelectedSource?: { runId: string; clonePath: string; attemptId: string },
-    durability: MemoryParkDurability = {}): Promise<RemediationRestrictionFacts> {
+    durability: MemoryParkDurability = {}, progress?: RemediationRestrictionProgress): Promise<RemediationRestrictionFacts> {
+    function fail(cause: NonNullable<RemediationRestrictionProgress["cause"]>, message: string): never {
+      if (progress) progress.cause = cause;
+      throw new Error(message);
+    }
+    const observe = (record: RemediationRecovery | undefined): void => {
+      if (!record || !progress) return;
+      progress.cause = "enrolled_observed";
+      progress.observe?.({ enrolled: true,
+        blocked: record.blocked !== false || record.excludedRoots === undefined || record.edges.some(e => e.phase !== "committed"),
+        flaggedOIDs: record.flaggedOIDs,
+        roots: [...record.flaggedOIDs, ...record.edges.map(e => e.from), ...(record.excludedRoots ?? [])],
+        fingerprint: "" });
+    };
     try {
       if (!OWED_RUN_ID.test(exactRunId) || Buffer.byteLength(exactRunId) > 128 ||
           sanitizeForLog(exactRunId, Infinity) !== exactRunId || !validRemediationBranch(branch) ||
           Buffer.byteLength(branch) > 1024 || sanitizeForLog(branch, Infinity) !== branch)
-        throw new Error("invalid restriction identity");
+        fail("identity", "invalid restriction identity");
       if (workerSelectedSource && workerSelectedSource.runId !== exactRunId)
-        throw new Error("restriction source run mismatch");
+        fail("identity", "restriction source run mismatch");
       const read = async () => {
         const snapshot = await this.readRecoverySnapshot(barePath);
         // Unlike the legacy last-value reader, negative absence cannot ignore duplicates.
@@ -9265,32 +9789,36 @@ export class GitCache {
         const key = recoveryCaptureKey(branch);
         const activeEntries = entries.filter(e => e === key || e.startsWith(key + "\n"));
         if (activeEntries.length > 1 || activeEntries.some(e => !e.startsWith(key + "\n")))
-          throw new Error("ambiguous restriction journal");
+          fail("integrity", "ambiguous restriction journal");
         let activeRaw = activeEntries[0]?.slice(key.length + 1) || undefined;
-        let active = activeRaw === undefined ? undefined : parseRecoveryJournal(activeRaw);
+        let active: RecoveryJournalEntry | undefined;
+        try { active = activeRaw === undefined ? undefined : parseRecoveryJournal(activeRaw); }
+        catch { fail("integrity", "invalid restriction journal"); }
         // issue #3644: under a composite the active journal is S's entry (P is opaque and plain). A tombstone has none, so
         // `activeSource` stays undefined, syncJournalAndReadBack then compares that absence with P's non-empty raw and
         // throws: restriction facts REFUSE (fail closed) under a tombstone.
         let activeSource: { runId: string; clonePath: string; attemptId?: string } | undefined;
         if (this.restoreValueIn(entries, branch) !== undefined) {
           const composite = await this.resolveBranchJournalUnderLock(barePath, branch, entries);
-          if (composite.kind !== "composite") throw new Error("restriction restore composite unavailable");
+          if (composite.kind !== "composite") fail("integrity", "restriction restore composite unavailable");
           const live = composite.successor.kind === "entry" && composite.stage !== "retired" ? composite.successor : undefined;
           active = live?.journal;
           activeRaw = live?.raw;
           activeSource = live?.journal;
         }
+        if (active?.runId === exactRunId) observe(active.remediationRecovery);
         // Ordinary journals retain their legacy writer order. Strict parsing and the two
         // identical raw reads prove absence; only enrolled evidence requires canonical bytes.
         if (active?.remediationRecovery && recoveryJournalJson(active) !== activeRaw)
-          throw new Error("noncanonical restriction journal");
+          fail("integrity", "noncanonical restriction journal");
         if (workerSelectedSource) {
           const authenticated = await this.remediationSourceUnderLock(barePath, branch, workerSelectedSource, snapshot);
-          if (authenticated.raw !== activeRaw) throw new Error("restriction source changed");
+          if (authenticated.raw !== activeRaw) fail("changed_facts", "restriction source changed");
         }
         const protectedRaw: string[] = [];
         const protectedRecords = await this.protectedRecoveries(barePath, exactRunId, raw => protectedRaw.push(raw), snapshot);
-        if (protectedRecords.some(r => r.branch !== branch)) throw new Error("restriction custody branch mismatch");
+        for (const record of protectedRecords) observe(record.journal.remediationRecovery);
+        if (protectedRecords.some(r => r.branch !== branch)) fail("identity", "restriction custody branch mismatch");
         const relevant = active?.runId === exactRunId ? [active] : [];
         for (const journal of relevant) {
           const shape = parseAttemptPath(journal.clonePath, path.resolve(this.runnerRoot));
@@ -9299,15 +9827,22 @@ export class GitCache {
         }
         relevant.push(...protectedRecords.map(r => r.journal));
         if (relevant.some(j => j.remediationRecovery && j.remediationRecovery.branch !== branch))
-          throw new Error("restriction record branch mismatch");
+          fail("identity", "restriction record branch mismatch");
         return { activeRaw, protectedRaw, relevant, activeSource };
       };
       const first = await read();
-      await this.syncJournalAndReadBack(barePath, branch, first.activeRaw, durability, first.activeSource);
+      await this.syncJournalAndReadBack(barePath, branch, first.activeRaw, {
+        ...durability,
+        readback: async read => {
+          const back = durability.readback ? await durability.readback(read) : await read();
+          if (back !== first.activeRaw && progress) progress.cause = "changed_facts";
+          return back;
+        },
+      }, first.activeSource);
       const second = await read();
       if (first.activeRaw !== second.activeRaw ||
           JSON.stringify(first.protectedRaw) !== JSON.stringify(second.protectedRaw))
-        throw new Error("restriction read-back differs");
+        fail("changed_facts", "restriction read-back differs");
       const records = second.relevant.flatMap(j => j.remediationRecovery ? [j.remediationRecovery] : []);
       const flaggedOIDs = [...new Set(records.flatMap(r => r.flaggedOIDs))].sort();
       const roots = [...new Set(records.flatMap(r =>
@@ -9316,7 +9851,7 @@ export class GitCache {
       // Each stored record already passed its 64 KiB bound. Two identical active
       // and protected copies must not invent a smaller per-record limit.
       if (flaggedOIDs.length > 64 || roots.length > 1524)
-        throw new Error("restriction union overflow");
+        fail("integrity", "restriction union overflow");
       const fingerprint = createHash("sha256").update(JSON.stringify({
         runId: exactRunId, branch, source: workerSelectedSource ? { runId: workerSelectedSource.runId,
           clonePath: workerSelectedSource.clonePath, attemptId: workerSelectedSource.attemptId } : null,
@@ -9392,7 +9927,7 @@ export class GitCache {
         serializeSourceFence(journal.completionSourceFence) !== serializeSourceFence(want);
       if (replacing && (opts.replaceStale === undefined ||
           serializeSourceFence(journal.completionSourceFence!) !== serializeSourceFence(parseSourceFence(opts.replaceStale.expectedOld)))) {
-        throw new CompletionSourceFenceError("completion source already carries a different fence");
+        throw new CompletionSourceFenceError("completion source already carries a different fence", "fence_conflict");
       }
       if (journal.completionSourceFence === undefined || replacing) {
         await this.writeRecovery(barePath, branch, { ...journal, completionSourceFence: want });
@@ -10558,6 +11093,28 @@ export class GitCache {
     });
   }
 
+  /** Crash rediscovery for a blocked `adoption_failed` journal whose in-memory refusal class died with the previous
+   * process. Classification only, never admission: it re-runs the read-only remediation source selection under the
+   * bare lock and maps an annotated refusal to its wire value. Success, an unannotated refusal, an interrupted
+   * operation, a changed identity or any missing precondition all answer undefined (the generic text). Writes no
+   * ledger, pin or journal content; the evidence read may only re-sync the unchanged canonical journal bytes. */
+  async classifyBlockedRemediationAdoption(barePath: string, branch: string, key: string, expected: RecoverySource):
+    Promise<RetainedAdoptionRefusal | undefined> {
+    try {
+      return await this.withLock(barePath, async () => {
+        // allowLegacyRepair=false: this read can never append an attempt-ledger entry.
+        const journal = await this.checkedRecovery(barePath, branch, key, expected, false, undefined, false);
+        const recovery = journal.recovery;
+        if (recovery?.stage !== "blocked" || recovery.blocker !== "adoption_failed" ||
+            !journal.remediationRecovery || !recovery.restoreSource) return undefined;
+        try {
+          await this.remediationAdoptionUnderLock(barePath, branch, expected, recovery.restoreSource);
+          return undefined;
+        } catch (error) { return retainedAdoptionRefusal(error); }
+      });
+    } catch { return undefined; }
+  }
+
   /** Resolve only the exact charged source/reservation, or its explicitly verified handoff.
    * This handles a journal-root write landing before prepareRecoverySuccessor throws. */
   async recoveryReservationSnapshot(barePath: string, branch: string, key: string,
@@ -11114,12 +11671,44 @@ export class GitCache {
     if (!expected.attemptId || !src) throw new Error("remediation adoption source unavailable");
     const record = await this.readRemediationUnderLock(barePath, branch, { ...expected, attemptId: expected.attemptId });
     if (!record || record.ownedTip !== src) throw new Error("remediation adoption source unverified");
-    for (const oid of [...record.flaggedOIDs, ...record.edges.map(e => e.from), ...(record.excludedRoots ?? [])]) {
-      if (await this.ancestry(barePath, oid, src) !== "divergent")
-        throw new Error("remediation adoption source still restricted");
+    const roots = [...record.flaggedOIDs, ...record.edges.map(e => e.from), ...(record.excludedRoots ?? [])];
+    const restricted = await this.classifyRestrictedRoots(barePath, roots, src);
+    if (restricted !== "clear") {
+      const error = new Error("remediation adoption source still restricted");
+      if (restricted !== "unclassified") annotateRetainedSuccessorError(error, restricted);
+      throw error;
     }
     await this.proveRemediationForwardTarget(barePath, record, src);
     return record;
+  }
+
+  /** Classify why a restricted root is not divergent from the source. Stops at the first `ancestor` (active
+   * remediation); an `unknown` probe is passed over and, when no ancestor is found, means the proof is unknown.
+   * Once the operation signal or deadline has fired `ancestry` answers `unknown` for the wrong reason, so an
+   * interrupted refusal carries no class at all. Classification only: it never admits a source. */
+  private async classifyRestrictedRoots(barePath: string, roots: readonly string[], src: string):
+    Promise<"clear" | "remediation_active" | "remediation_proof_unknown" | "unclassified"> {
+    let unknown = false;
+    for (const oid of roots) {
+      const relation = await this.ancestry(barePath, oid, src);
+      if (relation === "ancestor") return "remediation_active";
+      if (relation === "unknown") unknown = true;
+    }
+    if (!unknown) return "clear";
+    try { this.checkRecoveryInterruption(); }
+    catch { return "unclassified"; }
+    if (this.boundaryProcesses.getStore()?.signal.aborted) return "unclassified";
+    return "remediation_proof_unknown";
+  }
+
+  /** The replacement-ancestry refusal, classified as an unknown proof unless the operation was interrupted
+   * (an aborted or expired probe answers `unknown` for reasons that say nothing about the evidence). */
+  private unknownReplacementAncestry(): Error {
+    const error = new Error("remediation replacement ancestry unknown");
+    let interrupted = this.boundaryProcesses.getStore()?.signal.aborted === true;
+    try { this.checkRecoveryInterruption(); } catch { interrupted = true; }
+    if (!interrupted) annotateRetainedSuccessorError(error, "remediation_proof_unknown");
+    return error;
   }
 
   /** Each target gets its own bounded ordered proof: at most 64 edges and 64 squared
@@ -11135,7 +11724,7 @@ export class GitCache {
       if (visiting.has(index) || visiting.size >= 64) return false;
       const edge = record.edges[index]!;
       const relation = await this.ancestry(barePath, edge.to, target);
-      if (relation === "unknown") throw new Error("remediation replacement ancestry unknown");
+      if (relation === "unknown") throw this.unknownReplacementAncestry();
       if (relation === "ancestor") { reached.add(index); return true; }
       const next = new Set(visiting).add(index);
       for (let i = 0; i < record.edges.length; i++) {
@@ -11144,7 +11733,7 @@ export class GitCache {
         // cover several partial rewrites; grant identity need not increase per edge.
         if (i <= index) continue;
         const progress = await this.ancestry(barePath, edge.to, later.from);
-        if (progress === "unknown") throw new Error("remediation replacement ancestry unknown");
+        if (progress === "unknown") throw this.unknownReplacementAncestry();
         if (progress === "ancestor" && await reaches(i, next)) { reached.add(index); return true; }
       }
       refused.add(index);
@@ -11956,7 +12545,8 @@ export class GitCache {
    * shape stage (Node bytes, before anything is charged) and again by the object-store topology (Git's own parse)
    * before the worktree stage starts, and every file of it is re-checked at its end.
    */
-  private async automaticContentPreserved(epoch: EpochDiscardProofState): Promise<boolean> {
+  private async automaticContentPreserved(epoch: EpochDiscardProofState,
+    out?: { head?: string; trackedPaths?: Set<string> }): Promise<boolean> {
     const automatic: AutomaticPreservation = { roots: [], checkLive: () => this.checkEpochDiscardLive(epoch) };
     const read = <T>(action: () => Promise<T>) => this.automaticPreservationRead(automatic, action);
     const cwd = epoch.paths[0]!;
@@ -12030,10 +12620,75 @@ export class GitCache {
         await read(() => fs.realpath(cwd)) === cwd;
       if (stillReal) await ownGitDir();
       await automatic.finalStoreCheck?.();
+      // Read-only callers (proveEpochWorktreeContent) ask for what the proof established: the HEAD it verified
+      // and the index paths it hashed. Written only on success, so a refusal leaves `out` empty.
+      if (stillReal && out && automatic.shape) {
+        out.head = head;
+        out.trackedPaths = new Set(automatic.shape.index.entries.map(entry => entry.path.toString("latin1")));
+      }
       return stillReal;
     } catch (error) {
       if (error instanceof AutomaticCompletenessUnknown) throw error;
       return false;
+    }
+  }
+
+  /**
+   * Read-only exposure of {@link automaticContentPreserved} for the hibernation census (PRD #4208): the very same
+   * proof, run under the very same epoch limits and native read scope, that never trusts the index stat cache and
+   * refuses assume-valid, skip-worktree and every other index flag. It mutates nothing and mints no discard
+   * authority; the caller owns the exclusive reclaim scope it passes in.
+   *
+   * `proven` is the proof's verdict. When it is true and the clone is present, `head` is the HEAD that the proof
+   * verified and `trackedPaths` the raw index paths it hashed (each decoded as latin1, one character per byte, so a
+   * caller keying a lstat walk the same way compares exactly). A refusal, an exceeded bound or an unaccounted-for
+   * indirection input is `proven: false` with a fixed `reason`; an aborted signal, an exhausted deadline or a
+   * lost exclusion is thrown, never reported as a verdict.
+   */
+  async proveEpochWorktreeContent(input: {
+    scope: PodEpochReclaimScope;
+    barePath: string;
+    selector: RetainedSourceSelector;
+    clonePath: string;
+    signal: AbortSignal;
+    deadline: number;
+    checkLive?: () => void;
+  }): Promise<{ proven: boolean; trackedPaths: Set<string> | null; head: string | null;
+    reason?: "invalid_input" | "content_unproven" | "completeness_unknown" }> {
+    const unproven = (reason: "invalid_input" | "content_unproven" | "completeness_unknown") =>
+      ({ proven: false, trackedPaths: null, head: null, reason });
+    const scope = input.scope;
+    if (!scope || ["assertExclusive", "beginMutation", "inheritStdio", "stop", "stopped", "assertSettled", "finish"]
+      .some(name => typeof scope[name as keyof PodEpochReclaimScope] !== "function")) return unproven("invalid_input");
+    if (typeof input.selector?.runId !== "string" || !/^[A-Za-z0-9_-]{1,160}$/.test(input.selector.runId) ||
+        typeof input.barePath !== "string" || !path.isAbsolute(input.barePath) || path.resolve(input.barePath) !== input.barePath ||
+        typeof input.clonePath !== "string" || !path.isAbsolute(input.clonePath) || path.resolve(input.clonePath) !== input.clonePath ||
+        !(input.signal instanceof AbortSignal) || !Number.isFinite(input.deadline) || input.deadline <= Date.now())
+      return unproven("invalid_input");
+    const state: EpochDiscardProofState = Object.freeze({
+      selector: Object.freeze({ runId: input.selector.runId, generation: input.selector.generation, attempt: input.selector.attempt }),
+      barePath: input.barePath, paths: Object.freeze([input.clonePath]), confirm: "0".repeat(64),
+      expectedRawJournal: Object.freeze([""]), scope, checkLive: input.checkLive ?? (() => {}),
+      beforeEffect: async () => { throw new Error("read-only worktree proof has no effect"); },
+      signal: input.signal, deadline: input.deadline,
+    });
+    this.checkEpochDiscardLive(state);
+    const proof = Object.freeze({}) as EpochDiscardProof;
+    this.epochDiscardProofs.set(proof, state);
+    const out: { head?: string; trackedPaths?: Set<string> } = {};
+    try {
+      const verdict = await this.epochRetained.run(this.epochLimits(), () =>
+        this.withEpochNativeReads(proof, () => this.automaticContentPreserved(state, out)));
+      // The proof turns every failure, an abort or the deadline included, into false: a lost exclusion or an
+      // expired deadline is an error for the caller, not a verdict about the clone.
+      this.checkEpochDiscardLive(state);
+      if (!verdict) return unproven("content_unproven");
+      return { proven: true, trackedPaths: out.trackedPaths ?? null, head: out.head ?? null };
+    } catch (error) {
+      if (error instanceof AutomaticCompletenessUnknown) return unproven("completeness_unknown");
+      throw error;
+    } finally {
+      this.epochDiscardProofs.delete(proof);
     }
   }
 
@@ -13716,6 +14371,18 @@ export class GitCache {
    * descriptors. Pure reads. Unreadable evidence is reported as `problems`, never skipped.
    */
   private async gatherRetainedUnderLock(barePath: string): Promise<GatheredBare> {
+    const sink = this.retainedWorkScope.getStore();
+    if (!sink) return this.gatherRetainedUnderLockUncounted(barePath);
+    const started = performance.now();
+    sink.gathers += 1;
+    try {
+      return await this.gatherRetainedUnderLockUncounted(barePath);
+    } finally {
+      sink.gather_ms += Math.round(performance.now() - started);
+    }
+  }
+
+  private async gatherRetainedUnderLockUncounted(barePath: string): Promise<GatheredBare> {
     await this.assertRecoveryBare(barePath);
     const list = (await this.runGit(barePath, ["config", "--local", "--null", "--list"])).split("\0");
     const runnerRoot = path.resolve(this.runnerRoot);
@@ -14292,6 +14959,23 @@ export class GitCache {
     root: string, now: () => number, deadline: number, caps: RetainedMeasureCaps = {}, causes: PartialCauses = {},
     skip?: (rel: string) => boolean, partialOnIoError = false,
   ): Promise<{ bytes: number; entries: number; complete: boolean; local?: MeasurementShortfall }> {
+    const sink = this.retainedWorkScope.getStore();
+    if (!sink) return this.measureAllocatedWalk(root, now, deadline, caps, causes, skip, partialOnIoError);
+    const started = performance.now();
+    sink.tree_walks += 1;
+    try {
+      const measured = await this.measureAllocatedWalk(root, now, deadline, caps, causes, skip, partialOnIoError);
+      sink.tree_entries += measured.entries;
+      return measured;
+    } finally {
+      sink.tree_ms += Math.round(performance.now() - started);
+    }
+  }
+
+  private async measureAllocatedWalk(
+    root: string, now: () => number, deadline: number, caps: RetainedMeasureCaps = {}, causes: PartialCauses = {},
+    skip?: (rel: string) => boolean, partialOnIoError = false,
+  ): Promise<{ bytes: number; entries: number; complete: boolean; local?: MeasurementShortfall }> {
     const filesystem = async <T>(action: () => Promise<T>): Promise<T> => {
       try { return await action(); }
       catch (error) { countPartialCause(causes, "measurement_filesystem_error"); throw error; }
@@ -14432,34 +15116,74 @@ export class GitCache {
    * to get a disposition.
    */
   async inspectRetainedSources(opts: RetainedInspectOptions): Promise<RetainedInspectResult> {
-    const run = () => this.inspectRetainedSourcesScoped(opts);
-    return this.retainedCauseScope.run({ prefix: "inspection", errors: new WeakMap(), counted: new Set() },
-      () => opts.epoch ? this.epochRetained.run(this.epochLimits(opts.epochLimits), run) : run());
+    const run = async () => (await this.inspectRetainedBatchScoped({
+      epoch: opts.epoch === true, barePath: opts.barePath, maxDescriptors: opts.maxDescriptors, signal: opts.signal,
+      deadline: opts.deadline, budgetMs: opts.budgetMs, now: opts.now, isLivePath: opts.isLivePath,
+    }, [{
+      selector: opts.selector, holds: opts.holds, lifecycle: opts.lifecycle, maxPhysicalPaths: opts.maxPhysicalPaths,
+      beforeTree: opts.beforeTree, measureCaps: opts.measureCaps,
+    }]))[0]!;
+    return this.retainedWorkScope.run(opts.work, () => this.retainedCauseScope.run({ prefix: "inspection", errors: new WeakMap(), counted: new Set() },
+      () => opts.epoch ? this.epochRetained.run(this.epochLimits(opts.epochLimits), run) : run()));
   }
 
-  private async inspectRetainedSourcesScoped(opts: RetainedInspectOptions): Promise<RetainedInspectResult> {
-    const maxDescriptors = opts.epoch ? this.retainedCap(opts.maxDescriptors, 200) : RETAINED_MAX_DESCRIPTORS;
-    const maxPhysicalPaths = opts.epoch ? this.retainedCap(opts.maxPhysicalPaths, 200) : Infinity;
-    const physicalPaths = new Set<string>();
-    const clock = opts.now ?? Date.now;
+  /**
+   * issue #4265 — epoch-only multi-request inspection of ONE bare: one bare-lock section and ONE gather
+   * serve every request, and each request is then filtered, evaluated and measured against that same
+   * snapshot with its own selector, holds, lifecycle, caps, `beforeTree` and measurement cache (a tree
+   * named by two requests is walked once per request). Results come back in request order. A bare-level
+   * stop or failure marks every request and is recorded once in each request's own `partialCauses`; a
+   * `beforeTree` binding failure in any request strips dispositions and epoch settlements from every
+   * request's sources and makes every request partial. Always runs inside the epoch limit store.
+   */
+  async inspectEpochRetainedGroups(opts: EpochInspectGroupsOptions): Promise<RetainedInspectResult[]> {
+    if (opts.requests.length === 0) return [];
+    return this.retainedWorkScope.run(opts.work, () => this.retainedCauseScope.run({ prefix: "inspection", errors: new WeakMap(), counted: new Set() },
+      () => this.epochRetained.run(this.epochLimits(opts.epochLimits), () => this.inspectRetainedBatchScoped({
+        epoch: true, barePath: opts.barePath, maxDescriptors: opts.maxDescriptors, signal: opts.signal,
+        deadline: opts.deadline, budgetMs: opts.budgetMs, now: opts.now, isLivePath: opts.isLivePath,
+      }, opts.requests.map(r => ({
+        selector: r.selector, holds: r.holds, lifecycle: r.lifecycle, maxPhysicalPaths: r.maxPhysicalPaths,
+        beforeTree: r.beforeTree, measureCaps: r.measureCaps,
+      }))))));
+  }
+
+  private async inspectRetainedBatchScoped(common: InspectBatchCommon, inputs: InspectBatchRequest[]): Promise<RetainedInspectResult[]> {
+    const epoch = common.epoch;
+    const maxDescriptors = epoch ? this.retainedCap(common.maxDescriptors, 200) : RETAINED_MAX_DESCRIPTORS;
+    const clock = common.now ?? Date.now;
     let observedNow = -Infinity;
     const now = () => (observedNow = clock());
-    const budgetMs = opts.budgetMs ?? RETAINED_INSPECT_BUDGET_MS;
+    const budgetMs = common.budgetMs ?? RETAINED_INSPECT_BUDGET_MS;
     const deadline = now() + budgetMs;
-    const operationDeadline = Math.min(opts.deadline ?? Infinity, Date.now() +
-      (opts.now === undefined ? budgetMs : Math.max(budgetMs, RETAINED_INSPECT_BUDGET_MS)));
-    const partialCauses: PartialCauses = {};
-    let partial = false;
-    let unreadable = 0;
+    const operationDeadline = Math.min(common.deadline ?? Infinity, Date.now() +
+      (common.now === undefined ? budgetMs : Math.max(budgetMs, RETAINED_INSPECT_BUDGET_MS)));
     type Evaluated = Awaited<ReturnType<GitCache["evaluateRetained"]>>;
-    const found: Array<{ g: GatheredBare; rec: GatheredRecord; ev: Evaluated }> = [];
+    type Shortfall = MeasurementShortfall;
+    const outerErrors = this.retainedCauseScope.getStore()?.errors ?? new WeakMap<object, PartialCauses>();
+    // Each request owns its cause dedup (`counted`), so one bare-level error is recorded once in EACH request,
+    // exactly as separate calls would; the detail map is shared because it is keyed by the error object.
+    const reqs = inputs.map((input) => ({
+      ...input,
+      maxPhysicalPaths: epoch ? this.retainedCap(input.maxPhysicalPaths, 200) : Infinity,
+      physicalPaths: new Set<string>(),
+      found: [] as Array<{ g: GatheredBare; rec: GatheredRecord; ev: Evaluated }>,
+      partialCauses: {} as PartialCauses,
+      partial: false,
+      unreadable: 0,
+      sources: [] as RetainedSourceEvidence[],
+      bindingCounted: false,
+      scope: { prefix: "inspection" as const, errors: outerErrors, counted: new Set<unknown>() },
+    }));
     const exhausted = (err: unknown): boolean =>
-      opts.signal?.aborted === true || now() >= deadline || Date.now() >= (opts.deadline ?? Infinity) || (err instanceof Error && (err.name === "AbortError" || err.name === "TimeoutError" || /deadline exhausted/.test(err.message)));
+      common.signal?.aborted === true || now() >= deadline || Date.now() >= (common.deadline ?? Infinity) || (err instanceof Error && (err.name === "AbortError" || err.name === "TimeoutError" || /deadline exhausted/.test(err.message)));
     // Reuse the predicate's observations: diagnostic clock reads must not consume a test clock.
-    const interruption = (): PartialCause => opts.signal?.aborted ? "inspection_interrupted" :
-      observedNow >= deadline ? "inspection_budget" : Date.now() >= (opts.deadline ?? Infinity) ? "inspection_deadline" : "inspection_interrupted";
-    const failure = (error: unknown, stopped: boolean) => this.collectRetainedCause(error, partialCauses,
-      stopped ? interruption() : "inspection_unreadable_bare");
+    const interruption = (): PartialCause => common.signal?.aborted ? "inspection_interrupted" :
+      observedNow >= deadline ? "inspection_budget" : Date.now() >= (common.deadline ?? Infinity) ? "inspection_deadline" : "inspection_interrupted";
+    const failureAll = (error: unknown, stopped: boolean) => {
+      const fallback: PartialCause = stopped ? interruption() : "inspection_unreadable_bare";
+      for (const r of reqs) this.retainedCauseScope.run(r.scope, () => this.collectRetainedCause(error, r.partialCauses, fallback));
+    };
     const byIdentity = (x: { rec: GatheredRecord }, y: { rec: GatheredRecord }): number =>
       (x.rec.runId < y.rec.runId ? -1 : x.rec.runId > y.rec.runId ? 1 : 0) ||
       (x.rec.parts[0]!.clonePath < y.rec.parts[0]!.clonePath ? -1 : x.rec.parts[0]!.clonePath > y.rec.parts[0]!.clonePath ? 1 : 0);
@@ -14467,157 +15191,177 @@ export class GitCache {
       // One recovery clock covers the bare locks (queued waits included), the gather and the
       // evaluation; exhausting it is `partial`, never a silently shorter list.
       // (An injected clock governs the budget in tests; the real-time guard then stays at the default.)
-      await this.withRecoveryOperation(opts.signal ?? new AbortController().signal, operationDeadline, async () => {
-        for (const bare of await this.retainedBares(opts.barePath)) {
+      await this.withRecoveryOperation(common.signal ?? new AbortController().signal, operationDeadline, async () => {
+        for (const bare of await this.retainedBares(common.barePath)) {
           if (now() >= deadline) {
-            countPartialCause(partialCauses, "inspection_budget");
-            partial = true;
+            for (const r of reqs) {
+              countPartialCause(r.partialCauses, "inspection_budget");
+              r.partial = true;
+            }
             break;
           }
           try {
             // Gather AND evaluate in the same critical section: the disposition is computed from the
-            // same lock-held snapshot as the descriptor it is reported with.
+            // same lock-held snapshot as the descriptor it is reported with. Every request shares the
+            // one gather.
             await this.withLock(bare, async () => {
               const g = await this.gatherRetainedUnderLock(bare);
-              const matching = g.records
-                .filter((rec) => opts.selector === undefined
-                  // The aggregate view omits an attempt a running flight is still using.
-                  ? !(rec.kind === "attempt" && rec.parts[0]!.ledgerState === "live" && opts.isLivePath(rec.parts[0]!.clonePath))
-                  : this.matchesRetainedSelector(rec, opts.selector))
-                .map((rec) => ({ g, rec }))
-                .sort(byIdentity)
-                .slice(0, maxDescriptors + 1);
-              for (const { rec } of matching) {
-                this.checkRecoveryInterruption();
-                if (opts.epoch) {
-                  const fresh = [...new Set(rec.parts.map(p => p.clonePath))].filter(p => !physicalPaths.has(p));
-                  if (found.length >= maxDescriptors || physicalPaths.size + fresh.length > maxPhysicalPaths) {
-                    countPartialCause(partialCauses, found.length >= maxDescriptors ? "inspection_descriptor_cap" : "inspection_physical_path_cap");
-                    partial = true;
-                    continue;
+              for (const r of reqs) {
+                const matching = g.records
+                  .filter((rec) => r.selector === undefined
+                    // The aggregate view omits an attempt a running flight is still using.
+                    ? !(rec.kind === "attempt" && rec.parts[0]!.ledgerState === "live" && common.isLivePath(rec.parts[0]!.clonePath))
+                    : this.matchesRetainedSelector(rec, r.selector))
+                  .map((rec) => ({ g, rec }))
+                  .sort(byIdentity)
+                  .slice(0, maxDescriptors + 1);
+                for (const { rec } of matching) {
+                  this.checkRecoveryInterruption();
+                  if (epoch) {
+                    const fresh = [...new Set(rec.parts.map(p => p.clonePath))].filter(p => !r.physicalPaths.has(p));
+                    if (r.found.length >= maxDescriptors || r.physicalPaths.size + fresh.length > r.maxPhysicalPaths) {
+                      countPartialCause(r.partialCauses, r.found.length >= maxDescriptors ? "inspection_descriptor_cap" : "inspection_physical_path_cap");
+                      r.partial = true;
+                      continue;
+                    }
+                    for (const p of fresh) r.physicalPaths.add(p);
                   }
-                  for (const p of fresh) physicalPaths.add(p);
+                  const ev = await this.evaluateRetained(g, rec, {
+                    holds: r.selector === undefined ? undefined : r.holds,
+                    ...(r.selector === undefined || r.lifecycle === undefined ? {} : { lifecycle: r.lifecycle }),
+                    isLivePath: common.isLivePath,
+                  });
+                  r.found.push({ g, rec, ev });
                 }
-                const ev = await this.evaluateRetained(g, rec, {
-                  holds: opts.selector === undefined ? undefined : opts.holds,
-                  ...(opts.selector === undefined || opts.lifecycle === undefined ? {} : { lifecycle: opts.lifecycle }),
-                  isLivePath: opts.isLivePath,
-                });
-                found.push({ g, rec, ev });
               }
             });
           } catch (err) {
             const stopped = exhausted(err);
-            failure(err, stopped);
+            failureAll(err, stopped);
             if (stopped) {
-              partial = true;
+              for (const r of reqs) r.partial = true;
               break;
             }
-            unreadable++;
+            for (const r of reqs) r.unreadable++;
             this.log.warn("retained source inspection could not read a bare", { error: gitErrorMessage(err) });
           }
         }
       });
     } catch (err) {
       const stopped = exhausted(err);
-      failure(err, stopped);
-      if (stopped) partial = true;
+      failureAll(err, stopped);
+      if (stopped) for (const r of reqs) r.partial = true;
       else {
-        unreadable++;
+        for (const r of reqs) r.unreadable++;
         this.log.warn("retained source inspection could not enumerate the bares", { error: gitErrorMessage(err) });
       }
     }
-    found.sort(byIdentity);
-    if (found.length > maxDescriptors) {
-      countPartialCause(partialCauses, "inspection_descriptor_cap");
-      partial = true;
-      found.length = maxDescriptors;
-    }
-    const sources: RetainedSourceEvidence[] = [];
-    type Shortfall = MeasurementShortfall;
-    const measurements = new Map<string, { bytes: number; complete: boolean; local?: Shortfall }>();
+    // A beforeTree binding failure in ANY request poisons the whole batch.
     let bindingFailed = false;
-    for (const { g, rec, ev } of found) {
-      const parts: RetainedSourcePart[] = [];
-      let measured = 0;
-      let unmeasured = 0;
-      let total = 0;
-      for (const p of rec.parts) {
-        let bytes: number | null = null;
-        let shortfall: Shortfall | undefined;
-        if (p.presence === "missing") bytes = 0;
-        else if (p.presence === "present") {
-          let m: { bytes: number; complete: boolean; local?: Shortfall } = { bytes: 0, complete: false };
-          try {
-            if (bindingFailed) throw new Error("retained tree binding check failed");
-            m = (opts.epoch ? measurements.get(p.clonePath) : undefined) ??
-              await this.withRecoveryOperation(opts.signal ?? new AbortController().signal, operationDeadline,
-                async () => {
-                  this.checkRecoveryInterruption();
-                  try { opts.beforeTree?.(p.clonePath); }
-                  catch (error) { bindingFailed = true; countPartialCause(partialCauses, "tree_binding_failed"); throw error; }
-                  this.checkRecoveryInterruption();
-                  const detail: PartialCauses = {};
-                  try { return await this.measureAllocated(p.clonePath, now, deadline, opts.measureCaps, detail); }
-                  finally {
-                    // Only executed walks arrive here; cache hits bypass this callback.
-                    mergePartialCauses(partialCauses, detail);
-                  }
-                });
-            if (opts.epoch) measurements.set(p.clonePath, m);
-          } catch (error) {
-            const stopped = exhausted(error);
-            if (stopped) this.collectRetainedCause(error, partialCauses, interruption());
-            if (!stopped) unreadable++;
-          }
-          bytes = m.complete ? m.bytes : null;
-          // An epoch inspection keeps a tree-local shortfall (permission denied at the root or below, or a
-          // measurement cap) out of the pass-wide `partial`: the part stays unmeasured and the source is
-          // not byte-complete, so nothing is granted for it. Only a live signal, absolute deadline and
-          // inspection budget qualify. The budget is re-read here, and only on this local-stop path,
-          // because the walk's own check precedes its directory close and a cache hit reuses an earlier
-          // decision: a budget spent since then makes the stop pass-wide.
-          if (!m.complete) {
-            if (opts.epoch && m.local !== undefined && opts.signal?.aborted !== true && Date.now() < (opts.deadline ?? Infinity)) {
-              if (now() < deadline) shortfall = m.local;
-              else { countPartialCause(partialCauses, "inspection_budget"); partial = true; }
-            } else partial = true;
-          }
+    for (const r of reqs) {
+      await this.retainedCauseScope.run(r.scope, async () => {
+        r.found.sort(byIdentity);
+        if (r.found.length > maxDescriptors) {
+          countPartialCause(r.partialCauses, "inspection_descriptor_cap");
+          r.partial = true;
+          r.found.length = maxDescriptors;
         }
-        if (bytes === null) unmeasured++;
-        else {
-          measured++;
-          total += bytes;
+        // Per-request cache: no measurement is reused across requests.
+        const measurements = new Map<string, { bytes: number; complete: boolean; local?: Shortfall }>();
+        for (const { g, rec, ev } of r.found) {
+          const parts: RetainedSourcePart[] = [];
+          let measured = 0;
+          let unmeasured = 0;
+          let total = 0;
+          for (const p of rec.parts) {
+            let bytes: number | null = null;
+            let shortfall: Shortfall | undefined;
+            if (p.presence === "missing") bytes = 0;
+            else if (p.presence === "present") {
+              let m: { bytes: number; complete: boolean; local?: Shortfall } = { bytes: 0, complete: false };
+              try {
+                if (bindingFailed) throw new Error("retained tree binding check failed");
+                m = (epoch ? measurements.get(p.clonePath) : undefined) ??
+                  await this.withRecoveryOperation(common.signal ?? new AbortController().signal, operationDeadline,
+                    async () => {
+                      this.checkRecoveryInterruption();
+                      try { r.beforeTree?.(p.clonePath); }
+                      catch (error) {
+                        bindingFailed = true;
+                        r.bindingCounted = true;
+                        countPartialCause(r.partialCauses, "tree_binding_failed");
+                        throw error;
+                      }
+                      this.checkRecoveryInterruption();
+                      const detail: PartialCauses = {};
+                      try { return await this.measureAllocated(p.clonePath, now, deadline, r.measureCaps, detail); }
+                      finally {
+                        // Only executed walks arrive here; cache hits bypass this callback.
+                        mergePartialCauses(r.partialCauses, detail);
+                      }
+                    });
+                if (epoch) measurements.set(p.clonePath, m);
+              } catch (error) {
+                const stopped = exhausted(error);
+                if (stopped) this.collectRetainedCause(error, r.partialCauses, interruption());
+                if (!stopped) r.unreadable++;
+              }
+              bytes = m.complete ? m.bytes : null;
+              // An epoch inspection keeps a tree-local shortfall (permission denied at the root or below, or a
+              // measurement cap) out of the pass-wide `partial`: the part stays unmeasured and the source is
+              // not byte-complete, so nothing is granted for it. Only a live signal, absolute deadline and
+              // inspection budget qualify. The budget is re-read here, and only on this local-stop path,
+              // because the walk's own check precedes its directory close and a cache hit reuses an earlier
+              // decision: a budget spent since then makes the stop pass-wide.
+              if (!m.complete) {
+                if (epoch && m.local !== undefined && common.signal?.aborted !== true && Date.now() < (common.deadline ?? Infinity)) {
+                  if (now() < deadline) shortfall = m.local;
+                  else { countPartialCause(r.partialCauses, "inspection_budget"); r.partial = true; }
+                } else r.partial = true;
+              }
+            }
+            if (bytes === null) unmeasured++;
+            else {
+              measured++;
+              total += bytes;
+            }
+            parts.push({
+              clonePath: p.clonePath, attempt: p.attemptId ?? "canonical", generation: p.generation ?? "none",
+              presence: p.presence, ledgerState: p.ledgerState, live: ev.live.get(p.clonePath) ?? false, allocatedBytes: bytes,
+              ...(shortfall ? { measurementShortfall: shortfall } : {}),
+            });
+          }
+          const head = rec.parts[0]!;
+          r.sources.push({
+            barePath: g.barePath, runId: rec.runId, branch: rec.branch, key: rec.key, kind: rec.kind,
+            generation: head.generation ?? "none", attempt: head.attemptId ?? "canonical", ledgerState: head.ledgerState,
+            journalState: rec.journalState, markerState: rec.markerState,
+            presence: rec.parts.some((p) => p.presence === "unsafe") ? "unsafe"
+              : rec.parts.every((p) => p.presence === "missing") ? "missing" : "present",
+            descriptor: rec.digest, allocatedBytes: unmeasured === 0 ? total : measured === 0 ? null : total,
+            bytesState: unmeasured === 0 ? "measured" : measured === 0 ? "unknown" : "partial",
+            sources: parts, consumers: [...ev.consumers, ...ev.blockers.map((b) => `blocker:${b}`)], localRecords: ev.localRecords,
+            holds: ev.holdsView, disposition: ev.disposition,
+            ...(ev.epochSettlement ? { epochSettlement: ev.epochSettlement } : {}),
+            ...(rec.epochJournalExtraFields ? { epochJournalExtraFields: true as const } : {}),
+          });
         }
-        parts.push({
-          clonePath: p.clonePath, attempt: p.attemptId ?? "canonical", generation: p.generation ?? "none",
-          presence: p.presence, ledgerState: p.ledgerState, live: ev.live.get(p.clonePath) ?? false, allocatedBytes: bytes,
-          ...(shortfall ? { measurementShortfall: shortfall } : {}),
-        });
-      }
-      const head = rec.parts[0]!;
-      sources.push({
-        barePath: g.barePath, runId: rec.runId, branch: rec.branch, key: rec.key, kind: rec.kind,
-        generation: head.generation ?? "none", attempt: head.attemptId ?? "canonical", ledgerState: head.ledgerState,
-        journalState: rec.journalState, markerState: rec.markerState,
-        presence: rec.parts.some((p) => p.presence === "unsafe") ? "unsafe"
-          : rec.parts.every((p) => p.presence === "missing") ? "missing" : "present",
-        descriptor: rec.digest, allocatedBytes: unmeasured === 0 ? total : measured === 0 ? null : total,
-        bytesState: unmeasured === 0 ? "measured" : measured === 0 ? "unknown" : "partial",
-        sources: parts, consumers: [...ev.consumers, ...ev.blockers.map((b) => `blocker:${b}`)], localRecords: ev.localRecords,
-        holds: ev.holdsView, disposition: ev.disposition,
-        ...(ev.epochSettlement ? { epochSettlement: ev.epochSettlement } : {}),
-        ...(rec.epochJournalExtraFields ? { epochJournalExtraFields: true as const } : {}),
       });
     }
     if (bindingFailed) {
-      partial = true;
-      for (const source of sources) {
-        source.disposition = undefined;
-        delete source.epochSettlement;
+      for (const r of reqs) {
+        r.partial = true;
+        if (!r.bindingCounted) countPartialCause(r.partialCauses, "tree_binding_failed");
+        for (const source of r.sources) {
+          source.disposition = undefined;
+          delete source.epochSettlement;
+        }
       }
     }
-    return { partialCauses, sources, partial, unreadable, sampledAt: new Date(now()).toISOString() };
+    return reqs.map((r) => ({
+      partialCauses: r.partialCauses, sources: r.sources, partial: r.partial, unreadable: r.unreadable,
+      sampledAt: new Date(now()).toISOString(),
+    }));
   }
 
   /**
@@ -15500,6 +16244,139 @@ export class GitCache {
     } finally {
       this.checkRecoveryInterruption();
       if (physicalFailure) this.warnRecoveryPhysicalFailure();
+    }
+  }
+
+  /** issue #4007 M3 (read-only): the worker's bares, strictly enumerated. Any failure propagates; a caller treats it as unproved. */
+  listRunBares(): Promise<string[]> {
+    return this.retainedBares(undefined, { strict: true });
+  }
+
+  /**
+   * issue #4007 M3 (read-only): the attribution of ONE bare for ONE run, read under the bare lock inside the caller's
+   * report-proof budget. It reuses the strict parsers of {@link readInventoryCloneHeadsUnderLock}: a malformed ledger value,
+   * journal, stopped marker or protected record is `unknown` (FINAL cannot skip malformed evidence). The attempt ledger
+   * carries no generation; the generation is only what the attempt id embeds ({@link attemptGeneration}).
+   * Nothing is written, retired or repaired.
+   */
+  async readTerminalAttribution(barePath: string, runId: string, budget: { signal: AbortSignal; deadline: number }): Promise<TerminalAttribution> {
+    try {
+      return await this.withReportProofBudget(budget, async (): Promise<TerminalAttribution> => {
+        if (typeof runId !== "string" || !OWED_RUN_ID.test(runId)) return { kind: "unknown", cause: "invalid_run" };
+        await this.assertOwedBare(barePath);
+        return await this.withLock(barePath, async (): Promise<TerminalAttribution> => {
+          this.checkReportProof();
+          const entries = await this.configEntries(barePath);
+          const bad = (cause: string): TerminalAttribution => ({ kind: "unknown", cause });
+          const ledger = new Map<string, AttemptLedgerEntry & { branch: string }>();
+          for (const [branch, raw] of await this.readAllAttemptLedgerRaw(barePath, entries)) {
+            const parsed = parseAttemptLedgerEntry(raw);
+            // Only the canonical serialization is accepted, so a hand-written or reordered value is malformed evidence.
+            if (!parsed || raw !== attemptLedgerValue(parsed)) return bad("malformed_ledger");
+            // A state change re-appends the same attempt: the last value wins (config order) while run, clone and
+            // branch stay identical; any other repeat of an attempt id is a conflict.
+            const previous = ledger.get(parsed.attemptId);
+            if (previous && (previous.runId !== parsed.runId || previous.clonePath !== parsed.clonePath || previous.branch !== branch)) {
+              return bad("duplicate_attempt");
+            }
+            ledger.set(parsed.attemptId, { ...parsed, branch });
+          }
+          const attempts = [...ledger.values()].filter(e => e.runId === runId)
+            .map(e => ({ attemptId: e.attemptId, clonePath: e.clonePath, branch: e.branch, state: e.state }))
+            .sort((a, b) => (a.attemptId < b.attemptId ? -1 : a.attemptId > b.attemptId ? 1 : 0));
+          const journal: Array<{ branch: string; clonePath: string; attemptId?: string }> = [];
+          for (const item of entries) {
+            const nl = item.indexOf("\n");
+            const key = nl < 0 ? item : item.slice(0, nl);
+            const match = /^uzi-recovery\.(.+)\.clone$/.exec(key);
+            if (!match) continue;
+            if (nl < 0) return bad("valueless_journal");
+            if (item.slice(nl + 1) === "") continue; // retirement clears the key; the latest value is authoritative
+            let entry: RecoveryJournalEntry | undefined;
+            try { entry = await this.readRecoveryCapture(barePath, match[1]!, entries); } catch { return bad("malformed_journal"); }
+            if (!entry) return bad("malformed_journal");
+            if (entry.runId !== runId) continue;
+            for (const source of this.recoverySources(entry)) {
+              const row = { branch: match[1]!, clonePath: source.clonePath, ...(source.attemptId === undefined ? {} : { attemptId: source.attemptId }) };
+              if (!journal.some(j => j.branch === row.branch && j.clonePath === row.clonePath)) journal.push(row);
+            }
+          }
+          const markers = await this.readStoppedMarkers(barePath, entries);
+          if (markers.malformed.length > 0 || markers.overflow.size > 0) return bad("malformed_marker");
+          const stoppedMarkers = markers.valid.filter(v => v.marker.runId === runId)
+            .map(v => ({ branch: v.marker.branch, clonePath: v.marker.clonePath }));
+          const protectedRows = (await this.protectedRecoveries(barePath)).filter(r => r.journal.runId === runId)
+            .map(r => ({ branch: r.branch, key: r.key, clonePaths: this.recoverySources(r.journal).map(s => s.clonePath) }));
+          const owedRoots = (await this.enumerateOwedUnderLock(barePath, runId)).map(c => c.sha);
+          return { kind: "verified", attempts, journal, stoppedMarkers, protected: protectedRows, owedRoots };
+        });
+      });
+    } catch (error) {
+      return { kind: "unknown", cause: budget.signal.aborted || Date.now() >= budget.deadline ? "deadline" : gitErrorMessage(error).slice(0, 200) };
+    }
+  }
+
+  /**
+   * issue #4007 M3 (read-only): is every local ref of the clone, `refs/remotes/origin/*` included, an ancestor of `head`, with
+   * no stash and no linked worktree? Unlike {@link localRefsReachableFrom}, reachability from the bare's refs or from tracking
+   * state is NEVER evidence: only `head` counts. An annotated tag object is not a commit and is refused as `not_ancestor`
+   * (conservative). Refs are read as the runner uid in the clone and the ancestry question is chunked `rev-list` in the clone.
+   */
+  async readTerminalCloneLocalRefs(clonePath: string, head: string): Promise<{ ok: true } | { ok: false; reason: TerminalLocalRefReason }> {
+    const refuse = (reason: TerminalLocalRefReason): { ok: false; reason: TerminalLocalRefReason } => ({ ok: false, reason });
+    if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(head) || typeof clonePath !== "string" || !path.isAbsolute(clonePath)) return refuse("unreadable");
+    let stderr = "";
+    let oversized = false;
+    try {
+      this.checkReportProof();
+      const dotGit = await fs.lstat(path.join(clonePath, ".git"));
+      if (!dotGit.isDirectory() || dotGit.isSymbolicLink()) return refuse("unreadable");
+      try {
+        const wt = await fs.lstat(path.join(clonePath, ".git", "worktrees"));
+        if (!wt.isDirectory() || wt.isSymbolicLink()) return refuse("linked_worktree");
+        if ((await fs.readdir(path.join(clonePath, ".git", "worktrees"))).length > 0) return refuse("linked_worktree");
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT") return refuse("unreadable");
+      }
+      const env = { ...NO_REPLACE_ENV, GIT_ALLOW_PROTOCOL: RUNNER_GIT_NO_PROTOCOL };
+      const worktrees = await this.runGitAsRunner(clonePath, ["worktree", "list", "--porcelain"], { env });
+      const listed = worktrees.split("\n").filter(line => line.startsWith("worktree ")).length;
+      if (listed !== 1) return refuse(listed > 1 ? "linked_worktree" : "unreadable");
+      const out = await this.runGitAsRunner(clonePath, ["for-each-ref", "--format=%(objectname) %(refname)"], {
+        env,
+        onStderr: (text) => {
+          if (oversized || text === "") return;
+          if (stderr.length + text.length > 4096) { stderr = ""; oversized = true; } else stderr += text;
+        },
+      });
+      if (stderr !== "" || oversized) return refuse("stderr");
+      const shas = new Set<string>();
+      for (const line of out.split("\n")) {
+        if (line === "") continue;
+        const sp = line.indexOf(" ");
+        const sha = line.slice(0, sp), ref = line.slice(sp + 1);
+        if (sp < 0 || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(sha)) return refuse("unreadable");
+        if (ref === "refs/stash") return refuse("stash");
+        shas.add(sha);
+        if (shas.size > MAX_LOCAL_REF_SHAS) return refuse("cap");
+      }
+      const all = [...shas];
+      for (let i = 0; i < all.length; i += LOCAL_REF_REVLIST_CHUNK) {
+        this.checkReportProof();
+        // The clone is agent-writable: ancestry is read in the hardened proof view (no grafts, no replace objects, no
+        // commit-graph or multi-pack-index) so a forged `info/grafts` or commit-graph cannot fake reachability.
+        let revStderr = "";
+        const extra = await this.runGitAsRunner(clonePath,
+          ["-c", "core.commitGraph=false", "-c", "core.multiPackIndex=false", "-c", "advice.graftFileDeprecated=false",
+            "rev-list", "--objects", "-n", "1", ...all.slice(i, i + LOCAL_REF_REVLIST_CHUNK), "--not", head],
+          { env: { ...PROOF_READ_ENV, GIT_ALLOW_PROTOCOL: RUNNER_GIT_NO_PROTOCOL },
+            onStderr: (text) => { if (text !== "") revStderr = "x"; } });
+        if (revStderr !== "") return refuse("stderr");
+        if (extra.trim() !== "") return refuse("not_ancestor");
+      }
+      return { ok: true };
+    } catch {
+      return refuse("unreadable");
     }
   }
 
@@ -18880,9 +19757,55 @@ export class GitCache {
    *      are only probed for emptiness, never stat'ed or followed.
    *  Retained parents, parents skipped as recent, and an enumeration cut short by
    *  RETIRE_SCRATCH_ENUMERATION_BUDGET (charged on every entry read) are reported by ONE counted
-   *  warning `runner retire scratch retained` (bounded path list). Never recursive; never throws. */
-  async inspectRetireScratchAtStartup(processStartMs: number): Promise<{ retained: number }> {
+   *  warning `runner retire scratch retained` (bounded path list). Never throws.
+   *
+   *  issue #4143 — with `opts.outcomes` (the default in main.ts; `UZI_RETIRE_SCRATCH_OUTCOMES=0`
+   *  turns it off and leaves exactly the warning above, with no journal read and no walk), the
+   *  warning is followed by OBSERVATION records only: at most RETIRE_SCRATCH_REPORTED_PATHS
+   *  `runner retire scratch outcome` rows (every one `kept`, only for parents) and exactly one
+   *  `runner retire scratch total` per startup whenever outcomes are on and the runner root was
+   *  listed (it exists and is a real directory), including with zero parents. A missing,
+   *  non-directory or symlink runner root emits no lines; if the step throws,
+   *  `runner retire scratch outcomes failed` replaces the total. With zero parents no journal
+   *  read or walk happens and `retained_source_read` is `not_attempted`. They never remove,
+   *  change the owner of or reclaim anything.
+   *    - No ordinary durable disposition binding proves this moved footprint: rollback repair can
+   *      persist a protected moved-clone pointer, but the rename precedes the journal clear and the
+   *      retired-ledger write, so a parent can exist with nothing naming it. A retired ledger,
+   *      emptiness, age or name grants nothing. The legacy stderr-proof repair (#4141, landed via
+   *      #4152) does not certify old remnants retroactively.
+   *    - Attribution: one typed, read-only pass over every bare's config (`resolveBranchJournalUnderLock`
+   *      per recovery or restore branch, same lock, bounds and recovery operation as discovery) collects
+   *      only the `clonePath`s the journals name. A parent equal to, or an ancestor of, such a path is
+   *      `protected_by_retained_source`; every other parent is `no_disposition_evidence`. Any cap, abort,
+   *      deadline, lock or bare failure, or an undecodable value, makes the whole read `unknown`
+   *      (no further bares) and then no parent is claimed as named or not named.
+   *    - Walk: descriptor-relative and read-only as the worker uid. The runner root and each directory
+   *      are opened O_NOFOLLOW|O_DIRECTORY and reached through `/proc/self/fd/<fd>`; every entry is
+   *      classified by lstat, never by dirent type; only a directory whose fstat matches its lstat and
+   *      the parent's device is descended. Anything else counts its own allocated blocks and is never
+   *      opened. A directory whose mtime, ctime or nlink moves while it is walked is `changed`.
+   *      Bytes are allocated blocks * 512, a hard-linked inode once. All handles close in finally.
+   *    - Envelope: ONE absolute deadline (now + 30 s) for the whole invocation, never reset per bare,
+   *      branch or parent, plus a global cap of 200000 listed entries. The operation is awaited to
+   *      settlement (queued lock waits are cancelled; child processes and handles settle) before
+   *      startup continues, so the bound is the 30 s budget plus child settlement and handle closes.
+   *      There is no hard real-time bound for an uninterruptible syscall such as a stalled mount. */
+  async inspectRetireScratchAtStartup(processStartMs: number, opts: {
+    outcomes?: boolean;
+    signal?: AbortSignal;
+    /** Test hooks, never passed by main.ts. */
+    now?: () => number;
+    limits?: EpochRetainedLimits;
+    walkLimits?: { maxEntries?: number };
+    readRetainedSources?: () => Promise<RetireScratchSources>;
+    beforeEntry?: (dirPath: string, name: string) => Promise<void>;
+    beforeOpen?: (dirPath: string) => Promise<void>;
+  } = {}): Promise<{ retained: number }> {
     const root = path.resolve(this.runnerRoot);
+    const now = opts.now ?? Date.now;
+    const deadline = opts.outcomes ? now() + RETIRE_SCRATCH_OUTCOME_BUDGET_MS : 0;
+    const observed: Array<{ name: string; recent: boolean; kind: "dir" | "symlink" | "other" }> = [];
     const retained: string[] = [];
     let empty = 0;
     let skippedRecent = 0;
@@ -18908,8 +19831,10 @@ export class GitCache {
         const p = path.join(root, name);
         try {
           const st = await fs.lstat(p);
-          if (!st.isSymbolicLink() && st.mtimeMs >= processStartMs) { skippedRecent++; continue; }
+          const kind = st.isSymbolicLink() ? "symlink" : st.isDirectory() ? "dir" : "other";
+          if (!st.isSymbolicLink() && st.mtimeMs >= processStartMs) { skippedRecent++; observed.push({ name, recent: true, kind }); continue; }
           retained.push(p);
+          observed.push({ name, recent: false, kind });
           if (st.isSymbolicLink() || !st.isDirectory()) continue;
           let isEmpty = true;
           const pd = await fs.opendir(p);
@@ -18921,7 +19846,7 @@ export class GitCache {
           if (isEmpty) empty++;
         } catch (err) {
           if ((err as NodeJS.ErrnoException).code === "ENOENT") continue;
-          if (!retained.includes(p)) retained.push(p);
+          if (!retained.includes(p)) { retained.push(p); observed.push({ name, recent: false, kind: "other" }); }
         }
       }
     } catch (err) {
@@ -18942,7 +19867,178 @@ export class GitCache {
         paths: retained.slice(0, RETIRE_SCRATCH_REPORTED_PATHS).map((p) => sanitizeForLog(path.relative(root, p), 157)),
       });
     }
+    // Reaching here means the runner root exists, is a directory and was enumerated (a missing,
+    // non-directory or symlink root returned early above with no lines), so the total is emitted
+    // even with zero parents.
+    if (opts.outcomes) {
+      try { await this.emitRetireScratchOutcomes(root, observed.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0)), incomplete, deadline, opts); }
+      catch (err) {
+        this.log.warn("runner retire scratch outcomes failed", { error: sanitizeForLog(gitErrorMessage(err), 157) });
+      }
+    }
     return { retained: retained.length };
+  }
+
+  /** issue #4143 — the typed, read-only journal read for {@link inspectRetireScratchAtStartup}. One
+   *  absolute `deadline`, awaited to settlement; any failure of any kind is `unknown`. */
+  private async readRetireScratchSources(signal: AbortSignal, deadline: number, limitsOverride: EpochRetainedLimits | undefined,
+    now: () => number): Promise<RetireScratchSources> {
+    try {
+      const limits = this.epochLimits(limitsOverride);
+      const paths = new Set<string>();
+      let configBytes = 0;
+      let records = 0;
+      await this.epochRetained.run(limits, () => this.withRecoveryOperation(signal, deadline, async (combined) => {
+        for (const bare of await this.retainedBares(undefined, { strict: true })) {
+          this.checkRecoveryInterruption();
+          await this.withLock(bare, async () => {
+            const entries = await this.configEntries(bare);
+            // Charge before any decode: raw bytes, then records (both before the key-parsing loop).
+            for (const item of entries) configBytes += Buffer.byteLength(item) + 1;
+            if (configBytes > limits.maxMetadataBytes) throw new Error("retire scratch metadata byte limit");
+            records += entries.length;
+            if (records > limits.maxMetadataRecords) throw new Error("retire scratch metadata record limit");
+            const branches = new Set<string>();
+            // Last recovery raw value per branch, one pass, for the closure pre-charge below.
+            const lastRecoveryRaw = new Map<string, string>();
+            for (const item of entries) {
+              const nl = item.indexOf("\n");
+              const key = nl < 0 ? item : item.slice(0, nl);
+              const recovery = /^uzi-recovery\.(.+)\.clone$/.exec(key);
+              // A valueless recovery key is not a cleared value: undecodable evidence.
+              if (recovery && nl < 0) throw new Error("valueless recovery journal key");
+              if (recovery) lastRecoveryRaw.set(recovery[1]!, item.slice(nl + 1));
+              const branch = recovery?.[1] ?? restoreKeyBranch(key);
+              if (branch !== undefined) branches.add(branch);
+            }
+            records += branches.size;
+            if (records > limits.maxMetadataRecords) throw new Error("retire scratch metadata record limit");
+            const closure = this.recoveryOperations.getStore()?.closureBudget;
+            const collect = (journal: RecoveryJournalEntry | undefined): void => {
+              for (const p of [journal?.clonePath, ...(journal?.retainedSources ?? []).map((s) => s.clonePath)]) {
+                if (p === undefined) continue;
+                paths.add(p);
+                if (paths.size > limits.maxSeenPaths) throw new Error("retire scratch path limit");
+              }
+            };
+            for (const branch of [...branches].sort()) {
+              // Bounded by the one absolute deadline even when every await settles on a microtask.
+              if (now() >= deadline) throw new Error("retire scratch deadline");
+              this.checkRecoveryInterruption();
+              // Charge the decoded bytes the resolver will parse BEFORE it parses them.
+              if (closure) {
+                const pRaw = lastRecoveryRaw.get(branch) ?? "";
+                closure.delivered += Buffer.byteLength(pRaw) + Buffer.byteLength(this.restoreValueIn(entries, branch) ?? "");
+                if (closure.delivered > closure.limit) throw new Error("retire scratch decoded journal limit");
+              }
+              const resolved = await this.resolveBranchJournalUnderLock(bare, branch, entries);
+              if (resolved.kind === "plain") collect(resolved.journal);
+              else if (resolved.kind === "composite") {
+                collect(resolved.predecessor.journal);
+                if (resolved.successor.kind === "entry") collect(resolved.successor.journal);
+                else {
+                  collect(undefined);
+                  paths.add(resolved.successor.successor.clonePath);
+                  if (paths.size > limits.maxSeenPaths) throw new Error("retire scratch path limit");
+                }
+              }
+            }
+          }, combined);
+        }
+      }));
+      return { state: "read", paths: [...paths].sort() };
+    } catch {
+      return { state: "unknown" };
+    }
+  }
+
+  /** issue #4143 — the observation records. Every parent is `kept`; nothing here can change disk. */
+  private async emitRetireScratchOutcomes(root: string, parents: Array<{ name: string; recent: boolean; kind: "dir" | "symlink" | "other" }>,
+    incomplete: boolean, deadline: number, opts: {
+      outcomes?: boolean; signal?: AbortSignal; now?: () => number; limits?: EpochRetainedLimits; walkLimits?: { maxEntries?: number };
+      readRetainedSources?: () => Promise<RetireScratchSources>; beforeEntry?: (dirPath: string, name: string) => Promise<void>;
+      beforeOpen?: (dirPath: string) => Promise<void>;
+    }): Promise<void> {
+    const signal = opts.signal ?? new AbortController().signal;
+    // No parents: nothing to attribute or walk, so no journal read is attempted.
+    let sources: RetireScratchSources = parents.length === 0 ? { state: "not_attempted" }
+      : opts.readRetainedSources
+        ? await opts.readRetainedSources().catch((): RetireScratchSources => ({ state: "unknown" }))
+        : await this.readRetireScratchSources(signal, deadline, opts.limits, opts.now ?? Date.now);
+    const ctx: RetireScratchWalkCtx = {
+      now: opts.now ?? Date.now, deadline, signal, entries: 0,
+      maxEntries: opts.walkLimits?.maxEntries ?? RETIRE_SCRATCH_WALK_MAX_ENTRIES, seen: new Set(),
+      ...(opts.beforeEntry ? { beforeEntry: opts.beforeEntry } : {}),
+      ...(opts.beforeOpen ? { beforeOpen: opts.beforeOpen } : {}),
+    };
+    // Classify each source once, while the shared budget still admits work. Rows and
+    // totals only look up a top-level parent name, never re-scan/normalize every path.
+    const namedParents = new Set<string>();
+    if (sources.state === "read") {
+      const prefix = root.endsWith(path.sep) ? root : `${root}${path.sep}`;
+      for (const source of sources.paths) {
+        if (retireWalkSpent(ctx)) break;
+        const normalized = path.resolve(source);
+        if (!normalized.startsWith(prefix)) continue;
+        const relative = normalized.slice(prefix.length);
+        const slash = relative.indexOf(path.sep);
+        namedParents.add(slash < 0 ? relative : relative.slice(0, slash));
+      }
+      if (retireWalkSpent(ctx)) {
+        sources = { state: "unknown" };
+        namedParents.clear();
+      }
+    }
+    const results: RetireScratchParentResult[] = [];
+    let rootHandle: FileHandle | undefined;
+    try {
+      let rootDev: bigint | undefined;
+      try {
+        if (parents.length > 0) {
+          rootHandle = await fs.open(root, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
+          rootDev = (await rootHandle.stat({ bigint: true })).dev;
+        }
+      } catch { /* every parent is then reported unreadable below */ }
+      for (const parent of parents) {
+        if (rootHandle === undefined || rootDev === undefined) {
+          results.push({ name: parent.name, recent: parent.recent, kind: parent.kind, bytes: 0n, bytesState: "unknown", reasons: ["unreadable"], empty: false });
+          continue;
+        }
+        results.push(await retireWalkParent(ctx, rootHandle.fd, rootDev, root, parent));
+      }
+    } finally {
+      await rootHandle?.close().catch(() => undefined);
+    }
+    const row = (r: RetireScratchParentResult): {
+      retained_source: "named" | "not_named" | "unknown"; reason: "protected_by_retained_source" | "no_disposition_evidence";
+    } => {
+      if (sources.state !== "read") return { retained_source: "unknown", reason: "no_disposition_evidence" };
+      return namedParents.has(r.name) ? { retained_source: "named", reason: "protected_by_retained_source" }
+        : { retained_source: "not_named", reason: "no_disposition_evidence" };
+    };
+    for (const r of results.slice(0, RETIRE_SCRATCH_REPORTED_PATHS)) {
+      this.log.info("runner retire scratch outcome", {
+        name: sanitizeForLog(r.name, 157), kind: r.kind, outcome: "kept", ...row(r),
+        empty: r.empty, recent: r.recent, bytes: Number(r.bytes), bytes_state: r.bytesState, partial_reasons: r.reasons,
+      });
+    }
+    const totalReasons = new Set<RetireScratchWalkReason>();
+    for (const r of results) for (const reason of r.reasons) totalReasons.add(reason);
+    const protectedCount = results.filter((r) => row(r).reason === "protected_by_retained_source").length;
+    const allMeasured = results.every((r) => r.bytesState === "measured");
+    this.log.info("runner retire scratch total", {
+      parents_enumerated: results.length,
+      outcomes_omitted: results.length - Math.min(results.length, RETIRE_SCRATCH_REPORTED_PATHS),
+      kept: results.length,
+      reclaimed: 0,
+      protected_by_retained_source: protectedCount,
+      no_disposition_evidence: results.length - protectedCount,
+      bytes: Number(results.reduce((n, r) => n + r.bytes, 0n)),
+      bytes_state: allMeasured && !incomplete ? "measured" : results.every((r) => r.bytesState === "unknown") ? "unknown" : "partial",
+      partial_reasons: [...totalReasons].sort(),
+      enumeration_incomplete: incomplete,
+      retained_source_read: sources.state,
+    });
   }
 
   /** issue #3153 — the ONE best-effort removal helper for scratch the worker created under the
@@ -19868,6 +20964,719 @@ try {
   }
 
   /**
+   * Terminal-preservation snapshot of a runner clone's working tree, production-dark. Every git child
+   * runs as the runner uid on {@link TERMINAL_GIT_PINS} / {@link TERMINAL_GIT_ENV}; the clone's real
+   * `.git/index`, HEAD, branch and every other ref (the `refs/uzi-terminal-local/` namespace aside)
+   * are proven unchanged before and after. Phases, in order:
+   *  1. bounded enumeration of changed paths BEFORE any staging (refusals touch no index);
+   *  2. bounded ignored-file extents (counted, never captured);
+   *  3. a clean tree returns the HEAD commit with no index or ref write;
+   *  4. staging on a PRIVATE index (`GIT_INDEX_FILE` under the runner tmp, removed in `finally`);
+   *  5. staged validation against the enumeration (set, modes, sizes), then `write-tree` and a
+   *     deterministic `commit-tree` on HEAD, proven by a tree-diff backstop;
+   *  6. parent-in-bare precondition (HEAD reachable from the bare's `refs/uzi-runner/<branch>`), then
+   *     record-first transfer: `onPhase("capturing")`, create-only clone ref, worker-uid file://
+   *     fetch (negotiating against that ref) into a unique bare staging ref (no `+`), validation incl. a
+   *     reachable-object check against the staged diff, CAS-create of the bare's same-named ref
+   *     from it, staging-ref delete, CAS-delete of the clone ref, `onPhase("captured")`.
+   * A failure after the clone ref exists returns `refused` and leaves refs as they are; the bare ref is
+   * never deleted here. `deadlineMs` is a duration budget for the whole call.
+   */
+  async captureTerminalSnapshot(clonePath: string, opts: TerminalSnapshotOptions): Promise<TerminalSnapshotResult> {
+    const refused = (reason: string): TerminalSnapshotResult => ({ kind: "refused", reason });
+    const fail = (reason: string): never => { throw new TerminalSnapshotRefusal(reason); };
+    if (!path.isAbsolute(clonePath) || path.resolve(clonePath) !== clonePath || Buffer.byteLength(clonePath, "utf8") > 4096 ||
+        !opts || typeof opts.runId !== "string" || !TERMINAL_RUN_ID_RE.test(opts.runId) ||
+        !Number.isSafeInteger(opts.generation) || opts.generation < 1 ||
+        !Number.isFinite(opts.deadlineMs) || opts.deadlineMs <= 0 ||
+        typeof opts.barePath !== "string" || !path.isAbsolute(opts.barePath)) return refused("invalid_input");
+    // Same containment fetchAgentBranch applies: only a worker-selected runner clone reaches the transport.
+    if (!isWithinPath(clonePath, path.resolve(this.runnerRoot))) return refused("clone_outside_runner_root");
+    const deadlineAt = Date.now() + opts.deadlineMs;
+    const left = (): number => {
+      if (opts.signal?.aborted) fail("aborted");
+      const remaining = deadlineAt - Date.now();
+      if (remaining <= 0) fail("deadline");
+      return remaining;
+    };
+    const cloneRef = `refs/uzi-terminal-local/${opts.runId}/g${opts.generation}`;
+    const bareRef = cloneRef;
+    let transferBudgeted = false;
+    // `strictStderr` fails closed on ANY stderr from an enumeration or staging read (git reports a directory or file
+    // it could not read as a warning on a zero exit, so the walk would silently omit work); there is no allowlist.
+    const git = async (args: string[], extra: { env?: NodeJS.ProcessEnv; input?: string; overflow?: string; strictStderr?: boolean } = {}): Promise<string> => {
+      const timeoutMs = left();
+      let stderr = "";
+      let out: string;
+      try {
+        out = await this.runGitAsRunner(clonePath, [...TERMINAL_GIT_PINS, "-c", `core.worktree=${clonePath}`, ...args], {
+          timeoutMs, env: { ...TERMINAL_GIT_ENV, ...extra.env },
+          ...(extra.input === undefined ? {} : { input: extra.input }),
+          ...(extra.strictStderr ? { onStderr: (text: string) => { stderr += text; } } : {}),
+        });
+      } catch (err) {
+        if (err instanceof GitBoundaryAbortError || err instanceof CheckpointSoftDeadlineError || err instanceof TerminalSnapshotRefusal || isUnsafeCleanup(err)) throw err;
+        if (extra.overflow && isBoundOverflow(err)) return fail(extra.overflow);
+        return fail("git_failed");
+      }
+      if (stderr !== "") return fail("enumeration_warning");
+      return out;
+    };
+    const runnerNode = async (script: string, arg: string, fixedTimeoutMs?: number): Promise<string> => {
+      const timeoutMs = fixedTimeoutMs ?? Math.min(left(), 30_000);
+      const env = unmarkedSpawnEnv({ ...gitEnv(), PATH: runnerPath() });
+      const tmp = runnerTmpdir();
+      if (tmp) env.TMPDIR = tmp;
+      const wrapped = this.boundaryProcesses.getStore()
+        ? { command: process.execPath, args: ["-e", script, arg] }
+        : runnerCommand(process.execPath, ["-e", script, arg]);
+      try {
+        const result = await this.execScoped(wrapped.command, wrapped.args, { cwd: "/", env, timeout: timeoutMs, maxBuffer: 4096 }, "command");
+        if (result.stderr) return fail("helper_failed");
+        return result.stdout;
+      } catch (err) {
+        if (err instanceof TerminalSnapshotRefusal || err instanceof GitBoundaryAbortError || err instanceof CheckpointSoftDeadlineError || isUnsafeCleanup(err)) throw err;
+        return fail("helper_failed");
+      }
+    };
+    const indexHash = async (): Promise<string> => {
+      const out = await runnerNode(TERMINAL_INDEX_HASH_SCRIPT, path.join(clonePath, ".git", "index"));
+      if (!/^([0-9a-f]{64}|absent)$/.test(out)) return fail("index_unreadable");
+      return out;
+    };
+    const rows = (raw: string, cap: number, reason: string): string[] => {
+      const list = raw === "" ? [] : raw.endsWith("\0") ? raw.slice(0, -1).split("\0") : fail("unparseable");
+      if (list.length > cap) fail(reason);
+      if (raw.includes("�")) fail("unparseable");
+      return list;
+    };
+    const invariants = async () => {
+      const head = (await git(["rev-parse", "--verify", "HEAD^{commit}"])).trim();
+      const symbolic = (await git(["rev-parse", "--symbolic-full-name", "HEAD"])).trim();
+      const refs = (await git(["for-each-ref", "--format=%(refname)%00%(objectname)%00%(symref)"]))
+        .split("\n").filter((l) => l !== "" && !l.startsWith("refs/uzi-terminal-local/")).join("\n");
+      if (!SHA40_RE.test(head)) fail("head_unreadable");
+      return { head, symbolic, refs, index: await indexHash() };
+    };
+    const sameInvariants = (a: Awaited<ReturnType<typeof invariants>>, b: Awaited<ReturnType<typeof invariants>>): boolean =>
+      a.head === b.head && a.symbolic === b.symbolic && a.refs === b.refs && a.index === b.index;
+
+    // The worker-uid fetch has upload-pack read the agent-controlled clone, which could serve objects from a
+    // foreign store the worker can read. Two controls bound that. (a) Alternates: `clone --shared` runner
+    // clones legitimately carry `objects/info/alternates` naming the bare's own objects directory, so that
+    // single line (resolved against the clone's objects directory) and an empty file are the only accepted
+    // shapes; `http-alternates` must be absent or empty; anything else, or an unreadable entry, refuses.
+    // (b) The snapshot's only parent (the clone HEAD) must already be reachable in the bare from
+    // `refs/uzi-runner/<branch>`, the fetched-back agent branch, so negotiation can bound the transfer to
+    // snapshot-new objects, and the reachable-object check below accepts nothing but the snapshot commit,
+    // its trees and the blobs of the validated staged diff before the final ref exists.
+    // Residual: the clone is agent-writable, so an alternates file or a symlinked foreign pack or loose object
+    // planted after the checks can still make upload-pack import unreferenced objects into the bare object
+    // store; none is reachable from any ref this code creates (the staging ref is dropped on refusal). That
+    // shared fetch-back class pre-exists in fetchAgentBranch and is tracked separately.
+    const alternatesClean = async (): Promise<boolean> => {
+      const info = path.join(clonePath, ".git", "objects", "info");
+      // Git resolves a relative alternates line against the REAL objects directory: refuse a
+      // symlinked objects or info directory so the path we resolve is the path git resolves.
+      for (const dir of [path.join(clonePath, ".git", "objects"), info]) {
+        const st = await fs.lstat(dir).catch(() => undefined);
+        if (st && (!st.isDirectory() || st.isSymbolicLink())) return false;
+        if (!st && dir !== info) return false;
+      }
+      try {
+        const http = await fs.lstat(path.join(info, "http-alternates"));
+        if (!http.isFile() || http.size !== 0) return false;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT") return false;
+      }
+      try {
+        const file = path.join(info, "alternates");
+        const st = await fs.lstat(file);
+        if (!st.isFile() || st.size > 4096) return false;
+        if (st.size === 0) return true;
+        const line = (await fs.readFile(file, "utf8")).trim();
+        if (line === "") return true;
+        if (/[\r\n\0]/.test(line)) return false;
+        const allowed = new Set([path.resolve(opts.barePath, "objects")]);
+        const real = await fs.realpath(path.join(opts.barePath, "objects")).catch(() => undefined);
+        if (real) allowed.add(real);
+        return allowed.has(path.resolve(path.dirname(info), line));
+      } catch (err) {
+        return (err as NodeJS.ErrnoException).code === "ENOENT";
+      }
+    };
+    const bareEnv = { ...gitEnv(), ...PROOF_READ_ENV };
+    // Bare-side read on the original-object view (no replace refs, grafts, commit-graph or multi-pack-index).
+    const bareRead = async (args: string[], maxBuffer = 1 << 20, input?: string): Promise<string> => {
+      const result = await this.execScoped("git", withDir(opts.barePath, [
+        "-c", "core.commitGraph=false", "-c", "core.multiPackIndex=false", "--no-replace-objects", ...args,
+      ]), { env: bareEnv, timeout: left(), maxBuffer, ...(input === undefined ? {} : { input }) });
+      return result.stdout;
+    };
+
+    let privateIndex: string | undefined;
+    // Cleanup state. One allowance (see TerminalSnapshotOptions.cleanupBound) serves the staging-ref delete and the
+    // private-index removal; it starts at the first cleanup step, so a capture that needs none never opens one.
+    let allowance: { deadline: number; signal: AbortSignal } | undefined;
+    const cleanupAllowance = (): { deadline: number; signal: AbortSignal } => {
+      if (allowance) return allowance;
+      const boundary = this.boundaryProcesses.getStore();
+      const bound = opts.cleanupBound;
+      const signals = [bound?.signal, boundary?.signal].filter((sig): sig is AbortSignal => sig !== undefined);
+      // A non-finite caller deadline fails closed (already lapsed). Neither opts.signal nor the capture's own
+      // deadline applies: both have usually lapsed by the time cleanup runs.
+      const deadline = Math.min(Date.now() + (opts.caps?.cleanupMs ?? TERMINAL_CAPTURE_CLEANUP_MS),
+        bound?.deadlineAt === undefined ? Infinity : (Number.isFinite(bound.deadlineAt) ? bound.deadlineAt : 0),
+        boundary?.softDeadlineAt ?? Infinity);
+      allowance = { deadline, signal: signals.length ? AbortSignal.any(signals) : new AbortController().signal };
+      return allowance;
+    };
+    const underCleanup = <T>(action: () => Promise<T>): Promise<T> => {
+      const a = cleanupAllowance();
+      return this.withReportProofBudget({ signal: a.signal, deadline: a.deadline }, action);
+    };
+    let stagingRemnant: TerminalSnapshotRemnant | undefined;
+    let stagingUnsafe: unknown;
+    let indexRemnant: string | undefined;
+    let indexUnsafe: unknown;
+    const attempt = async (): Promise<TerminalSnapshotResult> => {
+      try {
+        // Clone shape and configuration that would redirect or extend the staging.
+        const dotGit = await fs.lstat(path.join(clonePath, ".git")).catch(() => undefined);
+        if (!dotGit?.isDirectory()) return refused("clone_shape");
+        // A commondir file redirects every object and ref read to another store.
+        if (await fs.lstat(path.join(clonePath, ".git", "commondir")).then(() => true, () => false)) return refused("clone_shape");
+        // A per-worktree config file (core.worktree, sparse and index keys) is read by git but not by `config --local`.
+        if (await fs.lstat(path.join(clonePath, ".git", "config.worktree")).then(() => true, () => false)) return refused("config_refused");
+        if (!(await alternatesClean())) return refused("alternates_present");
+        // `.git/info/attributes` is read whatever --attr-source says, so any entry there (or any type of node) could
+        // select a filter driver: refuse it outright.
+        if (await fs.lstat(path.join(clonePath, ".git", "info", "attributes")).then(() => true, (err: NodeJS.ErrnoException) => err.code !== "ENOENT")) return refused("config_refused");
+        for (const row of rows(await git(["config", "--local", "--null", "--list"]), 100_000, "config_cap")) {
+          // A valueless boolean key (`key\0` with no newline) is the whole row, never "".
+          const nl = row.indexOf("\n");
+          const key = (nl < 0 ? row : row.slice(0, nl)).toLowerCase();
+          if (key === "core.worktree" || key === "extensions.worktreeconfig" || key.startsWith("include.") || key.startsWith("includeif.") ||
+              key.startsWith("filter.") || key === "core.sparsecheckout" || key === "core.splitindex" || key === "index.sparse" ||
+              (key === "core.bare" && row.slice(key.length + 1) !== "false")) return refused("config_refused");
+        }
+        if ((await git(["rev-parse", "--shared-index-path"])).trim() !== "") return refused("config_refused");
+        const before = await invariants();
+        const head = before.head;
+        const headTree = (await git(["rev-parse", "--verify", `${head}^{tree}`])).trim();
+
+        // An assume-unchanged or skip-worktree entry hides edits from status: refuse (same rule as worktreeCleanHardened).
+        for (const entry of (await git(["ls-files", "-v", "-z"], { overflow: "entry_cap", strictStderr: true })).split("\0")) {
+          if (entry.length > 0 && !/^[HMRCK?U] /.test(entry)) return refused("index_flags");
+        }
+
+        // 1. Enumeration before any staging.
+        const status = rows(await git(["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=none", "--no-renames"],
+          { overflow: "entry_cap", strictStderr: true }), opts.caps?.maxEntries ?? WIP_CAPTURE_MAX_ENTRIES, "entry_cap");
+        type Entry = { kind: "file" | "exec" | "symlink" | "absent"; size: number; untracked: boolean };
+        const entries = new Map<string, Entry>();
+        let totalBytes = 0;
+        for (const row of status) {
+          const m = /^(.)(.) ([\s\S]+)$/.exec(row);
+          if (!m) return refused("unparseable");
+          const [, x, y, rel] = m as unknown as [string, string, string, string];
+          if (x === "U" || y === "U" || (x === "A" && y === "A") || (x === "D" && y === "D") || "RC!".includes(x) || "RC!".includes(y)) return refused("unsupported_status");
+          if (!wipPathValid(rel) || rel.endsWith("/") || entries.has(rel)) return refused("unsafe_path");
+          if (rel === ".uzi/scratch" || rel.startsWith(".uzi/scratch/")) return refused("scratch_not_ignored");
+          let st: Stats | undefined;
+          try { st = await fs.lstat(path.join(clonePath, rel)); }
+          catch (err) { if ((err as NodeJS.ErrnoException).code !== "ENOENT") return refused("unsized"); }
+          if (entries.size % 1024 === 0) left();
+          if (!st) {
+            if (x !== "D" && y !== "D") return refused("vanished");
+            entries.set(rel, { kind: "absent", size: 0, untracked: false });
+            continue;
+          }
+          if (x === "?" && y === "?" && st.isDirectory()) return refused("nested_repository");
+          let kind: Entry["kind"];
+          if (st.isSymbolicLink()) kind = "symlink";
+          else if (st.isFile()) kind = (st.mode & 0o100) !== 0 ? "exec" : "file";
+          else return refused("unsafe_type");
+          if (WIP_CORE_FILE_RE.test(path.posix.basename(rel))) return refused("core_file");
+          if (kind !== "symlink" && st.size > WIP_CAPTURE_MAX_FILE_BYTES) return refused("oversized");
+          if (terminalCredentialPath(rel, opts.workerTokenFile, clonePath)) return refused("credential_path");
+          totalBytes += st.size;
+          if (totalBytes > (opts.caps?.maxTotalBytes ?? CHECKPOINT_SCAN_MAX_TOTAL_BYTES)) return refused("total_bytes");
+          entries.set(rel, { kind, size: st.size, untracked: x === "?" && y === "?" });
+        }
+        if (entries.size > 0) {
+          const attrs = (await git(["check-attr", "-z", "--stdin", "filter"], { input: [...entries.keys()].join("\0") + "\0", strictStderr: true })).split("\0");
+          if (attrs[attrs.length - 1] === "") attrs.pop();
+          if (attrs.length !== entries.size * 3) return refused("attr_unreadable");
+          for (let i = 0; i < attrs.length; i += 3) {
+            if (!entries.has(attrs[i]!) || attrs[i + 1] !== "filter") return refused("attr_unreadable");
+            // Under the pins (empty attribute tree, `.git/info/attributes` refused above, `filter.*` config refused) this is
+          // reachable only through a `.git/info/attributes` created after that earlier lstat (a TOCTOU window) or a future
+          // pin regression: kept as a fail-closed backstop, not as the primary control.
+          if (attrs[i + 2] !== "unspecified" && attrs[i + 2] !== "unset") return refused("filter_attribute");
+          }
+        }
+
+        // 2. Ignored extents: counted with their own caps, never captured.
+        const ignoredPaths = rows(await git(["ls-files", "--others", "--ignored", "--exclude-standard", "-z"], { overflow: "ignored_cap", strictStderr: true }),
+          TERMINAL_IGNORED_MAX_ENTRIES, "ignored_cap");
+        let ignoredBytes = 0;
+        for (let i = 0; i < ignoredPaths.length; i++) {
+          if (i % 1024 === 0) left();
+          const st = await fs.lstat(path.join(clonePath, ignoredPaths[i]!)).catch(() => undefined);
+          if (st?.isFile()) ignoredBytes += st.size;
+        }
+        const ignored = { files: ignoredPaths.length, bytes: ignoredBytes };
+
+        // 3. Index-independent preflight. The agent-writable real index (stat cache and entry oids) can hide an edit from
+        // the enumeration above, and `add -A` on it would write the hidden content into the object store before any
+        // check could refuse it. So a private index is built from HEAD (read-tree writes no object), `status` runs on it
+        // with the same pins (no attribute, filter, or autocrlf/eol conversion applies: attributes are pinned to the
+        // empty tree, autocrlf/safecrlf/eol are pinned off, and filter config and info/attributes were refused above),
+        // and its changed-path set must equal the real enumeration's before anything is staged. A clean verdict is an
+        // empty set on both, reached with no `add` and no `write-tree`. No ref or real-index write.
+        privateIndex = path.join(runnerTmpdir() || os.tmpdir(), `uzi-term-idx-${randomUUID()}`);
+        const indexEnv = { GIT_INDEX_FILE: privateIndex };
+        await git(["read-tree", head], { env: indexEnv, strictStderr: true });
+        const privateStatus = rows(await git(["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=none", "--no-renames"],
+          { env: indexEnv, overflow: "entry_cap", strictStderr: true }), opts.caps?.maxEntries ?? WIP_CAPTURE_MAX_ENTRIES, "entry_cap");
+        const privatePaths = new Set<string>();
+        for (const row of privateStatus) {
+          const m = /^(.)(.) ([\s\S]+)$/.exec(row);
+          if (!m) return refused("unparseable");
+          privatePaths.add(m[3]!);
+        }
+        if (privatePaths.size !== entries.size || ![...privatePaths].every((rel) => entries.has(rel))) return refused("index_mismatch");
+        if (entries.size === 0) {
+          if (!sameInvariants(before, await invariants())) return refused("invariant_changed");
+          return { kind: "clean", root: head, tree: headTree, ignored };
+        }
+
+        // 4. Private-index staging (the preflight's index, still exactly HEAD's tree). Residual: a file can still change
+        // between its lstat above, the preflight status and this `add`; the staged validation and the tree-diff backstop
+        // below bound the set, modes and sizes, and the secret scan over the published range is the content control.
+        await opts.seam?.beforeStaging?.();
+        left();
+        await git(["add", "-A"], { env: indexEnv, strictStderr: true });
+
+        // 5. Staged validation against the enumeration, then the commit.
+        const rawStaged = await git(["diff", "--cached", "--raw", "-z", "--no-abbrev", "--no-renames", head], { env: indexEnv, strictStderr: true });
+        const staged = terminalParseRaw(rawStaged);
+        if (!staged || staged.length > WIP_CAPTURE_MAX_ENTRIES) return refused("staged_unparseable");
+        const stagedPaths = new Set<string>();
+        for (const row of staged) {
+          const info = entries.get(row.path);
+          if (!info || stagedPaths.has(row.path)) return refused("staged_set_mismatch");
+          stagedPaths.add(row.path);
+          if (row.status === "D") { if (row.mode !== "000000" || info.kind !== "absent") return refused("staged_set_mismatch"); continue; }
+          const expectedMode = info.kind === "file" ? "100644" : info.kind === "exec" ? "100755" : info.kind === "symlink" ? "120000" : "";
+          if (row.mode !== "100644" && row.mode !== "100755" && row.mode !== "120000") return refused("staged_mode");
+          if (row.mode !== expectedMode) return refused("staged_mode");
+        }
+        // Backstop: every enumerated entry (tracked, untracked or deleted) must stage to a change, so a conversion that
+        // makes a status-visible edit stage to HEAD's bytes fails closed instead of capturing HEAD's content.
+        for (const rel of entries.keys()) if (!stagedPaths.has(rel)) return refused("staged_set_mismatch");
+        const live = staged.filter((r) => r.status !== "D");
+        const sizes = await this.wipBlobSizes(clonePath, live.map((r) => r.oid), left()).catch((err: unknown) => {
+          if (isUnsafeCleanup(err)) throw err;
+          return fail("staged_unsized");
+        });
+        let stagedTotal = 0;
+        for (const row of live) {
+          const size = sizes.get(row.oid)!;
+          if (size > WIP_CAPTURE_MAX_FILE_BYTES) return refused("staged_oversized");
+          if (size !== entries.get(row.path)!.size) return refused("staged_size_changed");
+          stagedTotal += size;
+        }
+        if (stagedTotal > CHECKPOINT_SCAN_MAX_TOTAL_BYTES) return refused("staged_total_bytes");
+        if (staged.length === 0) return refused("staged_empty");
+        if (opts.reprove && !(await opts.reprove())) return refused("reprove_failed");
+
+        const tree = (await git(["write-tree"], { env: indexEnv })).trim();
+        if (!SHA40_RE.test(tree)) return refused("tree_unreadable");
+        if (tree === headTree) return refused("staged_empty");
+        const when = "2000-01-01T00:00:00Z";
+        const subject = `uzi terminal snapshot ${opts.runId} g${opts.generation}`;
+        const commit = (await git(["commit-tree", tree, "-p", head, "-m", subject], { env: {
+          GIT_AUTHOR_NAME: AGENT_GIT_IDENTITY.name, GIT_AUTHOR_EMAIL: AGENT_GIT_IDENTITY.email,
+          GIT_COMMITTER_NAME: AGENT_GIT_IDENTITY.name, GIT_COMMITTER_EMAIL: AGENT_GIT_IDENTITY.email,
+          GIT_AUTHOR_DATE: when, GIT_COMMITTER_DATE: when,
+        } })).trim();
+        if (!SHA40_RE.test(commit)) return refused("commit_unreadable");
+        const identity = `${AGENT_GIT_IDENTITY.name} <${AGENT_GIT_IDENTITY.email}> 946684800 +0000`;
+        if (await git(["cat-file", "-p", commit]) !== `tree ${tree}\nparent ${head}\nauthor ${identity}\ncommitter ${identity}\n\n${subject}\n`)
+          return refused("commit_mismatch");
+        // Backstop: the commit's own tree-diff against HEAD is exactly the validated staged diff.
+        if (await git(["diff-tree", "-r", "--raw", "-z", "--no-abbrev", "--no-renames", head, commit]) !== rawStaged)
+          return refused("backstop_mismatch");
+        if (opts.reprove && !(await opts.reprove())) return refused("reprove_failed");
+        if (!sameInvariants(before, await invariants())) return refused("invariant_changed");
+
+        // The parent must already be reachable in the bare from the fetched-back agent branch (no fetch yet).
+        const branchMatch = /^refs\/heads\/(.+)$/.exec(before.symbolic);
+        if (!branchMatch) return refused("parent_not_in_bare");
+        const runnerRef = `refs/uzi-runner/${branchMatch[1]}`;
+        try {
+          await bareRead(["cat-file", "-e", `${head}^{commit}`]);
+          await bareRead(["merge-base", "--is-ancestor", head, runnerRef]);
+        } catch (err) {
+          if (err instanceof GitBoundaryAbortError || err instanceof CheckpointSoftDeadlineError || isCheckpointBoundaryFailure(err)) throw err;
+          if (err instanceof TerminalSnapshotRefusal) throw err;
+          return refused("parent_not_in_bare");
+        }
+        const newBlobs = new Set(live.map((r) => r.oid));
+        const maxTrees = wipDirectoryCount(staged.map((r) => r.path));
+
+        // 6. Record-first transfer. From the clone ref's creation on, a failure leaves refs as they are.
+        try { await opts.onPhase?.("capturing", { cloneRef, bareRef, commit }); }
+        catch (err) { if (isUnsafeCleanup(err)) throw err; return refused("phase_callback_failed"); }
+        left();
+        try { await git(["update-ref", cloneRef, commit, ""]); }
+        catch (err) {
+          if (err instanceof GitBoundaryAbortError || err instanceof CheckpointSoftDeadlineError || isUnsafeCleanup(err)) throw err;
+          // A retry of the same capture finds its own deterministic commit already pinned.
+          const current = (await git(["for-each-ref", "--format=%(objectname)", cloneRef]).catch((readErr: unknown) => {
+            if (isUnsafeCleanup(readErr)) throw readErr;
+            return "";
+          })).trim();
+          if (current !== commit) return refused("clone_ref_exists");
+        }
+        await opts.seam?.afterCloneRef?.();
+        // The lock wait and every bare child git call run under the capture's own budget: an abort or the deadline
+        // forfeits a queued wait without running, and clamps, kills and awaits a running child.
+        transferBudgeted = true;
+        await this.withReportProofBudget({ signal: opts.signal ?? new AbortController().signal, deadline: deadlineAt }, () => {
+          const locked = this.withLock(opts.barePath, async () => {
+          const present = (await this.runGit(opts.barePath, ["for-each-ref", "--format=%(objectname)", bareRef])).trim();
+          if (present !== "" && present !== commit) fail("bare_ref_conflict");
+          if (!(await alternatesClean())) fail("alternates_present");
+          left();
+          // Fetch into a unique staging ref (ours by uuid), validate it, and only then create the final ref by CAS,
+          // so a clone ref swapped after validation never lands an unvalidated commit in the final ref.
+          const stage = `refs/uzi-incoming/${randomUUID()}`;
+          let transferFailure: { error: unknown } | undefined;
+          try {
+            await opts.seam?.beforeFetch?.();
+            left();
+            await this.runGit(opts.barePath, [
+              "-c", "protocol.file.allow=user", "fetch", "--refmap=", "--no-tags", "--no-write-fetch-head",
+              `--negotiation-tip=${runnerRef}`, `file://${clonePath}`, `${cloneRef}:${stage}`,
+            ]);
+            await opts.seam?.inTransfer?.();
+            const landed = (await this.runGit(opts.barePath, ["for-each-ref", "--format=%(objectname)", stage])).trim();
+            if (landed !== commit) fail("bare_transfer_mismatch");
+            if ((await this.runGit(opts.barePath, ["--no-replace-objects", "cat-file", "-t", commit])).trim() !== "commit") fail("bare_transfer_mismatch");
+            if (!(await alternatesClean())) fail("alternates_present");
+            // Everything the snapshot reaches beyond the fetched-back branch: the commit, trees (at most one
+            // per touched directory) and blobs of the validated staged diff; any other object refuses.
+            const cap = 1 + newBlobs.size + maxTrees;
+            let listed: string;
+            try {
+              listed = await bareRead(["rev-list", "--objects", "--no-object-names", commit, "--not", runnerRef], (cap + 1) * 41 + 4096);
+            } catch (err) {
+              if (err instanceof GitBoundaryAbortError || err instanceof CheckpointSoftDeadlineError || isCheckpointBoundaryFailure(err)) throw err;
+              return fail(isBoundOverflow(err) ? "foreign_object" : "object_verify_failed");
+            }
+            const oids = listed.split("\n").filter((l) => l !== "");
+            if (oids.length > cap || oids.some((o) => !SHA40_RE.test(o))) fail("foreign_object");
+            const kinds = (await bareRead(["cat-file", "--batch-check=%(objecttype) %(objectname)"], 1 << 20, oids.join("\n") + "\n"))
+              .split("\n").filter((l) => l !== "");
+            if (kinds.length !== oids.length) fail("foreign_object");
+            let commits = 0, trees = 0;
+            for (const line of kinds) {
+              const [type, oid] = line.split(" ") as [string, string];
+              if (type === "commit" && oid === commit) commits++;
+              else if (type === "tree") trees++;
+              else if (type !== "blob" || !newBlobs.has(oid)) fail("foreign_object");
+            }
+            if (commits !== 1 || trees > maxTrees) fail("foreign_object");
+            left();
+            if (present !== commit) await this.runGit(opts.barePath, ["update-ref", bareRef, commit, ""]);
+            if ((await this.runGit(opts.barePath, ["for-each-ref", "--format=%(objectname)", bareRef])).trim() !== commit) fail("bare_transfer_mismatch");
+          } catch (transferError) {
+            transferFailure = { error: transferError };
+          }
+          // Only the staging ref is dropped, never the final ref. Cleanup runs outside the capture's budget (still under
+          // the lock) on its own bounded allowance, so an expired capture budget neither leaves our staging ref behind
+          // nor lets the cleanup run unbounded. A ref that is not confirmed gone is reported (stagingRemnant); nothing
+          // is retried after this call returns.
+          const unknown: TerminalSnapshotRemnant = { ref: stage, expectedOid: commit, state: "unknown" };
+          await this.reportProofs.exit(() => underCleanup(async () => {
+            const allowanceNow = cleanupAllowance();
+            const readStage = async (): Promise<string> => (await this.runGit(opts.barePath, ["for-each-ref", "--format=%(objectname)", stage])).trim();
+            // A failed or cancelled step leaves the ref unconfirmed; an unsafe-cleanup error also stops further launches.
+            const unconfirmed = (err: unknown): void => {
+              stagingRemnant = unknown;
+              if (isUnsafeCleanup(err)) stagingUnsafe ??= err;
+              else this.log.warn("terminal snapshot staging ref cleanup failed", { error: gitErrorMessage(err) });
+            };
+            let present: string;
+            try { present = await readStage(); } catch (err) { unconfirmed(err); return; }
+            if (present === "") return;
+            try { await opts.seam?.afterStagingRead?.(); } catch (err) { unconfirmed(err); return; }
+            // Confirmed present but the allowance is spent: no delete is launched, the ref is known to be retained.
+            if (allowanceNow.signal.aborted || Date.now() >= allowanceNow.deadline) {
+              // Only a ref still at our commit is known retained; a different oid is reported with both.
+              stagingRemnant = present === commit
+                ? { ref: stage, oid: present, state: "retained" }
+                : { ref: stage, oid: present, expectedOid: commit, state: "unknown" };
+              return;
+            }
+            try { await this.runGit(opts.barePath, ["update-ref", "-d", stage, present]); }
+            catch (err) {
+              if (isUnsafeCleanup(err)) { unconfirmed(err); return; }
+              this.log.warn("terminal snapshot staging ref cleanup failed", { error: gitErrorMessage(err) });
+            }
+            // A delete was launched: only a confirming read showing the ref gone clears it.
+            try { if (await readStage() !== "") stagingRemnant = unknown; } catch (err) { unconfirmed(err); }
+          }));
+          // Unsafe cleanup outranks the transfer's own failure.
+          if (stagingUnsafe !== undefined) throw stagingUnsafe;
+          if (transferFailure) throw transferFailure.error;
+          });
+          opts.seam?.lockQueued?.();
+          return locked;
+        });
+        await git(["update-ref", "-d", cloneRef, commit]);
+        if (!sameInvariants(before, await invariants())) return refused("invariant_changed");
+        try { await opts.onPhase?.("captured", { cloneRef, bareRef, commit }); }
+        catch (err) { if (isUnsafeCleanup(err)) throw err; return refused("phase_callback_failed"); }
+        return { kind: "captured", root: commit, parent: head, tree, ignored };
+      } catch (err) {
+        if (err instanceof TerminalSnapshotRefusal) return refused(err.reason);
+        // An unsafe cleanup is never a refusal, whatever the capture's own budget did.
+        if (isUnsafeCleanup(err)) throw err;
+        // A lapse of this capture's own budget alone is a refusal; the outer boundary's abort is rethrown below.
+        if (transferBudgeted && !this.boundaryProcesses.getStore()?.signal.aborted && (opts.signal?.aborted || Date.now() >= deadlineAt)) {
+          return refused(opts.signal?.aborted ? "aborted" : "deadline");
+        }
+        if (err instanceof GitBoundaryAbortError || err instanceof CheckpointSoftDeadlineError || isCheckpointBoundaryFailure(err)) throw err;
+        this.log.warn("terminal snapshot failed (refused)", { cwd: clonePath, error: gitErrorMessage(err) });
+        return refused("error");
+      }
+    };
+    let outcome: TerminalSnapshotResult | undefined;
+    let thrown: { error: unknown } | undefined;
+    try { outcome = await attempt(); } catch (error) { thrown = { error }; }
+    if (privateIndex) {
+      // The private index (and any lock a killed git left) is runner-owned: remove it as the runner, on the cleanup
+      // allowance shared with the staging-ref delete. A removal that did not run or is unconfirmed is reported.
+      const index = privateIndex;
+      await underCleanup(async () => {
+        for (const leftover of [index, `${index}.lock`]) {
+          const isLock = leftover !== index;
+          try {
+            if (opts.seam?.indexCleanupError !== undefined) throw opts.seam.indexCleanupError;
+            if (isLock && opts.seam?.indexLockCleanupError !== undefined) throw opts.seam.indexLockCleanupError;
+            const remaining = cleanupAllowance().deadline - Date.now();
+            if (remaining <= 0) throw new Error("cleanup allowance exhausted");
+            await runnerNode(`try{require("fs").rmSync(process.argv[1],{force:true})}catch{process.exitCode=1}`, leftover,
+              Math.max(1, Math.min(15_000, Math.floor(remaining))));
+          } catch (cleanup) {
+            // The index itself is the remnant; a lock-only failure is logged, not reported.
+            if (!isLock) indexRemnant = index;
+            if (isUnsafeCleanup(cleanup)) indexUnsafe ??= cleanup;
+            else this.log.warn("terminal snapshot private index cleanup failed", { error: gitErrorMessage(cleanup) });
+          }
+        }
+      });
+    }
+    // Unsafe cleanup outranks every other outcome, but only after every cleanup step above ran.
+    if (thrown && isUnsafeCleanup(thrown.error)) throw thrown.error;
+    if (indexUnsafe !== undefined) throw indexUnsafe;
+    if (thrown) throw thrown.error;
+    const remnant: TerminalSnapshotRemnant = { ...stagingRemnant, ...(indexRemnant === undefined ? {} : { index: indexRemnant }) };
+    return Object.keys(remnant).length === 0 ? outcome! : { ...outcome!, remnant };
+  }
+
+  /**
+   * Chain `extraRoots` under `base` as two-parent "ours" merges built bare-side: every link carries
+   * base's tree, takes the previous link as first parent and one extra root as second parent, with a
+   * deterministic identity. Refuses when a root is missing from the bare, when `existingMerges` plus
+   * the roots exceed the checkpoint merge budget (32) or the roots exceed 63. No extra roots returns
+   * `base` with no write. Otherwise the result is pinned at `refs/uzi-terminal-local/<runId>/g<gen>`
+   * by compare-and-swap: created when absent, or moved from `base` (the captured snapshot commit).
+   */
+  async buildTerminalAggregate(barePath: string, input: {
+    base: string; extraRoots: string[]; runId: string; generation: number; existingMerges?: number;
+    /** Absolute `Date.now()` deadline and abort signal: child timeouts are clamped and killed, a queued lock wait forfeits
+     *  without running, and a lapse between links or before the pin refuses with `deadline` (a lapse while the pin runs can still leave the ref moved; that result is kept, never adopted). */
+    budget?: { signal: AbortSignal; deadline: number };
+    /** Test-only: runs after each link commit (still under the lock), before the next budget check. */
+    seam?: { afterLink?: (i: number) => Promise<void> };
+  }): Promise<{ tip: string } | { refused: string }> {
+    const budget = input.budget;
+    const existing = input.existingMerges ?? 0;
+    if (!SHA40_RE.test(input.base) || !Array.isArray(input.extraRoots) || !input.extraRoots.every((r) => SHA40_RE.test(r)) ||
+        !TERMINAL_RUN_ID_RE.test(input.runId) || !Number.isSafeInteger(input.generation) || input.generation < 1 ||
+        !Number.isSafeInteger(existing) || existing < 0) return { refused: "invalid_input" };
+    const roots = [...new Set(input.extraRoots)].filter((r) => r !== input.base);
+    if (roots.length === 0) return { tip: input.base };
+    if (roots.length > TERMINAL_AGGREGATE_MAX_ROOTS || existing + roots.length > TERMINAL_AGGREGATE_MAX_MERGES) return { refused: "merge_budget" };
+    const ref = `refs/uzi-terminal-local/${input.runId}/g${input.generation}`;
+    const body = (): Promise<{ tip: string } | { refused: string }> => this.withLock(barePath, async () => {
+        const kind = async (sha: string): Promise<string> => {
+          const out = (await this.runGit(barePath, ["--no-replace-objects", "cat-file", "-t", sha]).catch((err: unknown) => {
+            if (isUnsafeCleanup(err)) throw err;
+            return "";
+          })).trim();
+          // A budget abort or lapse that the catch swallowed must surface, not read as a missing root.
+          if (out === "" && budget) this.checkReportProof();
+          return out;
+        };
+        for (const sha of [input.base, ...roots]) if (await kind(sha) !== "commit") return { refused: "root_missing" };
+        const tree = (await this.runGit(barePath, ["--no-replace-objects", "rev-parse", `${input.base}^{tree}`])).trim();
+        if (!SHA40_RE.test(tree)) return { refused: "tree_unreadable" };
+        let tip = input.base;
+        for (let i = 0; i < roots.length; i++) {
+          if (budget) this.checkReportProof();
+          tip = (await this.runSynthesisGit(barePath, [
+            "--no-replace-objects", "-c", "commit.gpgsign=false", "commit-tree", tree, "-p", tip, "-p", roots[i]!,
+            "-m", `uzi terminal aggregate ${input.runId} g${input.generation} link ${i}`,
+          ], {
+            GIT_AUTHOR_NAME: AGENT_GIT_IDENTITY.name, GIT_AUTHOR_EMAIL: AGENT_GIT_IDENTITY.email,
+            GIT_COMMITTER_NAME: AGENT_GIT_IDENTITY.name, GIT_COMMITTER_EMAIL: AGENT_GIT_IDENTITY.email,
+            GIT_AUTHOR_DATE: "2000-01-01T00:00:00Z", GIT_COMMITTER_DATE: "2000-01-01T00:00:00Z",
+          })).trim();
+          if (!SHA40_RE.test(tip)) return { refused: "commit_unreadable" };
+          await input.seam?.afterLink?.(i);
+          if (budget) this.checkReportProof();
+        }
+        if (budget) this.checkReportProof();
+        const current = (await this.runGit(barePath, ["for-each-ref", "--format=%(objectname)", ref])).trim();
+        if (current === tip) return { tip };
+        if (current !== "" && current !== input.base) return { refused: "ref_conflict" };
+        await this.runGit(barePath, ["update-ref", ref, tip, current === "" ? "" : current]);
+        if ((await this.runGit(barePath, ["for-each-ref", "--format=%(objectname)", ref])).trim() !== tip) return { refused: "pin_mismatch" };
+        return { tip };
+    });
+    try {
+      return budget ? await this.withReportProofBudget(budget, body) : await body();
+    } catch (err) {
+      // An unsafe cleanup is never a refusal, whatever the budget did.
+      if (isUnsafeCleanup(err)) throw err;
+      // The outer boundary's own abort is rethrown below; a lapse of this call's budget alone is a refusal.
+      if (budget && !this.boundaryProcesses.getStore()?.signal.aborted && (budget.signal.aborted || Date.now() >= budget.deadline)) {
+        return { refused: "deadline" };
+      }
+      if (err instanceof GitBoundaryAbortError || err instanceof CheckpointSoftDeadlineError || isCheckpointBoundaryFailure(err)) throw err;
+      this.log.warn("terminal aggregate failed (refused)", { barePath, error: gitErrorMessage(err) });
+      return { refused: "error" };
+    }
+  }
+
+  /** sha256 hex over the sorted unique OIDs `rev-list --objects <tip> ^<exclude> ^<each scan floor>` reaches, on the
+   *  proof-read view (no replace refs, grafts, commit-graph or multi-pack-index). Null past the checkpoint scan
+   *  object cap, the deadline, or on any failure. */
+  async terminalScanDigest(barePath: string, range: CheckpointRange, opts: { deadlineMs: number }): Promise<string | null> {
+    const revs = this.terminalRangeRevs(range);
+    if (!revs || !Number.isFinite(opts?.deadlineMs) || opts.deadlineMs <= 0) return null;
+    try {
+      const out = await this.execScoped("git", withDir(barePath, [
+        "-c", "core.commitGraph=false", "-c", "core.multiPackIndex=false",
+        "rev-list", "--objects", "--no-object-names", ...revs,
+      ]), { env: { ...gitEnv(), ...PROOF_READ_ENV, GIT_SHALLOW_FILE: "/dev/null" }, timeout: Math.max(1, Math.floor(opts.deadlineMs)),
+        maxBuffer: (CHECKPOINT_SCAN_MAX_OBJECTS + 1) * 41 + 4096 });
+      const oids = new Set<string>();
+      for (const line of out.stdout.split("\n")) {
+        if (line === "") continue;
+        if (!SHA40_RE.test(line)) return null;
+        oids.add(line);
+        if (oids.size > CHECKPOINT_SCAN_MAX_OBJECTS) return null;
+      }
+      return createHash("sha256").update([...oids].sort().join("\n")).digest("hex");
+    } catch (err) {
+      if (err instanceof GitBoundaryAbortError || isCheckpointBoundaryFailure(err)) throw err;
+      return null;
+    }
+  }
+
+  /** sha256 hex over the sorted OIDs a pack carries, read in a fresh scratch directory outside any repository
+   *  (`index-pack <file>` then `show-index`). Touches no repo; null on any failure or the deadline. */
+  async terminalTransportDigest(pack: Buffer, opts: { deadlineMs: number }): Promise<string | null> {
+    if (!Buffer.isBuffer(pack) || !Number.isFinite(opts?.deadlineMs) || opts.deadlineMs <= 0) return null;
+    const deadlineAt = Date.now() + opts.deadlineMs;
+    let dir: string | undefined;
+    try {
+      const parent = process.env.TMPDIR || os.tmpdir();
+      dir = await fs.mkdtemp(path.join(parent, "uzi-term-pack-"));
+      const env = { ...gitEnv(), GIT_CEILING_DIRECTORIES: parent };
+      const packFile = path.join(dir, "in.pack"), idxFile = path.join(dir, "in.idx");
+      await fs.writeFile(packFile, pack, { mode: 0o600 });
+      const remaining = (): number => Math.max(1, deadlineAt - Date.now());
+      await this.execScoped("git", ["index-pack", "-o", idxFile, packFile], { env, cwd: dir, timeout: remaining(), maxBuffer: 1 << 20 });
+      const idx = await fs.readFile(idxFile);
+      const shown = await this.execScoped("git", ["show-index"], {
+        env, cwd: dir, timeout: remaining(), maxBuffer: (CHECKPOINT_SCAN_MAX_OBJECTS * 4 + 1) * 90, input: idx,
+      });
+      const oids: string[] = [];
+      for (const line of shown.stdout.split("\n")) {
+        if (line === "") continue;
+        const m = /^\d+ ([0-9a-f]{40})(?: |$)/.exec(line);
+        if (!m) return null;
+        oids.push(m[1]!);
+      }
+      if (oids.length === 0) return null;
+      return createHash("sha256").update([...new Set(oids)].sort().join("\n")).digest("hex");
+    } catch (err) {
+      if (err instanceof GitBoundaryAbortError || isCheckpointBoundaryFailure(err)) throw err;
+      return null;
+    } finally {
+      if (dir) await fs.rm(dir, { recursive: true, force: true }).catch(() => undefined);
+    }
+  }
+
+  /** For every commit of `<tip> ^<exclude> ^<scan floors>` (merges included, at most 1000), the paths that differ
+   *  between `targetSha` and that commit (`diff --no-renames --name-only`), so an intermediate commit a later one
+   *  reverts is still reported. Null on any failure, the deadline, more commits than the cap, or more retained
+   *  path bytes (16 MiB) or paths (100k) in total than the budget. With `flag`, the first commit whose paths it
+   *  accepts ends the walk and is returned alone. `caps` is test-only. */
+  async changedCiPathsPerCommit(barePath: string, range: CheckpointRange, targetSha: string,
+    opts: { deadlineMs: number; flag?: (paths: string[]) => boolean; caps?: { totalBytes?: number; totalPaths?: number } },
+  ): Promise<Array<{ commit: string; paths: string[] }> | null> {
+    const revs = this.terminalRangeRevs(range);
+    if (!revs || !SHA40_RE.test(targetSha) || !Number.isFinite(opts?.deadlineMs) || opts.deadlineMs <= 0) return null;
+    const deadlineAt = Date.now() + opts.deadlineMs;
+    const remaining = (): number => deadlineAt - Date.now();
+    const env = { ...gitEnv(), ...PROOF_READ_ENV, GIT_SHALLOW_FILE: "/dev/null" };
+    const pins = ["-c", "core.commitGraph=false", "-c", "core.multiPackIndex=false"];
+    try {
+      const listed = await this.execScoped("git", withDir(barePath, [...pins, "rev-list", ...revs]),
+        { env, timeout: Math.max(1, remaining()), maxBuffer: (TERMINAL_CI_MAX_COMMITS + 1) * 41 + 4096 });
+      const commits = listed.stdout.split("\n").filter((l) => l !== "");
+      if (commits.length > TERMINAL_CI_MAX_COMMITS || commits.some((c) => !SHA40_RE.test(c))) return null;
+      const result: Array<{ commit: string; paths: string[] }> = [];
+      const byteCap = opts.caps?.totalBytes ?? TERMINAL_CI_MAX_TOTAL_BYTES;
+      const pathCap = opts.caps?.totalPaths ?? TERMINAL_CI_MAX_TOTAL_PATHS;
+      let totalBytes = 0, totalPaths = 0;
+      for (const commit of commits) {
+        if (remaining() <= 0) return null;
+        const diff = await this.execScoped("git", withDir(barePath, [...pins, "diff", "--no-renames", "--name-only", "-z", targetSha, commit]),
+          { env, timeout: Math.max(1, remaining()), maxBuffer: 16 * 1024 * 1024 });
+        const out = diff.stdout;
+        if (out !== "" && !out.endsWith("\0")) return null;
+        const paths = out === "" ? [] : out.slice(0, -1).split("\0");
+        if (opts.flag?.(paths)) return [{ commit, paths }];
+        totalBytes += Buffer.byteLength(out, "utf8");
+        totalPaths += paths.length;
+        if (totalBytes > byteCap || totalPaths > pathCap) return null;
+        result.push({ commit, paths });
+      }
+      return result;
+    } catch (err) {
+      if (err instanceof GitBoundaryAbortError || isCheckpointBoundaryFailure(err)) throw err;
+      return null;
+    }
+  }
+
+  /** `<tip> ^<exclude> ^<floors>` for a fully valid range, else undefined. */
+  private terminalRangeRevs(range: CheckpointRange): string[] | undefined {
+    const floors = range?.scanFloorShas ?? [];
+    if (!range || !SHA40_RE.test(range.tipSha) || !SHA40_RE.test(range.excludeSha) || floors.some((f) => !SHA40_RE.test(f))) return undefined;
+    return [range.tipSha, `^${range.excludeSha}`, ...floors.map((f) => `^${f}`)];
+  }
+
+  /**
    * Issue #281 / CodeRabbit #655: the porcelain read for the no-progress detector's
    * worktree fingerprint. Identical git invocation and runner-uid rationale as
    * planChangedFiles, but returns `null` on a failed read instead of `[]`, so an
@@ -20358,14 +22167,14 @@ try {
   }
 
   /** Sizes of `oids` (blobs) from ONE `cat-file --batch-check`; a missing or non-blob object throws. */
-  private async wipBlobSizes(clonePath: string, oids: string[]): Promise<Map<string, number>> {
+  private async wipBlobSizes(clonePath: string, oids: string[], timeoutMs?: number): Promise<Map<string, number>> {
     const uniq = [...new Set(oids)];
     const sizes = new Map<string, number>();
     if (uniq.length === 0) return sizes;
     const out = await this.runGitAsRunner(
       clonePath,
       ["cat-file", "--batch-check=%(objectname) %(objecttype) %(objectsize)"],
-      { input: `${uniq.join("\n")}\n`, env: NO_REPLACE_ENV },
+      { input: `${uniq.join("\n")}\n`, env: NO_REPLACE_ENV, ...(timeoutMs === undefined ? {} : { timeoutMs }) },
     );
     const lines = out.split("\n");
     if (lines[lines.length - 1] === "") lines.pop();
@@ -26716,14 +28525,31 @@ try {
    * A permit-scoped caller waiting behind another run observes its hard or soft abort
    * promptly and forfeits its slot without running `fn`. The stored chain still
    * waits for the prior holder before it settles, so a cancelled waiter can never
-   * let a later mutation overtake the holder and violate serialization. */
-  private withLock<T>(key: string, fn: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+   * let a later mutation overtake the holder and violate serialization.
+   *
+   * `key` is a bare filesystem path (never a URL): a waiter that aborts before acquisition logs it
+   * as `bare`, with how long it waited, how long the current holder had held the lock and which
+   * signal fired. The rejection itself is unchanged. */
+  private withLock<T>(key: string, fn: () => Promise<T>, signal?: AbortSignal, restrictionProgress?: RemediationRestrictionProgress): Promise<T> {
+    const enqueuedAt = performance.now();
     const prev = this.locks.get(key) ?? Promise.resolve();
     const boundary = this.boundaryProcesses.getStore();
-    const recovery = this.recoveryOperation();
+    let recovery: ReturnType<typeof this.recoveryOperation>;
+    try { recovery = this.recoveryOperation(); }
+    catch (error) {
+      // Only a positively identified maintenance-budget expiry before any read is a clearable interruption.
+      if (restrictionProgress && !restrictionProgress.started && !restrictionProgress.acquired
+        && this.isBudgetExpiry(error, this.recoveryOperations.getStore()?.budget)) restrictionProgress.cause = "pre_read_unavailable";
+      throw error;
+    }
     const report = this.reportProofs.getStore();
     this.checkReportProof();
-    this.checkRecoveryInterruption();
+    try {
+      this.checkRecoveryInterruption();
+    } catch (error) {
+      if (restrictionProgress && !restrictionProgress.acquired) restrictionProgress.cause = "pre_read_unavailable";
+      throw error;
+    }
     const signals = [boundary?.signal, recovery?.signal, report?.signal, MaintenanceBudget.signal()].filter((s): s is AbortSignal => s !== undefined);
     const scope = signals.length ? { signal: AbortSignal.any(signals) } : undefined;
     const softSignal = boundary?.softSignal;
@@ -26739,7 +28565,17 @@ try {
     const abortBeforeAcquisition = (): void => {
       if (started || settled) return;
       settled = true;
+      if (restrictionProgress) restrictionProgress.cause = "pre_read_unavailable";
       removeAbortListener();
+      // Same precedence as the rejection below: caller signal, then the scope members in the order of
+      // `signals`, then the soft deadline. This names the signal that fired, not the root cause: a
+      // caller signal aborted with the soft deadline's reason (e.g. the gate checkpoint) logs "caller".
+      this.logLockWaitAbort(key, enqueuedAt, signal?.aborted ? "caller"
+        : boundary?.signal.aborted ? "boundary"
+        : recovery?.signal.aborted ? "recovery"
+        : report?.signal.aborted ? "report"
+        : scope?.signal.aborted ? "maintenance_budget"
+        : "soft_deadline");
       rejectResult(signal?.aborted ? new Error(GIT_LOCK_WAIT_ABORT_MESSAGE) : scope?.signal.aborted
         ? new GitBoundaryAbortError(GIT_LOCK_WAIT_ABORT_MESSAGE, undefined, boundary?.capture?.signal)
         : new CheckpointSoftDeadlineError());
@@ -26764,33 +28600,72 @@ try {
         return;
       }
       started = true;
-      removeAbortListener();
-      let outcome: { ok: true; value: T } | { ok: false; error: unknown };
+      const holder = { since: performance.now() };
+      this.lockHolders.set(key, holder);
       try {
-        this.checkRecoveryInterruption();
-        const value = await fn();
-        this.checkRecoveryInterruption();
-        outcome = { ok: true, value };
-      } catch (error) {
-        outcome = { ok: false, error };
+        if (restrictionProgress) restrictionProgress.acquired = true;
+        removeAbortListener();
+        let outcome: { ok: true; value: T } | { ok: false; error: unknown };
+        try {
+          // The bare lock is already held here (started = true above), so a failure is post-acquisition
+          // and must stay sticky (#4191): it is never classified as pre-read unavailability.
+          try { this.checkRecoveryInterruption(); }
+          catch (error) {
+            if (restrictionProgress) restrictionProgress.cause = "unknown";
+            throw error;
+          }
+          const value = await fn();
+          try { this.checkRecoveryInterruption(); }
+          catch (error) {
+            if (restrictionProgress) restrictionProgress.cause = "post_read_expiry";
+            throw error;
+          }
+          outcome = { ok: true, value };
+        } catch (error) {
+          outcome = { ok: false, error };
+        }
+        // issue #1597 M2: a scope's pre-release hook runs while this lock is STILL held (the chain
+        // below does not advance until `run` returns), so a cancelled tick can settle its children and
+        // reconcile lock files before any other bare mutation starts. It never fails the op.
+        if (boundary?.beforeLockRelease) {
+          await boundary.beforeLockRelease(key).catch(() => undefined);
+        }
+        try { this.checkRecoveryInterruption(); }
+        catch (error) {
+          if (restrictionProgress?.started) restrictionProgress.cause = "post_read_expiry";
+          outcome = { ok: false, error };
+        }
+        settled = true;
+        if (outcome.ok) resolveResult(outcome.value);
+        else rejectResult(outcome.error);
+      } finally {
+        // Diagnostic holder entry: cleared after beforeLockRelease (the lock is held through it), in the same
+        // tick the result is published, and even if the post-acquisition body throws.
+        if (this.lockHolders.get(key) === holder) this.lockHolders.delete(key);
       }
-      // issue #1597 M2: a scope's pre-release hook runs while this lock is STILL held (the chain
-      // below does not advance until `run` returns), so a cancelled tick can settle its children and
-      // reconcile lock files before any other bare mutation starts. It never fails the op.
-      if (boundary?.beforeLockRelease) {
-        await boundary.beforeLockRelease(key).catch(() => undefined);
-      }
-      try { this.checkRecoveryInterruption(); }
-      catch (error) { outcome = { ok: false, error }; }
-      settled = true;
-      if (outcome.ok) resolveResult(outcome.value);
-      else rejectResult(outcome.error);
     };
     const next = prev.then(run, run);
     // Keep the serialization chain alive but swallow its stored result so one
     // failed mutation does not poison every later op on the same repo.
     this.locks.set(key, next.catch(() => undefined));
     return result;
+  }
+
+  /** The one diagnostic for a withLock waiter that aborted before acquiring `key`. Contended (a holder
+   *  held the lock) logs at warn; an uncontended abort (e.g. a call under an already-aborted scope)
+   *  logs at debug so a burst after a deadline does not flood warnings. Never changes the rejection. */
+  private logLockWaitAbort(key: string, enqueuedAt: number, abortedBy: string): void {
+    // The caller rejects the waiter right after this returns, so a throwing logger must never
+    // strand it or replace its abort error: the diagnostic is best effort.
+    try {
+      const now = performance.now();
+      const holder = this.lockHolders.get(key);
+      const fields: Record<string, unknown> = { bare: key, waited_ms: Math.round(now - enqueuedAt), aborted_by: abortedBy };
+      if (holder) fields.holder_held_ms = Math.round(now - holder.since);
+      else fields.holder = "none";
+      if (holder) this.log.warn("bare repo lock wait aborted before acquisition", fields);
+      else this.log.debug("bare repo lock wait aborted before acquisition", fields);
+    } catch { /* diagnostic only */ }
   }
 }
 
@@ -26820,6 +28695,162 @@ function wipPathValid(value: string): boolean {
     }
   }
   return true;
+}
+
+// ---- Terminal-preservation snapshot (captureTerminalSnapshot and its siblings) ----
+
+/** Options of {@link GitCache.captureTerminalSnapshot}. */
+export interface TerminalSnapshotOptions {
+  runId: string;
+  generation: number;
+  /** Duration budget (ms) for the whole call. */
+  deadlineMs: number;
+  signal?: AbortSignal;
+  /** Basename (and exact path, when inside the clone) of the worker token file; never captured. */
+  workerTokenFile?: string;
+  /** Bare repository the snapshot is transferred into. */
+  barePath: string;
+  /** Record-first hook: "capturing" runs before the clone ref exists, "captured" after the transfer settled. */
+  onPhase?: (phase: "capturing" | "captured", info: { cloneRef: string; bareRef: string; commit?: string }) => Promise<void>;
+  /** Post-runner-git re-proof supplied by the caller's flight context; false refuses. */
+  reprove?: () => Promise<boolean>;
+  /**
+   * Bound the caller's own lane imposes on the post-capture cleanup (staging-ref delete, private-index removal):
+   * the cleanup allowance ends at the earlier of `deadlineAt` (absolute `Date.now()` ms), the cleanup cap
+   * ({@link TERMINAL_CAPTURE_CLEANUP_MS}) and the boundary scope's soft deadline, and is cancelled by `signal`.
+   * An absent `deadlineAt` means no caller deadline (the cap and soft deadline still apply); a present non-finite
+   * one fails closed. Cleanup is never bound to {@link TerminalSnapshotOptions.signal} or the capture's own deadline, which have
+   * usually lapsed by then.
+   */
+  cleanupBound?: { deadlineAt?: number; signal?: AbortSignal };
+  /**
+   * Test-only seams; production never passes them. `lockQueued` runs synchronously right after the bare-lock
+   * wait is queued (not awaited); `beforeFetch` runs under the lock before the fetch; `inTransfer` after the
+   * fetch landed the staging ref; `afterStagingRead` after the cleanup's confirming read of the staging ref;
+   * `indexCleanupError` makes each private-index removal reject with that value; `indexLockCleanupError` does so
+   * for the `.lock` removal only.
+   */
+  seam?: {
+    beforeStaging?: () => Promise<void>; afterCloneRef?: () => Promise<void>;
+    lockQueued?: () => void; beforeFetch?: () => Promise<void>; inTransfer?: () => Promise<void>;
+    afterStagingRead?: () => Promise<void>; indexCleanupError?: unknown; indexLockCleanupError?: unknown;
+  };
+  /** Test-only lowered caps; production never passes them. */
+  caps?: { maxEntries?: number; maxTotalBytes?: number; cleanupMs?: number };
+}
+/**
+ * What a capture could not prove it removed. Absent when the staging ref was confirmed absent or deleted and the
+ * private index was removed. `ref` names the bare's staging ref: `state: "retained"` (with `oid`) only when a
+ * confirming read inside the cleanup allowance showed it at the snapshot commit and no delete was launched;
+ * `state: "unknown"` (with the commit it may hold as `expectedOid`, and the `oid` a confirming read observed when
+ * that differs from it) for every other unconfirmed case (no read was possible, the read failed or was cancelled,
+ * the ref was seen at a different oid, or a launched delete was cancelled or failed unconfirmed).
+ * `index` is the private index path when the index file's own removal did not run or could not be confirmed (a
+ * failed `.lock` removal alone is only logged). Nothing retries
+ * after the call returns.
+ */
+export interface TerminalSnapshotRemnant {
+  ref?: string;
+  oid?: string;
+  expectedOid?: string;
+  state?: "retained" | "unknown";
+  index?: string;
+}
+export type TerminalSnapshotResult =
+  | { kind: "clean"; root: string; tree: string; ignored: { files: number; bytes: number }; remnant?: TerminalSnapshotRemnant }
+  | { kind: "captured"; root: string; parent: string; tree: string; ignored: { files: number; bytes: number }; remnant?: TerminalSnapshotRemnant }
+  | { kind: "refused"; reason: string; remnant?: TerminalSnapshotRemnant };
+
+/** Cap on the staging-ref and private-index cleanup that follows a capture (one shared allowance per call). */
+const TERMINAL_CAPTURE_CLEANUP_MS = 2000;
+/** An error the boundary marked as cancellation without verified disposal: never downgraded to a refusal. */
+const isUnsafeCleanup = (err: unknown): boolean =>
+  err instanceof CheckpointUnsafeCleanupError || (err as { checkpointBoundary?: unknown } | null)?.checkpointBoundary === "unsafe_cleanup";
+
+/** A refusal carrying a stable, path-free reason. Never thrown past the public methods below. */
+class TerminalSnapshotRefusal extends Error {
+  constructor(readonly reason: string) { super(`terminal snapshot refused: ${reason}`); }
+}
+/** Run and generation naming: the ref `refs/uzi-terminal-local/<runId>/g<generation>` must be a plain ref. */
+const TERMINAL_RUN_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
+/** Bound on ignored-file listings, separate from the changed-path cap. */
+const TERMINAL_IGNORED_MAX_ENTRIES = 200_000;
+/** Aggregate budget (see buildTerminalAggregate): merges per chain, and extra roots per call. */
+const TERMINAL_AGGREGATE_MAX_MERGES = CHECKPOINT_SCAN_MAX_MERGES;
+const TERMINAL_AGGREGATE_MAX_ROOTS = 63;
+/** Commits one changedCiPathsPerCommit call will examine. */
+const TERMINAL_CI_MAX_COMMITS = 1000;
+/** Cumulative retained path bytes and path count across one changedCiPathsPerCommit call. */
+const TERMINAL_CI_MAX_TOTAL_BYTES = 16 * 1024 * 1024;
+const TERMINAL_CI_MAX_TOTAL_PATHS = 100_000;
+// The credential denylist is defence in depth: the secret scan over the published range is the control.
+const TERMINAL_CREDENTIAL_BASENAMES = new Set([
+  "auth.json", ".credentials.json", ".claude.json", ".netrc", ".git-credentials",
+  "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa",
+  ".npmrc", ".pypirc", ".env",
+]);
+const TERMINAL_CREDENTIAL_SUFFIXES = [".pem", ".key", ".p12", ".pfx"];
+const TERMINAL_CREDENTIAL_DIRS = new Set([".ssh", ".aws", ".gnupg"]);
+/** Credential files named by their last two (or three) path segments. */
+const TERMINAL_CREDENTIAL_TAILS = [".docker/config.json", ".kube/config", ".config/gh/hosts.yml"];
+/** Pins every terminal-snapshot git carries (the captureMaintenanceWip set plus the proof-read walk pins). */
+const TERMINAL_GIT_PINS: readonly string[] = [
+  "--no-replace-objects", "--no-optional-locks",
+  // Attributes come from the empty tree only (not the work-tree .gitattributes, no global or system file), so no
+  // attribute-selected filter, eol or ident conversion is selected for the verdict or the staging. `.git/info/attributes`
+  // is read regardless of these pins; captureTerminalSnapshot refuses a clone that has one, and any `filter.*` key.
+  // The core.autocrlf/safecrlf/eol pins disable the config-driven conversion that applies without any attribute.
+  `--attr-source=${EPOCH_EMPTY_TREE_OID}`, "-c", "core.attributesFile=/dev/null",
+  "-c", "core.autocrlf=false", "-c", "core.safecrlf=false", "-c", "core.eol=lf",
+  // GIT_GRAFT_FILE=/dev/null (TERMINAL_GIT_ENV) makes newer Git print a deprecation hint on stderr; the strict stderr check
+  // would otherwise refuse every capture, so silence only that advice (same pin as the ancestry proof reads).
+  "-c", "advice.graftFileDeprecated=false",
+  "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false",
+  "-c", "core.ignoreStat=false", "-c", "core.checkStat=default",
+  "-c", "core.trustctime=true", "-c", "core.fileMode=true", "-c", "core.ignoreCase=false",
+  // A symlink replaced by a regular file with the same bytes must read as a type change, never as unchanged.
+  "-c", "core.symlinks=true",
+  "-c", "commit.gpgsign=false", "-c", "core.commitGraph=false", "-c", "core.multiPackIndex=false",
+  "-c", `core.hooksPath=${EMPTY_GIT_HOOKS_DIR}`,
+  // The global excludes file (core.excludesFile, else $XDG_CONFIG_HOME/git/ignore or $HOME/.config/git/ignore) would
+  // hide untracked work from the enumeration and the staging; no ignore source outside the repository applies.
+  "-c", "core.excludesFile=/dev/null",
+];
+/** Env for every terminal-snapshot git: no replace refs, no grafts, no shallow file, no optional locks. */
+const TERMINAL_GIT_ENV: NodeJS.ProcessEnv = {
+  ...PROOF_READ_ENV, GIT_OPTIONAL_LOCKS: "0", GIT_SHALLOW_FILE: "/dev/null", GIT_ATTR_NOSYSTEM: "1",
+};
+
+/** Whether a changed path names a credential a snapshot must never carry. */
+function terminalCredentialPath(rel: string, workerTokenFile: string | undefined, clonePath: string): boolean {
+  const parts = rel.split("/");
+  const base = parts[parts.length - 1]!.toLowerCase();
+  if (TERMINAL_CREDENTIAL_BASENAMES.has(base)) return true;
+  // Backup copies of denylisted names (auth.json.bak, .env.bak).
+  if (base.endsWith(".bak") && TERMINAL_CREDENTIAL_BASENAMES.has(base.slice(0, -4))) return true;
+  const lowered = parts.map((p) => p.toLowerCase()).join("/");
+  if (TERMINAL_CREDENTIAL_TAILS.some((tail) => lowered === tail || lowered.endsWith(`/${tail}`))) return true;
+  if (TERMINAL_CREDENTIAL_SUFFIXES.some((s) => base.endsWith(s))) return true;
+  if (parts.slice(0, -1).some((p) => TERMINAL_CREDENTIAL_DIRS.has(p.toLowerCase()))) return true;
+  if (workerTokenFile) {
+    if (base === path.posix.basename(workerTokenFile).toLowerCase()) return true;
+    if (path.join(clonePath, rel) === path.resolve(workerTokenFile)) return true;
+  }
+  return false;
+}
+
+/** Parse `diff --raw -z --no-abbrev --no-renames` into rows; undefined on any deviation. */
+function terminalParseRaw(out: string): Array<{ path: string; status: string; mode: string; oid: string }> | undefined {
+  const toks = out.split("\0");
+  if (toks[toks.length - 1] === "") toks.pop();
+  if (toks.length % 2 !== 0) return undefined;
+  const res: Array<{ path: string; status: string; mode: string; oid: string }> = [];
+  for (let i = 0; i < toks.length; i += 2) {
+    const m = /^:\d{6} (\d{6}) [0-9a-f]{40} ([0-9a-f]{40}) ([AMDT])$/.exec(toks[i]!);
+    if (!m) return undefined;
+    res.push({ path: toks[i + 1]!, status: m[3]!, mode: m[1]!, oid: m[2]! });
+  }
+  return res;
 }
 
 /** Distinct directories (the root included) touched by resolving every path's ancestors. */

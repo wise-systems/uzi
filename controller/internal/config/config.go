@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -87,6 +88,12 @@ type Config struct {
 	// stays verbatim.
 	APICAPEM []byte
 
+	// WorkerExtraCAPEM is an operator-supplied CA bundle (UZI_WORKER_EXTRA_CA_FILE) that
+	// workers trust ON TOP of the api's CA, for private-CA hosts a worker talks to: an
+	// LLM gateway, a self-hosted forge, a package mirror. It rides the same per-worker
+	// Secret entry as APICAPEM (appended, never replacing it). Empty means none.
+	WorkerExtraCAPEM []byte
+
 	// --- the worker namespace (M3) --------------------------------------------
 	// Everything below describes the pods this controller renders. It is all
 	// operator config: the api sends NAMES and this side owns every mapping to a
@@ -136,6 +143,13 @@ type Config struct {
 	// kubernetes.io/arch=amd64, because the published agent images are amd64 only and
 	// would crash-loop on an arm64 node of a mixed-arch cluster.
 	WorkerNodeSelector map[string]string
+	// WorkerDeploymentLabels / WorkerDeploymentAnnotations are extra metadata on every
+	// worker Deployment (UZI_WORKER_DEPLOYMENT_LABELS / _ANNOTATIONS, JSON objects of
+	// string to string), for admission policies that key on Deployment metadata. The
+	// chart passes its workloadLabels / workloadAnnotations. A label may not replace one
+	// the controller stamps: those are its teardown provenance.
+	WorkerDeploymentLabels      map[string]string
+	WorkerDeploymentAnnotations map[string]string
 	// WorkerTolerations are rendered onto every worker pod, all three tiers
 	// (UZI_WORKER_TOLERATIONS, a JSON array of Kubernetes tolerations). Unset, empty,
 	// "null" or "[]" means none, which keeps the pod template hash unchanged.
@@ -257,6 +271,14 @@ type Config struct {
 	// flipping it changes those pods' spec hash, so it rolls every non-ephemeral docker
 	// worker.
 	WorkerDiskRecycleEnabled bool
+	// WorkerDinDBuilderPruneEnabled gates the pressure-only DinD builder-cache prune leg
+	// (issue #4291) on docker workers. DEFAULT TRUE (UZI_WORKER_DIND_BUILDER_PRUNE_ENABLED);
+	// a set-but-unparseable value is a BOOT error, like WorkerDiskRecycleEnabled. It is
+	// SUBORDINATE to the disk-recycle master: the controller renders it independently as
+	// UZI_DIND_BUILDER_PRUNE_ENABLED, and the agent ANDs it with UZI_DIND_PRUNE_ENABLED, so
+	// disabling the master disables this leg too, while false here disables only this leg.
+	// Flipping it changes docker workers' spec hash and rolls them.
+	WorkerDinDBuilderPruneEnabled bool
 	// WorkerDiskRecycleCooldown bounds how soon after a recycle the same worker may be
 	// recycled again (UZI_WORKER_DISK_RECYCLE_COOLDOWN, default 1h). A worker back at disk
 	// pressure WITHIN the cooldown is a capacity signal (its volumes are genuinely too
@@ -285,6 +307,10 @@ type Config struct {
 	// template carries UZI_EPOCH_RECLAIM_DELETION=1. Empty means no worker does. It is
 	// exactly one canonical lowercase UUID: no list, wildcard or padding.
 	WorkerEpochReclaimDeletionCanaryID string
+	WorkerEpochScratchDeletion         bool
+	// WorkerRetireScratchOutcomes controls worker retirement-scratch outcome records
+	// (UZI_RETIRE_SCRATCH_OUTCOMES). Default true; false renders the worker opt-out.
+	WorkerRetireScratchOutcomes bool
 	// WorkerDinDImage is the fully-pinned DinD sidecar image
 	// (docker:<tag>-dind-rootless@sha256:... or, non-rootless, docker:<tag>-dind@...).
 	// It is operator config, not wire data — the api never names an image — and shared
@@ -403,6 +429,15 @@ func Load() (Config, error) {
 		}
 		cfg.WorkerDiskRecycleEnabled = enabled
 	}
+	// The builder-cache prune leg (issue #4291) also defaults on; a typo is a boot error.
+	cfg.WorkerDinDBuilderPruneEnabled = true
+	if raw := strings.TrimSpace(os.Getenv("UZI_WORKER_DIND_BUILDER_PRUNE_ENABLED")); raw != "" {
+		enabled, err := strconv.ParseBool(raw)
+		if err != nil {
+			return Config{}, fmt.Errorf("UZI_WORKER_DIND_BUILDER_PRUNE_ENABLED=%q is not a boolean (want true or false): %w", raw, err)
+		}
+		cfg.WorkerDinDBuilderPruneEnabled = enabled
+	}
 
 	// The emergency force-roll override (PRD #422 M5). Empty defaults false; a set but
 	// unparseable value is a BOOT error rather than a silent false, mirroring
@@ -446,6 +481,9 @@ func Load() (Config, error) {
 	if err := loadAPICA(&cfg); err != nil {
 		return Config{}, err
 	}
+	if err := loadWorkerExtraCA(&cfg); err != nil {
+		return Config{}, err
+	}
 	if err := loadWorkerSettings(&cfg); err != nil {
 		return Config{}, err
 	}
@@ -466,6 +504,20 @@ func loadWorkerSettings(cfg *Config) error {
 	case "", "containerd-runc", "crio-crun":
 	default:
 		return fmt.Errorf("UZI_WORKER_POD_EPOCH_RUNTIME must be unset, containerd-runc or crio-crun")
+	}
+	switch os.Getenv("UZI_WORKER_EPOCH_SCRATCH_DELETION") {
+	case "", "false":
+	case "true":
+		cfg.WorkerEpochScratchDeletion = true
+	default:
+		return fmt.Errorf("UZI_WORKER_EPOCH_SCRATCH_DELETION must be empty, true or false")
+	}
+	switch os.Getenv("UZI_WORKER_RETIRE_SCRATCH_OUTCOMES") {
+	case "", "true":
+		cfg.WorkerRetireScratchOutcomes = true
+	case "false":
+	default:
+		return fmt.Errorf("UZI_WORKER_RETIRE_SCRATCH_OUTCOMES must be empty, true or false")
 	}
 	cfg.WorkerEpochReclaimDeletionCanaryID = os.Getenv("UZI_WORKER_EPOCH_RECLAIM_DELETION_CANARY_ID")
 	if id := cfg.WorkerEpochReclaimDeletionCanaryID; id != "" && !canonicalUUIDRE.MatchString(id) {
@@ -506,6 +558,12 @@ func loadWorkerSettings(cfg *Config) error {
 		return err
 	}
 	cfg.WorkerNodeSelector = sel
+	if cfg.WorkerDeploymentLabels, err = parseDeploymentMetadata("UZI_WORKER_DEPLOYMENT_LABELS", true); err != nil {
+		return err
+	}
+	if cfg.WorkerDeploymentAnnotations, err = parseDeploymentMetadata("UZI_WORKER_DEPLOYMENT_ANNOTATIONS", false); err != nil {
+		return err
+	}
 	tol, err := parseTolerations(os.Getenv("UZI_WORKER_TOLERATIONS"))
 	if err != nil {
 		return err
@@ -830,6 +888,54 @@ func parseNodeSelector(raw string) (map[string]string, error) {
 	return sel, nil
 }
 
+// controllerLabelKeys are the labels the controller stamps on every object it creates
+// (kube.objectLabels): provenance, so operator metadata may never replace one. Kept as
+// literals because config must not import kube; TestDeploymentLabelsRefuseControllerKeys
+// pins them against the kube constants.
+var controllerLabelKeys = []string{"app.kubernetes.io/name", "app.kubernetes.io/component", "app.kubernetes.io/managed-by", "uzi.dev/hosted-worker-id"}
+
+// parseDeploymentMetadata reads one of the worker Deployment metadata variables: a JSON
+// object of string to string. Keys must be qualified names; label values must be
+// valid label values and may not use a controller-owned key. Unset, "null" or "{}"
+// means none. Refused at boot, since the API server would otherwise reject every
+// worker Deployment and workers would simply never appear.
+func parseDeploymentMetadata(name string, labels bool) (map[string]string, error) {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" || raw == "null" {
+		return nil, nil
+	}
+	var members map[string]*string
+	if err := json.Unmarshal([]byte(raw), &members); err != nil {
+		return nil, fmt.Errorf("%s=%q is not a JSON object of string to string: %w", name, raw, err)
+	}
+	out := make(map[string]string, len(members))
+	for k, v := range members {
+		if v == nil {
+			return nil, fmt.Errorf("%s: key %q has a null value; give it a string value or remove the key", name, k)
+		}
+		if errs := validation.IsQualifiedName(k); len(errs) > 0 {
+			return nil, fmt.Errorf("%s: key %q is not a valid key: %s", name, k, strings.Join(errs, "; "))
+		}
+		// uzi.dev/ is the controller's own namespace (worker id, spec hash, roll marker...).
+		if strings.HasPrefix(k, "uzi.dev/") {
+			return nil, fmt.Errorf("%s: %q uses the reserved uzi.dev/ prefix", name, k)
+		}
+		if labels {
+			if slices.Contains(controllerLabelKeys, k) {
+				return nil, fmt.Errorf("%s: %q is set by the controller and cannot be overridden", name, k)
+			}
+			if errs := validation.IsValidLabelValue(*v); len(errs) > 0 {
+				return nil, fmt.Errorf("%s: value %q for key %q is not a valid label value: %s", name, *v, k, strings.Join(errs, "; "))
+			}
+		}
+		out[k] = *v
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
+	return out, nil
+}
+
 // parseTolerations reads UZI_WORKER_TOLERATIONS, a JSON array of tolerations, and
 // applies the API server's toleration rules (Equal/Exists only) at boot: a Deployment carrying a toleration
 // the API server rejects would otherwise surface only as workers that never appear.
@@ -961,6 +1067,39 @@ func loadAPICA(cfg *Config) error {
 	// Kept raw as well: the pool verifies THIS process's hop, the PEM is what gets
 	// relayed into each worker's Secret so the worker can verify its own.
 	cfg.APICAPEM = pem
+	return nil
+}
+
+// maxWorkerExtraCABytes bounds the extra bundle so the per-worker Secret (the join token,
+// the api CA, the fetcher CA and this) stays far below Kubernetes' 1 MiB Secret limit.
+const maxWorkerExtraCABytes = 512 * 1024
+
+// loadWorkerExtraCA reads the optional extra CA bundle relayed to workers next to the
+// api's CA. A file holding no PEM certificate is a boot error, as for UZI_API_CA_FILE:
+// the operator who set it expects workers to trust something.
+func loadWorkerExtraCA(cfg *Config) error {
+	path := strings.TrimSpace(os.Getenv("UZI_WORKER_EXTRA_CA_FILE"))
+	if path == "" {
+		return nil
+	}
+	pem, err := os.ReadFile(path) //nolint:gosec // G304: the path is operator config (UZI_WORKER_EXTRA_CA_FILE), not user input; reading the mounted CA bundle by its configured path is intended.
+	if err != nil {
+		return fmt.Errorf("UZI_WORKER_EXTRA_CA_FILE: read %s: %w", path, err)
+	}
+	if !x509.NewCertPool().AppendCertsFromPEM(pem) {
+		return fmt.Errorf("UZI_WORKER_EXTRA_CA_FILE: %s contains no PEM certificate", path)
+	}
+	if len(pem) > maxWorkerExtraCABytes {
+		return fmt.Errorf("UZI_WORKER_EXTRA_CA_FILE: %s is %d bytes, over the %d-byte limit: it rides each worker's Secret, which Kubernetes caps at 1 MiB", path, len(pem), maxWorkerExtraCABytes)
+	}
+	// The bundle rides the Secret entry the api CA creates, and the worker entrypoint
+	// requires that entry wherever NODE_EXTRA_CA_CERTS points. Without the api CA, adding an
+	// extra CA would point existing workers (whose write-once Secrets lack the entry) at a
+	// missing file on their next roll, and a docker worker's entrypoint refuses to start.
+	if len(cfg.APICAPEM) == 0 {
+		return fmt.Errorf("UZI_WORKER_EXTRA_CA_FILE needs UZI_API_CA_FILE: the extra CA rides the worker's api CA bundle, so it requires api TLS")
+	}
+	cfg.WorkerExtraCAPEM = pem
 	return nil
 }
 

@@ -1,7 +1,7 @@
-// The Overview preview's Held work card (PRD #3880 M2): the owner's custody capacity and holds
-// as three always-present figures, with the same headline and tone as the Dashboard's custody
+// The default Overview's Held work card (PRD #3880 M2): the owner's custody capacity and holds
+// as three always-present figures, with the same headline and tone as the classic page's custody
 // alert when custodyAlertView says there is something to say. It replaces CustodyBoardAlert on
-// the preview, so the alert's own request is gone: the holds arrive as a prop from
+// the default page, so the alert's own request is gone: the holds arrive as a prop from
 // useOverviewData. A "Review held work" link appears only when a hold needs a decision.
 
 import { Link } from "react-router-dom";
@@ -78,7 +78,7 @@ export function HeldWorkCard({
         <SlotMeter used={used} limit={limit} fill={fill} />
 
         <div className="mt-3 grid grid-cols-3 gap-3">
-          <Figure value={`${used} / ${limit}`} label="custody slots used" />
+          <Figure value={`${used} / ${limit}`} label="custody units used" />
           <Figure value={String(open)} label={open === 1 ? "open custody hold" : "open custody holds"} />
           <Figure value={String(decisions)} label={decisions === 1 ? "hold needs a decision" : "holds need a decision"} />
         </div>
@@ -91,7 +91,7 @@ export function HeldWorkCard({
 
         <p className="mt-3 text-xs text-faint">
           Holds protect each run&apos;s committed but unpushed work, while it runs and after a worker is lost.
-          {limit > 0 && ` New runs wait for admission once all ${limit} custody slots are taken.`}
+          {limit > 0 && ` New runs wait for admission once all ${limit} custody units are taken. A run's holds from the same original worker usually count as one unit; other holds count singly.`}
         </p>
       </section>
     </Card>

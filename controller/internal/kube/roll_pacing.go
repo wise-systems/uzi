@@ -3,6 +3,8 @@ package kube
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"sort"
@@ -60,6 +62,27 @@ type rollEntry struct {
 	claim              *corev1.PersistentVolumeClaim
 	rawReservation     bool
 	migrationHeldDrift bool
+	// snapshotIncomplete is set when the roll snapshot could not read this worker's
+	// deployment/pod/claim evidence; display-only (RollMarkerReports), never read by planning.
+	snapshotIncomplete bool
+	// markerReport is the snapshot-time display summary, captured before planning
+	// rewrites e.marker in memory. Display-only.
+	markerReport *protocol.RollMarker
+	// hibernation marks a worker whose desired hibernation state is set (PRD #4205).
+	// It stays in rollTick.entries so its snapshot evidence (marker, reservation,
+	// blocked) is readable through rollFrom, but it takes no part in pool grouping,
+	// admission, canary, slots or coverage: a parked worker is neither a roll
+	// participant nor a coverage provider.
+	hibernation bool
+	// historyDependents marks a hibernation candidate whose completed-canary marker
+	// could not be retired because an in-scope peer still carries roll evidence.
+	historyDependents bool
+	// historyAnchor marks such a candidate (or one whose retirement is unconfirmed) as
+	// a read-only completed-canary closure for its own coverage pool.
+	historyAnchor bool
+	// historyRetireUnknown marks a candidate whose marker retirement write is unconfirmed;
+	// reconcileHibernation writes nothing for it this tick.
+	historyRetireUnknown bool
 }
 type rollTick struct {
 	entries   map[string]*rollEntry
@@ -68,8 +91,11 @@ type rollTick struct {
 	uncertain map[string]bool
 	// layoutUncertain names, per coverage key, the held worker whose own reservation
 	// could not be shown withdrawn (see holdForLayoutMigration).
-	layoutUncertain   map[string]string
-	errors            []error
+	layoutUncertain map[string]string
+	errors          []error
+	// unplanned lists the non-ephemeral desired workers planRoll could not render
+	// (placement or template/size resolution failed). They never reach the roll snapshot.
+	unplanned         []unplannedWorker
 	unavailable       map[string]bool
 	migrationFences   map[string]bool
 	migrationMultiple bool
@@ -77,8 +103,76 @@ type rollTick struct {
 	// storageClasses memoises this tick's StorageClass expandability lookups
 	// (issue #3890), reset with every Reconcile because the tick is rebuilt.
 	storageClasses map[string]string
+	// reclaimPolicies memoises this tick's StorageClass reclaim-policy reads for the
+	// hibernation volume inventory (classReclaimPolicy).
+	reclaimPolicies map[string]string
+}
+
+// unplannedWorker is a desired worker outside the roll snapshot. nsKnown is false when
+// its placement failed, so the namespace it keeps its objects in is unknown.
+type unplannedWorker struct {
+	id      string
+	ns      string
+	nsKnown bool
 }
 type rollTickKey struct{}
+
+// RollMarkerReports returns a copy of the per-worker display-only roll marker
+// summaries from the last reconcile (issue #4385). It is replaced on every
+// synchronous reconcile and never used to admit or hibernate. Unlike PacingOutcomes it
+// includes completed markers.
+func (m *Materializer) RollMarkerReports() map[string]*protocol.RollMarker {
+	out := make(map[string]*protocol.RollMarker, len(m.rollMarkers))
+	for id, r := range m.rollMarkers {
+		c := *r
+		if r.Blocked != nil {
+			b := *r.Blocked
+			c.Blocked = &b
+		}
+		out[id] = &c
+	}
+	return out
+}
+
+// captureRollMarkerReport summarises the retained cluster evidence as the snapshot
+// read it, before any planning mutation rewrites e.marker.
+func captureRollMarkerReport(e *rollEntry) *protocol.RollMarker {
+	r := &protocol.RollMarker{
+		State:       protocol.RollMarkerAbsent,
+		Reservation: e.marker != nil || e.rawReservation || hasOpenReservation(e),
+	}
+	switch {
+	case e.snapshotIncomplete:
+		r.State = protocol.RollMarkerUnavailable
+	case e.marker != nil:
+		sum := sha256.Sum256([]byte(coverageKey(e.marker.Coverage)))
+		r.State = protocol.RollMarkerPresent
+		r.Canary = e.marker.Canary
+		r.Completed = e.marker.Completed
+		r.TargetVersion = boundedText(e.marker.TargetVersion, 128)
+		r.CoverageGroup = hex.EncodeToString(sum[:])[:16]
+	case e.rawReservation || (e.dep != nil && e.dep.Annotations[annotationRoll] != "") || (e.claim != nil && e.claim.Annotations[annotationRoll] != ""):
+		r.State = protocol.RollMarkerUnreadable
+	}
+	return r
+}
+
+// boundedText replaces control bytes and truncates to n bytes on a rune boundary.
+func boundedText(s string, n int) string {
+	s = strings.Map(func(r rune) rune {
+		if r < 32 || r == 127 {
+			return ' '
+		}
+		return r
+	}, s)
+	if len(s) > n {
+		s = s[:n]
+		for !utf8.ValidString(s) {
+			s = s[:len(s)-1]
+		}
+	}
+	return s
+}
 
 // PacingOutcomes is replaced on every synchronous reconcile, never used to admit.
 func (m *Materializer) PacingOutcomes() map[string]*protocol.Pacing {
@@ -106,10 +200,12 @@ func (m *Materializer) planRoll(ctx context.Context, desired []protocol.DesiredW
 		}
 		ns, err := m.cfg.Placement(w)
 		if err != nil {
+			t.unplanned = append(t.unplanned, unplannedWorker{id: w.ID})
 			continue
 		}
 		spec, err := m.resolver.Resolve(w.Template, w.Size)
 		if err != nil {
+			t.unplanned = append(t.unplanned, unplannedWorker{id: w.ID, ns: ns, nsKnown: true})
 			continue
 		}
 		target := RenderDeployment(m.cfg, w, spec)
@@ -117,13 +213,26 @@ func (m *Materializer) planRoll(ctx context.Context, desired []protocol.DesiredW
 		t.entries[w.ID] = e
 		namespaces[ns] = append(namespaces[ns], e)
 		t.outcomes[w.ID] = &protocol.Pacing{State: "waiting_evidence", TargetImage: workerImage(target), TargetVersion: targetVersion(m.cfg, workerImage(target))}
+		if w.Hibernation != nil {
+			// Excluded from every roll decision below (see rollEntry.hibernation). The
+			// placeholder outcome is "completed", which PacingOutcomes never exports, so
+			// a parked worker carries no pacing signal.
+			e.hibernation = true
+			t.outcomes[w.ID].State = "completed"
+		}
 	}
 	for ns, entries := range namespaces {
 		if err := m.rollSnapshot(ctx, ns, entries); err != nil {
 			for _, e := range entries {
 				e.blocked = "incomplete deployment/pod/ancestry snapshot"
+				e.snapshotIncomplete = true
 			}
 		}
+	}
+	// Capture the retained evidence before prepareMigrationDrains or any planning
+	// mutation rewrites e.marker (display-only; hibernation entries included).
+	for _, e := range t.entries {
+		e.markerReport = captureRollMarkerReport(e)
 	}
 	// Account for drained held workers using the newer pod snapshot before any
 	// ordinary admission can count them as serving coverage.
@@ -136,12 +245,16 @@ func (m *Materializer) planRoll(ctx context.Context, desired []protocol.DesiredW
 				e.dep.Spec.Template.Annotations[AnnotationGeneration] != e.target.Spec.Template.Annotations[AnnotationGeneration]
 		}
 	}
+	m.retireHibernationHistory(ctx, t)
 	for _, e := range t.entries {
-		if e.blocked != "" || e.marker == nil || !e.marker.Completed || e.dep == nil {
+		if e.hibernation || e.blocked != "" || e.marker == nil || !e.marker.Completed || e.dep == nil {
 			continue
 		}
 		pending, drift := false, e.drift
 		for _, peer := range t.entries {
+			if peer.hibernation {
+				continue
+			}
 			c, ok := coverageOf(peer.w, peer.ns)
 			drift = drift || (ok && c.Owner == e.marker.Coverage.Owner && c.Lane == e.marker.Coverage.Lane && peer.drift)
 			if peer.marker != nil && !peer.marker.Completed && coverageKey(peer.marker.Coverage) == coverageKey(e.marker.Coverage) {
@@ -162,7 +275,15 @@ func (m *Materializer) planRoll(ctx context.Context, desired []protocol.DesiredW
 		}
 	}
 	pools := map[string][]*rollEntry{}
+	anchors := map[string][]*rollEntry{}
 	for _, e := range t.entries {
+		if e.hibernation {
+			if e.historyAnchor && e.marker != nil {
+				key := coverageKey(e.marker.Coverage)
+				anchors[key] = append(anchors[key], e)
+			}
+			continue
+		}
 		m.releasePressureHold(ctx, t, e)
 		if firstProvision(e) {
 			e.admitted = true
@@ -244,7 +365,7 @@ func (m *Materializer) planRoll(ctx context.Context, desired []protocol.DesiredW
 	}
 	sort.Strings(keys)
 	for _, key := range keys {
-		m.planPool(ctx, t, pools[key])
+		m.planPool(ctx, t, append(append([]*rollEntry{}, pools[key]...), anchors[key]...))
 	}
 	order := append([]protocol.DesiredWorker{}, desired...)
 	sort.SliceStable(order, func(i, j int) bool {
@@ -254,7 +375,7 @@ func (m *Materializer) planRoll(ctx context.Context, desired []protocol.DesiredW
 		return order[i].ID < order[j].ID
 	})
 	for _, e := range t.entries {
-		if strings.Contains(e.blocked, "unconfirmed") {
+		if !e.hibernation && strings.Contains(e.blocked, "unconfirmed") {
 			t.uncertain[coverageKey(e.coverage)] = true
 			t.errors = append(t.errors, fmt.Errorf("worker %s: %s; re-observe and re-poll required", e.w.ID, e.blocked))
 		}
@@ -277,6 +398,15 @@ func (m *Materializer) planRoll(ctx context.Context, desired []protocol.DesiredW
 	}
 	m.selectMigrationDrains(ctx, t, desired, observed, pools)
 	m.pacing = t.outcomes
+	markers := make(map[string]*protocol.RollMarker, len(t.entries))
+	for id, e := range t.entries {
+		if e.markerReport == nil {
+			continue
+		}
+		e.markerReport.Blocked = pacingText(e.blocked)
+		markers[id] = e.markerReport
+	}
+	m.rollMarkers = markers
 	return t, order
 }
 
@@ -366,7 +496,7 @@ func pacingText(s string) *string {
 }
 func (m *Materializer) planPool(ctx context.Context, t *rollTick, pool []*rollEntry) {
 	for _, e := range pool {
-		if e.blocked == "" && m.incarnationComplete(t, e) {
+		if !e.hibernation && e.blocked == "" && m.incarnationComplete(t, e) {
 			m.releaseRollHold(ctx, t, e)
 		}
 	}
@@ -384,6 +514,9 @@ func (m *Materializer) planPool(ctx context.Context, t *rollTick, pool []*rollEn
 			continue
 		}
 		for _, peer := range pool {
+			if peer.hibernation {
+				continue // a read-only anchor: no cleanup, outcome or admission
+			}
 			// Current-incarnation proof retires completed pacing metadata only;
 			// this does not release source custody or mutate protected storage.
 			if peer.blocked == "" && peer.marker != nil && !peer.marker.Canary && m.incarnationComplete(t, peer) {
@@ -763,7 +896,7 @@ func (m *Materializer) remainingCoverage(t *rollTick, pool []*rollEntry, candida
 	// can supply it; an admitted old pod or unresolved replacement cannot.
 	population, usable := 0, false
 	for _, e := range t.entries {
-		if e.coverage.Owner != candidate.coverage.Owner || e.ns != candidate.ns {
+		if e.hibernation || e.coverage.Owner != candidate.coverage.Owner || e.ns != candidate.ns {
 			continue
 		}
 		population++
@@ -785,7 +918,7 @@ func (m *Materializer) remainingCoverage(t *rollTick, pool []*rollEntry, candida
 		return true
 	}
 	for _, e := range t.entries {
-		if e.ns != candidate.ns || !covers(e.w, candidate.coverage) || e.blocked != "" || t.unavailable[e.w.ID] {
+		if e.hibernation || e.ns != candidate.ns || !covers(e.w, candidate.coverage) || e.blocked != "" || t.unavailable[e.w.ID] {
 			continue
 		}
 		if e == candidate || (e.admitted && (e.drift || (!m.currentUsable(t, e) && !m.promoted(t, e)))) {
@@ -809,7 +942,7 @@ func (m *Materializer) remainingCoverage(t *rollTick, pool []*rollEntry, candida
 func (m *Materializer) coverageBlocker(t *rollTick, candidate *rollEntry) (string, string) {
 	peers := []*rollEntry{}
 	for _, peer := range t.entries {
-		if peer != candidate && peer.ns == candidate.ns && peer.coverage.Owner == candidate.coverage.Owner {
+		if peer != candidate && !peer.hibernation && peer.ns == candidate.ns && peer.coverage.Owner == candidate.coverage.Owner {
 			peers = append(peers, peer)
 		}
 	}
@@ -1410,6 +1543,7 @@ func (m *Materializer) rollSnapshot(ctx context.Context, ns string, entries []*r
 	if err != nil {
 		return err
 	}
+	claimUsers := claimUsersOf(pods)
 	for _, e := range entries {
 		e.rawReservation = rawReservations[e.w.ID]
 		e.dep = deps[e.w.ID]
@@ -1430,6 +1564,7 @@ func (m *Materializer) rollSnapshot(ctx context.Context, ns string, entries []*r
 			e.o.DeploymentResourceVersion = e.dep.ResourceVersion
 			e.o.SpecHash = e.dep.Spec.Template.Annotations[AnnotationSpecHash]
 			e.o.DeploymentNodeSelector = e.dep.Spec.Template.Spec.NodeSelector
+			applyDeploymentHibernationEvidence(&e.o, e.dep)
 			e.marker, err = decodeRoll(e.dep.Annotations[annotationRoll])
 			if err != nil {
 				e.blocked = err.Error()
@@ -1455,6 +1590,7 @@ func (m *Materializer) rollSnapshot(ctx context.Context, ns string, entries []*r
 			}
 		} else if e.o.HasDeployment {
 			e.blocked = "deployment missing from snapshot"
+			e.snapshotIncomplete = true
 		}
 		if e.dep != nil && e.marker != nil && e.dep.Spec.Replicas != nil && *e.dep.Spec.Replicas == 0 {
 			e.recovery = true
@@ -1488,6 +1624,12 @@ func (m *Materializer) rollSnapshot(ctx context.Context, ns string, entries []*r
 			failure = replicaFailureReason(e.dep)
 		}
 		e.o.RunnerLayout = observeRunnerLayout(e.w.ID, e.pods)
+		// The snapshot is newer than Observe's lists; the hibernation arm reads pod
+		// absence and readiness from this refreshed view.
+		applyPodEvidence(&e.o, e.pods)
+		// PodsKnown was just set from this list, so the PVC-user set comes from it too
+		// (Observe's own pod list may have failed and left it unset).
+		e.o.PVCUserPodUIDs = pvcUserPodUIDs(claimUsers, e.w.ID)
 		health := deriveRollHealth(current, e.target.Spec.Template.Annotations[AnnotationSpecHash], failure, m.now())
 		if e.o.Roll.Phase != protocol.PhaseStuck || e.o.Roll.PodPhase != string(corev1.ClaimPending) {
 			e.o.Roll = health
@@ -1511,7 +1653,7 @@ func (m *Materializer) reserveRoll(ctx context.Context, e *rollEntry, r *rollMar
 		}
 		value = string(raw)
 	}
-	body, err := json.Marshal(map[string]any{"metadata": map[string]any{"uid": e.dep.UID, "resourceVersion": e.dep.ResourceVersion, "annotations": map[string]any{annotationRoll: value}}})
+	body, err := json.Marshal(map[string]any{"metadata": m.withOperatorMetadata(map[string]any{"uid": e.dep.UID, "resourceVersion": e.dep.ResourceVersion, "annotations": map[string]any{annotationRoll: value}})})
 	if err != nil {
 		return err
 	}

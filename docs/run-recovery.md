@@ -65,6 +65,10 @@ For operators investigating checkpoint acknowledgement failures, see
 HTTP evidence boundary and a deployment comparison procedure. An unknown
 acknowledgement does not prove that origin rejected the update.
 
+For a definitive declined source end, follow the
+[source-end declined hold instructions](./run-recovery-wait.md#source-end-declined-hold).
+This is distinct from an uncertain source end or a settled memory park.
+
 ## Memory-pressure holds
 
 With the [proactive memory guard](./worker-setup.md#proactive-memory-guard)
@@ -135,14 +139,18 @@ leaves the slot ineligible, so the run continues normally on Resume). The
 record may be missing because of an unknown authority incarnation or source
 epoch, a stopped or protected source, a write failure, or a timeout whose write
 did not land (a write already holding the bare lock may still land, and Resume
-then re-parks). Without a record, on a different worker process (for example
-after a restart, when the slot is foreign-active), or when the successor lacks
-the memory guard, the existing flow runs and the run fails as
-`preservation_failed`, as before. Without a record on the same worker process
+then re-parks). Without a record, a different worker process now takes the
+eligible #3644 verified-pin restore route; otherwise that route refuses
+nonterminally or holds an unsupported predecessor. Outside that route,
+including a successor lacking the required memory support, the terminal
+`preservation_failed` fallback remains. Restore preserves the predecessor and
+may omit edits after the verified pin. Without a record on the same worker process
 (the earlier flight's source end unconfirmed), the claim stops without failing
 ("held by an earlier flight's unended source use") and retries until the requeue
 cap, then ends in `worker_requeue_exhausted` or `failed` per the existing
-exhaustion rule; this is new with #3638, not as before.
+exhaustion rule; this is new with #3638, not as before. A positive definitive
+source-end decline now takes the separate owner-held `source_end_declined`
+path linked above; sink retirement or an uncertain end alone does not qualify.
 
 At the two retained-predecessor refusals inside retained recovery (before capture
 or model execution), a worker can observe an already accepted owner **Cancel**
@@ -170,8 +178,9 @@ the fresh worker logs `predecessor cooperative settlement verified` or
 issue on that worker, meeting another flight's unconfirmed source end, now stops
 without failing until the requeue cap, then ends in `worker_requeue_exhausted`
 (or `failed` per the existing exhaustion rule). A crash after the park was
-accepted but before the worker finished tearing down leaves no record and
-follows the existing terminal path.
+accepted but before the worker finished tearing down can leave no record;
+the eligible #3644 restore route now applies instead of an unconditional
+terminal outcome.
 
 A successor that meets a terminal owner whose completed source is not yet retired
 (#3645) takes the same kind of stop. The owner's journal carries a
@@ -192,8 +201,7 @@ the cap the run parks `recovery_wait` with `worker_requeue_exhausted` for an own
 Resume or Cancel. Every claim on this path opens its own custody hold and the stop leaves it open, so at
 the default cap of 3, when the server accepted the initial `running` report,
 this stop loop accrues at most 1 + `RUN_MAX_REQUEUES` (4) open holds per exhaustion episode, below the default
-`custody_hold_limit` of 8; those holds share the owner's admission count with the
-owner's other runs, so several exhausted runs can hold the owner's new claims
+`custody_hold_limit` of 8; those holds count toward the owner's admission units (a run's generations on one original worker are one unit), so several exhausted runs can hold the owner's new claims
 queued until those holds are discarded or released (Resume and Cancel leave them open). A retained-sources journal
 where authority finds neither a record carrying the fence nor a slot for the path
 (a classify `not_completion`) still takes the unchanged detach. In retire mode, a
@@ -314,8 +322,8 @@ durable authority and is otherwise retained, for both harnesses (see
 Registered-root capture exclusion does not exclude daemon or sibling writers,
 accepted-but-invisible creates (#1860), or Claude terminal residuals; per-attempt
 cgroup proof (#1862) remains unshipped. Automatic reclaim remains disabled (#1858;
-the one gated exception, verified-epoch deletion under PRD #3431, is off in
-production, see [Verified-epoch reclaim](#verified-epoch-reclaim-prd-3431)),
+verified-epoch attempt deletion under PRD #3431 is selector-gated, default off;
+scratch reclaim is independently requested by default, see [Verified-epoch reclaim](#verified-epoch-reclaim-prd-3431)),
 and custody SETTLE and physical CLEANUP remain separate (#2746).
 Failed or uncertain capture keeps local source custody; there is no archive or
 latest-work guarantee, and loss of that worker's retained storage can lose
@@ -339,13 +347,26 @@ completion projection cannot be confirmed. The feed names up to five
 offending SHAs and a remaining count, or reports unreadable messages without
 a SHA. Unknown projection uses fixed copy without commit content.
 
-1. For unpublished commits on a declared or owner-partial run without Stop,
-   use `uzi run decide <id> --continue --guidance "<text>"`. Name the SHAs
-   and ask the lead to reword its own unpublished commits. The worker does
-   not rewrite history or force-push.
-2. For published history or a Stop directive, cancel and manually deliver
-   the preserved work through the recovery paths on this page. Stop resumes
-   into finalization without another lead turn. Partial and accept decisions
+1. When no offending commit is reachable from published history, on a
+   declared or owner-partial run without Stop, use
+   `uzi run decide <id> --continue --guidance "<text>"`. Name the SHAs and
+   ask the lead to reword its own unpublished commits. The worker does not
+   rewrite history or force-push. Published history is the run branch as it
+   exists on the forge and any [published checkpoint ref](#published-checkpoint-refs),
+   not the local candidate; mid-run checkpoints count. Check each offending
+   SHA with `git merge-base --is-ancestor <sha> <published tip>` in a full
+   (non-shallow) clone holding both commits: exit 0 means published; exit 1
+   means unpublished only when the history is complete; an error or
+   unavailable history means unknown, so treat it as published. When the
+   feed shows a remaining count, the listed SHAs alone cannot settle this:
+   check every commit in the default-branch..candidate range or cancel.
+2. For an offending commit reachable from published history, a Stop
+   directive, or a hold that returns after a reword, cancel and manually
+   deliver the preserved work with corrected messages through the recovery
+   paths on this page. Continue cannot clear such a hold, because finalize
+   re-parents published checkpoint floors into the push candidate and the
+   push-time rescan refuses the same commit again. Stop resumes into
+   finalization without another lead turn. Partial and accept decisions
    cannot repair commit history.
 3. Check the available recovery evidence before replacing the worker.
    Pre-push holds skip remote checkpoint publication. If bounded capture
@@ -408,7 +429,10 @@ without requesting a hold when the API lacks the `credential_switch_hold` protoc
 feature or the retained flight's ownership reads `awaiting_*`. A refused hold report
 also stops the flight without a hold.
 
-If a hold report stays unconfirmed after one retry and an ownership read, the hold
+If a hold report stays unconfirmed (for a v1 report, after one retry and an
+ownership read; an in-place report retries transient failures on a capped backoff
+until it is confirmed, refused, the claim goes stale or a lifecycle stop arrives,
+and any other failure ends it unconfirmed at once), the hold
 may already exist on the server. After its own operations join, the worker still
 sends the fenced settlement acknowledgement, with bounded heartbeat retries if
 delivery is uncertain. If the hold never applied, that acknowledgement changes
@@ -600,6 +624,14 @@ A confirmed `adoption_failed` blocker can instead hold at `recovery_wait` /
 A temporary API connection failure of the ownership check after the successor
 is verified is retried in place first; see
 [Retained recovery adoption failed](run-recovery-wait.md#retained-recovery-adoption-failed).
+When the refusal confirms the retained source still descends from a secret-scan-flagged
+commit (and the API advertised `recovery_detail_adoption_refusal_v1`), the run carries
+`recovery_wait_detail` `secret_remediation_active` and owner
+Resume is refused (409, no claim, no generation, no audit row, no custody released):
+export an available archive (`uzi run export <id> --output <path>`, which may omit later
+work kept on the worker) or have an operator recover from retained worker storage (see
+the failed source-only paragraph below), then Cancel. `remediation_proof_unknown` means
+the proof could not be verified and a retry may help.
 A retained continuation whose `running` report the server refuses, and whose
 flight departed or showed presence without a witnessed departure, is charged
 against the requeue budget or held at `retained_continuation_unwitnessed`
@@ -1147,7 +1179,7 @@ operator-configurable environment variable on the API:
 | Automatic upload-retry window | 24 hours | How long uzi keeps retrying a stalled upload before it needs your attention. |
 | Captures per claim | 16 | Distinct capture attempts one worker claim can accumulate. |
 | Retained captures per owner | 256 | Captures on file that are neither discarded nor expired (preparing, uploading, available, needs action; any other state also counts). Expired tombstones stay for audit but free their slot. |
-| Admission-counted recovery holds per owner | 8 by default; the admin setting `custody_hold_limit` (1 to 1000) | Open holds count except at most one per run backing a healthy current claim without an owner decision. Total open custody stays protected. At the admission limit, uzi pauses admitting **new** runs subject to custody admission until the counted pressure falls. Hold-free Plan and Code checker children (`kind = 'cross_check'`, both harness families) are exempt; judges and jobs gain no exemption. A requeued run with 1 to limit-1 of its own owner-scoped open holds remains exempt; at the limit it loses that exemption. This admission gate is not a strict ceiling: concurrent claims and stale heartbeats can raise pressure past the limit. Admins change the limit in [Admin settings](./admin-settings.md#custody-hold-limit); it is not an environment variable. See [ADR-2445](../adr/2445-custody-admission-accounting.md). |
+| Admission units per owner | 8 by default; the admin setting `custody_hold_limit` (1 to 1000) | After excluding at most one hold per run backing a healthy current claim without an owner decision, the remaining open holds of one run, from any of its generations, that share the same original worker count as **one unit** together (heartbeat freshness plays no part, so a dead worker's group is still one unit); every other open hold counts as one unit by itself. Total open custody stays protected. At the admission limit, uzi pauses admitting **new** runs subject to custody admission until the counted pressure falls. Hold-free Plan and Code checker children (`kind = 'cross_check'`, both harness families) are exempt; judges and jobs gain no exemption. A requeued run with 1 to limit-1 of its own owner-scoped open holds remains exempt. A queued run whose own open holds (counted or not) reach the limit is not claimable at all, even when its owner is below the limit; only that run waits, Resume does not bypass it, and discarding or settling that run's own holds frees it. This admission gate is not a strict ceiling: concurrent claims and stale heartbeats can raise pressure past the limit. Admins change the limit in [Admin settings](./admin-settings.md#custody-hold-limit); it is not an environment variable. See [ADR-2445](../adr/2445-custody-admission-accounting.md). |
 
 A byte refusal keeps the source retained. The archive's **Needs action**
 reason can read `storage quota exceeded`; current workers preserve a typed
@@ -1391,8 +1423,8 @@ disk parks can compound retained storage (#2013/#225). The retention-only,
 non-closing #1858 change disables unsafe automatic retention reclaim on every
 worker, including abandoned attempts and crash-window live orphans, shared
 own-key residue from canonical and attempt entries, and orphaned skills.
-There is no automatic reclaim escape from that accumulation in production: the
-verified-epoch deletion code exists but is switched off (see
+Verified-epoch attempt deletion is selector-gated, default off; scratch reclaim
+is independently requested by default and does not reclaim these attempt sources (see
 [Verified-epoch reclaim](#verified-epoch-reclaim-prd-3431)).
 
 **Slice A contract (Refs #2852) (AI-synced 2026-10-22):** credential-free capture, including owner pause,
@@ -2017,8 +2049,8 @@ keeps the pass switched off. See the
 
 ## Reviewing and resolving held work
 
-Once the **admission-counted holds per owner** limit (the *Admission-counted
-recovery holds* limit above: default 8, the admin setting `custody_hold_limit`)
+Once the **admission units per owner** limit (the *Admission units per owner*
+limit above: default 8, the admin setting `custody_hold_limit`)
 is reached, uzi pauses admitting **new** runs subject to
 custody admission for you. Hold-free Plan and Code checker children
 (`kind = 'cross_check'`) in both harness families are exempt; judges and jobs
@@ -2026,13 +2058,24 @@ gain no exemption. Checker claims still require eligible owner identity,
 current parent/generation/round, deadline, protocol, vault, credentials,
 checker slots and workers (see [Cross-check](./cross-check.md)).
 A run that was interrupted and requeued while it has 1 to limit-1 of its own open
-holds keeps resuming; once that one run alone holds the limit, it loses the exemption.
-When that happens, the dashboard shows a full-width alert beneath the page
-heading with your safety-slot use, how many held sources need a decision, how
-many runs are blocked, and a **Review held work** button; if you connected
-Slack, you also get one coalesced direct message per blocked episode (not one
+holds keeps resuming; once that one run alone holds the limit, it is not started at all
+(a per-run bound that applies even when you are below the owner limit; discard or settle
+that run's own holds to free it).
+The new Overview's **Held work** card always shows your custody admission unit
+use, how many held sources need a decision, and how many runs are blocked. When
+the owner limit is reached, or when a queued run reaches its own hold limit,
+the card shows the corresponding warning tone. When at least one hold needs a
+decision, it also shows a **Review held work** link. During the classic-Overview
+soak, the old page keeps its
+full-width alert beneath the heading. If you connected Slack, then when the owner limit is
+reached you also get one coalesced direct message per blocked episode (not one
 per run) carrying your open-hold and blocked-run counts, a link to the surface,
-and the exact discard command. The per-worker **retaining work** pills stay as
+and the exact discard command. A queued run that reaches its own bound instead gets
+a threaded per-run run-health nudge on entry (subject to the nudge cooldown; see
+[Slack](./slack.md)). In the per-run case the alert says a queued run has reached
+its own custody hold limit and points to `uzi run recovery <run>` and
+`uzi run discard <run> --hold <id>`; it does not mean the owner is at capacity, and only the
+affected runs wait. The per-worker **retaining work** pills stay as
 row context.
 
 The **Workers** settings page is where you resolve them: the holds that need a
@@ -2064,7 +2107,10 @@ At or over the limit, the surface also shows an **Admission information**
 section so you can see what is consuming capacity without needing a decision.
 **Counting toward the limit** lists the non-decision holds the server confirms
 it counts, each with its run link, claim generation, worker, and the reason it
-counts (for example, no live claim backs it). These rows are read-only: this is
+counts (for example, no live claim backs it). A run's generations on the same
+original worker (the current one included unless it backs a healthy live claim, which counts 0) count as one unit: one row is the counted representative and the others
+are listed under "Counted with another hold" with the label "Counted once with this run's
+other holds on the same worker" (`uzi run recovery` prints `not counted (same_run_group)`). These rows are read-only: this is
 visibility only, and adds no new way to release or discard custody and changes
 no accounting. **Admission membership not reported** lists holds from an older
 server that does not report membership; uzi never infers it, so an unreported
@@ -2245,15 +2291,19 @@ does not start the agent and touches nothing of the predecessor. It emits `orpha
 with `remediation_retained`, sends a status message naming only the predecessor run id, and parks the
 run for you at `recovery_wait` / `retained_recovery_adoption_failed`. The message says the agent did not
 start and the source requires review. **Resume** on this worker holds again and adds at least one
-admission-counted custody hold; **Cancel** ends the run and leaves its open holds for you to discard.
+open custody hold while this run's own open holds are below the custody hold limit (at the limit,
+Resume creates no further claim or hold); **Cancel** ends the run and leaves its open holds for you to discard.
 Run `uzi run recovery <predecessor-run-id>` to inspect the predecessor. Resume grants no remediation
-authority, and this page names no route that disposes of the remediation. While held or queued, the
-run's holds count toward your [custody admission limit](admin-settings.md) (`custody_hold_limit`), and a
+authority, and this page names no route that disposes of the remediation. This
+predecessor-remediation hold carries no `recovery_wait_detail` (#4177 classifies only the
+adoption refusal, not this hold or the unsupported-predecessor hold below). While held or queued, the
+run's holds count toward your [custody admission limit](admin-settings.md) (`custody_hold_limit`; its generations on one worker count as one unit), and a
 held run blocks its worker's upgrade or drain. If the api does not support the park, the worker does not
 park and the message says so; the run is then handled by the ordinary requeue paths. A worker restart
 consumes a requeue, so repeated restarts end at `recovery_wait` / `worker_requeue_exhausted`,
-unless the run's own open holds reach the custody admission limit first; it then stays queued for
-capacity (not an owner park) until it can be claimed again.
+unless the run's own open holds reach the custody hold limit first; it then stays queued (not an owner park) with the per-run reason
+"this run has reached its own custody hold limit; retained holds still protect its work; resolve or discard this run's own retained holds to let it start".
+Resume does not bypass that bound and creates no further claim or hold; discard or settle the run's own holds to free it.
 
 ### When a restarted worker continues from a saved pin (independent restore)
 
@@ -2289,8 +2339,10 @@ attribution and own-record checks pass, so with no pin or several pins it is ref
 `recovery_cause_retained_recovery_adoption_failed`), the run parks for you at
 `recovery_wait` / `retained_recovery_adoption_failed` instead of requeueing into the
 same refusal: Resume claims again and holds again unchanged on this release and adds at
-least one admission-counted custody hold, and Cancel ends the run. Without that
-capability the refusal is the ordinary nonterminal stop described below. The park
+least one open custody hold while this run's own open holds are below the custody hold limit (at the
+limit, Resume creates no further claim or hold), and Cancel ends the run. Without that
+capability the refusal is the ordinary nonterminal stop described below. Like the predecessor-remediation hold, this
+hold is unclassified: its `recovery_wait_detail` is NULL. The park
 changes no predecessor bytes (journal, slot, clone, HOME and provision directories stay
 as they were) and reaps nothing. Here the cause has a third meaning: continuation was
 refused because this release does not support the predecessor, not because an adoption
@@ -2346,12 +2398,12 @@ without cancel and stops nonterminally.
   live worker can stay queued even at the cap: there is no universal hold at the cap.
   Each accepted generation opens a custody hold that counts toward `custody_hold_limit`.
   A parked unsupported run holds the predecessor's hold and the current generation's,
-  and an owner Resume adds a claim and a hold.
+  and an owner Resume adds a claim and a hold (except at the run's own custody bound, where Resume requeues the run but creates no claim and no hold).
 - The restore uses the single ordinary pin record of the dead generation. Several
   records refuse with `pin_ambiguous` and none with `no_eligible_pin`. Choosing among
   several records, and preferring a finalization pin, are not implemented.
 - The predecessor's hold stays open and counts toward your
-  [custody admission limit](admin-settings.md) (`custody_hold_limit`) until you
+  [custody admission limit](admin-settings.md) (`custody_hold_limit`, as part of one admission unit with the run's other generations on the same worker) until you
   discard it. The generation's final acknowledgment, settlement and report retirement
   all refuse while it is open. Merging the PR closes only the server custody holds; it
   never deletes the predecessor's copy on the worker. The server's verified-merge
@@ -2629,7 +2681,7 @@ verified pod epoch, under the exclusive epoch lock and before it admits runs
 The evaluation is reported in the `pod_epoch_reclaim` log line. The worker image
 also contains a deletion phase that reclaims through the same discard core as the
 operator channel above. **That phase is off unless an operator opts in on exactly
-one worker: a production worker deletes nothing and settles no records by default.**
+one worker: attempt deletion settles no records and deletes no attempt trees by default.**
 The worker reads `UZI_EPOCH_RECLAIM_DELETION` once at startup, before it creates
 its pod epoch: unset, empty or `0` is off; `1` is on only for an epoch-locked,
 Docker-wired worker (`UZI_EPOCH_LOCK=1` and `DOCKER_HOST` or `UZI_DIND_SOCKET`),
@@ -2707,6 +2759,49 @@ accepted this historical-writer residual on 2026-10-24 in
 [PRD #3430](../prds/3430-pod-epoch-lock-shadow.md). It does not authorize bypassing
 a current source-use, custody, process, Docker, or epoch-lock refusal. A known or
 unverified current writer keeps the source.
+
+#### Runner TMPDIR scratch reclaim: startup disable and observation
+
+Scratch reclaim is requested by default through chart
+`workers.epochReclaim.scratchDeletion: true` (#4182), independently of the
+attempt-deletion selector below. It requires a fresh `eligible` + `attested`
+verdict; the default empty runtime declaration supplies no attestation and keeps
+scratch. The deployed worker image must contain #4171 (`7cd46526`, merged).
+No hosted proof is claimed here.
+
+To disable scratch reclaim operationally:
+
+1. Set `workers.epochReclaim.scratchDeletion: false` and keep
+   `workers.forceRoll: false`. Reconcile the updated controller configuration
+   (`UZI_WORKER_EPOCH_SCRATCH_DELETION="false"`). Global ForceRoll bypasses
+   pacing and busy deferral and can interrupt a run; keep it off.
+2. Inspect the desired, reconciled worker Deployment pod template and confirm
+   `UZI_EPOCH_SCRATCH_DELETION` is omitted. A values file or Helm render alone
+   does not prove the controller has reconciled that template.
+3. Wait for safe worker replacement through ordinary pacing, busy and custody
+   guards; a busy worker may defer indefinitely. A same-pod restart or eviction
+   from an old template can still carry `1`. Do not force replacement to obtain
+   disable evidence.
+4. Inspect the new pod, actual worker image and epoch. Record its
+   `pod_epoch_reclaim_activation` startup line with `scratch_requested: false`
+   and inspect the actual `pod_epoch_reclaim.scratch` result before claiming
+   disabled. An old worker ignoring the env is not equivalent evidence.
+
+This is a startup switch, not a hot switch: changing it cannot stop an active
+pass or restore deleted bytes. Old controllers and outside-chart deployments
+with absent env leave the phase off; rendered `1` on an old worker proves
+neither activation nor deletion.
+
+Post-release owner observation is separate from operational disable evidence,
+not a pre-enable canary or approval gate. Record the actual image, pod, epoch,
+requested state and scratch result (deleted counts, kept reasons, or fatal
+settlement). Report three separate figures: the deleted allocated-byte estimate
+(`scratch.deleted_allocated_bytes_estimate`), the unattributed statfs free delta
+(`scratch.statfs_free_delta_unattributed`), and independently measured physical reclaim.
+Neither of the first two proves the third. Hosted before/after-byte acceptance
+and the owner's keep-default decision remain pending on #4043; the PRD stays
+open pending hosted acceptance. Existing mechanism protections and residuals
+are recorded in [ADR-3153](../adr/3153-runner-shared-pvc-subpath.md).
 
 #### One-worker deletion canary checklist
 
@@ -2845,6 +2940,54 @@ acknowledgement). After `partial`, run `local-records` again before doing anythi
 A client that disconnects before the first mutation (the cleanup, the replay's
 release POST, or the Case B first unlink) ends the request `client_disconnected` with nothing touched; afterwards the
 request runs to completion or to its deadline.
+
+**Cleanup diagnostics.** A `local-records` generation classified `cleanup_pending`
+may also carry `cleanupPendingReason`. The classification is unchanged; the optional
+field explains the pending check and is outside the confirmation digest. Pending
+views have no digest. The closed set of tokens is:
+
+| `cleanupPendingReason` | Meaning |
+|---|---|
+| `missing_ack` | No guarded record has an acknowledgement paired with a saved FINAL and coverage digest. |
+| `ack_quiescence_breach` | The acknowledged record reports an inventory quiescence breach. |
+| `ack_snapshot_changed` | The acknowledged record reports an inventory snapshot change. |
+| `unacknowledged_sibling_final` | Another source record in the coverage check has an unacknowledged FINAL. |
+| `missing_frozen_source_heads` | A frozen source lacks its original or current source head. |
+| `source_coverage_bare_unavailable` | The bare repository needed for source coverage cannot be resolved. |
+| `source_coverage_bare_mismatch` | The resolved bare repository differs from the acknowledged coverage context. |
+| `source_coverage_proof_unavailable` | The ancestry proof operation is unavailable. |
+| `source_coverage_unverified` | Ancestry does not prove a source head is covered by the acknowledged source. |
+| `multiple_saved_finals` | Operator assessment found more than one guarded saved FINAL with a coverage digest. |
+| `unpaired_final_evidence` | Operator assessment found FINAL evidence without a paired coverage digest. |
+| `missing_frozen_anchor` | Operator assessment found no guarded frozen anchor when no saved FINAL was available. |
+| `multiple_frozen_anchors` | Operator assessment found multiple guarded frozen anchors when no saved FINAL was available. |
+
+The first failing check supplies the detail. Ordinary Case A cleanup can report
+`missing_ack` while operator assessment instead selects `case_a_replay` or a Case B
+classification from the saved FINAL and hold evidence. A cleanup diagnostic does
+not itself determine the operator classification.
+
+**Retirement re-drive diagnostics.** The structured info event
+`recovery: re-drive exit` reports retirement results with `path` (`boot`, `live` or `terminal_source`)
+and the existing `run_id`, `generation` and `capture_id` fields:
+
+- `reason: completion_retirement`: `outcome` is the existing completion-retirement
+  kind: `retired`, `pending`, `invalid`, `uncertain` or `unsupported`. `why` is
+  included where that outcome defines it; `retired` has no `why`.
+- `reason: case_a_retirement`: `outcome` is the existing `ForgetOutcome`:
+  `forgotten`, `legacy_removed`, `no_records`, `cleanup_pending`,
+  `cleanup_unavailable`, `source_protected`, `ack_incomplete`, `bare_mismatch`,
+  `bundle_path_unknown`, `pending_generation_report`, `cleanup_retained`,
+  `not_guarded` or `operator_refused`. The last two belong only to the operator
+  forget path and are not emitted by this automatic re-drive call.
+  A `cleanup_pending` outcome includes `cleanupPendingReason` when available.
+
+A bounded map (256 entries) remembers the last diagnostic tuple per
+run/generation/capture. An identical tuple is suppressed; a changed outcome kind,
+`why` or reason is emitted, as is a changed cleanup detail. The map is pruned
+against the live journal snapshot and is process-local: a crash loses its memory,
+so a later process can emit the same tuple again. These fields are diagnostic only;
+they add no authority, eligibility, disposition, retries or deletion behavior.
 
 **Refusals and blockers.**
 
@@ -3282,6 +3425,85 @@ refused with a 409 that names the refs (see
 for the body). The block lifts once each ref is deleted or settled. An
 acknowledged ref clears at its retention expiry, or sooner with
 `uzi run held expire`.
+
+## Terminal preservation refs (slice A, inactive)
+
+A **terminal preservation ref** is a forge ref, `refs/uzi-terminal/<run-id>`,
+meant to keep a finished run's final work for as long as the run's issue or
+merge request is open. It is separate from held-work refs and checkpoint refs,
+and neither touches it.
+
+**Nothing creates one yet.** This release adds only the API groundwork. No
+worker asks the API to publish a terminal ref, so no such ref exists on your
+forge and the background sweep for them finds nothing to do. Capturing and
+publishing the work, and turning the feature on, are still to come.
+
+When refs do exist, they are **retained**: automatic retirement is built but
+switched off, so uzi does not delete a terminal ref on its own.
+
+### Removing a repo or forge connection
+
+While a terminal ref of one of its runs may still be on the forge, removing the
+repo or the forge connection is refused with a 409. It reads like this:
+
+```text
+this repo has 2 terminal-preservation ref(s) of finished runs still on the forge (refs/uzi-terminal/<run-id> (live); refs/uzi-terminal/<run-id> (live)); a ref clears when its retirement completes against the forge, so remove the repo after the block lifts
+```
+
+For a connection it says `this connection`. The body also carries
+`terminal_refs` (up to five refs) and `terminal_count` (the total). Because
+retirement is switched off, a live ref's block does not lift on its own, and an owner
+escape for it is not built yet. Nothing creates these refs in this release, so
+you should not see this 409 from them.
+
+### Two new completion refusal reasons
+
+A completion-publication release for a run can now be refused with one of two
+reasons, only when that run's completing generation has a terminal preservation
+record:
+
+- `terminal_preservation_pending`: the terminal push for that generation has
+  not finished or its outcome is not known yet.
+- `terminal_preservation_refused`: the terminal push for that generation was
+  refused.
+
+With no such record, completion behaves as before, and your own discard is
+never blocked. Since nothing creates a record yet, you should not see either
+reason today.
+
+### The worker side is built but switched off
+
+The worker code that captures a finished run's work and calls the terminal
+route is built, but it is behind a compile-time switch that is off. No shipped
+worker runs it or advertises the capability, so nothing changes for you today.
+Workers do already understand the two refusal reasons above, so a later
+activation needs no matching worker upgrade for that part.
+
+Once it is enabled in a later release, you may see the following on the worker.
+It applies to branch-based runs only (issue, rework and self-improve runs
+without an egress profile); other kinds are kept unchanged.
+
+- **Operation records.** A small record per run under a `terminal-preservation`
+  directory next to the recovery root in the worker's data directory. Each
+  records what was captured, prepared and sent. They are not deleted
+  automatically.
+- **Retained private refs.** A `refs/uzi-terminal-local/<run-id>/g<generation>`
+  ref in the run's bare repository, and sometimes a short-lived
+  `refs/uzi-incoming/<id>` staging ref. If a worker restarts mid-capture, the
+  record is marked incomplete and its refs are kept. Nothing removes them yet;
+  that is a later slice. A capture never deletes the staging ref past a short
+  fixed cleanup bound (2 seconds, or the caller's earlier bound); a staging ref
+  or private index file it could not confirm removed is reported on the
+  capture's result as a remnant and is not retried.
+- **The clean verdict does not trust the clone's own index.** The capture
+  rebuilds a private index from HEAD and compares it with the work tree; an
+  edit hidden by a forged real index is refused (`index_mismatch`) before any
+  content is written to the object store, and a clean tree writes nothing.
+- **The work is kept, not published, when proof is missing.** A run whose
+  local sources cannot be fully accounted for (for example an extra attempt
+  clone, a stash, or an unreachable local ref) is kept as it is.
+
+Failed, cancelled and rate-limited terminal sends are not covered by this work.
 
 ## Resuming an approved run in a fresh attempt
 

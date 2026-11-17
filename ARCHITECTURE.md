@@ -44,7 +44,7 @@ All images are pulled/built by digest or pinned tag in `docker-compose.yml`, not
 - **The session cookie is the only credential**, and it is `HttpOnly` — never readable by any JavaScript running in the SPA, including an XSS payload. See [docs/auth-design.md](docs/auth-design.md) for the full cookie/CSRF/revocation design.
 - **`GET /api/version` is the one endpoint that publishes a runtime fact, and it does so on purpose.** It is unauthenticated *and* unrate-limited: mounted directly under `r.Route("/api")` with only `Recoverer` + `RequestID` above it, pinned `noLimiter` by `route_limiter_mounts_test.go`, and in k8s reachable through `deploy/chart/templates/web-ingress.yaml`, which by default publishes the SPA origin at path `/` with no auth annotation (both are chart values, so a hardened override could narrow them; the enforced property is the route mount, not the chart). Most of the body is public by construction — the version *is* the chart's image tag, the commit is in the repo. `uptime_seconds` is not: it describes this **process**, not this image. It is published deliberately ([PRD #175](prds/done/175-build-info-popover.md), severity Low) because process age is worth real debugging time and discloses no identity, topology or schedule. Two things follow. "It carries no secret" is not the whole test — a field can be secret-free and still be a runtime disclosure. And **any new surface for this body republishes uptime by default**: an `/about` page or a signed-out footer, both named as follow-ups in that PRD, would widen the audience with nothing in the code to notice. Re-decide it there rather than inheriting this decision.
 - **The in-app changelog (issue #415) is not one of those new surfaces.** It is a build-time-bundled (`?raw` import) read of the repo-root `CHANGELOG.md`, rendered in a drawer opened from that same version popover; it adds no new service, no new API route, and no new trust boundary, and it reuses the `runningVersion` the popover already carries from `GET /api/version` rather than fetching it again — so it renders inside the same authenticated app, not a wider audience for that endpoint's body.
-- **The upstream-release check (PRD #836) gives `api` a new outbound-egress destination: `api.github.com`.** On a schedule (`api/internal/releasecheck`, default 6h) `api` — the only component that makes THIS release-check request (its own egress; the agent worker's outbound reach is the separate tiered egress of ADR-0285) — polls `GET https://api.github.com/repos/vtmocanu/uzi/releases/latest`, persists the remote facts to `app_settings`, and derives `update_available`/`far_behind`/`security` at **read time**, with zero egress on every subsequent read. `GET /api/version` then serves those derived fields alongside the existing build info, so `web` and the CLI still never call GitHub themselves. This is unrelated to the worker egress tiers below (ADR-0285): it is `api`'s own egress, gated off entirely by an admin runtime toggle for an air-gapped install, and it targets a compile-time-constant URL rather than a user-supplied one, so it does not go through the forge/agent-source SSRF allowlists. See [ADR-836](adr/0836-upstream-release-check.md) and [docs/updates.md](docs/updates.md).
+- **The upstream-release check (PRD #836) gives `api` a new outbound-egress destination: `api.github.com`.** On a schedule (`api/internal/releasecheck`, default 6h) `api` — the only component that makes THIS release-check request (its own egress; the agent worker's outbound reach is the separate tiered egress of ADR-0285) — polls `GET https://api.github.com/repos/vtmocanu/uzi/releases/latest` (plus the release list and, since #4314, the two Homebrew formula files in `vtmocanu/homebrew-tap`, all compile-time-constant paths on the same host and client), persists the remote facts to `app_settings`, and derives `update_available`/`far_behind`/`security` at **read time**, with zero egress on every subsequent read. `GET /api/version` then serves those derived fields alongside the existing build info, so `web` and the CLI still never call GitHub themselves. This is unrelated to the worker egress tiers below (ADR-0285): it is `api`'s own egress, gated off entirely by an admin runtime toggle for an air-gapped install, and it targets a compile-time-constant URL rather than a user-supplied one, so it does not go through the forge/agent-source SSRF allowlists. See [ADR-836](adr/0836-upstream-release-check.md) and [docs/updates.md](docs/updates.md).
 - **Instance branding (PRD #685) is the other deliberately public endpoint pair.** `GET /api/branding` and `GET /api/branding/logo/{slot}` are unauthenticated by design, same as `GET /api/version` above, because the app mark and the optional "POWERED BY" brand they carry must render for a signed-out visitor too. Config (modes, flags, company text) lives in the existing `app_settings` KV store, admin-writable via `PUT /admin/settings`; logo bytes live in a separate `branding_assets` table and are served only from the cacheable image route, never inlined into the JSON, keeping the anonymous response small. A `MIT © Vlad Mocanu` credit is gated on a build-time source constant `SHOW_LICENSE_CREDIT` (`web/src/lib/flags.ts`), default OFF/hidden, and when enabled renders in the signed-in sidebar version row, the signed-out `PublicShell` footer, and the Admin → Branding live preview; it is still not admin-editable. See [docs/branding.md](docs/branding.md).
 
 ## Request flow: an authenticated API call
@@ -84,7 +84,7 @@ Read-through forge views in the TUI (open PRs, live PR checks, CI runs — PRD #
 
 The Forgejo driver (`code.gitea.io/sdk/gitea`, Forgejo ≥16.0.0 — [ADR-65](adr/0065-forgejo-driver.md) for why both) proved the abstraction was more than Go-deep by finding the three places it was **not**: (1) the worker held a second, un-abstracted GitLab client, now a minimal TS forge seam (`agent/src/forge.ts`, `GitLabClient`/`ForgejoClient`/`GitHubClient`); (2) the web reconstructed forge URLs by string surgery, now a per-card/run `forge_type` DTO field mapped only at `web/src/lib/forgeNoun.ts` (`forgeNoun`/`forgePlatform`, one Go twin in `slacksvc/notifier_state.go`, one CLI twin in `api/cmd/uzi/render.go`); (3) each forge stored its pipeline status verbatim, so `api/internal/pipelinestatus` is the one Go-side classifier that folds all three vocabularies — the domain twin of `web/src/lib/pipelineBadge.ts`, kept in sync by `TestMirrorsWebPipelineBadge`. Merge-permission is now modelled on all three forges (`BranchProtection.WriteRoleCanMerge`/`BotCanMerge`); the drivers **report** it, and **enforcement is implemented** — [PRD #66](prds/done/66-guardrail-enforcement.md) refuses a run whenever the bot could push or merge to the default branch, at repo-enable, at run creation, and at claim, live and fail-closed, with an admin-only per-repo override for the deliberate, audited exception.
 
-The GitHub driver (`github.com/google/go-github/v92`, github.com only, classic PAT — [ADR-238](adr/0238-github-driver.md) for the design) filled the same four per-forge seams: a `privcheck.requiredScopesFor(github)` scope rule (exactly `{repo}`, with a `workflow`-scoped token refused as over-privilege — a deliberate CI-integrity boundary), the Actions two-field (`status`/`conclusion`) status fold into `pipelinestatus`/`pipelineBadge`, the `forgeNoun`/`forgePlatform` "Pull Request"/"PR"/"#" vocabulary, and `agent/src/forge.ts`'s `GitHubClient` (whose one shared-base change was widening the worker's duplicate-PR detection to a **driver-declared** status set, since GitHub signals a duplicate PR with 422 rather than GitLab/Forgejo's 409). GitHub's branch-protection guardrail is materially weaker than Forgejo's: a write-role bot can read GitHub's newer *rulesets* but not classic branch protection, so on a classically-protected repo `BranchProtection` gains an additive `ProtectionUnverified` field rather than a fabricated safe/unsafe answer — see [ADR-238](adr/0238-github-driver.md) for the accepted limitation and the fail-closed requirement it places on PRD #66.
+The GitHub driver (`github.com/google/go-github/v92`, github.com and GHES via `<host>/api/v3` (untested in CI), classic PAT — [ADR-238](adr/0238-github-driver.md) for the design) filled the same four per-forge seams: a `privcheck.requiredScopesFor(github)` scope rule (exactly `{repo}`, with a `workflow`-scoped token refused as over-privilege — a deliberate CI-integrity boundary), the Actions two-field (`status`/`conclusion`) status fold into `pipelinestatus`/`pipelineBadge`, the `forgeNoun`/`forgePlatform` "Pull Request"/"PR"/"#" vocabulary, and `agent/src/forge.ts`'s `GitHubClient` (whose one shared-base change was widening the worker's duplicate-PR detection to a **driver-declared** status set, since GitHub signals a duplicate PR with 422 rather than GitLab/Forgejo's 409). GitHub's branch-protection guardrail is materially weaker than Forgejo's: a write-role bot can read GitHub's newer *rulesets* but not classic branch protection, so on a classically-protected repo `BranchProtection` gains an additive `ProtectionUnverified` field rather than a fabricated safe/unsafe answer — see [ADR-238](adr/0238-github-driver.md) for the accepted limitation and the fail-closed requirement it places on PRD #66.
 
 ### Issue comments as untrusted worker input (PRD #381)
 
@@ -120,7 +120,7 @@ For other issues, or a run without a matching target snapshot, live `get_issue` 
 
 ### SSRF guard
 
-The server making authenticated outbound calls to a `base_url` supplied at connection time is a classic SSRF surface (cloud metadata endpoints, internal services, loopback). `config.Config.ForgeAllowedBaseURLs` (from `FORGE_ALLOWED_BASE_URLS`, default `https://github.com`) is the only set of base URLs a connection may target; `config.NormalizeForgeBaseURL` requires `https` and canonicalizes to `scheme://host[:port]` before every allowlist comparison, and boot fails if the parsed list is empty or any entry is malformed or non-`https`. The Settings → Forge UI offers only this set (`GET /api/forge/config`), so a user cannot even attempt a free-text URL.
+The server making authenticated outbound calls to a `base_url` supplied at connection time is a classic SSRF surface (cloud metadata endpoints, internal services, loopback). `config.Config.ForgeAllowedBaseURLs` (from `FORGE_ALLOWED_BASE_URLS`, default `https://github.com`) is the only set of base URLs a connection may target; `config.NormalizeForgeBaseURL` requires `https` and canonicalizes to `scheme://host[:port]` before every allowlist comparison, and boot fails if the parsed list is empty or any entry is malformed or non-`https`. Allowlist entries carrying userinfo, a path, a query or a fragment are refused at boot rather than reduced to their host, while `NormalizeForgeBaseURL` still canonicalizes user-supplied URLs for comparison. The Settings → Forge UI offers only this set (`GET /api/forge/config`), so a user cannot even attempt a free-text URL.
 
 ### Data model: forge as source of truth
 
@@ -136,6 +136,8 @@ Migration `00002_forge.sql` adds four tables, all scoped down to `forge_connecti
 `api/internal/forgesvc.Service` is shared by the HTTP handlers and the background poller: it builds a `Forge` driver from a stored (encrypted) connection, runs the PRD-link check, and implements `IncrementalSync`/`FullSync` against an `IssueStore` interface (narrowed for unit testing against a fake store and a mocked `Forge`, without a live database).
 
 `api/internal/poller.Engine` (`main.go`) is started as a single background goroutine alongside the HTTP server. Each tick, for every enabled repo, it either runs an incremental pull — two fetches, the `uzi`-labelled set (`state=all`, PRD #764 M5 keys this on the configured `uzi_label` rather than the old `PRD` label) plus PRD #102 M6's additive open, no-label set, each bounded by its own high-water mark in `forgesvc.Marks{PRD, Open}` (the struct field is still named `PRD` in code; never the client clock; the max `updated_at` that fetch itself returned) — or, every `FORGE_RECONCILE_EVERY`-th tick (and always on a repo's first poll after being enabled), a full reconcile: fetch both complete sets with no lower bound, upsert everything, and evict cache rows absent from their union. Eviction is the only way to observe de-labeling, closing-with-label-removed, or deletion, which an `updated_after`-filtered query structurally cannot report. Per-repo state (`marks forgesvc.Marks`, poll count) lives only in the `Engine`'s in-memory map — a disabled repo simply drops out and a re-enabled one starts over with a fresh full reconcile.
+
+Enabling a repo no longer runs its first import in the request (issue #4399). `SetRepoEnabled` records a `waiting` import on the repo row (`repos.initial_import_*`, migration `00465`) and calls `Engine.RequestImport` (`uzi server setup` records the same `waiting` import but cannot wake the poller, so its import starts on the next tick), which coalesces per repo and wakes the poller; the wake pass runs only those repos' first full reconcile inside the same `Run` goroutine as the ticks, so the poller never syncs a repo concurrently with itself. The poller claims the import `running` and settles it `succeeded` (also for zero issues) or `failed` with a coarse error class, and a failed import is retried on the next tick; after an api restart any `waiting`, `running` or `failed` import is picked up on the first tick. Claim and finish are guarded by an `initial_import_generation` bumped by each enable that owes an import (re-enabling an already-enabled repo whose import succeeded changes nothing), so a completion from an older enable never overwrites a newer one. The board response carries this as `initial_import` (null for repos enabled before the change and not re-enabled since), which the web board renders as a banner. The board's Refresh and first-open seeding still import inside their own request.
 
 Writes are forge-first: a board move (`POST /api/repos/:id/issues/:iid/move`) calls `UpdateIssueLabels` before touching the cache, and only updates the cache on success — a failed forge write leaves the card where it was (snap-back), never an optimistically-moved card the forge disagrees with.
 
@@ -202,14 +204,21 @@ a running one.
   `lead`/`orchestrator` case-insensitively and routes its body and delivered
   harness pin into the main thread. Every own lead-shaped template is withheld
   from subagents; repo templates, including `lead`, remain ordinary subagents.
-  Both harnesses use this rule. Run models follow the frozen schedule pin,
-  the owner's per-harness lane, the selected lead's harness pin, then the
-  SDK/account default for Claude or `gpt-6.1-sol` for Codex.
+  Both harnesses use this rule. Run models follow the model chosen when the
+  run was started (`runs.model_source = 'run_override'`), else the frozen
+  schedule pin (`schedule_pin`), then the owner's per-harness lane, the selected
+  lead's harness pin, then the SDK/account default for Claude or `gpt-6.1-sol`
+  for Codex. A run-chosen model or effort is validated at create (a bad
+  shape is a 400; a model the harness cannot run is a 422
+  `model_incompatible_with_harness`), frozen across requeue and reclaim, and,
+  if the claim can no longer honor it, parks the run `paused` on hold
+  `run_override_unavailable` instead of substituting another value
+  ([PRD #3250](prds/done/3250-run-start-model-effort.md)).
   A subagent's delivered pin wins when set;
   otherwise it follows the resolved main-thread model, subject to the schedule's
   subagent override. See [docs/worker-model.md](docs/worker-model.md). The same
-  claim carries the owner's
-  per-user **reasoning effort** (`users.default_effort`, PRD #617): set, it applies
+  claim carries the run's chosen **reasoning effort** (`runs.effort`), else the
+  owner's per-user effort (`users.default_effort`, PRD #617): set, it applies
   to the SDK top-level effort for the main thread and its subagents; unset, the SDK
   default (`high`) applies. See [docs/worker-effort.md](docs/worker-effort.md).
 - **Per-harness pins (PRD #3249).** The template API validates `model` as
@@ -636,16 +645,26 @@ the token rides the claim rather than the worker, re-pointing a worker is
 complete server-side — no restart, no re-minted join token. Since PRD #1247
 `claimSecretID` also consults, ahead of the worker's own bind mode, a
 per-run (or per-schedule) credential override the owner can set or change at
-any time — queued, parked, at the plan gate, or mid-run — and a mid-run
-switch never rewrites a live claim in place: it reuses the same custody
-`runs.claim_generation` (below) plus a new `claim_released_at` fence to force
-the switch to cross an actual claim boundary, so the run always resumes with
-the new token rather than swapping it out from under a running turn. For a
-run carrying retained recovery authority the worker first proves the run's
-processes stopped; if it cannot, the run is held `paused` for the owner
-(`credential_switch_settling`, then `credential_switch_unsettled`) instead of
-releasing the claim; see
-[adr/1247-per-run-token-selection.md](adr/1247-per-run-token-selection.md).
+any time — queued, parked, at the plan gate, or mid-run. A mid-run switch
+reuses the same custody `runs.claim_generation` (below) as its fence. On a
+worker that negotiated `credential_switch_in_place_v1` (against an api serving
+`credential_switch_apply_v1`) it is applied **in place** (issue #4201): once
+the worker has proven its own processes quiescent, it asks the fenced,
+idempotent `POST /api/worker/runs/{id}/credential-switch/apply` route, which in
+one transaction journals a child epoch (`run_credential_switch_epochs`),
+withdraws the switch stamp and appends the `credential_switch` feed message,
+and returns the token only after COMMIT. The worker, claim generation and
+working directory stay the same and the SDK restarts on the new token,
+resuming the same session where the provider allows (otherwise a fresh session
+in the same directory, with a notice). A worker without the capability still crosses an actual claim
+boundary: it releases the claim (`claim_released_at` fence) and the next claim
+delivers the token. Where quiescence cannot be proven the run is held `paused`
+for the owner (`credential_switch_settling`, then `credential_switch_unsettled`)
+instead; an apply whose outcome the worker cannot prove becomes a plain owner
+pause (`credential_switch_uncertain`; the worker posts that feed line itself
+through its own message stream, not the server). See
+[adr/1247-per-run-token-selection.md](adr/1247-per-run-token-selection.md) and
+[adr/4201-in-place-credential-switch.md](adr/4201-in-place-credential-switch.md).
 
 Since PRD #111 the bind mode is three-valued — `default`, `pinned` or `auto`
 — and `auto` ranks the owner's opted-in tokens, by default the soonest weekly
@@ -1717,6 +1736,8 @@ chain in the diagram above, with no intervening `running`.
   recovery journal and inventory schemas. It grants no custody or deletion authority.
   After timer promotion or owner Resume, existing proof-based release rules
   apply again; execution-claim release alone never permits source deletion.
+  An Anthropic spend-limit hold (`anthropic_spend_limit`, NULL retry) is owner-held
+  the same way as a NULL-retry `data_volume_full` hold: a worker's final proof does not release its custody.
   Archive availability remains independent of attention and does not release
   these causes' custody; other classifier decisions remain unchanged.
   See [ADR-2445](adr/2445-custody-admission-accounting.md),
@@ -2953,13 +2974,18 @@ pressure. All non-terminal worker-owned runs, including parks and approval waits
 block it. Requested maintenance drains unrelated run, chat and cross-check
 claims while owned runs and pinned plan checkers may finish; only an atomic terminal-only claim fence, drained local activity and fresh
 custody clearance permit gated anonymous-volume prune and stop authorization.
-One narrow exception (#3891): a separate worker-side pressure-only leg runs
+Two narrow pressure-only exceptions. The first (#3891): a separate worker-side pressure-only leg runs
 exactly `docker volume prune -f` (server API >=1.42, request pinned to 1.42 in
 its own child env) on a busy or custody-held non-ephemeral worker after two
 fresh samples at or above 85%, without closing the claim gate or waiting for
 idle, terminal runs or custody; it defers only while maintenance holds its
-fence and touches no PVC. It rides the same default-on flag. See ADR-1759 D8,
-"Exception — #3891", in
+fence and touches no PVC. It rides the same default-on flag. A second separate
+pressure-only leg (#4291) runs exactly `docker builder prune -f --filter
+type=regular --filter until=24h --max-used-space 4GiB` on busy or custody-held
+non-ephemeral workers under the same pressure rule, never touching the claim
+gate, custody or images; it needs the master flag plus its own default-on
+`workers.dindBuilderPruneEnabled`. See ADR-1759 D8, "Exception — #3891" and
+"Exception — #4291", in
 [adr/1759-dind-data-metering-and-prune.md](adr/1759-dind-data-metering-and-prune.md).
 The controller observes the old Deployment and pods gone before deleting only
 `dind-data`, then publishes replacement readiness before reopening claims.

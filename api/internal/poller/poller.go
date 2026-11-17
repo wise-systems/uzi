@@ -11,12 +11,14 @@ package poller
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"runtime/debug"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/forgesvc"
@@ -35,6 +37,31 @@ type projectReverseSyncer interface {
 type RepoStore interface {
 	ListEnabledReposWithConnections(context.Context) ([]store.ListEnabledReposWithConnectionsRow, error)
 }
+
+// ImportStateStore is the poller's write seam for a repo's durable first-import
+// status (issue #4399). Enabling a repo records a 'waiting' import; the poller
+// claims it at the generation it read, runs a FullSync, and finishes it. Both
+// statements are generation-guarded in SQL, so a claim or finish from a stale
+// generation (the repo was disabled and re-enabled meanwhile) writes zero rows.
+// *store.Queries satisfies it. Kept apart from RepoStore so that seam stays
+// read-only and its fakes unchanged.
+type ImportStateStore interface {
+	ClaimRepoInitialImport(ctx context.Context, arg store.ClaimRepoInitialImportParams) (int64, error)
+	FinishRepoInitialImport(ctx context.Context, arg store.FinishRepoInitialImportParams) (int64, error)
+}
+
+// Initial-import states, mirroring the repos_initial_import_state_check constraint.
+const (
+	importWaiting   = "waiting"
+	importRunning   = "running"
+	importSucceeded = "succeeded"
+	importFailed    = "failed"
+)
+
+// importWriteTimeout bounds each claim/finish write. The writes use a context
+// detached from the tick so a tick deadline that already fired (the very failure
+// being recorded) cannot stop the row from leaving 'running'.
+const importWriteTimeout = 5 * time.Second
 
 // defaultMaxConcurrency bounds how many repos are synced in parallel per tick.
 const defaultMaxConcurrency = 4
@@ -115,6 +142,18 @@ type Engine struct {
 	// must NOT import healthsvc (the registry is a leaf; the loop only receives a callback).
 	beat        func()
 	syncAttempt func(uuid.UUID) func(bool, forge.ErrorClass)
+
+	// Initial-import seam (issue #4399). RequestImport (any goroutine) adds a repo to
+	// importReq under importMu and pokes importWake (capacity 1, non-blocking send,
+	// so requests coalesce). Only the Run goroutine drains it (importRequested), so
+	// the import runs serialized with ticks and states still needs no lock; never
+	// call PollOnce from elsewhere to get this effect. importStore nil disables all
+	// state writes (set via SetImportStateStore before Run).
+	importWake  chan struct{}
+	importMu    sync.Mutex
+	importReq   map[uuid.UUID]struct{}
+	importStore ImportStateStore
+
 	// itSyncAttempt observes a linked repo's issue sync result (the issue_tracker.sync
 	// health check); the forge.sync observation of a linked repo is a code-host probe.
 	itSyncAttempt func(uuid.UUID) func(bool, forge.ErrorClass)
@@ -152,6 +191,8 @@ func New(svc *forgesvc.Service, q RepoStore, interval time.Duration, reconcileEv
 		maxConcurrency: defaultMaxConcurrency,
 		states:         make(map[uuid.UUID]*repoState),
 		forceReconcile: make(chan struct{}, 1),
+		importWake:     make(chan struct{}, 1),
+		importReq:      make(map[uuid.UUID]struct{}),
 	}
 }
 
@@ -205,6 +246,27 @@ func (e *Engine) SetBeat(beat func()) { e.beat = beat }
 // SetSyncAttempt wires issue-sync observations before Run or PollOnce.
 func (e *Engine) SetSyncAttempt(begin func(uuid.UUID) func(bool, forge.ErrorClass)) {
 	e.syncAttempt = begin
+}
+
+// SetImportStateStore wires the durable first-import status writes (issue #4399).
+// Call once at startup, before Run. A nil store (the default) disables them: the
+// poller then never claims or finishes an import and syncs exactly as before.
+func (e *Engine) SetImportStateStore(s ImportStateStore) { e.importStore = s }
+
+// RequestImport asks the Run loop to run repoID's owed first import now instead of
+// waiting for the next tick. It is non-blocking and coalescing: repeated requests
+// for the same repo collapse to one entry, and a pending wake absorbs the rest, so a
+// request handler never waits on the poller. It is only a hint: the repo is synced
+// only if its row still says an import is owed, and the regular ticks pick up any
+// owed import whose hint was lost (or when Run is not running).
+func (e *Engine) RequestImport(repoID uuid.UUID) {
+	e.importMu.Lock()
+	e.importReq[repoID] = struct{}{}
+	e.importMu.Unlock()
+	select {
+	case e.importWake <- struct{}{}:
+	default:
+	}
 }
 
 // SetIssueTrackerSyncAttempt wires linked-repo issue sync observations before Run or
@@ -297,6 +359,8 @@ func (e *Engine) Run(ctx context.Context) {
 			// itself does the forge work.
 			slog.Info("poller: force reconcile requested")
 			e.resetReconcileState()
+		case <-e.importWake:
+			e.importRequested(ctx)
 		case <-ticker.C:
 			if e.beat != nil {
 				e.beat() // admin-health loop-beat: this loop ticked (PRD #1484 M2)
@@ -339,13 +403,32 @@ func (e *Engine) PollOnce(ctx context.Context) {
 		return
 	}
 
-	// Pre-create every repo's state entry in this goroutine so the workers below
-	// only ever touch their own (distinct) *repoState — no map writes race, no
-	// per-state lock needed. Ticks never overlap (the ticker loop calls tick
-	// synchronously and we wait for all workers before returning).
+	e.pollRepos(tickCtx, repos)
+
+	// Pruning is driven by the COMPLETE enabled set, never by a subset run through
+	// pollRepos (see importRequested).
 	seen := make(map[uuid.UUID]struct{}, len(repos))
 	for _, r := range repos {
 		seen[r.ID] = struct{}{}
+	}
+	e.pruneStates(seen)
+	if e.svc != nil {
+		repoIDs := make([]uuid.UUID, 0, len(repos))
+		for _, r := range repos {
+			repoIDs = append(repoIDs, r.ID)
+		}
+		e.svc.ReconcileMergedPredecessors(ctx, repoIDs)
+	}
+}
+
+// pollRepos syncs the given repos once with bounded concurrency under ctx (the tick
+// context). It pre-creates every repo's state entry in this goroutine so the workers
+// only ever touch their own (distinct) *repoState: no map writes race, no per-state
+// lock needed. Only the Run goroutine (or a serial PollOnce) calls it, and it waits
+// for all workers before returning, so syncs never overlap. It never prunes: the
+// caller may pass a subset of the enabled repos.
+func (e *Engine) pollRepos(ctx context.Context, repos []store.ListEnabledReposWithConnectionsRow) {
+	for _, r := range repos {
 		if e.states[r.ID] == nil {
 			e.states[r.ID] = &repoState{}
 		}
@@ -359,18 +442,103 @@ func (e *Engine) PollOnce(ctx context.Context) {
 		go func(r store.ListEnabledReposWithConnectionsRow, st *repoState) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			guardPanic(r.PathWithNamespace, func() { e.syncRepo(tickCtx, r, st) })
+			guardPanic(r.PathWithNamespace, func() { e.syncRepo(ctx, r, st) })
 		}(r, e.states[r.ID])
 	}
 	wg.Wait()
+}
 
-	e.pruneStates(seen)
-	if e.svc != nil {
-		repoIDs := make([]uuid.UUID, 0, len(repos))
-		for _, r := range repos {
-			repoIDs = append(repoIDs, r.ID)
+// importRequested runs the first import for the repos RequestImport named, inside
+// the Run goroutine (so it is serialized with ticks and the states map needs no
+// lock). It drains the request set, lists the enabled repos under a tick-budget
+// deadline, keeps those that were requested AND still owe an import (waiting or
+// running; a failed one is retried by the regular ticks, a succeeded or legacy NULL
+// one is skipped), and syncs just those. It does not prune and does not run the
+// per-tick ReconcileMergedPredecessors: other repos' state is left intact.
+func (e *Engine) importRequested(ctx context.Context) {
+	e.importMu.Lock()
+	req := e.importReq
+	e.importReq = make(map[uuid.UUID]struct{})
+	e.importMu.Unlock()
+	if len(req) == 0 {
+		return
+	}
+
+	tickCtx, cancel := context.WithTimeout(ctx, tickBudget(e.interval, e.forgeTimeout))
+	defer cancel()
+	repos, err := e.q.ListEnabledReposWithConnections(tickCtx)
+	if err != nil {
+		slog.Error("poller: list enabled repos for requested import", "error", err)
+		return
+	}
+	owed := make([]store.ListEnabledReposWithConnectionsRow, 0, len(req))
+	for _, r := range repos {
+		if _, ok := req[r.ID]; !ok {
+			continue
 		}
-		e.svc.ReconcileMergedPredecessors(ctx, repoIDs)
+		if s := r.InitialImportState; s.Valid && (s.String == importWaiting || s.String == importRunning) {
+			owed = append(owed, r)
+		}
+	}
+	e.pollRepos(tickCtx, owed)
+}
+
+// importOwed reports whether the row owes a first import the poller should run.
+// A NULL state is a legacy repo and is never owed.
+func importOwed(r store.ListEnabledReposWithConnectionsRow) bool {
+	if !r.InitialImportState.Valid {
+		return false
+	}
+	switch r.InitialImportState.String {
+	case importWaiting, importRunning, importFailed:
+		return true
+	}
+	return false
+}
+
+// importErrorClass classifies an import failure for the persisted error class: a
+// deadline (the error's own or the tick context's) is a timeout, otherwise the
+// forge's classification, which is other for anything unclassified.
+func importErrorClass(ctx context.Context, err error) forge.ErrorClass {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return forge.ErrorClassTimeout
+	}
+	return forge.Class(err)
+}
+
+// claimImport claims the row's owed import at the generation it read. A write error
+// is logged and treated as not claimed (the row stays as it was and a later tick
+// retries); zero rows means the generation moved, so another enable owns the import.
+func (e *Engine) claimImport(ctx context.Context, r store.ListEnabledReposWithConnectionsRow) bool {
+	wctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), importWriteTimeout)
+	defer cancel()
+	n, err := e.importStore.ClaimRepoInitialImport(wctx, store.ClaimRepoInitialImportParams{ID: r.ID, InitialImportGeneration: r.InitialImportGeneration})
+	if err != nil {
+		slog.Error("poller: claim initial import", "repo", r.PathWithNamespace, "error", err)
+		return false
+	}
+	return n == 1
+}
+
+// finishImport settles a claimed import at its generation. The class is mapped into
+// the closed set the column's CHECK accepts, so a future forge.ErrorClass value can
+// never fail the write and leave the row 'running'. A stale generation writes zero
+// rows, which is the intended no-op.
+func (e *Engine) finishImport(ctx context.Context, r store.ListEnabledReposWithConnectionsRow, ok bool, class forge.ErrorClass) {
+	arg := store.FinishRepoInitialImportParams{ID: r.ID, Generation: r.InitialImportGeneration, State: importSucceeded}
+	if !ok {
+		arg.State = importFailed
+		switch class {
+		case forge.ErrorClassTimeout, forge.ErrorClassAuth, forge.ErrorClassServerError, forge.ErrorClassRateLimited, forge.ErrorClassOther:
+		default:
+			class = forge.ErrorClassOther
+		}
+		arg.ErrorClass = pgtype.Text{String: string(class), Valid: true}
+	}
+	wctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), importWriteTimeout)
+	defer cancel()
+	if _, err := e.importStore.FinishRepoInitialImport(wctx, arg); err != nil {
+		slog.Error("poller: finish initial import", "repo", r.PathWithNamespace, "error", err)
 	}
 }
 
@@ -423,9 +591,26 @@ func (e *Engine) syncRepo(ctx context.Context, r store.ListEnabledReposWithConne
 		}
 		itReport(false, forge.ErrorClassOther)
 	}()
+
+	// Owed first import (issue #4399): claim BEFORE anything can fail, so the row
+	// reads 'running' for the whole attempt, then force a full sync below. The
+	// deferred finisher guarantees a claimed row never stays 'running': any exit not
+	// explicitly settled (including a panic guardPanic recovers above) writes
+	// failed/other. A lost claim (the generation moved) just syncs normally.
+	claimed := e.importStore != nil && importOwed(r) && e.claimImport(ctx, r)
+	importSettled := false
+	settleImport := func(ok bool, class forge.ErrorClass) {
+		if claimed && !importSettled {
+			importSettled = true
+			e.finishImport(ctx, r, ok, class)
+		}
+	}
+	defer func() { settleImport(false, forge.ErrorClassOther) }()
+
 	f, err := e.svc.ForgeForConnection(r.ForgeType, r.BaseUrl, r.TokenCiphertext)
 	if err != nil {
 		slog.Error("poller: build forge client", "repo", r.PathWithNamespace, "error", err)
+		settleImport(false, importErrorClass(ctx, err))
 		report(false, forge.Class(err))
 		return
 	}
@@ -465,13 +650,20 @@ func (e *Engine) syncRepo(ctx context.Context, r store.ListEnabledReposWithConne
 		// Boundary: when the forge client cannot be built (the early return above) this
 		// attempt is never started for the tick, and forge.sync is red then.
 		itBegun = true
+		//
+		// An owed first import (issue #4399) forces the full form here as it does on an
+		// unlinked repo, and settles on the linked sync's result alone: the import is
+		// the issue cache's first fill, which the code-host probe below does not touch.
 		if trErr != nil {
 			slog.Error("poller: build linked issue tracker", "repo", r.PathWithNamespace, "error", trErr)
+			settleImport(false, importErrorClass(ctx, trErr))
 			itReport(false, forge.Class(trErr))
-		} else if err := e.syncLinkedIssues(ctx, r, tr, st); err != nil {
+		} else if err := e.syncLinkedIssues(ctx, r, tr, st, claimed); err != nil {
 			slog.Error("poller: linked issue sync", "repo", r.PathWithNamespace, "error", err)
+			settleImport(false, importErrorClass(ctx, err))
 			itReport(false, forge.Class(err))
 		} else {
+			settleImport(true, forge.ErrorClassOther)
 			itReport(true, forge.ErrorClassOther)
 		}
 		_, perr := f.GetProject(ctx, r.ForgeProjectID)
@@ -480,13 +672,15 @@ func (e *Engine) syncRepo(ctx context.Context, r store.ListEnabledReposWithConne
 		}
 		report(perr == nil, forge.Class(perr))
 	} else {
-		if reconcileDue(st.pollCount, e.reconcileEvery) {
+		if claimed || reconcileDue(st.pollCount, e.reconcileEvery) {
 			observed, err := e.svc.FullSync(ctx, r.ID, r.ForgeProjectID, f)
 			if err != nil {
 				slog.Error("poller: full sync", "repo", r.PathWithNamespace, "error", err)
+				settleImport(false, importErrorClass(ctx, err))
 				report(false, forge.Class(err))
 				return
 			}
+			settleImport(true, forge.ErrorClassOther)
 			// FullSync is unbounded and reports what it observed, not an advance; the
 			// clamp is the caller's. Field-wise, so a fetch that legitimately came back
 			// empty leaves its own mark alone rather than dragging the other's down.
@@ -501,6 +695,7 @@ func (e *Engine) syncRepo(ctx context.Context, r store.ListEnabledReposWithConne
 			// Already clamped inside, and held at the caller's pair on any fetch error.
 			st.marks = next
 		}
+
 		report(true, forge.ErrorClassOther)
 	}
 
@@ -636,8 +831,8 @@ func (e *Engine) syncRepo(ctx context.Context, r store.ListEnabledReposWithConne
 // syncLinkedIssues runs the linked repo's issue sync through the forgesvc
 // dispatchers on the same full/incremental cadence as an unlinked repo, folding the
 // marks only on success.
-func (e *Engine) syncLinkedIssues(ctx context.Context, r store.ListEnabledReposWithConnectionsRow, tr forge.IssueTracker, st *repoState) error {
-	if reconcileDue(st.pollCount, e.reconcileEvery) {
+func (e *Engine) syncLinkedIssues(ctx context.Context, r store.ListEnabledReposWithConnectionsRow, tr forge.IssueTracker, st *repoState, forceFull bool) error {
+	if forceFull || reconcileDue(st.pollCount, e.reconcileEvery) {
 		observed, err := e.svc.SyncIssues(ctx, r.UserID, r.ID, r.ForgeProjectID, tr)
 		if err != nil {
 			return err

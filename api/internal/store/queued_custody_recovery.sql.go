@@ -185,7 +185,7 @@ func (q *Queries) LockFrozenQueuedCustodyHolds(ctx context.Context, arg LockFroz
 }
 
 const lockStaleQueuedCustodyWorkers = `-- name: LockStaleQueuedCustodyWorkers :many
-SELECT w.id, w.user_id, w.name, w.token_hash, w.status, w.last_heartbeat_at, w.version, w.created_at, w.updated_at, w.template_declared, w.template_reported, w.max_concurrent_runs, w.stats_cpu_pct, w.stats_mem_bytes, w.stats_mem_limit_bytes, w.stats_source, w.kind, w.hosted_size, w.hosted_generation, w.docker_enabled, w.anthropic_secret_id, w.anthropic_bind_mode, w.online_since, w.draining_since, w.capabilities, w.ephemeral, w.ephemeral_run_id, w.stats_disk_nix_bytes, w.stats_disk_nix_total_bytes, w.stats_disk_data_bytes, w.stats_disk_data_total_bytes, w.stats_disk_pressure_streak, w.protocol_capabilities, w.snapshot_epoch, w.snapshot_register_nonce, w.pending_overflow, w.pending_overflow_until, w.stats_disk_dind_bytes, w.stats_disk_dind_total_bytes, w.stats_disk_dind_inodes, w.stats_disk_dind_total_inodes, w.stats_disk_data_inodes, w.stats_disk_data_total_inodes, w.isolated_lane, w.lease_since, w.lease_repo_id, w.lease_branch, w.dind_register_floor, w.dind_meter_epoch, w.dind_meter_at, w.dind_pressure_streak, w.dind_meter_over, w.dind_below_threshold, w.maintenance_owns_drain, w.nix_pressure, w.data_pressure, w.maintenance_id, w.maintenance_nonce, w.maintenance_phase, w.maintenance_deployment_uid, w.maintenance_pvc_uid, w.maintenance_register_nonce, w.maintenance_fenced, w.maintenance_ready_ack, w.maintenance_ack_at, w.maintenance_activity_floor, w.max_cross_check_slots, w.registered_pod_uid, w.roll_heartbeat_at, w.draining_reason, w.manual_cordoned_at, w.manual_cordoned_by, w.manual_cordoned_by_label, w.manual_cordon_reason FROM workers w
+SELECT w.id, w.user_id, w.name, w.token_hash, w.status, w.last_heartbeat_at, w.version, w.created_at, w.updated_at, w.template_declared, w.template_reported, w.max_concurrent_runs, w.stats_cpu_pct, w.stats_mem_bytes, w.stats_mem_limit_bytes, w.stats_source, w.kind, w.hosted_size, w.hosted_generation, w.docker_enabled, w.anthropic_secret_id, w.anthropic_bind_mode, w.online_since, w.draining_since, w.capabilities, w.ephemeral, w.ephemeral_run_id, w.stats_disk_nix_bytes, w.stats_disk_nix_total_bytes, w.stats_disk_data_bytes, w.stats_disk_data_total_bytes, w.stats_disk_pressure_streak, w.protocol_capabilities, w.snapshot_epoch, w.snapshot_register_nonce, w.pending_overflow, w.pending_overflow_until, w.stats_disk_dind_bytes, w.stats_disk_dind_total_bytes, w.stats_disk_dind_inodes, w.stats_disk_dind_total_inodes, w.stats_disk_data_inodes, w.stats_disk_data_total_inodes, w.isolated_lane, w.lease_since, w.lease_repo_id, w.lease_branch, w.dind_register_floor, w.dind_meter_epoch, w.dind_meter_at, w.dind_pressure_streak, w.dind_meter_over, w.dind_below_threshold, w.maintenance_owns_drain, w.nix_pressure, w.data_pressure, w.maintenance_id, w.maintenance_nonce, w.maintenance_phase, w.maintenance_deployment_uid, w.maintenance_pvc_uid, w.maintenance_register_nonce, w.maintenance_fenced, w.maintenance_ready_ack, w.maintenance_ack_at, w.maintenance_activity_floor, w.max_cross_check_slots, w.registered_pod_uid, w.roll_heartbeat_at, w.draining_reason, w.manual_cordoned_at, w.manual_cordoned_by, w.manual_cordoned_by_label, w.manual_cordon_reason, w.hibernation_state, w.hibernation_op_id, w.hibernation_requested_at, w.hibernated_at, w.wake_requested_at, w.wake_error, w.hibernation_reason, w.hibernation_admission_pod_uid, w.hibernation_scaling_down_at, w.wake_ready_op_id, w.wake_ready_pod_uid, w.wake_ready_resource_version, w.wake_register_op_id, w.wake_register_pod_uid, w.credential_switch_apply_nonce, w.hibernation_cleanup, w.hibernation_cleanup_reason, w.cleanup_op_id, w.cleanup_phase, w.cleanup_register_nonce, w.cleanup_pod_uid, w.cleanup_requested_at, w.cleanup_started_at, w.cleanup_unknown_at, w.cleanup_settled_at, w.cleanup_cancel_requested, w.cleanup_reconcile_seq, w.cleanup_reconciled_at, w.last_wake_settled_at, w.hibernation_blocked_reason, w.hibernation_blocked_at, w.hibernation_blocked_since FROM workers w
 WHERE w.id = ANY($1::uuid[])
   AND (w.last_heartbeat_at IS NULL OR w.last_heartbeat_at < $2::timestamptz)
 ORDER BY w.id FOR UPDATE OF w
@@ -281,6 +281,38 @@ func (q *Queries) LockStaleQueuedCustodyWorkers(ctx context.Context, arg LockSta
 			&i.ManualCordonedBy,
 			&i.ManualCordonedByLabel,
 			&i.ManualCordonReason,
+			&i.HibernationState,
+			&i.HibernationOpID,
+			&i.HibernationRequestedAt,
+			&i.HibernatedAt,
+			&i.WakeRequestedAt,
+			&i.WakeError,
+			&i.HibernationReason,
+			&i.HibernationAdmissionPodUid,
+			&i.HibernationScalingDownAt,
+			&i.WakeReadyOpID,
+			&i.WakeReadyPodUid,
+			&i.WakeReadyResourceVersion,
+			&i.WakeRegisterOpID,
+			&i.WakeRegisterPodUid,
+			&i.CredentialSwitchApplyNonce,
+			&i.HibernationCleanup,
+			&i.HibernationCleanupReason,
+			&i.CleanupOpID,
+			&i.CleanupPhase,
+			&i.CleanupRegisterNonce,
+			&i.CleanupPodUid,
+			&i.CleanupRequestedAt,
+			&i.CleanupStartedAt,
+			&i.CleanupUnknownAt,
+			&i.CleanupSettledAt,
+			&i.CleanupCancelRequested,
+			&i.CleanupReconcileSeq,
+			&i.CleanupReconciledAt,
+			&i.LastWakeSettledAt,
+			&i.HibernationBlockedReason,
+			&i.HibernationBlockedAt,
+			&i.HibernationBlockedSince,
 		); err != nil {
 			return nil, err
 		}
@@ -355,19 +387,19 @@ WHERE r.worker_id = $2 AND r.id = ANY($3::uuid[])
         AND f.stop_kind IS NOT DISTINCT FROM r.stop_kind
         AND f.stop_reason IS NOT DISTINCT FROM r.stop_reason
         AND f.hold_reason IS NOT DISTINCT FROM r.hold_reason)
-  -- Same owner count and bounded continuation exemption as ClaimRun. An own
+  -- The park needs only the run's own in-range open holds at the limit (ClaimRun's hard per-run
+  -- bound, issue #4162); the owner admission count is deliberately not required here. An own
   -- open hold is also mandatory, so ordinary and generation-zero work cannot park.
   AND $6::integer > 0
   AND (SELECT count(*) FROM recovery_custody_holds h
       WHERE h.id = ANY($7::uuid[])
         AND h.run_id = r.id AND h.user_id = r.user_id AND h.state = 'open'
         AND h.generation BETWEEN 1 AND r.claim_generation) >= $6
-  AND fn_custody_admission_count(r.user_id, $8::timestamptz) >= $6
   -- A fresh current-generation execution or pending outcome still owns this run.
   AND NOT EXISTS (SELECT 1 FROM worker_active_runs a
       WHERE a.worker_id = r.worker_id AND a.run_id = r.id AND a.claim_generation = r.claim_generation
         AND r.claim_released_at IS NULL
-        AND (a.reported_at >= $9::timestamptz
+        AND (a.reported_at >= $8::timestamptz
              OR (a.terminal_pending AND a.terminal_pending_until > now())))
   AND NOT EXISTS (SELECT 1 FROM workers w
       WHERE w.id = r.worker_id AND w.pending_overflow_until > now())
@@ -389,7 +421,6 @@ type ParkFrozenQueuedCustodyExhaustedParams struct {
 	FrozenTargets       []byte             `json:"frozen_targets"`
 	CustodyHoldLimit    int32              `json:"custody_hold_limit"`
 	LockedHoldIds       []uuid.UUID        `json:"locked_hold_ids"`
-	HeartbeatCutoff     pgtype.Timestamptz `json:"heartbeat_cutoff"`
 	SnapshotFreshCutoff pgtype.Timestamptz `json:"snapshot_fresh_cutoff"`
 }
 
@@ -410,7 +441,6 @@ func (q *Queries) ParkFrozenQueuedCustodyExhausted(ctx context.Context, arg Park
 		arg.FrozenTargets,
 		arg.CustodyHoldLimit,
 		arg.LockedHoldIds,
-		arg.HeartbeatCutoff,
 		arg.SnapshotFreshCutoff,
 	)
 	if err != nil {

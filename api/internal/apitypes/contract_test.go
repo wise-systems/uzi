@@ -74,6 +74,12 @@ func contractCases() []contractCase {
 		newContractCase[RunDTO]("run"),
 		newContractCase[RunListItemDTO]("run_list_item"),
 		newContractCase[RunSummaryItemDTO]("run_summary_item"),
+		// Issue #4198: the admin run debug listing envelope; its runs slice is non-omitempty
+		// (the zero.json carries a null the handler normalizes to []).
+		newContractCase[AdminRunsDebugDTO]("admin_runs_debug"),
+		// Issue #4198: the run inputs envelope (GET /api/runs/{id}/inputs); inputs is
+		// non-omitempty (zero.json carries a null the handler normalizes to []).
+		newContractCase[RunInputsEnvelopeDTO]("run_inputs_envelope"),
 		newContractCase[CrossCheckHistoryDTO]("cross_check_history"),
 		newContractCase[CrossCheckHistoryAvailabilityDTO]("cross_check_history_availability"),
 		// M2 — the rest of the apitypes hot set.
@@ -248,6 +254,10 @@ func contractCases() []contractCase {
 		newContractCase[ResetLinkPreviewRequest]("reset_link_preview_request"),
 		newContractCase[ResetLinkPreviewDTO]("reset_link_preview"),
 		newContractCase[ResetLinkRedeemRequest]("reset_link_redeem_request"),
+		// Issue #4334: the admin repo-activity envelope; repos is non-omitempty (the
+		// zero.json carries a null the handler normalizes to []) and last_run_at is
+		// present-as-null.
+		newContractCase[AdminRepoActivityDTO]("admin_repo_activity"),
 	}
 }
 

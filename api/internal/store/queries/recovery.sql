@@ -158,7 +158,7 @@ WHERE target.id = @id AND target.state = 'open' AND NOT target.inventory_guarded
       SELECT 1 FROM locked_run r
       WHERE r.status = 'recovery_wait'
         AND (r.recovery_wait_cause IN ('worker_requeue_exhausted', 'worker_memory_pressure', 'retained_recovery_exhausted', 'retained_recovery_adoption_failed', 'retained_continuation_unwitnessed')
-             OR (r.recovery_wait_cause = 'data_volume_full' AND r.recovery_retry_not_before IS NULL))
+             OR (r.recovery_wait_cause IN ('data_volume_full', 'anthropic_spend_limit') AND r.recovery_retry_not_before IS NULL))
   );
 
 -- name: DiscardCaptureForOwner :one
@@ -282,7 +282,7 @@ WHERE h.state = 'open' AND NOT h.inventory_guarded
                     WHERE r.id = h.run_id
                       AND r.status = 'recovery_wait'
                       AND (r.recovery_wait_cause IN ('worker_requeue_exhausted', 'worker_memory_pressure', 'retained_recovery_exhausted', 'retained_recovery_adoption_failed', 'retained_continuation_unwitnessed')
-                           OR (r.recovery_wait_cause = 'data_volume_full' AND r.recovery_retry_not_before IS NULL)))
+                           OR (r.recovery_wait_cause IN ('data_volume_full', 'anthropic_spend_limit') AND r.recovery_retry_not_before IS NULL)))
   AND (
       EXISTS (SELECT 1 FROM runs r
                 WHERE r.id = h.run_id
@@ -396,7 +396,7 @@ WHERE run_id = @run_id
   AND state = 'open' AND NOT inventory_guarded
   AND NOT EXISTS (SELECT 1 FROM locked_run r WHERE r.status = 'recovery_wait'
       AND (r.recovery_wait_cause IN ('worker_requeue_exhausted', 'worker_memory_pressure', 'retained_recovery_exhausted', 'retained_recovery_adoption_failed', 'retained_continuation_unwitnessed')
-           OR (r.recovery_wait_cause = 'data_volume_full' AND r.recovery_retry_not_before IS NULL)));
+           OR (r.recovery_wait_cause IN ('data_volume_full', 'anthropic_spend_limit') AND r.recovery_retry_not_before IS NULL)));
 
 -- name: GetCustodyHoldForSettle :one
 -- Issue #1582 M1: the exact hold the predecessor-settle endpoint names, scoped to its run so a
@@ -707,18 +707,20 @@ ORDER BY h.created_at ASC;
 
 -- name: GetCustodyAggregateForOwner :one
 -- PRD #1349 M1 (D6/D10): the owner-level custody aggregate the board alert and one-per-episode
--- Slack DM read (M6). open_holds is total open custody; admission_counted_holds is the
--- shared live-claim-discounted admission signal (ADR-2445). blocked_runs counts the owner's QUEUED
--- code-publishing runs currently blocked by the custody-admission predicate: it mirrors the
--- reasonCustodyLimit predicate in workersvc/health.go — a run stays queued for custody ONLY when
--- the owner is AT/OVER the limit — so it is 0 unless admission_counted_holds >= @custody_hold_limit (and a
--- non-positive @custody_hold_limit DISABLES the gate exactly like the claim path, yielding 0).
+-- Slack DM read (M6). open_holds is total open custody; admission_counted_holds is the shared
+-- admission-UNIT signal (ADR-2445, issue #4162: one run's holds on one original worker are one
+-- unit). blocked_runs counts the owner's QUEUED code-publishing runs the ClaimRun custody
+-- predicate currently refuses, i.e. exactly NOT(that clause): a run is blocked when its OWN open
+-- holds (every open hold, counted or not) reach @custody_hold_limit (the hard per-run bound,
+-- counted even when the owner is below the limit) OR the owner is AT/OVER the limit in units and
+-- the run is not continuation-exempt. A non-positive @custody_hold_limit DISABLES the gate
+-- exactly like the claim path, yielding 0.
 -- The code-publishing kinds match ClaimRun's custody-hold CTE (issue/ci_fix/self_improve/prompt/
 -- task/mr_rework). Issue #1751 / ADR-1751: a CONTINUATION-EXEMPT queued run (claim_generation >= 1
 -- AND its own owner-scoped open-hold count at least 1 and below @custody_hold_limit, the per-run
--- bound that stops a never-started sweep loop) is NOT blocked — ClaimRun admits it at/over the
--- cap — so blocked_runs excludes it with the SAME expression ClaimRun and
--- GetCustodyAdmissionForRun use (parity: the aggregate, the pill and the claim agree).
+-- bound that stops a never-started sweep loop) is NOT blocked by the owner arm — ClaimRun admits
+-- it at/over the cap — so the owner arm excludes it with an expression logically equivalent, under the
+-- hard per-run bound, to the one ClaimRun and GetCustodyAdmissionForRun use (parity: the aggregate, the pill and the claim agree).
 -- Count columns are cast ::bigint so sqlc types them as int64, never interface{}.
 -- Every column is table-qualified and @user_id carries an explicit ::uuid cast: this is a
 -- SELECT over a single-row CTE, so sqlc's param-type inference cannot pick a single relation
@@ -732,17 +734,27 @@ SELECT
     (SELECT count(*) FROM recovery_custody_holds h
         WHERE h.user_id = @user_id::uuid AND h.state = 'open')::bigint AS open_holds,
     (CASE
+        -- Owner at/over the limit in units: a queued run is blocked unless it is continuation
+        -- exempt, and a run at its own hold bound is blocked regardless.
         WHEN @custody_hold_limit::int > 0
              AND admission.counted >= @custody_hold_limit::int
         THEN (SELECT count(*) FROM runs r
                 WHERE r.user_id = @user_id::uuid
                   AND r.status = 'queued'
                   AND r.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'task', 'mr_rework')
-                  AND NOT (r.claim_generation >= 1
-                           AND EXISTS (SELECT 1 FROM recovery_custody_holds oh
-                                         WHERE oh.user_id = r.user_id AND oh.run_id = r.id AND oh.state = 'open')
-                           AND (SELECT count(*) FROM recovery_custody_holds oh2
-                                  WHERE oh2.user_id = r.user_id AND oh2.run_id = r.id AND oh2.state = 'open') < @custody_hold_limit::int))
+                  AND ((SELECT count(*) FROM recovery_custody_holds oh2
+                          WHERE oh2.user_id = r.user_id AND oh2.run_id = r.id AND oh2.state = 'open') >= @custody_hold_limit::int
+                       OR NOT (r.claim_generation >= 1
+                               AND EXISTS (SELECT 1 FROM recovery_custody_holds oh
+                                             WHERE oh.user_id = r.user_id AND oh.run_id = r.id AND oh.state = 'open'))))
+        -- Owner below the limit: only the hard per-run bound blocks.
+        WHEN @custody_hold_limit::int > 0
+        THEN (SELECT count(*) FROM runs r
+                WHERE r.user_id = @user_id::uuid
+                  AND r.status = 'queued'
+                  AND r.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'task', 'mr_rework')
+                  AND (SELECT count(*) FROM recovery_custody_holds oh2
+                         WHERE oh2.user_id = r.user_id AND oh2.run_id = r.id AND oh2.state = 'open') >= @custody_hold_limit::int)
         ELSE 0
      END)::bigint AS blocked_runs
 FROM admission;
@@ -750,7 +762,8 @@ FROM admission;
 -- name: ListCustodyAdmissionMembersForOwner :many
 -- Issue #2970: per-hold custody admission membership for the owner hold list, one row per
 -- state='open' hold. counted mirrors fn_custody_admission_count membership and reason names the
--- first matching cause (closed vocabulary, see migration 00336). Read-only visibility only:
+-- first matching cause (closed vocabulary, see migrations 00336 and 00427: same_run_group marks a
+-- hold counted once with its run's representative hold on the same worker). Read-only visibility only:
 -- admission accounting stays on fn_custody_admission_count. Callers pass the SAME
 -- @heartbeat_cutoff as GetCustodyAggregateForOwner so both read one cutoff. Explicit casts type
 -- the columns as uuid/bool/string, never interface{}.
@@ -960,7 +973,7 @@ WHERE h.id = @id AND h.run_id = @run_id AND h.user_id = @user_id
   AND h.generation = @generation AND h.original_worker_id = @worker_id::uuid
   AND h.live_worker_id = @worker_id::uuid AND h.inventory_guarded AND h.state = 'open'
   AND NOT EXISTS (SELECT 1 FROM runs r WHERE r.id = h.run_id
-    AND r.status = 'recovery_wait' AND r.recovery_wait_cause = 'data_volume_full'
+    AND r.status = 'recovery_wait' AND r.recovery_wait_cause IN ('data_volume_full', 'anthropic_spend_limit')
     AND r.recovery_retry_not_before IS NULL)
   AND EXISTS (SELECT 1 FROM runs r WHERE r.id = h.run_id AND r.user_id = h.user_id
     AND (r.claim_generation > h.generation OR (r.claim_generation = h.generation AND
@@ -1030,7 +1043,7 @@ WHERE h.id = @id AND h.run_id = @run_id AND h.user_id = @user_id
     AND NOT (r.status = 'recovery_wait' AND r.recovery_wait_cause IS NOT NULL
       AND (r.recovery_wait_cause IN ('worker_requeue_exhausted',
       'worker_memory_pressure', 'retained_recovery_exhausted', 'retained_recovery_adoption_failed', 'retained_continuation_unwitnessed')
-           OR (r.recovery_wait_cause = 'data_volume_full' AND r.recovery_retry_not_before IS NULL))))
+           OR (r.recovery_wait_cause IN ('data_volume_full', 'anthropic_spend_limit') AND r.recovery_retry_not_before IS NULL))))
   AND EXISTS (SELECT 1 FROM recovery_captures c WHERE c.id = @final_capture_id::uuid
     AND c.hold_id = h.id AND c.run_id = h.run_id AND c.user_id = h.user_id
     AND c.original_worker_id = h.original_worker_id AND c.source_sha = @final_source_sha::text

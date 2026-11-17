@@ -23,6 +23,7 @@ import (
 type countingRecoveryClient struct {
 	uzicli.Client
 	holdsCalls    int
+	scopedCalls   int
 	archivesCalls int
 	getRunCalls   int
 	archivesArgs  []string
@@ -32,6 +33,11 @@ type countingRecoveryClient struct {
 func (c *countingRecoveryClient) RecoveryHolds(ctx context.Context) (apitypes.RecoveryCustodyHoldsDTO, error) {
 	c.holdsCalls++
 	return c.Client.RecoveryHolds(ctx)
+}
+
+func (c *countingRecoveryClient) RecoveryHoldsScoped(ctx context.Context, userID, runID string) (apitypes.RecoveryCustodyHoldsDTO, error) {
+	c.scopedCalls++
+	return c.Client.RecoveryHoldsScoped(ctx, userID, runID)
 }
 
 func (c *countingRecoveryClient) RecoveryArchives(ctx context.Context, runID string) (apitypes.RecoveryArchiveSummaryDTO, error) {
@@ -167,9 +173,11 @@ func TestRunRecoveryValidEmptyControls(t *testing.T) {
 			if code != uzicli.ExitOK || out != want || errb != "" {
 				t.Errorf("exit=%d stdout=%q stderr=%q; want success and stdout=%q", code, out, errb, want)
 			}
-			if client.holdsCalls != 1 || client.archivesCalls != 0 || client.getRunCalls != 0 {
-				t.Errorf("calls: holds=%d archives=%d GetRun=%d; want 1, 0, 0",
-					client.holdsCalls, client.archivesCalls, client.getRunCalls)
+			// No own hold: the run is also asked for under admin run debug (?run=) and its capture
+			// metadata is read, since a capture can outlive its hold.
+			if client.holdsCalls != 1 || client.scopedCalls != 1 || client.archivesCalls != 1 || client.getRunCalls != 0 {
+				t.Errorf("calls: holds=%d scoped=%d archives=%d GetRun=%d; want 1, 1, 1, 0",
+					client.holdsCalls, client.scopedCalls, client.archivesCalls, client.getRunCalls)
 			}
 		})
 	}
@@ -208,7 +216,9 @@ func TestRunRecoveryCanonicalRunID(t *testing.T) {
 						},
 					}
 					if state == "empty" {
-						// Keep a distinct held run to prove the requested run is filtered.
+						// Keep a distinct held run to prove the requested run is filtered. The
+						// owner's unmarked archives summary adds nothing (#4198: unattached
+						// captures appear only on an admin debug read).
 						fc.RecoveryHoldsResult.Holds = fc.RecoveryHoldsResult.Holds[2:]
 					}
 					client := &countingRecoveryClient{Client: fc}
@@ -232,9 +242,9 @@ func TestRunRecoveryCanonicalRunID(t *testing.T) {
 						if mode == "json" {
 							want = "[]\n"
 						}
-						if out != want || errb != "" || client.getRunCalls != 0 || client.archivesCalls != 0 {
-							t.Errorf("empty: stdout=%q stderr=%q GetRun=%d archives=%d; want %q and no lookups",
-								out, errb, client.getRunCalls, client.archivesCalls, want)
+						if out != want || errb != "" || client.getRunCalls != 0 || client.archivesCalls != 1 || client.scopedCalls != 1 {
+							t.Errorf("empty: stdout=%q stderr=%q GetRun=%d archives=%d scoped=%d; want %q, no GetRun and one scoped and one archives lookup",
+								out, errb, client.getRunCalls, client.archivesCalls, client.scopedCalls, want)
 						}
 						return
 					}
@@ -412,7 +422,7 @@ func TestOwnerRecoveryHuman(t *testing.T) {
 	for i, want := range [][]string{
 		{"run-a", "hold-a", "1", "source_only", "-", "false", "worker-a"},
 		{"run-b", "hold-b", "2", "needs_action", "counted", "(decision_needed)", "false", "beta"},
-		{"run-z", "hold-z", "3", "active", "not", "counted", "false", "worker-z"},
+		{"run-z", "hold-z", "3", "active", "not", "counted", "(live_claim)", "false", "worker-z"},
 	} {
 		got := strings.Fields(lines[i+1])
 		n := len(want)
@@ -424,7 +434,7 @@ func TestOwnerRecoveryHuman(t *testing.T) {
 		strings.Contains(out, "run-r") || strings.Contains(out, "run-d") {
 		t.Errorf("settled hold in human view: %q", out)
 	}
-	if !strings.Contains(out, "open_holds: 3  admission_counted_holds: 2  custody_hold_limit: 8  decision_needed: 2  blocked_runs: 1") {
+	if !strings.Contains(out, "open_holds: 3  admission_units (admission_counted_holds): 2  custody_hold_limit: 8  decision_needed: 2  blocked_runs: 1") {
 		t.Errorf("aggregate absent: %q", out)
 	}
 	if !strings.Contains(out, "2 hold(s) await a decision") || !strings.Contains(out, "run discard <run-id> --hold <hold-id> --yes") {
@@ -466,7 +476,7 @@ func TestOwnerRecoveryEmptyAndNoHint(t *testing.T) {
 		}}
 		out, _, code := runCLI(t, fakeEnv(fc), "run", "recovery")
 		if code != uzicli.ExitOK || !strings.Contains(out, "no open custody holds") ||
-			!strings.Contains(out, "open_holds: 0  admission_counted_holds: 0  custody_hold_limit: 8  decision_needed: 0  blocked_runs: 0") ||
+			!strings.Contains(out, "open_holds: 0  admission_units (admission_counted_holds): 0  custody_hold_limit: 8  decision_needed: 0  blocked_runs: 0") ||
 			strings.Contains(out, "await a decision") || strings.Contains(out, "settled") {
 			t.Errorf("empty human view: code=%d output=%q", code, out)
 		}
@@ -495,7 +505,7 @@ func TestOwnerRecoveryHelp(t *testing.T) {
 	if code != uzicli.ExitOK {
 		t.Fatalf("help exit = %d", code)
 	}
-	for _, want := range []string{"recovery [run-id]", "open custody holds", "including settled holds", "With a run id"} {
+	for _, want := range []string{"recovery [run-id | --user <uuid>]", "open custody holds", "including settled holds", "With a run id"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("help missing %q: %s", want, out)
 		}
@@ -660,7 +670,7 @@ func TestRunRecoveryHintFoldsRunID(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	env := fakeEnv(&uzicli.FakeClient{})
 	env.Stdout, env.Stderr = &stdout, &stderr
-	if err := renderRunRecovery(env, &globalFlags{}, runID, holds, nil, nil); err != nil {
+	if err := renderRunRecovery(env, &globalFlags{}, runID, holds, nil, nil, false, false); err != nil {
 		t.Fatal(err)
 	}
 	out := stdout.String()
@@ -678,7 +688,7 @@ func TestRunRecoveryEmptyFoldsRunID(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	env := fakeEnv(&uzicli.FakeClient{})
 	env.Stdout, env.Stderr = &stdout, &stderr
-	if err := renderRunRecovery(env, &globalFlags{}, runID, nil, nil, nil); err != nil {
+	if err := renderRunRecovery(env, &globalFlags{}, runID, nil, nil, nil, false, false); err != nil {
 		t.Fatal(err)
 	}
 	want := "run run with tabs has no retained custody holds\n"
@@ -696,7 +706,7 @@ func TestRunRecoveryJSONWarningFoldsRunID(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	env := fakeEnv(&uzicli.FakeClient{})
 	env.Stdout, env.Stderr = &stdout, &stderr
-	if err := renderRunRecovery(env, &globalFlags{json: true}, runID, holds, archives, nil); err != nil {
+	if err := renderRunRecovery(env, &globalFlags{json: true}, runID, holds, archives, nil, false, false); err != nil {
 		t.Fatal(err)
 	}
 	out, errb := stdout.String(), stderr.String()
@@ -738,6 +748,7 @@ func TestRunRecoveryEmptyJSON(t *testing.T) {
 // TestRunRecoveryJSONCaptures (issue #1417) proves --json attaches each hold's captures, in
 // archive order, joined on hold_id: a capture reserved under another hold, or with no hold_id
 // (an older server, kept as documentation of that shape), is attached nowhere, and the hold's own keys stay flat.
+// The owner's output carries no unattached element (#4198 shows one only on an admin debug read).
 func TestRunRecoveryJSONCaptures(t *testing.T) {
 	fc := &uzicli.FakeClient{
 		RecoveryHoldsResult: recoveryHoldsFixture(),
@@ -771,6 +782,9 @@ func TestRunRecoveryJSONCaptures(t *testing.T) {
 	}
 	if len(holds) != 1 || holds[0].ID != "hold-run1-gen1" || holds[0].Attention != "source_only" {
 		t.Fatalf("run recovery --json = %+v, want run1's single hold with its flat keys", holds)
+	}
+	if strings.Contains(out, "unattached") {
+		t.Fatalf("owner --json carries an unattached element: %s", out)
 	}
 	caps := holds[0].Captures
 	if len(caps) != 2 || caps[0].ID != "cap-1" || caps[1].ID != "cap-2" {
@@ -1263,7 +1277,7 @@ func TestRunRecoveryHumanAdmissionColumn(t *testing.T) {
 	for hold, want := range map[string]string{
 		"hold-a": "-",
 		"hold-b": "counted (decision_needed)",
-		"hold-z": "not counted",
+		"hold-z": "not counted (live_claim)",
 	} {
 		var row []string
 		for _, line := range lines[1:] {

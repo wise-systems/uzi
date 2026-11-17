@@ -244,6 +244,11 @@ export type RunState =
   /** issue #3181: the worker's acknowledgement that the held flight's owned operations have
    *  joined (hold_reason credential_switch_unsettled). Same fences as the hold report. */
   | "credential_switch_hold_settled"
+  /** Issue #4201: an in-place apply whose outcome the worker could not determine after proven
+   *  quiescence (`{status:"credential_switch_uncertain", claim_generation, register_nonce, op_id}`,
+   *  feature credential_switch_apply_v1). The server parks the run as a plain owner pause
+   *  (hold_reason NULL), custody kept; the worker starts neither token. */
+  | "credential_switch_uncertain"
   /** Issue #3985: a plan cross-check run whose lead asked a clarification after a HUMAN
    *  revise_plan verdict has the owner's answer; the run returns to awaiting_approval with the
    *  revise still pending (an answer is never plan approval). Carries `clarification_settlement`
@@ -386,7 +391,11 @@ export type MessageKind =
    *  (Decision 8). Emitted by the runner instead of `paused`; the run stays running. Payload
    *  `{ text: string }` — the human-readable reason, WORKER-authored (the server carries none
    *  on the pause_failed report). A free-form run_messages kind. */
-  | "pause_failed";
+  | "pause_failed"
+  /** Issue #4201: the worker's own feed line for an in-place credential switch whose outcome it could
+   *  not establish (option A, an owner pause). Payload `{ op_id, generation }`. Worker-emitted through
+   *  the batcher so it takes a seq the worker owns; the api writes no such message. */
+  | "credential_switch_uncertain";
 
 /** run_user_inputs.kind (PRD #4 §Schema; PRD #41 adds `revise_plan` — the user asks
  *  for a new plan version at the gate, body = their feedback text; PRD #88 adds
@@ -883,6 +892,40 @@ export interface DindMaintenanceReadyACK extends DindMaintenance {
   resampled_epoch: number;
 }
 
+/** Heartbeat response member `hibernation_cache_prune` (PRD #4206): the api's view of the
+ *  worker's hibernation cache prune attempt. Only decoded when the worker advertised
+ *  `hibernation_cache_prune_v1`. */
+export interface HibernationCachePrune {
+  op_id: string;
+  register_nonce: string;
+  phase: "requested" | "started" | "unknown" | "settled";
+  cancel_requested: boolean;
+  reconcile_seq: number;
+}
+
+export type HibernationPruneCommand = "image_prune_dangling" | "builder_prune";
+
+export interface HibernationCachePruneStep {
+  command: HibernationPruneCommand;
+  state: "not_started" | "exited_ok" | "unknown";
+}
+
+/** Heartbeat request member `hibernation_cache_prune_report`; never sent in the same heartbeat as
+ *  a `dind_maintenance_ready_ack`. */
+export interface HibernationCachePruneReport {
+  op_id: string;
+  register_nonce: string;
+  kind: "refused" | "ready" | "result";
+  reason?: "daemon_unreachable" | "custody_stale" | "active_work" | "claim_in_flight" | "gate_not_exclusive" | "cancelled";
+  local_claims?: number;
+  local_executions?: number;
+  custody_clear?: boolean;
+  custody_checked_at?: string;
+  gate_exclusive?: boolean;
+  steps?: HibernationCachePruneStep[];
+  gate_exclusive_throughout?: boolean;
+}
+
 export interface HeartbeatRequest {
   /** Original implemented capabilities and fixed validated local limits, echoed with the
    * original canonical registration nonce once heartbeat_protocol_refresh_v1 is advertised.
@@ -896,6 +939,7 @@ export interface HeartbeatRequest {
   };
   dind_meter?: DindMeter;
   dind_maintenance_ready_ack?: DindMaintenanceReadyACK;
+  hibernation_cache_prune_report?: HibernationCachePruneReport;
   version: string;
   /** Optional container resource sample (PRD #49), same absent-optional convention
    *  as `template` on register: the worker omits it when the collector produced
@@ -2700,6 +2744,10 @@ export interface OutgoingMessage {
    *  `task_description`. Absent whenever the SDK frame omits that field. */
   agent_label?: string;
   payload: Record<string, unknown>;
+  /** Issue #4201 (feature credential_switch_apply_v1): the in-generation credential epoch the frame
+   *  was produced under; absent or 0 is the claim's base epoch, n>=1 the nth applied in-place switch.
+   *  Sent only when the feature is negotiated. */
+  credential_epoch_ordinal?: number;
 }
 
 export interface MessagesRequest {
@@ -2986,7 +3034,30 @@ export interface ClarificationSettlement {
   gate_revision: number;
 }
 
+/** Issue #4257: negotiated feature for the `running` report's checkpoint-publication diagnostic. */
+export const CHECKPOINT_PUBLICATION_WITHHELD_FEATURE = "checkpoint_publication_withheld_v1";
+
+/** Issue #4257: content-free diagnostic that checkpoint publication is withheld by a
+ *  secret-scan restriction (or that the withholding cleared). Carries no finding, path,
+ *  rule or SHA. `report_seq` orders writes within one worker/generation/nonce. */
+export interface CheckpointPublicationReport {
+  state: "withheld" | "cleared";
+  /** RFC3339; required iff `state` is `withheld`. */
+  since?: string;
+  claim_generation: number;
+  register_nonce: string;
+  report_seq: number;
+}
+
+/** What a caller hands the client: the client stamps `register_nonce` and `claim_generation`. */
+export type CheckpointPublicationInput = Pick<CheckpointPublicationReport, "state" | "since" | "report_seq">;
+
+export type CheckpointPublicationAck = "recorded" | "cleared" | "refused" | "unrecorded";
+
 export interface StateRequest {
+  /** Issue #4257: set by the client alone (from the caller's `checkpointPublication` option),
+   *  never read from a caller-supplied body. Content-free. */
+  checkpoint_publication?: CheckpointPublicationReport;
   /** Issue #3985: present only on a `clarification_settled` report. */
   clarification_settlement?: ClarificationSettlement;
   /** Issue #3859: set by the client alone, never by a caller. */
@@ -3258,7 +3329,10 @@ export interface StateRequest {
    *  (feature `recovery_cause_retained_recovery_exhausted`, timed or owner-held) and
    *  "retained_recovery_adoption_failed" for a confirmed persisted adoption refusal
    *  (feature `recovery_cause_retained_recovery_adoption_failed`, owner Resume or Cancel only,
-   *  no automatic retry). Both require a positive claim generation and exact fenced ACK;
+   *  no automatic retry). Issue #3767: "anthropic_spend_limit" parks a Claude lead whose terminal
+   *  was an Anthropic organization or workspace spend-limit 400 (feature
+   *  `recovery_cause_anthropic_spend_limit`; owner-held, the api writes a NULL retry; sent once,
+   *  fenced by a positive claim generation, never re-sent untyped). Both retained causes require a positive claim generation and exact fenced ACK;
    *  feature absence keeps the retained terminal fallback. The api validates its cause enum
    *  before SQL, and a legacy/untyped park omits it (NULL). Additive + optional and OMITTED ENTIRELY on every
    *  other report so a pre-#1392 worker's payload and an ordinary (empty-turn) recovery park
@@ -3313,6 +3387,11 @@ export interface StateRequest {
    *  a timer. Sent only when the api advertised `retained_recovery_capacity_hold_v1` at register; absent
    *  is today's counted park. */
   retained_capacity_only?: boolean;
+  /** Issue #4177: qualifies a `retained_recovery_adoption_failed` park with why the retained adoption was refused.
+   *  Only with state `recovery_wait`, that cause and a positive `claim_generation`; closed set. Sent only when
+   *  the api advertised `recovery_detail_adoption_refusal_v1` at register (an older api 400s the unknown field).
+   *  Absent selects the generic text and never permits adoption. */
+  recovery_detail?: "secret_remediation_active" | "remediation_proof_unknown" | "source_end_declined";
   /** PRD #1809 D8: on a process-ending park report that published a checkpoint (the usage-limit
    *  park, the owner pause park, a recovery park including the mid-run `data_volume_full` one),
    *  whether that published checkpoint contains the run's latest committed work. `false` when the
@@ -3370,7 +3449,58 @@ export interface CompletedPublicationReceipt {
 export type CompletedPublicationReason =
   | "completion_identity_missing" | "not_completed" | "identity_changed"
   | "mr_missing" | "branch_missing" | "branch_mismatch" | "head_mismatch"
-  | "not_ancestor" | "ancestry_unknown" | "forge_timeout" | "unsupported_feature";
+  | "not_ancestor" | "ancestry_unknown" | "forge_timeout" | "unsupported_feature"
+  | "terminal_preservation_pending" | "terminal_preservation_refused";
+
+// Terminal preservation (issue #4007): TS mirrors of api/internal/apitypes/terminal_preservation.go.
+export type TerminalAbandonedClass = "ignored" | "cold_dirty";
+
+export interface TerminalPreservationRequest {
+  generation: number;
+  tip: string;
+  prior_tip?: string;
+  manifest: {
+    run_id: string;
+    generation: number;
+    worker_id: string;
+    roots: Array<{ source_id: string; attempt_id: string; commit: string; tree: string }>;
+    abandoned: Array<{ class: TerminalAbandonedClass; source_id: string; extents: { files: number; bytes: number } }>;
+  };
+  disposition: "preserve";
+  /** Standard-base64 raw (non-thin) packfile; omitted when the tip is already on the forge. */
+  pack?: string;
+}
+
+export const TERMINAL_CONTRIBUTION_STATES = [
+  "published", "invoked", "publish_unknown", "refused", "recorded", "prepared",
+] as const;
+export type TerminalContributionState = (typeof TERMINAL_CONTRIBUTION_STATES)[number];
+
+export const TERMINAL_REASONS = [
+  "send_suppressed", "create_refused", "update_refused",
+  "unsupported", "hold_missing", "identity_changed", "excluded_origin", "manifest_invalid",
+  "manifest_mismatch", "generation_bound", "prior_tip_mismatch", "preservation_retired",
+  "publication_in_flight", "forge_unavailable", "pack_invalid", "pack_too_large", "tip_missing",
+  "ci_config_guard", "not_descendant", "root_unreachable", "tree_mismatch", "walk_too_large",
+  "foreign_tip", "authority_changed",
+] as const;
+export type TerminalReason = (typeof TERMINAL_REASONS)[number];
+/** Reasons a non-200 can carry that the server never stores or lists in the vocabulary fixture. */
+export type TerminalWireOnlyReason = "busy" | "stale_claim" | "missing_claim_generation" | "invalid_request";
+export type TerminalWireReason = TerminalReason | TerminalWireOnlyReason;
+/** The stored run_terminal_contributions.disposition values; the request's "preserve" is never echoed. */
+export type TerminalResponseDisposition = "preserved" | "closed_issue_abandoned" | "closed_pr_abandoned";
+
+export interface TerminalPreservationResponse {
+  preservation_id: string;
+  contribution_id: string;
+  ref: string;
+  tip: string;
+  state: TerminalContributionState;
+  preservation_state: string;
+  disposition: TerminalResponseDisposition;
+  reason?: TerminalReason;
+}
 
 /**
  * What the server answered a state report with (PRD #35's park acknowledgement
@@ -3396,6 +3526,7 @@ export type CompletedPublicationReason =
 export interface StateAck {
   /** Cause read from the same RunDTO as status; required to confirm a typed idle park. */
   recoveryCause?: string;
+  recoveryDetail?: string;
   /** Local acceptance proof from the memory park RPC, never a serialized API receipt.
    *  Only this binding authorizes marking a memory park; status/applied alone do not. */
   readonly memoryParkAccepted?: Readonly<{
@@ -3431,6 +3562,8 @@ export interface StateAck {
   /** Issue #3859: the server's top-level answer to a report that carried registration_evidence.
    *  Logged only; no behavior branches on it. */
   registrationEvidence?: "recorded" | "refused";
+  /** Issue #4257: the server's top-level answer to a report that carried checkpoint_publication. */
+  checkpointPublication?: CheckpointPublicationAck;
   /** Whether the server applied the transition. Diagnostics and logging only —
    *  see the warning above before branching on it. */
   applied: boolean;
@@ -3521,7 +3654,7 @@ export interface StateAck {
    *  when a switch is pending for the claim the worker still holds; the `generation` is the one the
    *  worker must release at. Absent otherwise. M5b (MINOR-7) trips the switch off it — the
    *  reportState closure calls steering.tripCredentialSwitch(generation). */
-  credentialSwitch?: { generation: number };
+  credentialSwitch?: { generation: number; op_id?: string };
   /** PRD #1247 M5b: true when the /state ack carried the top-level `disposition: "stale_claim"`
    *  (a 409) — a held-state switch RELEASED this claim, or a reclaim SUPERSEDED it, so the old
    *  flight must STOP without further reports. Absent otherwise. The reportState closure throws
@@ -3538,6 +3671,8 @@ export interface StateAck {
   credentialSwitchHeld?: boolean;
   /** issue #3181: true when the 200 ack carried `disposition: "hold_settled"`. */
   credentialSwitchHoldSettled?: boolean;
+  /** Issue #4201: true when the 200 ack carried `disposition: "uncertain"` (the uncertain report applied). */
+  credentialSwitchUncertain?: boolean;
   /** Issue #3985: true when the 200 ack carried `disposition: "clarification_settled"`. */
   clarificationSettled?: boolean;
   /** PRD #1795 M1 (decision 5): the TOP-LEVEL `gate_revision` of an `awaiting_approval` ACK — the
@@ -3582,7 +3717,7 @@ export interface InputsResponse {
    *  continuously) — so the worker holding the current claim learns a switch was requested. Present
    *  only when a switch is pending for this claim; omitted otherwise. M5b trips the switch off it —
    *  the runner's inputs poll calls steering.maybeTripCredentialSwitch(generation). */
-  credential_switch?: { generation: number };
+  credential_switch?: { generation: number; op_id?: string };
   /** PRD #2603: the run's effective "Now summary" setting (admin switch AND the owner's user
    *  setting). Absent means OFF: a new worker against an older api, or a reply that took an
    *  early return, never spends tokens on a summary. */

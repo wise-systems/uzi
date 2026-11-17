@@ -123,7 +123,10 @@ protected; committed-only coverage cannot discharge unproven residue.
   and a 30 s answer grace. The write deadline is their 300 s sum. The worker's
   per-request timeout for this route alone is 330 s
   (`HELD_PUBLICATION_TIMEOUT_MS`, `agent/src/client.ts`). At most four
-  requests are in flight process-wide (429 `busy` otherwise).
+  requests are in flight process-wide (429 `busy` otherwise). Hardening
+  (2026-11-14): held-work and terminal-preservation uploads share an additional
+  limit of one in-flight request per authenticated worker. Both reservations
+  release together when request handling ends; the existing busy response is unchanged.
   Clarification (#4140): that 330 s is narrowed only by budgets, slot
   deadlines and cancellation the enclosing scope already holds. The worker's
   own frozen-preparation clock (30 s on a background recovery pass, the scan
@@ -294,6 +297,28 @@ retention delete needs.
 run's publications (ref, tip, state, timestamps, sanitized last error). The run
 page shows a held-publication panel. Forge-originated text is sanitized and
 secret-scrubbed before it is stored or shown.
+
+## Amendment (2026-11-13, #4007)
+
+Terminal preservation refs (`refs/uzi-terminal/<run-id>`) are a separate
+namespace with their own tables, not held publications. The held sweep
+(`SweepHeldPublications`) and `validManagedRef` never touch them, and the held
+publication state machine, retention clock and removal guard above are
+unchanged. Their own removal 409 is separate. See
+[ADR-4007](4007-terminal-preservation.md); slice A is dark.
+
+## Amendment (2026-11-14, #4007 slice B)
+
+Worker-side, `prepareFrozenHeld` was split internally into `resolveFrozenRange`
+and `prepareOverRange`. Legacy callers see identical behaviour: same signature,
+return shape, single budget, callback order and tip-only CI check. A new
+terminal-only `prepareFrozenHeldPinned` adds an opt-in per-commit CI check and
+the scan and transport digests. With the terminal gate on, the held publish
+closure runs the terminal preservation step after the legacy preparation and
+before any held create or FINAL, and keeps the hold (no held FINAL) unless that
+step is `published` or `recorded`. The gate is a
+compile-time constant that is off, so this is production-dark. See
+[ADR-4007](4007-terminal-preservation.md).
 
 ## Consequences
 

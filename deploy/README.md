@@ -582,6 +582,15 @@ one). It polls the api outbound, listens on nothing, and materializes each hoste
 worker's Deployment + Secret + PVCs into the `uzi-workers` namespace, which contains
 nothing else by design.
 
+### Workload metadata for admission policies
+
+`workloadLabels` and `workloadAnnotations` add labels and annotations to every
+Deployment and StatefulSet the chart renders and to every hosted worker Deployment the
+controller creates, e.g. a policy exemption annotation or a required owner label. They
+go on the workload's own metadata, not the pod template, so no worker or app pod rolls;
+an existing worker picks them up the next time the controller updates its Deployment.
+Values must be strings, and a label uzi already sets, or any `uzi.dev/` key, is refused.
+
 ### Expanding existing worker data volumes
 
 New persistent L workers request 50Gi of `/data` (#2013), and Docker workers' DinD
@@ -1094,8 +1103,8 @@ runs. See [adr/1598-codex-command-storage.md](../adr/1598-codex-command-storage.
 ### Pod-epoch shadow reclaim (PRD #3430)
 
 Hosted Docker workers now participate in epoch ownership and can report a
-`pod_epoch_reclaim` verdict before run admission. **Production deletion is off
-by default: the pass does not delete attempt trees, release holds or remove
+`pod_epoch_reclaim` verdict before run admission. **Attempt deletion is off
+by default: that phase does not delete attempt trees, release holds or remove
 stopped containers.** The worker image carries a deletion phase from
 [PRD #3431](../prds/3431-pod-epoch-reclaim.md) that runs only when the worker
 starts with `UZI_EPOCH_RECLAIM_DELETION=1` (read once at startup). The only
@@ -1116,11 +1125,35 @@ every tree, logs `deferred` / `runtime_not_declared` without waiting for evidenc
 and reports no candidates, while still taking part in lifetime epoch locking.
 Candidate inventory needs a declared value. Setting a value attests the
 **full audited runtime/storage contract** below for the nodes eligible for these
-workers (a future hosted-Docker deletion under PRD #3431 will require it). The
+workers (hosted-Docker deletion under PRD #3431 requires it). The
 declaration does not verify versions or storage itself; the controller and worker
-only cross-check it against observations (see *Reading verdicts*). This release
-deletes nothing either way, except on a worker an operator selects with the
-deletion canary below.
+only cross-check it against observations (see *Reading verdicts*). Attempt deletion remains off except on a worker selected with the
+deletion canary below. Scratch reclaim is independently requested by default
+with `workers.epochReclaim.scratchDeletion: true`: the chart quotes controller
+`UZI_WORKER_EPOCH_SCRATCH_DELETION` as `"true"` or `"false"` (explicit false is
+preserved), and the controller emits worker `UZI_EPOCH_SCRATCH_DELETION=1` only
+for persistent Docker workers when enabled, omitting it otherwise. The value
+must be a boolean. This grants no attestation; undeclared/unattested keeps scratch.
+Older controllers or absent env leave scratch off; older workers ignore the env,
+so rendered `1` is not proof. The worker image must include #4171 (`7cd46526`).
+
+`.retire-*` retirement scratch is observation only (#4143): each worker startup
+logs bounded per-parent outcome rows (parents only) and one total line (whenever
+records are on and the runner root is a directory that was listed, even with
+zero parents; none when the root is missing, a symlink, not a directory or
+unlistable, which logs `runner retire scratch inspection failed`; `runner retire
+scratch outcomes failed` replaces it if the outcome step itself throws) and keeps every parent, with no reclaim. Chart `workers.epochReclaim.retireScratchOutcomes` is a strict
+boolean, default `true`; a non-boolean fails rendering. `false` makes the
+controller render worker `UZI_RETIRE_SCRATCH_OUTCOMES=0` on every worker (Docker
+or not); default renders are unchanged, so upgrading does not roll workers,
+while disabling rolls the worker template and takes effect at the next worker
+startup. `helm upgrade --reuse-values` from an older release lacks the key and
+fails the boolean guard, as `scratchDeletion` does: use
+`--reset-then-reuse-values` or `-f`. See
+[Disk-full residual](../docs/worker-docker.md#disk-full-residual-on-the-data-volume).
+See [startup disable and observation](../docs/run-recovery.md#runner-tmpdir-scratch-reclaim-startup-disable-and-observation)
+for safe replacement, evidence and startup-only limits; hosted observation and
+the keep-default decision remain pending on #4043.
 
 | Declaration | Audited stack |
 |---|---|
@@ -1264,9 +1297,9 @@ every tree). Admitted shapes, content-proof budgets and crash residuals are in
 
 The cross-checks have limits. Matching observations never prove the
 unobservable OCI-handler, crun/conmon, NRI, attachment or ownership-walk facts,
-and the kernel observation covers the successor's node only. In production
-nothing is deleted or settled: the PRD #3431 M1b deletion phase is switched off
-and its activation is separately gated by an owner decision.
+and the kernel observation covers the successor's node only. Attempt deletion is off by default and selector-gated; scratch reclaim is
+requested independently by default, with the same attestation requirement
+and unchanged mechanism protections described above.
 
 **Kernel allowlist (operator note).** Any kernel release outside the exact
 `crio-crun` allowlist above yields `kernel_unaudited` and defers, including after
@@ -1367,7 +1400,7 @@ base/candidate controls; exact-head PR CI is still pending. Before delivery,
 a formal owner partial decision must name the actual milestone IDs and the
 outstanding M1/M2c image/full-gate criteria and M3 live acceptance. Continuation
 guidance does not waive these checks. These pending proofs are not production
-verification; deletion stays off in production under #3431 except on the one canary worker an operator selects.
+verification; attempt deletion stays off in production under #3431 except on the one canary worker an operator selects.
 
 [PRD #3431](../prds/3431-pod-epoch-reclaim.md) records M1a's widened live
 acceptance as an owner-relayed assertion that this guide has not independently
@@ -1380,7 +1413,8 @@ the measured caps. PRD #3430's items above stay pending.
 
 ### One-worker deletion canary
 
-`workers.epochReclaim.deletionCanaryWorkerId` defaults to `""` (off everywhere).
+`workers.epochReclaim.deletionCanaryWorkerId` defaults to `""` (attempt deletion off everywhere).
+It does not gate scratch reclaim, which the chart requests by default as described above.
 It accepts empty or exactly one canonical lowercase UUID; a list, wildcard,
 uppercase, padded or non-string value fails chart rendering, and the controller
 (`UZI_WORKER_EPOCH_RECLAIM_DELETION_CANARY_ID`, always a string) refuses to boot
@@ -1505,6 +1539,18 @@ The controller reads the CA via `UZI_API_CA_FILE` and pins it *exclusively* (the
 system roots are not also trusted). There is no skip-verification knob in this path
 and there must not be one — an unverified peer is the attack the encryption exists
 to stop.
+
+**Extra CA for private-CA hosts.** `workers.extraCA` adds a bundle the workers trust
+next to the api's CA: set `pem` inline, or `configMap.name`/`key` for an existing
+ConfigMap in the release namespace (a trust-manager `Bundle` target works). The
+controller appends it after the api CA in each worker's Secret, and the worker plus
+the Claude Code CLI it starts trust both (the CLI not under `workers.uidSplit`, except on isolated-lane workers, which never take the split).
+Workers verify the api with that same bundle, so the extra CA is also trusted for the
+worker-to-api connection: keep it as narrow as your hosts allow. It needs
+`api.tls.enabled`, covers HTTPS from Node only (not git clone), and, like the api CA,
+is written at worker creation: restart the controller after editing an existing
+ConfigMap, and reprovision existing workers after any change (a paced roll does not
+rewrite an existing worker's Secret).
 
 Related trap, worth one line so nobody "simplifies" the projection away: do **not**
 mount the `uzi-ca` Secret instead. That one holds the **CA private key**, which is

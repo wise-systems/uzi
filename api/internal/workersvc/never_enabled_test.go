@@ -26,7 +26,7 @@ func TestNeverEnabledRepoRefusedBeforeForge(t *testing.T) {
 		fb := &fakeForges{f: &fakeForge{}}
 		svc := New(fs, newBox(t), testParams())
 		svc.SetForges(fb)
-		_, err := svc.CreateRun(ctx, user, repo, 7, "desc", nil, nil, false, nil, nil, nil, nil)
+		_, err := svc.CreateRun(ctx, user, repo, 7, "desc", nil, nil, false, nil, nil, nil, nil, nil, nil)
 		if !errors.Is(err, ErrRepoNeverEnabled) {
 			t.Fatalf("err = %v, want ErrRepoNeverEnabled", err)
 		}
@@ -40,7 +40,7 @@ func TestNeverEnabledRepoRefusedBeforeForge(t *testing.T) {
 		fb := &fakeForges{f: &fakeForge{}}
 		svc := New(fs, newBox(t), testParams())
 		svc.SetForges(fb)
-		_, err := svc.StartRunForUser(ctx, user, repo, 7, nil, nil, false, nil, nil, nil, nil)
+		_, err := svc.StartRunForUser(ctx, user, repo, 7, nil, nil, false, nil, nil, nil, nil, nil, nil)
 		if !errors.Is(err, ErrRepoNeverEnabled) {
 			t.Fatalf("err = %v, want ErrRepoNeverEnabled", err)
 		}

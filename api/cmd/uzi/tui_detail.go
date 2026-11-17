@@ -877,6 +877,53 @@ func (m tuiModel) detailHeaderLines() []string {
 	return []string{clampVisual(left, m.width)}
 }
 
+// checkDetailLines expands the server's live completion and cross-check facts below the
+// compact state token. Each item is one bounded physical row, charged by the transcript
+// viewport so a narrow terminal never loses its footer. Milestone ids are model text.
+func (m tuiModel) checkDetailLines() []string {
+	r := m.detail.run
+	var lines []string
+	add := func(text string, style lipgloss.Style) {
+		lines = append(lines, clampVisual(style.Render(m.renderer.Plain(text, 240)), m.width))
+	}
+	if label := completionPhaseLabel(r.CompletionPhase); label != "" {
+		text := label
+		if r.CompletionPhase == "reworking" {
+			// Put the fixed attempt count before model-authored ids, whose bounded list
+			// can be clipped on a narrow terminal without hiding the count.
+			if r.CompletionAttempts > 0 {
+				text += " · attempt " + itoa(r.CompletionAttempts)
+			}
+			if len(r.CompletionUnmet) > 0 {
+				ids := make([]string, 0, len(r.CompletionUnmet))
+				for _, id := range r.CompletionUnmet {
+					ids = append(ids, m.renderer.Plain(id, 32))
+				}
+				text += " · unmet: " + strings.Join(ids, ", ")
+			}
+		}
+		ink := m.pal.indigo
+		switch r.CompletionPhase {
+		case "reworking":
+			ink = m.pal.amber
+		case "blocked":
+			ink = m.pal.alarm
+		}
+		add(text, lipgloss.NewStyle().Foreground(ink))
+	}
+	if label := crossCheckActiveLabel(r.CrossCheckActive); label != "" {
+		add(label, lipgloss.NewStyle().Foreground(m.pal.indigo))
+	}
+	if label := planCrossCheckGateText(r); label != "" {
+		ink := m.pal.amber
+		if r.PlanCrossCheckGateReason != nil && *r.PlanCrossCheckGateReason == "block" {
+			ink = m.pal.alarm
+		}
+		add(label, lipgloss.NewStyle().Foreground(ink))
+	}
+	return lines
+}
+
 // providerDetailLines uses the CLI's policy clauses without clipping away action
 // hints. Sanitize before wrapping: each returned element is one physical row.
 // Work is bounded by the fixed policy copy plus the renderer's 240-rune ID cap.
@@ -965,6 +1012,9 @@ func (m tuiModel) renderDetail() string {
 	for _, hl := range m.detailHeaderLines() {
 		sb.WriteString(hl + "\n")
 	}
+	for _, line := range m.checkDetailLines() {
+		sb.WriteString(line + "\n")
+	}
 
 	// The park line (PRD #35). The status word alone is already in the header, and it
 	// is not enough: "limit_wait" tells a user their run stopped and nothing about
@@ -1007,6 +1057,9 @@ func (m tuiModel) renderDetail() string {
 		sb.WriteString(clampVisual(m.pal.state(crewWaiting).Render(m.renderer.Plain(line, 240)), m.width) + "\n")
 	}
 	for _, line := range workerExhaustionTUILines(d.run) {
+		sb.WriteString(clampVisual(m.pal.state(crewWaiting).Render(m.renderer.Plain(line, 240)), m.width) + "\n")
+	}
+	for _, line := range spendLimitHoldTUILines(d.run) {
 		sb.WriteString(clampVisual(m.pal.state(crewWaiting).Render(m.renderer.Plain(line, 240)), m.width) + "\n")
 	}
 	if line := fitDiskParkLine(d.run, m.width); line != "" {

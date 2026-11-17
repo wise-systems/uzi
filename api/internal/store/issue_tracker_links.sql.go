@@ -117,7 +117,7 @@ type LockRepoForEnableForUserRow struct {
 // rows that reference the repo by foreign key (board columns, cards).
 // source_locked: the project was linked before it was removed and this row is not linked, so
 // its issue source cannot change and the enable is refused before any board or label work
-// (the repos trigger from 00427 refuses it too, later and less cheaply).
+// (the repos trigger from 00467 refuses it too, later and less cheaply).
 func (q *Queries) LockRepoForEnableForUser(ctx context.Context, arg LockRepoForEnableForUserParams) (LockRepoForEnableForUserRow, error) {
 	row := q.db.QueryRow(ctx, lockRepoForEnableForUser, arg.ID, arg.UserID)
 	var i LockRepoForEnableForUserRow
@@ -169,7 +169,7 @@ SELECT (
 `
 
 // True when any table that stores an issue number for the repo has such a row. The
-// guard triggers (migration 00425) make this false for an awaiting repo; the link
+// guard triggers (migration 00466) make this false for an awaiting repo; the link
 // checks it anyway as defence in depth. Keep in step with the trigger list there.
 func (q *Queries) RepoStoresIssueNumber(ctx context.Context, repoID uuid.UUID) (bool, error) {
 	row := q.db.QueryRow(ctx, repoStoresIssueNumber, repoID)
@@ -191,7 +191,7 @@ WHERE r.id = $6
   AND c.id = r.connection_id AND c.user_id = $7
   AND itc.id = $1::uuid AND itc.user_id = $7
   AND r.awaiting_first_enable AND r.issue_tracker_connection_id IS NULL
-RETURNING r.id, r.connection_id, r.forge_project_id, r.path_with_namespace, r.web_url, r.default_branch, r.enabled, r.repo_skills_enabled, r.repo_devbox_opt_in, r.repo_claudemd_enabled, r.guardrail_override_reason, r.guardrail_override_by, r.guardrail_override_at, r.required_capabilities, r.fold_improve_uzi_backlog, r.code_cross_check_guidance, r.cross_check_repo_instructions_enabled, r.ignored_inferred_capabilities, r.agent_source_default, r.awaiting_first_enable, r.issue_tracker_connection_id, r.issue_tracker_project_id, r.issue_tracker_project_short, r.eligibility_tag_id, r.eligibility_tag_name, r.issue_tracker_linked_at
+RETURNING r.id, r.connection_id, r.forge_project_id, r.path_with_namespace, r.web_url, r.default_branch, r.enabled, r.repo_skills_enabled, r.repo_devbox_opt_in, r.repo_claudemd_enabled, r.guardrail_override_reason, r.guardrail_override_by, r.guardrail_override_at, r.required_capabilities, r.fold_improve_uzi_backlog, r.code_cross_check_guidance, r.cross_check_repo_instructions_enabled, r.ignored_inferred_capabilities, r.agent_source_default, r.initial_import_state, r.initial_import_generation, r.initial_import_error_class, r.initial_import_updated_at, r.awaiting_first_enable, r.issue_tracker_connection_id, r.issue_tracker_project_id, r.issue_tracker_project_short, r.eligibility_tag_id, r.eligibility_tag_name, r.issue_tracker_linked_at
 `
 
 type SetRepoIssueTrackerLinkParams struct {
@@ -239,6 +239,10 @@ func (q *Queries) SetRepoIssueTrackerLink(ctx context.Context, arg SetRepoIssueT
 		&i.CrossCheckRepoInstructionsEnabled,
 		&i.IgnoredInferredCapabilities,
 		&i.AgentSourceDefault,
+		&i.InitialImportState,
+		&i.InitialImportGeneration,
+		&i.InitialImportErrorClass,
+		&i.InitialImportUpdatedAt,
 		&i.AwaitingFirstEnable,
 		&i.IssueTrackerConnectionID,
 		&i.IssueTrackerProjectID,

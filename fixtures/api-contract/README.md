@@ -65,6 +65,20 @@ ordering under database collations. Re-record the corpus from the Go test's
 printed replacement JSON with `UZI_TEST_DATABASE_URL` set; a skipped test does
 not verify it.
 
+Issue #4162 adds hand-authored new-server samples for custody admission units:
+`recovery_custody_holds.grouped.json` (a `same_run_group` member beside its
+group's representative; counted flags sum to `admission_counted_holds`),
+`recovery_custody_holds.grouped-zero.json` (explicit-zero aggregate) and
+`run.custody_run_hold_bound.json` (a queued run carrying the per-run hold-bound
+health reason). `TestCustodyAdmissionUnitsGroupedFixturesLiveDB` decodes them
+strictly into the Go DTOs; client tests render them.
+
+Issue #4257 adds `run.checkpoint_publication_withheld.json`, a running run with health
+`publication_withheld`, the fixed owner-only `health_reason` and `health_since`. The hint is not on
+the wire; the Go CLI renders it from `apitypes.HintCheckpointPublicationWithheld` and the web from a
+mirrored literal in `lib/runBadge.ts`. `TestCheckpointPublicationWithheldFixtureRenders` and the web
+`runBadge.test.ts` read it.
+
 ### M2 `ZeroOf` exemptions, each cited (Decision 7)
 
 Every exemption below is a field the TS type says never-null while the Go **mapper**

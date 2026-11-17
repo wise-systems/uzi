@@ -3,7 +3,7 @@ import { minsAgo } from "./time";
 
 // Admin-health fixtures (PRD #1484 M4). These stand in for GET /api/admin/health in mock
 // mode and back the Health-tab component tests. They mirror the real registry
-// (api/internal/healthsvc): all 23 of its check ids, in the SAME stable order the
+// (api/internal/healthsvc): all of its check ids, in the SAME stable order the
 // server emits (service.go Evaluate), so the demo and the tests exercise a well-formed document.
 //
 // Summaries here are illustrative demo copy, not byte-for-byte the server's templates — the
@@ -18,6 +18,10 @@ const CHECK_META: { id: string; scope: string; group: string; title: string; doc
   { id: "fleet.rundisk", scope: "owner", group: "workers", title: "Run disk size", doc: "hosted-workers" },
   { id: "fleet.quarantine", scope: "owner", group: "workers", title: "Worker residue quarantine", doc: "hosted-workers" },
   { id: "fleet.memory_authority", scope: "owner", group: "workers", title: "Worker memory authority", doc: "hosted-workers" },
+  { id: "fleet.hibernation_wake", scope: "instance", group: "workers", title: "Hibernation wakes", doc: "hosted-workers" },
+  { id: "fleet.hibernation_cleanup", scope: "instance", group: "workers", title: "Hibernation cache cleanup", doc: "hosted-workers" },
+  { id: "fleet.hibernation", scope: "instance", group: "workers", title: "Automatic hibernation", doc: "hosted-workers" },
+  { id: "fleet.hibernation_retirement", scope: "instance", group: "workers", title: "Hibernation volume retirement (dry run)", doc: "hosted-workers" },
   { id: "queue.waiting", scope: "owner", group: "queue", title: "Runs waiting for a worker", doc: null },
   { id: "queue.undispatched", scope: "owner", group: "queue", title: "Undispatched task runs", doc: null },
   { id: "controller.report", scope: "instance", group: "control", title: "Controller reporting", doc: "hosted-workers" },
@@ -46,6 +50,10 @@ const OK_SUMMARY: Record<string, string> = {
   "fleet.rundisk": "No run is close to filling its worker's data volume.",
   "fleet.quarantine": "No worker reports a residue quarantine.",
   "fleet.memory_authority": "No worker has lost memory authority.",
+  "fleet.hibernation_wake": "No hosted worker has a failed or overdue wake.",
+  "fleet.hibernation_cleanup": "No hosted worker has an unsettled hibernation cache cleanup.",
+  "fleet.hibernation": "No idle hosted worker is blocked from automatic hibernation.",
+  "fleet.hibernation_retirement": "Dry run: no volumes are deleted. 0 of 2 evaluated worker(s) are blocked past the retirement period; 2 would retire only after M2 verifies the PV reclaim policy and pod exclusion.",
   "queue.waiting": "No run is waiting for a worker.",
   "queue.undispatched": "No task run is stuck undispatched.",
   "controller.report": "The controller is reporting.",
@@ -75,8 +83,8 @@ function build(overrides: Record<string, CheckOverride>): HealthCheck[] {
     scope: m.scope,
     group: m.group,
     title: m.title,
-    severity: "ok",
-    summary: OK_SUMMARY[m.id] ?? "",
+    severity: m.id === "fleet.hibernation" ? "na" : "ok",
+    summary: m.id === "fleet.hibernation" ? "Automatic hibernation is off." : OK_SUMMARY[m.id] ?? "",
     since: null,
     evidence: [],
     action: null,
@@ -150,7 +158,7 @@ export function maintenanceDoc(): HealthDoc {
 }
 
 // overview-next (PRD #3878): one owner warning that opts into the admin attention banner,
-// so the Overview preview shows that banner and a non-passing health chip.
+// so the default Overview shows that banner and a non-passing health chip.
 export function overviewNextDoc(): HealthDoc {
   return doc(
     build({
@@ -316,6 +324,10 @@ export function noHostedWorkersDoc(): HealthDoc {
   return doc(
     build({
       "fleet.roll": { severity: "na", summary: "No hosted workers are configured on this deployment." },
+      "fleet.hibernation_wake": { severity: "na", summary: "No hosted workers are configured on this deployment." },
+      "fleet.hibernation_cleanup": { severity: "na", summary: "No hosted workers are configured on this deployment." },
+      "fleet.hibernation": { severity: "na", summary: "No hosted workers are configured on this deployment." },
+      "fleet.hibernation_retirement": { severity: "na", summary: "Dry run: no volumes are deleted. No hibernated worker is waiting for volume retirement." },
       "controller.report": {
         severity: "na",
         summary: "No hosted workers are configured, so the controller does not report.",
@@ -333,6 +345,11 @@ export function noHostedWorkersDoc(): HealthDoc {
 // (the ones the admin list lacked before this PRD) are populated across users.
 function stuckHosted(over: Partial<AdminWorker>): AdminWorker {
   return {
+    hibernation_state: "none",
+    hibernation_reason: null,
+    hibernated_at: null,
+    wake_requested_at: null,
+    wake_error: null,
     id: "w-stuck",
     name: "base.l-7c2e",
     status: "offline",
@@ -397,6 +414,11 @@ export function incidentFleetWorkers(): AdminWorker[] {
 // always agree; this only keeps the DEMO scenarios coherent. No upgrade_failed row here.
 function healthyHosted(over: Partial<AdminWorker>): AdminWorker {
   return {
+    hibernation_state: "none",
+    hibernation_reason: null,
+    hibernated_at: null,
+    wake_requested_at: null,
+    wake_error: null,
     id: "w-ok",
     name: "base.l-7c2e",
     status: "online",

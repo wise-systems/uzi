@@ -116,6 +116,7 @@ export const mockRuns: Run[] = [
     // PRD #3244 rule 2: a schedule-pinned model on a queued run reads "lead: fable · effort
     // resolves at claim".
     model: "fable",
+    model_source: "schedule_pin",
     lead_config: LEAD_CONFIG_NO_ROWS,
     override_subagent_model: false,
     forge_type: "gitlab",
@@ -1087,6 +1088,7 @@ export const mockRuns: Run[] = [
     // null = inherited the owner's Worker default). PRD #3244 rule 3: claimed with no
     // recorded rows, so the chip reads "lead: not recorded" beside the schedule pin.
     model: "fable",
+    model_source: "schedule_pin",
     lead_config: LEAD_CONFIG_NO_ROWS,
     override_subagent_model: true,
     forge_type: "gitlab",
@@ -2209,6 +2211,18 @@ mockRuns.push({
   usage_estimated_tail: null,
 });
 
+// PRD #3257 M2: the judge-skipped fixture. A terminal Claude issue run with no review and no
+// pending judge, paired with a mockJudgeSkips row, so /runs/run-judge-skipped shows the run-review
+// panel's skip notice. Derived from run-unjudged (whose own job is the never-judged state and
+// must stay skip-free) so every other field stays realistic.
+mockRuns.push({
+  ...mockRuns.find((r) => r.id === "run-unjudged")!,
+  id: "run-judge-skipped", issue_iid: 21,
+  issue_title: "Rotate worker registration tokens on a schedule",
+  issue_description: "", branch: "agent/issue-21",
+  mr_web_url: "https://gitlab.example.com/myorg/uzi/-/merge_requests/44", mr_iid: 44,
+});
+
 // PRD #3708: gated plan cross-check runs (checked before your review), from the parked gate.
 mockRuns.push(...gatedCrossCheckRuns(mockRuns.find((r) => r.id === "run-awaiting")!));
 
@@ -2238,6 +2252,29 @@ for (const [id, max, sourceOnly] of [
     },
   });
 }
+// Per-run custody bound: open /runs/run-custody-run-bound under ?mock=custody-run-bound. The
+// literal is apitypes.ReasonCustodyRunHoldBound (api/internal/apitypes/recovery.go); the run's
+// own open holds reach the limit while the owner's counted units stay below it.
+mockRuns.push({
+  ...pausedBase, id: "run-custody-run-bound", status: "queued", hold_reason: null,
+  health: "ok", health_since: null,
+  health_reason: "this run has reached its own custody hold limit; retained holds still protect its work; resolve or discard this run's own retained holds to let it start",
+});
+// Issue #4257: a running run whose checkpoint publication is withheld by a secret-scan
+// restriction: open /runs/run-publication-withheld. The reason literal is
+// apitypes.ReasonCheckpointPublicationWithheld (api/internal/apitypes/checkpoint_publication.go);
+// the hint is not on the wire and RunView renders it from lib/runBadge.ts.
+mockRuns.push({
+  ...mockRuns.find((r) => r.id === "run-live")!, id: "run-publication-withheld",
+  health: "publication_withheld", health_since: minsAgo(12),
+  health_reason: "checkpoint publication is withheld by a secret-scan restriction; new work stays on the worker until it is resolved",
+});
+// Issue #3767: a Claude run held on its Anthropic API key's spend limit. Owner-held (explicit
+// null retry stamp); open /runs/run-spend-limit-hold.
+mockRuns.push({
+  ...pausedBase, id: "run-spend-limit-hold", status: "recovery_wait", hold_reason: null,
+  recovery_wait_cause: "anthropic_spend_limit", recovery_retry_not_before: null,
+});
 mockRuns.push(
   { ...pausedBase, id: "run-iteration-hold", hold_reason: "iteration_budget_exhausted",
     budget_wall_seconds: null, budget_total_seconds: 3600, budget_used_seconds: 1800,
@@ -2255,6 +2292,23 @@ mockRuns.push(
   { ...pausedBase, id: "run-provider-recovery", status: "recovery_wait", hold_reason: null,
     recovery_wait_cause: "provider_outage", provider_park_count: 3,
     provider_park_streak_started_at: minsAgo(90), recovery_retry_not_before: minsAhead(5) },
+);
+// PRD #3250 run-start choice shapes (lead-config display cases DC-P1 to DC-P3, DC-P6, DC-P8), built on
+// the paused run (they share its issue); open /runs/<id> for the chip and its tooltip.
+const startChoiceBase: Run = { ...pausedBase, status: "queued", hold_reason: null, lead_config: LEAD_CONFIG_NO_ROWS };
+mockRuns.push(
+  { ...startChoiceBase, id: "run-start-choice-both", model: "opus", model_source: "run_override",
+    effort: "xhigh", effort_source: "run_override" },
+  { ...startChoiceBase, id: "run-start-choice-effort", model: null, model_source: null,
+    effort: "xhigh", effort_source: "run_override" },
+  { ...startChoiceBase, id: "run-start-choice-model", model: "opus", model_source: "run_override",
+    effort: null, effort_source: null },
+  // DC-P6: the choice cannot run on this harness; held before any lead report.
+  { ...startChoiceBase, id: "run-start-choice-hold", status: "paused", hold_reason: "run_override_unavailable",
+    model: "opus", model_source: "run_override", effort: "xhigh", effort_source: "run_override" },
+  // DC-P8: a legacy row, a model with a NULL source, reads as a schedule pin.
+  { ...startChoiceBase, id: "run-start-choice-legacy", model: "opus", model_source: null,
+    effort: null, effort_source: null },
 );
 // Forge recovery: NULL is an owner hold; omitted timing is older-API uncertainty.
 for (const [id, status, retry] of [

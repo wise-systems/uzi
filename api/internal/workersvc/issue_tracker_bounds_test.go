@@ -68,7 +68,7 @@ func TestOversizedIssueDescriptionIsRefusedLikeTheForgeEquivalent(t *testing.T) 
 			if name == "forge" {
 				iid = 4
 			}
-			_, err := svc.CreateRun(context.Background(), uuid.New(), uuid.New(), iid, "caller body", nil, nil, false, nil, nil, nil, nil)
+			_, err := svc.CreateRun(context.Background(), uuid.New(), uuid.New(), iid, "caller body", nil, nil, false, nil, nil, nil, nil, nil, nil)
 			if err == nil || !strings.Contains(err.Error(), ErrDescriptionTooLarge.Error()) {
 				t.Fatalf("err = %v, want ErrDescriptionTooLarge", err)
 			}
@@ -143,7 +143,7 @@ func TestOversizedMappedIssueCommentIsTruncatedLikeTheForgeEquivalent(t *testing
 	svc := New(fs, newBox(t), testParams())
 	svc.SetForges(m2Builder{&m2Forge{disposition: forge.AuthorEligible}})
 	svc.SetIssueSources(&fakeSources{tr: linkedYouTrack{Driver: youTrackDriver(t, srv)}})
-	if _, err := svc.CreateRun(context.Background(), uuid.New(), uuid.New(), n, "", nil, nil, false, nil, nil, nil, nil); err != nil {
+	if _, err := svc.CreateRun(context.Background(), uuid.New(), uuid.New(), n, "", nil, nil, false, nil, nil, nil, nil, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	var th issueinput.Thread

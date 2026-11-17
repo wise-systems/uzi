@@ -87,7 +87,7 @@ type fakeStore struct {
 	// getRepoErr makes GetRepoForUser fail; provisionsvc logs that error
 	// through slog, the path a scrub test needs.
 	getRepoErr error
-	// setEnabledErr makes SetRepoEnabledForUser fail, as the database does when a trigger refuses the flip.
+	// setEnabledErr makes EnableRepoForUser fail, as the database does when a trigger refuses the flip.
 	setEnabledErr error
 	// onGetRepo, when set, runs at the start of GetRepoForUser, so a test can
 	// hold one run inside the enable step while another run starts.
@@ -166,14 +166,14 @@ func (s *fakeStore) GetRepoForUser(_ context.Context, a store.GetRepoForUserPara
 func (s *fakeStore) LockRepoForEnableForUser(context.Context, store.LockRepoForEnableForUserParams) (store.LockRepoForEnableForUserRow, error) {
 	return store.LockRepoForEnableForUserRow{}, nil
 }
-func (s *fakeStore) SetRepoEnabledForUser(_ context.Context, a store.SetRepoEnabledForUserParams) (store.Repo, error) {
+func (s *fakeStore) EnableRepoForUser(_ context.Context, a store.EnableRepoForUserParams) (store.Repo, error) {
 	s.writes++
 	if s.setEnabledErr != nil {
 		return store.Repo{}, s.setEnabledErr
 	}
 	s.flips[a.ID]++
 	r := s.repos[a.ID]
-	r.Enabled = a.Enabled
+	r.Enabled = true
 	return *r, nil
 }
 func (s *fakeStore) DeletePendingGuardrailOverrideRequestsForRepo(context.Context, uuid.UUID) error {

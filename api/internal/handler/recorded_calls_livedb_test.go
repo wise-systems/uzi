@@ -18,12 +18,12 @@ import (
 // Recorded-call test (PRD 4173 M4): for a repo with no issue-tracker link,
 // pin every forge call the repo-scoped handlers make: the first board open
 // (default-column seed plus initial import), the Refresh sync, a board card
-// move, a new board issue, promote, the issue page, column configuration, and a repo enable (live guard, column seed, import
-// after enable). The forge is reached
+// move, a new board issue, promote, the issue page, column configuration, and a repo enable (live guard, column seed;
+// the first import is the poller's, issue #4399, so the enable makes no ListIssues call). The forge is reached
 // through the real forgesvc builder seam and the real privcheck guard, so the
-// calls are the production ones. The golden was captured before the
-// tracker-link rerouting; regenerate only deliberately, with
-// UZI_UPDATE_GOLDEN=1.
+// calls are the production ones. The golden was recaptured in the 2026-11-17
+// port because the first import moved out of the enable request; regenerate
+// only deliberately, with UZI_UPDATE_GOLDEN=1.
 
 // rcRepoForge answers the issue and guard reads those handlers make.
 type rcRepoForge struct{ forgetest.BaseFake }
@@ -112,7 +112,7 @@ func TestRecordedCallsRepoHandlersLiveDB(t *testing.T) {
 	step("PromoteIssue (board promote, SetIssueLabel)", http.MethodPost, fmt.Sprintf("/api/repos/%s/issues/9/promote", tracked), "", http.StatusOK)
 	step("GetIssueDetail (issue page)", http.MethodGet, fmt.Sprintf("/api/repos/%s/issues/5", tracked), "", http.StatusOK)
 	step("ConfigureColumns", http.MethodPut, fmt.Sprintf("/api/repos/%s/board/columns", tracked), `{"columns":[{"label_name":"In Progress"},{"label_name":"Later"}]}`, http.StatusOK)
-	step("SetRepoEnabled true (guard, column seed, importAfterEnable)", http.MethodPut, fmt.Sprintf("/api/repos/%s", toEnable), `{"enabled":true}`, http.StatusOK)
+	step("SetRepoEnabled true (guard, column seed; the first import is the poller's, issue #4399)", http.MethodPut, fmt.Sprintf("/api/repos/%s", toEnable), `{"enabled":true}`, http.StatusOK)
 
 	forgetest.AssertGolden(t, "recorded_calls_handler_repo_handlers.golden", lines)
 }

@@ -107,6 +107,7 @@ apiget() {
     /api/auth/me) jq -cn --argjson value "$ORIGINAL" '{user:{autopilot_enabled:$value}}' ;;
     /api/forge/connections) echo '{"connections":[{"id":"connection","human_username":"owner-alice"}]}' ;;
     /api/forge/connections/connection/projects) echo '{"repos":[{"id":"repo2","path_with_namespace":"group/repo2"}]}' ;;
+    /api/repos/repo2/board) echo '{"board":{"initial_import":{"state":"succeeded"}}}' ;;
     /api/me/secrets)
       if [ -f "$STATE/token" ]; then
         echo '{"secrets":[{"id":"11111111-1111-4111-8111-111111111111","kind":"anthropic_token","label":"default","is_default":true},{"id":"22222222-2222-4222-8222-222222222222","kind":"anthropic_token","label":"console-key","is_default":false}]}'
@@ -345,6 +346,45 @@ regate "new claim not yet at the gate"              fail "timeout: run R was nev
 regate "gate row with no claimed_at"                fail "timeout: run R was never re-gated" awaiting_approval:
 regate "terminal failure while waiting"             fail "run R entered 'failed'" awaiting_approval:T0 failed:T1
 regate "cancelled while waiting"                    fail "run R entered 'cancelled'" awaiting_approval:T0 cancelled:
+
+# wait_initial_import (#4399): an API enable returns before the first issue import, and only a
+# `succeeded` board status proves the import's eviction pass is over. The scripted apiget serves
+# one board DTO per poll (sticking on the last); each step is a state name, `null` for a legacy
+# board with no import, or `raw:<json>` for a literal body. The virtual clock makes the 3s
+# timeout allow exactly three polls.
+eval "$(awk '/^wait_initial_import\(\) \{/,/^\}/' "$LIB")"
+cases=$((cases + 1))
+if type wait_initial_import >/dev/null 2>&1; then
+  passed=$((passed + 1)); echo "PASS: wait_initial_import extracted from lib.sh"
+else
+  echo "FAIL: wait_initial_import not defined — extraction failed or the helper was removed"
+fi
+# import_wait NAME WANT(pass|fail) DIAGNOSTIC_PREFIX STEP...
+import_wait() {
+  cases=$((cases + 1))
+  local name="$1" want="$2" diagnostic="$3" got output; shift 3
+  : > "$SEQ_DIR/seq"; echo 1 > "$SEQ_DIR/n"
+  for step in "$@"; do
+    case "$step" in
+      null) echo '{"board":{"initial_import":null}}' >> "$SEQ_DIR/seq" ;;
+      raw:*) echo "${step#raw:}" >> "$SEQ_DIR/seq" ;;
+      *) jq -nc --arg s "$step" '{board: {initial_import: {state: $s}}}' >> "$SEQ_DIR/seq" ;;
+    esac
+  done
+  if output="$(unset SECONDS; SECONDS=0; wait_initial_import REPO 3 2>&1)"; then got=pass; else got=fail; fi
+  if [ "$got" = "$want" ] && [[ "$output" == "$diagnostic"* ]]; then
+    passed=$((passed + 1)); echo "PASS: $name"
+  else
+    echo "FAIL: $name — got $got want $want; output [$output] (want prefix [$diagnostic])"
+  fi
+}
+import_wait "already succeeded"                     pass "" succeeded
+import_wait "waiting then running then succeeded"   pass "" waiting running succeeded
+import_wait "failed is retried, not terminal"       pass "" failed running succeeded
+import_wait "never leaves running"                  fail "timeout: repo REPO first issue import did not succeed within 3s (last state: running)" running
+import_wait "a persistent failure names its state"  fail "timeout: repo REPO first issue import did not succeed within 3s (last state: failed)" failed
+import_wait "legacy board without an import"        fail "timeout: repo REPO first issue import did not succeed within 3s (last state: none)" null
+import_wait "unparseable board is not success"      fail "timeout: repo REPO first issue import did not succeed within 3s (last state: unreadable)" raw:notjson
 
 # settle_runs_terminal: best-effort, so it must return 0 both when a run settles and when it
 # never does, and it must stop polling a run once that run is terminal. The virtual clock
@@ -696,6 +736,16 @@ for variant in wrong-generation wrong-order two-captures missing-id extra-claim 
   capture_fixture "$variant"
   custody_case "capture decoder refuses $variant" fail 'lacks the exact G+1' wait_same_claim_capture_resume R 2 0
 done
+
+# Issue #4198: `uzi run recovery <run> --json` may end with one {"unattached":true} element that
+# carries captures whose hold is not listed. It has no generation, so it must neither disturb the
+# exact generation join nor stand in for a missing capture.
+capture_fixture guarded
+uzi_cli() { echo '[{"generation":2,"captures":[{"id":"capture","state":"available"}]},{"run_id":"R","unattached":true,"captures":[{"id":"other","state":"available"}]}]'; }
+custody_case "an unattached element after the hold element is ignored" pass 'exact generation 2 captured' wait_same_claim_capture_resume R 2 0
+uzi_cli() { echo '[{"run_id":"R","unattached":true,"captures":[{"id":"capture","state":"available"}]}]'; }
+custody_case "an unattached-only listing is not the generation's capture" fail 'lacks the exact G+1' wait_same_claim_capture_resume R 2 0
+uzi_cli() { echo '[{"generation":2,"captures":[{"id":"capture","state":"available"}]}]'; }
 
 # #3644 independent restore: the production log sequence, in production order (agent/src/runner.ts
 # "run claimed", agent/src/git.ts "runner clone: seeding" with seeded_from restore_pin, runner.ts
@@ -1770,7 +1820,7 @@ for mode in entry window discard idle; do
 done
 
 # Stateful gate model driving the REAL phase end to end (no cutoff). The model is a set of
-# files (mocks run inside command substitutions): baseline holds B (all admission-counted),
+# files (mocks run inside command substitutions): baseline holds B (each its own admission unit),
 # the seeds the phase inserted, how many were attached/discarded. The fake claim loop admits
 # the wedge run iff counted = B + undiscarded seeds < 8, and wait_status FAILS unless the
 # model says the run was claimed, so a phase that discards too few holds cannot pass.
@@ -1799,6 +1849,7 @@ custody_model_phase() {
   sleep() { SECONDS=$((SECONDS + 1)); } # virtual clock for the negative window
   inventory_diagnostic_snapshot() { :; }
   wait_custody_headroom() { :; }
+  log_custody_entry_census() { :; }
   assert_earlier_held_custody_receipt() { :; }
   db_psql() {
     case "$1" in
@@ -1826,13 +1877,15 @@ custody_model_phase() {
     esac
   }
   apiget() {
-    local counted open
+    local counted open fresh
     case "$1" in
       /api/workers) echo '{"workers":[{"status":"online","busy":false}]}' ;;
       /api/recovery/holds)
         counted="$(model_counted)"; open="$counted"
         # A claimed run's fresh hold is open but excluded from admission counting.
-        if [ "$claim" != always ] && model_claimed; then open=$((counted + 1)); fi
+        # The wedge run does not exist before seeding, so the baseline read (before any seed)
+        # must not evaluate (and thereby latch) its claim.
+        if [ "$claim" != always ] && [ "$(cat "$M/seeds")" != 0 ] && model_claimed; then open=$((counted + 1)); fi
         # Aggregate-serving faults: seed-short serves counted=LIMIT-1 on the first read after
         # seeding; post-nodiff serves open == counted after the claim; post-high serves
         # counted >= LIMIT after the claim.
@@ -1841,8 +1894,16 @@ custody_model_phase() {
         elif [ "$agg" = post-nodiff ] && [ "$(cat "$M/claimed")" = 1 ]; then open="$counted"
         elif [ "$agg" = post-high ] && [ "$(cat "$M/claimed")" = 1 ]; then counted=8; open=9
         fi
-        jq -nc --argjson c "$counted" --argjson o "$open" --argjson b "$([ "$(cat "$M/claimed")" = 1 ] && echo 0 || echo 1)" \
-          '{aggregate:{open_holds:$o,admission_counted_holds:$c,custody_hold_limit:8,blocked_runs:$b}}' ;;
+        fresh='[]'
+        if [ "$(cat "$M/claimed")" = 1 ]; then
+          if [ "$agg" = fresh-counted ]; then
+            fresh="[{\"id\":\"${U}ffff\",\"state\":\"open\",\"counts_toward_admission\":true,\"admission_reason\":\"decision_needed\"}]"
+          else
+            fresh="[{\"id\":\"${U}ffff\",\"state\":\"open\",\"counts_toward_admission\":false,\"admission_reason\":\"live_claim\"}]"
+          fi
+        fi
+        jq -nc --argjson c "$counted" --argjson o "$open" --argjson b "$([ "$(cat "$M/claimed")" = 1 ] && echo 0 || echo 1)" --argjson f "$fresh" \
+          '{aggregate:{open_holds:$o,admission_counted_holds:$c,custody_hold_limit:8,blocked_runs:$b},holds:$f}' ;;
       /api/runs/wedge) if model_claimed; then echo '{"run":{"status":"running"}}'; else echo '{"run":{"status":"queued"}}'; fi ;;
       *) fail "unhandled model API read: $1" ;;
     esac
@@ -1907,6 +1968,7 @@ model_case "product control: claim while counted >= limit fails the negative win
 model_case "mutant seeding LIMIT - baseline wedges nothing when the baseline settles" fail "wedge run left 'queued'" "$SEQ_DIR/phase72-base.sh" 1 poll1 gate
 model_case "post-claim aggregate with open == counted fails" fail 'open_holds - admission_counted_holds = 0' "$CUSTODY_PHASE_TEST_SOURCE" 0 never gate post-nodiff
 model_case "post-claim aggregate with counted >= limit fails" fail 'still >= 8 after the unblock' "$CUSTODY_PHASE_TEST_SOURCE" 0 never gate post-high
+model_case "fresh hold counted toward admission fails the exact check" fail 'is not (counts_toward_admission=false, admission_reason=live_claim)' "$CUSTODY_PHASE_TEST_SOURCE" 0 never gate fresh-counted
 model_case "post-seed aggregate below the limit fails" fail 'after seeding 8 holds' "$CUSTODY_PHASE_TEST_SOURCE" 0 never gate seed-short
 
 # Exercise the actual handoff startup/trap, stopping before transport and dispatch.
@@ -2682,7 +2744,47 @@ pass() { echo "pass: $*"; }
 fail() { echo "fail: $*" >&2; exit 17; }
 wait_worker_online() { echo wait_worker_online >> "$S/calls"; }
 capture_agent_logs() { echo "capture $*" >> "$S/calls"; }
-docker() { [ "$1" = logs ] || return 1; cat "$S/log.$2"; }
+# inspect_format_ok TEMPLATE — the #4165 projection allowlist: every {{...}} action may hold only
+# if/else/end and refs to .Name or the selected .State fields, so a whole-object or environment template
+# (e.g. {{json .}}, {{.}}, {{.Config.Env}}) is rejected.
+inspect_format_ok() {
+  local rest="$1" act tok n=0 re='\{\{([^}]*)\}\}' ref='^\.(Name|State\.(ExitCode|OOMKilled|Error|Health(\.(Status|FailingStreak))?))$'
+  while [[ "$rest" =~ $re ]]; do
+    n=$((n + 1)); act="${BASH_REMATCH[1]}"; rest="${rest#*"${BASH_REMATCH[0]}"}"
+    [ -n "${act// /}" ] || return 1
+    for tok in $act; do
+      case "$tok" in if | else | end) ;; *) [[ "$tok" =~ $ref ]] || return 1 ;; esac
+    done
+  done
+  [ "$n" -gt 0 ]
+}
+docker() {
+  case "$1" in
+    logs) cat "$S/log.$2" ;;
+    inspect)
+      printf '%s\n' "$*" >> "$S/inspect-calls"
+      [ -z "${DIAG_FAIL:-}" ] || return 1
+      if [ "${2:-}" = --format ] && inspect_format_ok "${3:-}"; then
+        echo "name=/${4:-} ExitCode=1 OOMKilled=false Error= Health=none"
+      else
+        printf '%s\n' "${3:-bare}" >> "$S/inspect-rejected"
+        echo '[{"Config":{"Env":["ENV-SECRET-MARKER=1"]}}]'
+      fi ;;
+    *) return 1 ;;
+  esac
+}
+# The #4165 limiter stub: records `T CMD...`, simulates elapsed time (DIAG_SLOW=N seconds per read) or a
+# read killed at its deadline (DIAG_HANG=ps|logs|inspect|all -> 124 without running it), else runs CMD.
+diag_limiter_stub() {
+  local t verb="" a
+  if [ "${1:-}" = -k ] && [ "${2:-}" = 2 ]; then shift 2; else echo "$*" >> "$S/limiter-nokill"; fi
+  t="$1"; shift
+  printf '%s %s\n' "$t" "$*" >> "$S/limiter-calls"
+  if [ -n "${DIAG_SLOW:-}" ]; then SECONDS=$((SECONDS + DIAG_SLOW)); fi
+  for a in "$@"; do case "$a" in ps | logs | inspect) verb="$a"; break ;; esac; done
+  if [ -n "${DIAG_HANG:-}" ] && { [ "$DIAG_HANG" = all ] || [ "$DIAG_HANG" = "$verb" ]; }; then return 124; fi
+  "$@"
+}
 apiget() {
   case "$1" in
     /api/workers) jq -nc --argjson caps "$(cat "$S/api.caps" 2>/dev/null || echo '[]')" '{workers: [{id: "w-1", status: "online", capabilities: $caps}]}' ;;
@@ -2704,7 +2806,7 @@ agent_create() {
   [ -n "${STALE_API:-}" ] || echo "$caps" > "$S/api.caps"
 }
 fake_compose() {
-  local t svc
+  local t svc all=0 quiet=0
   printf '%s\n' "$*" >> "$S/rawcalls"
   while [ "${1:-}" = --profile ]; do shift 2; done
   printf '%s\n' "$*" >> "$S/calls"
@@ -2713,13 +2815,23 @@ fake_compose() {
     ps)
       [ -z "${PS_FAIL:-}" ] || return 1
       svc="${!#}"
+      for t in "$@"; do case "$t" in -a) all=1 ;; -q) quiet=1 ;; esac; done
       case "$svc" in
         agent) [ ! -f "$S/agent.id" ] || cat "$S/agent.id" ;;
-        dind | dind-init) [ ! -f "$S/running.$svc" ] || echo "id-$svc" ;;
+        dind | dind-init)
+          if [ "$all" = 1 ]; then
+            # #4165 diagnostics only (the entry checks never pass -a): exited containers are listed too.
+            [ -z "${DIAG_FAIL:-}" ] || return 1
+            if [ -f "$S/running.$svc" ] || [ -f "$S/exited.$svc" ]; then
+              if [ "$quiet" = 1 ]; then echo "c${svc//-/}"; else echo "PSROW $svc exited (1)"; fi
+            fi
+          else
+            [ ! -f "$S/running.$svc" ] || echo "id-$svc"
+          fi ;;
       esac ;;
     up)
       case "${!#}" in
-        dind) [ -z "${DIND_UP_FAIL:-}" ] || { echo "${DIND_UP_MSG:-}"; return 1; }
+        dind) [ -z "${DIND_UP_FAIL:-}" ] || { : > "$S/exited.dind"; : > "$S/exited.dind-init"; echo "${DIND_UP_MSG:-}"; return 1; }
           : > "$S/running.dind"; : > "$S/running.dind-init"; : > "$S/daemon"; : > "$S/sock" ;;
         agent) agent_create ;;
         *) echo "unexpected up: $*" >> "$S/forbidden" ;;
@@ -2737,7 +2849,11 @@ fake_compose() {
         [ ! -f "$S/running.$svc" ] || return 1
         echo "removed $svc" >> "$S/removed"
       done ;;
-    logs) cat "$S/agentlog.txt" 2>/dev/null || true ;;
+    logs)
+      case "${!#}" in
+        dind | dind-init) [ -z "${DIAG_FAIL:-}" ] || return 1; cat "$S/log-svc.${!#}" 2>/dev/null || true ;;
+        *) cat "$S/agentlog.txt" 2>/dev/null || true ;;
+      esac ;;
     *) echo "unexpected: $*" >> "$S/forbidden" ;;
   esac
 }
@@ -2745,9 +2861,26 @@ fn() { eval "$(awk -v n="$1" '$0 ~ ("^" n "\\(\\) \\{") { p = 1 } p { print } p 
 eval "$(awk '/^DOCKER_WIRE_LINE=/ { p = 1 } p { print } p && /^docker_restore_posture\(\) \{/ { q = 1 } q && /^\}/ { exit }' "$LIB")"
 for f in restore_agent_container hold_open_count assert_hold_count_le log_hold_census log_run_hold_census assert_no_open_run_holds \
   _restore_journal_value restore_check_p_shape restore_assert_canonical_refusal; do fn "$f"; done
-for f in docker_wire_prepare docker_wire_assert docker_restore_posture docker_wire_exit_restore restore_agent_container; do
+for f in docker_wire_prepare docker_wire_assert docker_restore_posture docker_wire_exit_restore restore_agent_container \
+  _docker_wire_startup_diagnostics _docker_wire_diag_limiter; do
   type "$f" >/dev/null 2>&1 || { echo "fail: $f not extracted from $LIB" >&2; exit 2; }
 done
+# The shipped limiter resolves a real timeout binary, which cannot exec these shell-function stubs; the
+# harness bounds the same reads through diag_limiter_stub instead (after the extraction check above). The
+# shipped resolver is kept as shipped_docker_wire_diag_limiter for its own PATH-fixture check.
+eval "shipped$(declare -f _docker_wire_diag_limiter)"
+_docker_wire_diag_limiter() { echo diag_limiter_stub; }
+# dw_bounded_run SETUP — reset, then run docker_wire_prepare against a failing `up dind` after eval'ing
+# SETUP in the same subshell. Sets OUT; requires the ORIGINAL failure (message and exit 17) and no other fail.
+dw_bounded_run() {
+  local rc=0
+  reset_state
+  OUT="$( ( DIND_UP_FAIL=1; DIND_UP_MSG=boom-from-compose; eval "$1"; docker_wire_prepare ) 2>&1 )" || rc=$?
+  [ "$rc" = 17 ] || fail "[$1] the original startup failure must exit 17, got $rc: $OUT"
+  case "$OUT" in *'the DinD sidecar did not become healthy'*'boom-from-compose'*) ;; *) fail "[$1] original failure message lost: $OUT" ;; esac
+  [ "$(grep -c '^fail: ' <<< "$OUT")" = 1 ] || fail "[$1] expected exactly the original fail: $OUT"
+}
+dw_count() { local n; n="$(grep -cE -- "$1" "$2" 2>/dev/null)" || true; echo "${n:-0}"; }
 
 line_of() { grep -n -- "$1" "$S/calls" | "$2" -n 1 | cut -d: -f1; }
 expect_failure() {
@@ -2849,6 +2982,77 @@ case "$SCENARIO" in
     ( reset_state; : > "$S/running.dind"; expect_failure 'inconsistent entry posture' docker_wire_prepare )
     ( reset_state; printf '%s\n' "$LINE" >> "$ENVFILE"; expect_failure 'inconsistent entry posture' docker_wire_prepare )
     echo "OK prepare failures name their cause (unhealthy sidecar, unreadable state, half-wired entry)" ;;
+  prepare-failure-diagnostics)
+    # #4165: a failed `up --wait dind` reads both services' state, log tails and selected inspect fields
+    # BEFORE the failure (and so before any exit-trap cleanup), all through the limiter, into one
+    # artifacts/docker-wiring/startup-* dir, then fails exactly as before.
+    for bad in '{{json .}}' '{{.}}' '{{.Config.Env}}' '{{.State.ExitCode}} {{.HostConfig.Binds}}' 'no-actions'; do
+      ! inspect_format_ok "$bad" || fail "projection allowlist accepted [$bad]"
+    done
+    inspect_format_ok '{{.Name}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' || fail "projection allowlist rejected the selected fields"
+    dw_bounded_run 'mkdir -p "$S/proc/kernel" "$S/proc/user"; echo 1 > "$S/proc/kernel/apparmor_restrict_unprivileged_userns"
+      echo 15000 > "$S/proc/user/max_user_namespaces"; DOCKER_WIRE_PROC_SYS="$S/proc"
+      echo DIND-INIT-MARKER > "$S/log-svc.dind-init"; echo DIND-DAEMON-MARKER > "$S/log-svc.dind"'
+    for want in 'PSROW dind-init exited' 'PSROW dind exited' DIND-INIT-MARKER DIND-DAEMON-MARKER 'name=/cdindinit ExitCode=1' 'name=/cdind ExitCode=1' \
+      'kernel.apparmor_restrict_unprivileged_userns=1' 'kernel.unprivileged_userns_clone=unavailable' 'user.max_user_namespaces=15000'; do
+      case "$OUT" in *"$want"*) ;; *) fail "diagnostics lack [$want]: $OUT" ;; esac
+    done
+    grep -qx 'logs --no-color --tail 80 dind' "$S/calls" && grep -qx 'logs --no-color --tail 80 dind-init' "$S/calls" \
+      || fail "the dind/dind-init log tails were not read: $(cat "$S/calls")"
+    # Limiter parity: every diagnostic Docker read went through the limiter, each bounded by <= 10s.
+    reads=$(( $(dw_count '^(ps -a|logs --no-color --tail 80 dind)' "$S/calls") + $(dw_count . "$S/inspect-calls") ))
+    [ "$reads" = 8 ] && [ "$(dw_count . "$S/limiter-calls")" = 8 ] \
+      || fail "limiter parity: $reads diagnostic reads vs $(dw_count . "$S/limiter-calls") limiter calls: $(cat "$S/limiter-calls")"
+    awk '!($1 >= 1 && $1 <= 10) { bad = 1 } END { exit bad }' "$S/limiter-calls" || fail "a read exceeded the 10s cap: $(cat "$S/limiter-calls")"
+    [ ! -e "$S/limiter-nokill" ] || fail "every read needs the 2s kill grace (-k 2): $(cat "$S/limiter-nokill")"
+    [ ! -e "$S/inspect-rejected" ] || fail "inspect used a non-allowlisted projection: $(cat "$S/inspect-rejected")"
+    case "$OUT" in *ENV-SECRET-MARKER*) fail "the environment leaked into the diagnostics" ;; esac
+    ! grep -rqF ENV-SECRET-MARKER "$S/artifacts" || fail "the environment leaked into the artifacts"
+    [ "$(ls -A "$S/artifacts")" = docker-wiring ] || fail "only artifacts/docker-wiring may be created: $(ls -A "$S/artifacts")"
+    set -- "$S"/artifacts/docker-wiring/startup-*
+    [ "$#" = 1 ] && [ -d "$1" ] || fail "expected exactly one startup-* evidence dir: $*"
+    grep -qF boom-from-compose "$1/up.log" && grep -qF 'PSROW dind exited' "$1/ps.txt" && grep -qF DIND-DAEMON-MARKER "$1/dind.log" \
+      && grep -qF DIND-INIT-MARKER "$1/dind-init.log" && grep -qF 'ExitCode=1' "$1/inspect.txt" \
+      && grep -qx 'kernel.apparmor_restrict_unprivileged_userns=1' "$1/host-userns.txt" && grep -q '^elapsed_seconds=' "$1/diagnostics.txt" \
+      || fail "evidence files incomplete: $(ls -A "$1")"
+    [ ! -s "$S/forbidden" ] || fail "the diagnostics must be read-only: $(cat "$S/forbidden")"
+    echo "OK startup diagnostics: ps, log tails and selected inspect fields of both services via the limiter, host userns, one evidence dir, original failure kept" ;;
+  prepare-failure-diagnostics-bounded)
+    # (a) every read hangs and is killed at its deadline: nothing runs past the limiter.
+    dw_bounded_run 'DIAG_HANG=all'
+    [ "$(dw_count . "$S/limiter-calls")" = 6 ] || fail "timeout: expected 6 bounded reads: $(cat "$S/limiter-calls")"
+    [ "$(grep -c 'MISSING-EVIDENCE: docker wiring diagnostics: timed out after 10s' <<< "$OUT")" = 6 ] || fail "timeout: each read must report MISSING-EVIDENCE: $OUT"
+    [ "$(dw_count '^(ps -a|logs --no-color)' "$S/calls")" = 0 ] && [ ! -e "$S/inspect-calls" ] || fail "timeout: a read ran past the limiter"
+    # (b) the 59s budget runs out after three 25s reads (remaining 59, 34, 9): the rest are never issued.
+    dw_bounded_run 'unset SECONDS; SECONDS=0; DIAG_SLOW=25'
+    [ "$(dw_count . "$S/limiter-calls")" = 3 ] || fail "budget: expected exactly 3 issued reads: $(cat "$S/limiter-calls")"
+    [ "$(grep -c 'MISSING-EVIDENCE: docker wiring diagnostics: budget exhausted, skipped' <<< "$OUT")" = 4 ] || fail "budget: 4 skipped reads must be reported: $OUT"
+    [ "$(cut -d' ' -f1 "$S/limiter-calls" | tr '\n' ' ')" = '10 10 9 ' ] || fail "budget: per-read limits must be 10 10 9: $(cat "$S/limiter-calls")"
+    # The last read is clamped to the remaining budget (remaining 59, 32, 5), so the total stays bounded.
+    dw_bounded_run 'unset SECONDS; SECONDS=0; DIAG_SLOW=27'
+    [ "$(cut -d' ' -f1 "$S/limiter-calls" | tr '\n' ' ')" = '10 10 5 ' ] || fail "budget: the last read must be clamped to 5s: $(cat "$S/limiter-calls")"
+    # The shipped resolver finds timeout, else gtimeout, else nothing (PATH fixtures; command -v is a builtin).
+    mkdir -p "$S/fx-t" "$S/fx-g" "$S/fx-none"; : > "$S/fx-t/timeout"; : > "$S/fx-g/gtimeout"; chmod +x "$S/fx-t/timeout" "$S/fx-g/gtimeout"
+    [ "$(PATH="$S/fx-t" shipped_docker_wire_diag_limiter)" = "$S/fx-t/timeout" ] || fail "the shipped resolver must find timeout"
+    [ "$(PATH="$S/fx-g" shipped_docker_wire_diag_limiter)" = "$S/fx-g/gtimeout" ] || fail "the shipped resolver must fall back to gtimeout"
+    [ -z "$(PATH="$S/fx-none" shipped_docker_wire_diag_limiter)" ] || fail "the shipped resolver must be empty without either"
+    # (c) no timeout command: no Docker read at all (no unbounded fallback); local evidence still written.
+    dw_bounded_run '_docker_wire_diag_limiter() { :; }'
+    case "$OUT" in *'MISSING-EVIDENCE: docker wiring diagnostics: no timeout command; Docker reads skipped'*) ;; *) fail "absent limiter not reported: $OUT" ;; esac
+    [ ! -e "$S/limiter-calls" ] && [ ! -e "$S/inspect-calls" ] && [ "$(dw_count '^(ps -a|logs)' "$S/calls")" = 0 ] \
+      || fail "absent limiter: an unbounded Docker read was issued: $(cat "$S/calls")"
+    set -- "$S"/artifacts/docker-wiring/startup-*
+    [ -s "$1/host-userns.txt" ] && grep -qF boom-from-compose "$1/up.log" || fail "absent limiter: host-userns.txt/up.log missing"
+    echo "OK bounded diagnostics: timed-out reads, an exhausted budget and a missing limiter all report MISSING-EVIDENCE and keep the original failure" ;;
+  prepare-failure-diagnostics-robust)
+    # Diagnostic reads fail (entry checks still pass), the proc dir is missing, RUNROOT unset or unwritable.
+    dw_bounded_run 'DIAG_FAIL=1; DOCKER_WIRE_PROC_SYS="$S/no-such-proc"'
+    case "$OUT" in *'read failed (exit 1)'*'kernel.apparmor_restrict_unprivileged_userns=unavailable'*) ;; *) fail "failing reads: diagnostics not attempted: $OUT" ;; esac
+    dw_bounded_run 'unset RUNROOT'
+    case "$OUT" in *'MISSING-EVIDENCE: docker wiring diagnostics: artifact dir unavailable'*'PSROW dind exited'*) ;; *) fail "RUNROOT unset: $OUT" ;; esac
+    dw_bounded_run ': > "$S/not-a-dir"; RUNROOT="$S/not-a-dir"'
+    case "$OUT" in *'MISSING-EVIDENCE: docker wiring diagnostics: artifact dir unavailable'*) ;; *) fail "RUNROOT unwritable: $OUT" ;; esac
+    echo "OK diagnostics never mask the startup failure: failing reads, missing proc, unset or unwritable RUNROOT" ;;
   assert-failures)
     ( reset_state; fake_compose up -d --no-deps --force-recreate agent
       expect_failure 'lacks "docker_wired":true' docker_wire_assert 1 )
@@ -2905,7 +3109,14 @@ case "$SCENARIO" in
     out="$(shape bogus)" && fail "an unknown mode must fail"
     echo "OK predecessor shape: attempt vs exactly {runId, clonePath} at a canonical path" ;;
   refusal)
-    db_psql() { cat "$S/dbrow"; }
+    db_psql() {
+      # Pin the projection as well as its row comparison: an omitted or reordered
+      # detail column must not make the unsupported-predecessor control pass.
+      case "$1" in
+        *"COALESCE(recovery_wait_cause,'')||'|'||COALESCE(recovery_wait_detail,'')||'|'||COALESCE(recovery_retry_not_before::text,'')"*) cat "$S/dbrow" ;;
+        *) echo "canonical refusal query omitted or reordered detail" >&2; return 1 ;;
+      esac
+    }
     apiget() { case "$1" in /api/runs/R/messages) cat "$S/feed.json" ;; *) return 1 ;; esac; }
     good_log() {
       echo '{"msg":"run claimed","run_id":"R"}'; echo '{"msg":"run claimed","run_id":"R"}'
@@ -2916,7 +3127,7 @@ case "$SCENARIO" in
       "$1" > "$S/agentlog.txt"; printf '%s\n' "$2" > "$S/dbrow"; printf '%s\n' "$3" > "$S/feed.json"
       restore_assert_canonical_refusal R 2 1
     }
-    GOOD_ROW='recovery_wait|retained_recovery_adoption_failed||2'
+    GOOD_ROW='recovery_wait|retained_recovery_adoption_failed|||2'
     GOOD_FEED='{"messages":[{"kind":"status","payload":{"text":"this release does not support this predecessor; it is held"}}]}'
     ( try good_log "$GOOD_ROW" "$GOOD_FEED" >/dev/null )
     unconfirmed_log() { good_log | sed 's/restore unsupported predecessor held/restore unsupported predecessor hold unconfirmed/'; }
@@ -2931,8 +3142,9 @@ case "$SCENARIO" in
     ( expect_failure 'missing: held-log' try no_held_log "$GOOD_ROW" "$GOOD_FEED" )
     ( expect_failure 'feed-text' try good_log "$GOOD_ROW" '{"messages":[]}' )
     ( expect_failure 'run-state([recovery_wait|worker_requeue_exhausted||2])' try good_log 'recovery_wait|worker_requeue_exhausted||2' "$GOOD_FEED" )
-    ( expect_failure 'run-state([recovery_wait|retained_recovery_adoption_failed|2026-01-01 00:00:00+00|2])' try good_log 'recovery_wait|retained_recovery_adoption_failed|2026-01-01 00:00:00+00|2' "$GOOD_FEED" )
-    ( expect_failure 'run-state([recovery_wait|retained_recovery_adoption_failed||3])' try good_log 'recovery_wait|retained_recovery_adoption_failed||3' "$GOOD_FEED" )
+    ( expect_failure 'run-state([recovery_wait|retained_recovery_adoption_failed||2026-01-01 00:00:00+00|2])' try good_log 'recovery_wait|retained_recovery_adoption_failed||2026-01-01 00:00:00+00|2' "$GOOD_FEED" )
+    ( expect_failure 'run-state([recovery_wait|retained_recovery_adoption_failed|||3])' try good_log 'recovery_wait|retained_recovery_adoption_failed|||3' "$GOOD_FEED" )
+    ( expect_failure 'run-state([recovery_wait|retained_recovery_adoption_failed|source_end_declined||2])' try good_log 'recovery_wait|retained_recovery_adoption_failed|source_end_declined||2' "$GOOD_FEED" )
     echo "OK canonical refusal: exactly one successor claim, no seed, frozen log + feed text, recovery_wait/adoption-failed with no retry stamp" ;;
   *) echo "fail: unknown scenario $SCENARIO" >&2; exit 2 ;;
 esac
@@ -2955,15 +3167,19 @@ dw_case "docker wiring: prepare is idempotent and keeps its recorded ownership" 
 dw_case "docker wiring: a second restore (and the exit restore after it) is a no-op" restore-idempotent
 dw_case "docker wiring: the exit restore unwires a failed phase, is loud on failure and keeps the status" exit-restore
 dw_case "docker wiring: prepare failures name their cause" prepare-failures
+dw_case "docker wiring: a failed sidecar start captures both services' state, logs and selected inspect fields before cleanup (#4165)" prepare-failure-diagnostics
+dw_case "docker wiring: startup diagnostics are bounded (timeout, budget, no limiter) and keep the original failure" prepare-failure-diagnostics-bounded
+dw_case "docker wiring: failing diagnostic reads or artifact dirs never mask the startup failure" prepare-failure-diagnostics-robust
 dw_case "docker wiring: assert failures name their cause" assert-failures
 dw_case "docker wiring: restore verifies the FINAL container is unwired" restore-failures
 dw_case "hold census helpers: baseline, run attribution and open-hold gates" census
 dw_case "predecessor shape: attempt-shaped vs exactly {runId, clonePath}" p-shape
 dw_case "canonical refusal: one successor claim, no seed, frozen log and feed, recovery_wait/adoption-failed" refusal
 
+bash "$ROOT/e2e/restore-fixtures.test.sh"
 node --test "$ROOT/e2e/settlement-diagnostic.test.mjs"
 node --test "$ROOT/e2e/recovery-record-projection.test.mjs"
 echo "cases=$cases passed=$passed"
-# Tally guard (the driver.test.sh idiom): a real run has at least 217 cases green (including the
+# Tally guard (the driver.test.sh idiom): a real run has at least 220 cases green (including the
 # capture_agent_logs cal_* cases); a zero-case or partially-red run must exit nonzero.
-[ "$cases" -ge 217 ] && [ "$cases" -eq "$passed" ]
+[ "$cases" -ge 220 ] && [ "$cases" -eq "$passed" ]

@@ -4,11 +4,14 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import fs from "node:fs";
+import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
+import type { spawn, ChildProcess } from "node:child_process";
 import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { runPodEpochShadow, PodEpochSettlementError, EPOCH_SCRATCH_DELETION_ENABLED } from "../src/pod-epoch-reclaim.js";
+import { runPodEpochShadow, PodEpochSettlementError } from "../src/pod-epoch-reclaim.js";
 import { PodEpochDaemonError, type PodEpochDaemonGuard } from "../src/pod-epoch-daemon.js";
 import { GitCache, type EpochScratchDiscardInput, type RetainedSourceEvidence } from "../src/git.js";
 import { censusScratchRoot } from "../src/rmtree.js";
@@ -16,7 +19,7 @@ import { scanScratchProcesses, type Settlement } from "../src/pod-epoch-scratch.
 import { WORKER_UID } from "../src/runner-uid.js";
 import { buildPodEpochScratchDeps } from "../src/main.js";
 import { nullLogger } from "./helpers.js";
-import { ENABLE_DELETION_FOR_TEST, ENABLE_SCRATCH_FOR_TEST } from "./pod-epoch-reclaim-support.js";
+import { ENABLE_DELETION_FOR_TEST, ENABLE_SCRATCH_FOR_TEST, perGroupInspect } from "./pod-epoch-reclaim-support.js";
 import type { PodEpochOwnership } from "../src/pod-epoch-lock.js";
 
 const bytes = await readFile(new URL("../../fixtures/pod-epoch/v2/positive.json", import.meta.url));
@@ -141,7 +144,7 @@ async function makeWorld(leaves: string[] = ["a", "b"]): Promise<World> {
     client: { listRecoveryHolds: async run_id => ({ run_id, holds: [] }), getRunOwnership: async () => ({ status: "completed" }) },
     git: {
       discoverEpochRetainedSources: async () => ({ groups: [], inventoryComplete: true, physicalPaths: 0, overflow: 0, overflowExact: true, unreadable: 0 }),
-      inspectRetainedSources: async () => { throw new Error("unexpected inspection"); },
+      inspectEpochRetainedGroups: async () => { throw new Error("unexpected inspection"); },
     },
     openDaemonGuard: async () => w.guard,
     scratch: {
@@ -184,8 +187,7 @@ const noScratchWork = (w: World) => {
 };
 const run = async (w: World) => (await runPodEpochShadow(w.options))!;
 
-test("the production scratch gate is closed, separate from the attempt gate, and nothing under agent/src opens it", async () => {
-  assert.equal(EPOCH_SCRATCH_DELETION_ENABLED, false);
+test("production scratch activation is separate and nothing under agent/src supplies the sentinel", async () => {
   const src = fileURLToPath(new URL("../src/", import.meta.url));
   const files = (await readdir(src, { recursive: true })).filter(f => /\.(ts|mts|cts|js|mjs|cjs)$/.test(f));
   assert.ok(files.length > 50);
@@ -198,15 +200,58 @@ test("the production scratch gate is closed, separate from the attempt gate, and
   const definition = await readFile(join(src, "pod-epoch-reclaim.ts"), "utf8");
   assert.equal(definition.match(/scratchTestGate\s*===\s*TEST_SCRATCH_GATE\b/g)?.length, 2, "the gate and the seams are tied to the sentinel");
   assert.equal(definition.match(/TEST_SCRATCH_GATE\b/g)?.length, 3, "the sentinel is defined once and compared twice");
-  assert.equal(definition.match(/export const EPOCH_SCRATCH_DELETION_ENABLED: boolean = false;/g)?.length, 1);
+  assert.match(definition, /scratchDeps\.activation === true \|\| scratchDeps\.scratchTestGate === TEST_SCRATCH_GATE/);
   assert.ok(!definition.includes("EPOCH_RECLAIM_DELETION_ENABLED"), "the attempt phase uses the #4134 startup activation, not a constant");
   const built = buildPodEpochScratchDeps({ git: {} as never, dockerHost: undefined });
-  assert.deepEqual(Object.keys(built).sort(), ["git", "quiesce"]);
+  assert.deepEqual(Object.keys(built).sort(), ["activation", "git", "quiesce"]);
+});
+
+test("production scratch activation without sentinel enters phase, refuses unsafe layout and cannot read test seams", async () => {
+  await withWorld(["a"], async w => {
+    const scratch = w.options.scratch!;
+    delete scratch.scratchTestGate;
+    assert.equal(scratch.scratchTestGate, undefined);
+    scratch.activation = true;
+    Object.defineProperty(scratch, "seams", { get() { throw new Error("production accessed test seams"); } });
+    // An unsupported fixed root refuses before pinning, census or deletion, regardless of host layout.
+    const saved = process.env.UZI_RUNNER_TMPDIR;
+    process.env.UZI_RUNNER_TMPDIR = "/unsupported-epoch-scratch-root";
+    try {
+      const result = await run(w);
+      assert.equal(result.verdict, "eligible");
+      assert.equal(result.scratch.state, "refused");
+      assert.equal(result.scratch.reason, "layout_refused");
+      assert.equal(result.scratch.deleted, 0);
+      noScratchWork(w);
+      await untouched(w, ["a"]);
+    } finally {
+      if (saved === undefined) delete process.env.UZI_RUNNER_TMPDIR;
+      else process.env.UZI_RUNNER_TMPDIR = saved;
+    }
+  });
+});
+
+test("scratch activation absent or false without sentinel stays not_run even with attempt activation", async () => {
+  for (const activation of [undefined, false]) {
+    await withWorld(["a"], async w => {
+      delete w.options.scratch!.scratchTestGate;
+      w.options.scratch!.activation = activation;
+      w.options.deletion = { activation: true } as NonNullable<Options["deletion"]>;
+      // No attempt candidates: it may settle its deps, but must never enter scratch.
+      w.options.deletion.git = { assertNoUnsettledDeletes() {} } as never;
+      const result = await run(w);
+      assert.equal(result.scratch.state, "not_run");
+      assert.equal(result.scratch.reason, "not_run");
+      noScratchWork(w);
+      await untouched(w, ["a"]);
+    });
+  }
 });
 
 test("gate closed: a pass with scratch deps does no census, no child, no new path read and reports not_run", async () => {
   await withWorld(["a", "b"], async w => {
     w.gateOpen = false;
+    w.options.scratch!.activation = false;
     const result = await run(w);
     assert.equal(result.verdict, "eligible");
     assert.equal(result.scratch.state, "not_run"); assert.equal(result.scratch.reason, "not_run");
@@ -647,6 +692,67 @@ test("settlement: residue that retained the leaf continues, and the third retain
   });
 });
 
+for (const mode of ["readable", "unreadable", "missingclose"] as const) {
+  test("async no-child reclaim real discard: " + mode, async () => {
+    await withWorld(["a", "b"], async w => {
+      const census = fakeCensus(() => [dirEntry("a", 1), dirEntry("b", 2)]);
+      w.census = census;
+      const child = Object.assign(new EventEmitter(), {
+        pid: undefined, stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(),
+        exitCode: null, signalCode: null,
+      });
+      const internal = w.git as unknown as { epochNativeTestDependencies: {
+        spawn: typeof spawn; alive: () => boolean; kill: () => void; joinMs: number;
+      } };
+      internal.epochNativeTestDependencies = {
+        spawn: (() => {
+          setImmediate(() => {
+            child.emit("error", Object.assign(new Error("exec refused"), { code: "EAGAIN" }));
+            child.stdout.end(); child.stderr.end();
+            if (mode !== "missingclose") child.emit("close", -11, null);
+          });
+          return child as unknown as ChildProcess;
+        }) as typeof spawn,
+        alive: () => { throw new Error("undefined pid has no group proof"); },
+        kill: () => assert.fail("no group to kill"), joinMs: 20,
+      };
+      let classified = false;
+      w.discard = input => w.git.discardEpochScratchLeaf({
+        ...input,
+        testSeam: { token: DELETE_SEAM, root: w.root, census: async (...args) => {
+          classified = true;
+          assert.equal(w.scope.pending(), 1);
+          assert.throws(() => w.git.assertNoUnsettledDeletes());
+          return mode === "unreadable" ? { code: 1, stdout: "" } : census(...args);
+        } },
+      });
+      if (mode === "readable") {
+        const result = await run(w);
+        assert.equal(result.scratch.state, "stopped");
+        assert.equal(result.scratch.reason, "helper_failed");
+        assert.equal(result.scratch.helper_failed, 1);
+        assert.equal(result.scratch.residue, 1);
+        assert.equal(w.scope.pending(), 0);
+        assert.equal(w.scope.stopped(), false);
+        w.git.assertNoUnsettledDeletes();
+        assert.ok(w.events.indexOf("finish") >= 0);
+        assert.ok(w.events.indexOf("handover") > w.events.indexOf("finish"));
+        assert.equal(w.calls.handovers, 1);
+      } else {
+        await assert.rejects(run(w), error => error instanceof PodEpochSettlementError);
+        assert.equal(w.scope.pending(), 1);
+        assert.equal(w.scope.stopped(), true);
+        assert.throws(() => w.git.assertNoUnsettledDeletes());
+        assert.equal(w.calls.handovers, 0);
+        assert.ok(!w.events.includes("finish"));
+      }
+      assert.equal(classified, mode !== "missingclose");
+      assert.deepEqual(w.calls.discards, ["a"], "the sibling never starts");
+      await untouched(w, ["a", "b"]);
+    });
+  });
+}
+
 test("settlement: a helper failure or a changed leaf stops the phase after that leaf", async () => {
   for (const kind of ["helper_failed", "changed"] as const) {
     await withWorld(["a", "b"], async w => {
@@ -976,10 +1082,10 @@ function attemptSource(over: Partial<RetainedSourceEvidence> = {}, partOver: Rec
 function withAttemptInventory(w: World, source: () => RetainedSourceEvidence) {
   const group = { barePath: "/bare", selector: { runId: "run0", generation: 1, attempt: "attempt" }, paths: ["/tree/0"] };
   w.options.git.discoverEpochRetainedSources = async () => ({ groups: [group], inventoryComplete: true, physicalPaths: 1, overflow: 0, overflowExact: true, unreadable: 0 });
-  w.options.git.inspectRetainedSources = async opts => {
+  w.options.git.inspectEpochRetainedGroups = perGroupInspect(async opts => {
     for (const p of group.paths) opts.beforeTree!(p);
     return { sources: [source()], partial: false, unreadable: 0, sampledAt: "" };
-  };
+  });
   w.options.client.listRecoveryHolds = async run_id => ({ run_id, holds: [], run_open_holds: { run_id, count: 0 } });
 }
 
@@ -1065,4 +1171,63 @@ test("#3851: an unmeasured attempt sibling does not gate scratch, and a byte-inc
     assert.deepEqual(w.calls.discards, ["proven"]);
     assert.equal(result.scratch.kept.incomplete, 1);
   });
+});
+
+// Issue #4143 (observation only): a `.retire-<uuid>` parent is never a scratch leaf the pass may remove. Its name
+// fails the leaf-name rule (name_refused), so it is never admitted, whatever the verdict.
+const RETIRE_PARENT = ".retire-0b7e1c52-4a64-4f0e-9a43-0c5f0d8a7e11";
+async function retireParentTree(w: World): Promise<string[]> {
+  const parent = join(w.root, RETIRE_PARENT);
+  await mkdir(join(parent, "clone", "sub"), { recursive: true });
+  await writeFile(join(parent, "clone", "sub", "f.txt"), "precious".repeat(700));
+  return retireParentNow(w);
+}
+function retireParentNow(w: World): string[] {
+  const out: string[] = [];
+  const walk = (p: string, rel: string): void => {
+    const st = fs.lstatSync(p);
+    out.push(`${rel}|${st.mode.toString(8)}|${st.size}|${st.mtimeMs}|${st.isFile() ? fs.readFileSync(p, "utf8").length : ""}`);
+    if (st.isDirectory()) for (const n of fs.readdirSync(p).sort()) walk(join(p, n), `${rel}/${n}`);
+  };
+  walk(join(w.root, RETIRE_PARENT), ".");
+  return out;
+}
+
+test("#4143: an eligible, attested pass keeps a .retire-<uuid> parent byte-identical and never admits it", {
+  skip: HAS_PROC_FD ? false : "no /proc/self/fd on this host: the pinned walk refuses here by design",
+}, async () => {
+  await withWorld(["ok-1"], async w => {
+    const before = await retireParentTree(w);
+    const result = await run(w);
+    assert.equal(result.verdict, "eligible");
+    assert.equal(result.authority.result, "attested");
+    assert.equal(result.scratch.state, "ran");
+    assert.equal(result.scratch.kept.name_refused, 1, "the retire parent is refused by name");
+    assert.equal(result.scratch.eligible, 1, "only the ordinary leaf is admitted");
+    assert.ok(!w.calls.discards.some(n => n.startsWith(".retire-")), "never offered to the delete path");
+    assert.deepEqual(retireParentNow(w), before);
+    await untouched(w, [RETIRE_PARENT]);
+  });
+});
+
+test("#4143: a partial or deferred pass never touches a .retire-<uuid> parent", async () => {
+  const cases: Array<[string, (w: World) => void]> = [
+    ["a partial inventory", w => {
+      const discover = w.options.git.discoverEpochRetainedSources;
+      w.options.git.discoverEpochRetainedSources = async o => ({ ...await discover(o), inventoryComplete: false, unreadable: 1 });
+    }],
+    ["same-pod restart (consumption existing)", w => { w.options.consumption = { result: "existing", mayEvaluate: false }; }],
+  ];
+  for (const [label, tune] of cases) {
+    await withWorld(["ok-1"], async w => {
+      const before = await retireParentTree(w);
+      tune(w);
+      w.discard = async () => assert.fail("must not delete");
+      const result = await runPodEpochShadow(w.options);
+      if (result) assert.equal(result.scratch.state, "not_run", label);
+      noScratchWork(w);
+      assert.deepEqual(retireParentNow(w), before, label);
+      await untouched(w, ["ok-1", RETIRE_PARENT]);
+    });
+  }
 });

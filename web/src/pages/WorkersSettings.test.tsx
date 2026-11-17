@@ -86,6 +86,11 @@ function aSecret(over: Partial<SecretMeta> = {}): SecretMeta {
 
 function aWorker(over: Partial<Worker> = {}): Worker {
   return {
+    hibernation_state: "none",
+    hibernation_reason: null,
+    hibernated_at: null,
+    wake_requested_at: null,
+    wake_error: null,
     // Unbound by default (PRD #104): every worker spends its owner's default token
     // until someone binds one, which is the state these pre-#104 tests assume.
     anthropic_secret_id: null,
@@ -230,6 +235,46 @@ describe("WorkersSettings — memory authority pill (issue #3142)", () => {
     const row = (name: string) => screen.getByText(name).closest("li");
     expect(row("gated-one")?.contains(pills[0])).toBe(true);
     expect(row("ungated-one")?.textContent).not.toContain("memory authority lost");
+  });
+});
+
+describe("WorkersSettings — hibernation chip (PRD #4205)", () => {
+  it("shows hibernated and waking in place of offline, never as cordoned, and leaves a normal worker alone", async () => {
+    mockApi.listWorkers.mockResolvedValue({
+      workers: [
+        aWorker({ id: "w-h", name: "sleeper", status: "offline", effective_cordoned: true, hibernation_state: "hibernated", upgrade_status: "unknown" }),
+        aWorker({ id: "w-w", name: "riser", status: "offline", effective_cordoned: true, hibernation_state: "waking", wake_error: "pod stuck" }),
+        aWorker({ id: "w-n", name: "plain-one", status: "offline" }),
+      ],
+    });
+    renderPage();
+    await screen.findByText("sleeper");
+    const row = (name: string) => screen.getByText(name).closest("li")!;
+    expect(within(row("sleeper")).getByText("hibernated")).toBeTruthy();
+    expect(within(row("sleeper")).queryByText("offline")).toBeNull();
+    expect(within(row("sleeper")).queryByText("intake fenced")).toBeNull();
+    expect(within(row("riser")).getByText("waking")).toBeTruthy();
+    expect(within(row("riser")).getByText("wake failed").getAttribute("title")).toBe("pod stuck");
+    expect(within(row("plain-one")).getByText("offline")).toBeTruthy();
+    expect(within(row("plain-one")).queryByText("hibernated")).toBeNull();
+  });
+});
+
+describe("WorkersSettings — hibernation cache cleanup (PRD #4206)", () => {
+  it("shows the cleanup outcome on the owner's row and nothing for a worker without one", async () => {
+    mockApi.listWorkers.mockResolvedValue({
+      workers: [
+        aWorker({ id: "w-s", name: "skipper", status: "offline", hibernation_state: "hibernated", hibernation_cleanup: { state: "settled", outcome: "skipped", reason: "daemon_unreachable" } }),
+        aWorker({ id: "w-c", name: "cleaner", status: "offline", hibernation_state: "preparing", hibernation_cleanup: { state: "cleaning", outcome: null, reason: null } }),
+        aWorker({ id: "w-n", name: "plain-one", status: "offline", hibernation_cleanup: null }),
+      ],
+    });
+    renderPage();
+    await screen.findByText("skipper");
+    const row = (name: string) => screen.getByText(name).closest("li")!;
+    expect(within(row("skipper")).getByText("cleanup skipped: Docker was not reachable")).toBeTruthy();
+    expect(within(row("cleaner")).getByText("cleaning up")).toBeTruthy();
+    expect(row("plain-one").textContent).not.toMatch(/cleanup|cache pruned|cleaning up/);
   });
 });
 
@@ -1079,7 +1124,7 @@ describe("WorkersSettings hosted delete confirms; external delete does not (PRD 
     it("renders the callout inside the acted-on row, focused, with exact links and a plain-text overflow", async () => {
       await refuse();
       expect(row().contains(callout())).toBe(true);
-      expect(document.activeElement).toBe(callout());
+      await waitFor(() => expect(document.activeElement).toBe(callout()));
       expect(callout().textContent).toContain("Fix login");
 
       const list = within(callout()).getByRole("list", { name: LIST });

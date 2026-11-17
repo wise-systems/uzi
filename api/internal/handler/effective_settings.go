@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/agenttmpl"
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
@@ -34,6 +35,7 @@ const (
 	harnessSourceUserDefault      = "user_default"
 	harnessSourceAutomatic        = "automatic"
 	harnessSourceChosenAtCreate   = "chosen_at_create"
+	harnessSourceSameAsRun        = "same_as_run"
 	sourceCrossCheckPin           = "cross_check_pin"
 	sourceCrossCheckWorkerDefault = "cross_check_worker_default"
 	sourceCrossCheckDefault       = "cross_check_default"
@@ -42,6 +44,7 @@ const (
 	noteSDKDefault             = "sdk_default"
 	noteNotConfigurable        = "not_configurable"
 	noteNotSent                = "not_sent"
+	noteNotUsed                = "not_used"
 	noteDefaultHarnessUnusable = "user_default_harness_unusable"
 	noteInstanceUnavailable    = "instance_settings_unavailable"
 
@@ -51,6 +54,7 @@ const (
 	refusalCredentialNotFound     = "credential_not_found"      //nolint:gosec // G101: refusal-reason token, not a secret
 	refusalOverrideUnsupported    = "credential_override_harness_unsupported"
 	refusalOverrideInvalid        = "credential_override_invalid"
+	refusalModelIncompatible      = "model_incompatible_with_harness"
 	detailCredentialDisabled      = "credential_disabled" //nolint:gosec // G101: refusal-reason token, not a secret
 )
 
@@ -130,6 +134,18 @@ func harnessValue(p workersvc.HarnessPrediction, explicitSource string) *apitype
 		notes = append(notes, noteDefaultHarnessUnusable)
 	}
 	return &apitypes.HarnessValueDTO{Value: strPtr(string(p.Harness)), Source: source, FixedAt: workersvc.FixedAtCreate, Notes: notes}
+}
+
+// judgeHarnessValue is the wire cell of the judge harness (PRD #3257): an explicit "Judge runs
+// on" choice is a user_default; unset is value null with source same_as_run, because the judge
+// then follows the harness of the run it reviews, which is not known until that run exists.
+func judgeHarnessValue(runsOn pgtype.Text) apitypes.HarnessValueDTO {
+	if runsOn.Valid {
+		return apitypes.HarnessValueDTO{
+			Value: strPtr(runsOn.String), Source: harnessSourceUserDefault, FixedAt: workersvc.FixedAtCreate, Notes: []string{},
+		}
+	}
+	return apitypes.HarnessValueDTO{Source: harnessSourceSameAsRun, FixedAt: workersvc.FixedAtCreate, Notes: []string{}}
 }
 
 // startOutcome is one start choice's prediction or refusal.
@@ -221,6 +237,10 @@ func (h *Handler) buildEffectiveSettings(ctx context.Context, userID uuid.UUID) 
 		dto.Start = append(dto.Start, effectiveStartChoice(choice, starts[i]))
 	}
 
+	// The judge harness (PRD #3257): the user's explicit choice, else the harness of the run
+	// the judge reviews. Always present; fixed when the judge run is created.
+	dto.JudgeHarness = judgeHarnessValue(s.JudgeRunsOn)
+
 	// Worker, judge, summary and task review, each Claude then Codex.
 	dto.Models = append(dto.Models, workerModelCell(leads[workersvc.HarnessClaude]), workerModelCell(leads[workersvc.HarnessCodex]))
 	if h.settings != nil {
@@ -230,7 +250,12 @@ func (h *Handler) buildEffectiveSettings(ctx context.Context, userID uuid.UUID) 
 		summaryLane := textPtrValue(s.SummaryModel.Valid, s.SummaryModel.String)
 		codexSummaryLane := textPtrValue(s.CodexSummaryModel.Valid, s.CodexSummaryModel.String)
 		for _, c := range judgeModelCells(judgeLane, codexJudgeLane, instance) {
-			dto.Models = append(dto.Models, claimedModelCell("judge_model", c, notes))
+			cellNotes := notes
+			if s.JudgeRunsOn.Valid && c.Harness != s.JudgeRunsOn.String {
+				// The judge runs on the other harness, so this lane's model is never read.
+				cellNotes = append(append([]string{}, notes...), noteNotUsed)
+			}
+			dto.Models = append(dto.Models, claimedModelCell("judge_model", c, cellNotes))
 		}
 		for _, c := range summaryModelCells(summaryLane, codexSummaryLane, instance) {
 			dto.Models = append(dto.Models, claimedModelCell("summary_model", c, notes))
@@ -493,12 +518,17 @@ func (h *Handler) PreviewStartSettings(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, "credential_override must have a mode of inherit, auto, default or pinned and a valid secret_id")
 		return
 	}
+	// The same shape step create runs (no trim, exact validators), before any prediction.
+	if msg := validateRunStartOptions(req.Model, req.Effort); msg != "" {
+		httpx.Error(w, http.StatusBadRequest, msg)
+		return
+	}
 	if h.wsvc == nil {
 		slog.Error("start preview: no worker service")
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	dto, err := h.buildStartPreview(r.Context(), user.ID, explicit, override)
+	dto, err := h.buildStartPreview(r.Context(), user.ID, explicit, override, req.Model, req.Effort)
 	if err != nil {
 		slog.Error("start preview", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
@@ -510,15 +540,37 @@ func (h *Handler) PreviewStartSettings(w http.ResponseWriter, r *http.Request) {
 // buildStartPreview predicts the harness with the override in the creation context (any non-inherit
 // override makes the creation-time policies ineligible), then validates the override against the
 // resulting harness, or, when the harness is chosen at creation, against each alternative.
-func (h *Handler) buildStartPreview(ctx context.Context, userID uuid.UUID, explicit *workersvc.Harness, ov *previewOverride) (apitypes.StartPreviewDTO, error) {
+//
+// A start-time model opts the run out of the creation-time harness policies (D22), exactly as create
+// passes it in the creation origin; effort never touches the origin, so an effort-only request can
+// still leave the harness undecided. The model and effort cells come from the claim's own resolver
+// (PredictRunOverrideLead); an incompatible model is the model_incompatible_with_harness refusal.
+//
+// Refusal precedence mirrors the create route: with an explicit harness the model refusal comes
+// before any credential refusal (create fast-fails it before the credential checks); with a harness
+// the server decides, the credential refusals come first (create's in-transaction model check runs
+// after them).
+func (h *Handler) buildStartPreview(ctx context.Context, userID uuid.UUID, explicit *workersvc.Harness, ov *previewOverride, model, effort *string) (apitypes.StartPreviewDTO, error) {
 	dto := apitypes.StartPreviewDTO{Version: apitypes.EffectiveSettingsVersion}
 	origin := workersvc.IssueStartOrigin()
 	origin.AnthropicOverride = ov != nil && ov.Mode != workersvc.CredentialOverrideModeInherit
+	origin.Model = model
+	modelFirst := explicit != nil && model != nil && !workersvc.RunOverrideModelHonorable(*explicit, *model)
+	// refuseModel answers the explicit-harness model refusal over a credential refusal: the decided
+	// harness is the explicit one and the credential cell is null.
+	refuseModel := func() apitypes.StartPreviewDTO {
+		dto.Harness = harnessValue(workersvc.HarnessPrediction{Harness: *explicit, Rule: workersvc.PredictRuleExplicit}, harnessSourceRunOverride)
+		dto.Refusal, dto.RefusalDetail = refusal{Token: refusalModelIncompatible}.ptrs()
+		return dto
+	}
 	out, err := h.predictStart(ctx, userID, explicit, origin)
 	if err != nil {
 		return dto, err
 	}
 	if out.refused.Token != "" {
+		if modelFirst {
+			return refuseModel(), nil
+		}
 		dto.Refusal, dto.RefusalDetail = out.refused.ptrs()
 		return dto, nil
 	}
@@ -530,10 +582,22 @@ func (h *Handler) buildStartPreview(ctx context.Context, userID uuid.UUID, expli
 			return dto, err
 		}
 		if ref.Token != "" {
+			if modelFirst {
+				return refuseModel(), nil
+			}
 			dto.Refusal, dto.RefusalDetail = ref.ptrs()
 			return dto, nil
 		}
 		dto.Credential = cred
+		cells, err := h.runOverrideCells(ctx, userID, pred.Harness, model, effort)
+		if err != nil {
+			return dto, err
+		}
+		if cells.refused.Token != "" {
+			dto.Refusal, dto.RefusalDetail = cells.refused.ptrs()
+			return dto, nil
+		}
+		dto.WorkerModel, dto.WorkerEffort = cells.model, cells.effort
 		return dto, nil
 	}
 
@@ -565,12 +629,63 @@ func (h *Handler) buildStartPreview(ctx context.Context, userID uuid.UUID, expli
 		}
 		alt.Credential = cred
 		alt.Refusal, alt.RefusalDetail = ref.ptrs()
+		if ref.Token == "" {
+			// A request with a model never reaches here (D22 decides its harness), so only effort remains.
+			cells, err := h.runOverrideCells(ctx, userID, hn, nil, effort)
+			if err != nil {
+				return dto, err
+			}
+			alt.WorkerEffort = cells.effort
+		}
 		dto.Alternatives = append(dto.Alternatives, alt)
 	}
 	if ref := commonAlternativeRefusal(dto.Alternatives); ref.Token != "" {
 		dto.Refusal, dto.RefusalDetail = ref.ptrs()
 	}
 	return dto, nil
+}
+
+// runOverrideResult is the start-time model and effort cells on one harness, or the refusal that
+// replaces them. A nil cell is a choice the request did not carry.
+type runOverrideResult struct {
+	model   *apitypes.ModelSettingCellDTO
+	effort  *apitypes.EffortSettingCellDTO
+	refused refusal
+}
+
+// runOverrideCells predicts a start-time model and effort on harness hn through the claim's own
+// resolver. An incompatible model is a refusal, never a different model.
+func (h *Handler) runOverrideCells(ctx context.Context, userID uuid.UUID, hn workersvc.Harness, model, effort *string) (runOverrideResult, error) {
+	var out runOverrideResult
+	if model == nil && effort == nil {
+		return out, nil
+	}
+	lead, err := h.wsvc.PredictRunOverrideLead(ctx, userID, hn, model, effort)
+	if err != nil {
+		return out, fmt.Errorf("predict run override lead %s: %w", hn, err)
+	}
+	if u := lead.Unhonorable; u != nil {
+		if u.Setting != "model" {
+			// Effort is shape-checked before prediction, so only a model can be unhonorable here.
+			return out, fmt.Errorf("predict run override lead %s: unexpected unhonorable %s", hn, u.Setting)
+		}
+		out.refused = refusal{Token: refusalModelIncompatible}
+		return out, nil
+	}
+	if model != nil {
+		out.model = &apitypes.ModelSettingCellDTO{
+			Harness: string(hn), Model: model, DefaultModel: lead.DefaultModel, DefaultSource: lead.DefaultModelSource,
+			ResolvedModel: lead.Model, Source: lead.ModelSource,
+		}
+	}
+	if effort != nil {
+		def := agenttmpl.ResolveHarnessEffort(string(hn), nil)
+		out.effort = &apitypes.EffortSettingCellDTO{
+			Harness: string(hn), Effort: lead.Effort, DefaultEffort: def.Level, DefaultSource: def.Source,
+			ResolvedEffort: lead.Effort, Source: lead.EffortSource, Mode: agenttmpl.EffortModeExplicit,
+		}
+	}
+	return out, nil
 }
 
 // commonAlternativeRefusal is the top-level refusal of a chosen-at-create start-preview response

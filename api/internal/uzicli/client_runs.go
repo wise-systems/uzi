@@ -188,7 +188,7 @@ func (c *HTTPClient) RunLogsPage(ctx context.Context, id string, q LogsPageQuery
 	return env.Messages, nil
 }
 
-func (c *HTTPClient) RunReview(ctx context.Context, id string) (*apitypes.ReviewDTO, *apitypes.PendingJudgeDTO, error) {
+func (c *HTTPClient) RunReview(ctx context.Context, id string) (*apitypes.ReviewDTO, *apitypes.PendingJudgeDTO, *apitypes.JudgeSkipDTO, error) {
 	// The envelope is {"review": <dto>|null, "pending_judge": <dto>|null} — both keys
 	// always present, either nullable (PRD #119 M1). A 200 with review:null is a
 	// visible-but-unjudged run — return a nil review so the command exits 0 rather
@@ -202,21 +202,27 @@ func (c *HTTPClient) RunReview(ctx context.Context, id string) (*apitypes.Review
 	var env struct {
 		Review       *apitypes.ReviewDTO       `json:"review"`
 		PendingJudge *apitypes.PendingJudgeDTO `json:"pending_judge"`
+		Skip         *apitypes.JudgeSkipDTO    `json:"skip"`
 	}
 	if err := c.get(ctx, "/api/runs/"+url.PathEscape(id)+"/review", &env); err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	return env.Review, env.PendingJudge, nil
+	return env.Review, env.PendingJudge, env.Skip, nil
 }
 
 func (c *HTTPClient) RunInputs(ctx context.Context, id string) ([]apitypes.SteerInputDTO, error) {
-	var env struct {
-		Inputs []apitypes.SteerInputDTO `json:"inputs"`
-	}
+	inputs, _, err := c.RunInputsMeta(ctx, id)
+	return inputs, err
+}
+
+// RunInputsMeta decodes the typed envelope so the admin_debug_read marker (issue #4198) rides
+// along with the queue.
+func (c *HTTPClient) RunInputsMeta(ctx context.Context, id string) ([]apitypes.SteerInputDTO, bool, error) {
+	var env apitypes.RunInputsEnvelopeDTO
 	if err := c.get(ctx, "/api/runs/"+url.PathEscape(id)+"/inputs", &env); err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	return env.Inputs, nil
+	return env.Inputs, env.AdminDebugRead, nil
 }
 
 func (c *HTTPClient) RunLeadConfigHistory(ctx context.Context, id string) (apitypes.LeadConfigHistoryDTO, error) {
@@ -484,7 +490,7 @@ func (r *CreatedRunResult) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-func (c *HTTPClient) CreateRun(ctx context.Context, repoID string, issueIID int64, waitOnLimit *bool, mrReworkEnabled *bool, force bool, seed *CreateRunSeed, agentSource string, credOverride *CreateRunCredentialOverride, harness string) (CreatedRunResult, error) {
+func (c *HTTPClient) CreateRun(ctx context.Context, repoID string, issueIID int64, waitOnLimit *bool, mrReworkEnabled *bool, force bool, seed *CreateRunSeed, agentSource string, credOverride *CreateRunCredentialOverride, harness, model, effort string) (CreatedRunResult, error) {
 	var env struct {
 		Run    apitypes.RunDTO `json:"run"`
 		Notice string          `json:"notice"`
@@ -537,7 +543,10 @@ func (c *HTTPClient) CreateRun(ctx context.Context, repoID string, issueIID int6
 		RequireBase        bool                         `json:"require_base,omitempty"`
 		CredentialOverride *createRunCredentialOverride `json:"credential_override,omitempty"`
 		Harness            string                       `json:"harness,omitempty"`
-	}{IssueIID: issueIID, WaitOnLimit: waitOnLimit, MrReworkEnabled: mrReworkEnabled, Force: force, Harness: harness}
+		// PRD #3250: the start-time model and effort; "" (flag omitted) sends no key.
+		Model  string `json:"model,omitempty"`
+		Effort string `json:"effort,omitempty"`
+	}{IssueIID: issueIID, WaitOnLimit: waitOnLimit, MrReworkEnabled: mrReworkEnabled, Force: force, Harness: harness, Model: model, Effort: effort}
 	if seed != nil {
 		reqBody.PlanMD = &seed.PlanMD
 		reqBody.Selection = seed.Selection

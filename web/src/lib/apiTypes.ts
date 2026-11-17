@@ -249,15 +249,16 @@ export interface CatalogDefault {
  *  source_labels of fixtures/model-settings/contract.json. */
 type EffectiveModelSource =
   | "user_default" | "instance_default" | "builtin" | "schedule_pin" | "template"
-  | "cross_check_pin" | "cross_check_worker_default";
+  | "cross_check_pin" | "cross_check_worker_default" | "run_override";
 type EffectiveEffortSource =
-  | "user_default" | "builtin" | "cross_check_pin" | "cross_check_default";
-type EffectiveHarnessSource = "run_override" | "schedule_pin" | "user_default" | "automatic" | "chosen_at_create";
+  | "user_default" | "builtin" | "cross_check_pin" | "cross_check_default" | "run_override";
+type EffectiveHarnessSource = "run_override" | "schedule_pin" | "user_default" | "automatic" | "chosen_at_create" | "same_as_run";
 type EffectiveCredentialSource =
   | "claim_selection" | "codex_default_credential" | "chosen_at_create" | "auto_selection" | "owner_default" | "token_override";
 type EffectiveRefusal =
   | "no_credential_for_harness" | "no_usable_credential" | "credential_disabled" | "credential_not_found"
-  | "credential_override_harness_unsupported" | "credential_override_invalid";
+  | "credential_override_harness_unsupported" | "credential_override_invalid"
+  | "model_incompatible_with_harness";
 type EffectiveRefusalDetail = "credential_disabled" | "codex_pool_unavailable";
 type EffectiveModelSetting = "worker_model" | "judge_model" | "summary_model" | "task_review_model" | "cross_check_plan" | "cross_check_code";
 type EffectiveEffortSetting = "worker_effort" | "task_review_effort" | "cross_check_plan" | "cross_check_code";
@@ -297,7 +298,8 @@ export interface Credential {
 }
 
 /** PRD #3254: a predicted harness. `value` is null with source chosen_at_create when a
- *  creation-time policy (a note: automatic_weekly_reset or overflow) picks it at creation. */
+ *  creation-time policy (a note: automatic_weekly_reset or overflow) picks it at creation. The
+ *  judge_harness cell (PRD #3257) is null with source same_as_run when "Judge runs on" is unset. */
 export interface HarnessValue {
   value: string | null;
   source: EffectiveHarnessSource;
@@ -329,6 +331,8 @@ export interface EffectiveSettings {
   models: EffectiveModelCell[];
   efforts: EffectiveEffortCell[];
   cross_check: { models: EffectiveModelCell[]; efforts: EffectiveEffortCell[] };
+  /** PRD #3257: the harness a judge run would use; always present. */
+  judge_harness: HarnessValue;
 }
 
 export interface StartPreviewCredentialOverride {
@@ -340,6 +344,11 @@ export interface StartPreviewCredentialOverride {
 export interface StartPreviewRequest {
   harness: string | null;
   credential_override: StartPreviewCredentialOverride | null;
+  /** PRD #3250: the start-time model, shape-checked like run create (no trim). A model opts the
+   *  run out of automatic harness selection. Omit for the default. */
+  model?: string | null;
+  /** PRD #3250: the start-time reasoning effort (low, medium, high, xhigh or max). Omit for the default. */
+  effort?: string | null;
 }
 
 /** One harness a creation-time policy might choose, computed as if it were chosen. A refused
@@ -349,17 +358,27 @@ export interface StartPreviewAlternative {
   credential: Credential | null;
   refusal: EffectiveRefusal | null;
   refusal_detail: EffectiveRefusalDetail | null;
+  /** Present only when the request carried an effort (source run_override). There is no worker_model
+   *  here: a request with a model never leaves the harness undecided (D22). */
+  worker_effort?: EffortSettingCell;
 }
 
 /** The start-preview response. When the harness is chosen at creation, `credential` is null and
- *  `alternatives` lists Claude then Codex. A top-level `refusal` is set only for a failure before
- *  a harness is decided, or when every alternative is refused for the same reason. */
+ *  `alternatives` lists Claude then Codex. A top-level `refusal` is set for a failure before a
+ *  harness is decided, for a refusal on a decided harness, or when every alternative is refused for
+ *  the same reason. A credential refusal leaves `credential` null; `model_incompatible_with_harness`
+ *  keeps it whenever the credential resolves, and is null only when, on a request that named the
+ *  harness, it superseded a credential refusal (create checks that model first). */
 export interface StartPreview {
   version: number;
   harness: HarnessValue | null;
   refusal: EffectiveRefusal | null;
   refusal_detail: EffectiveRefusalDetail | null;
   credential: Credential | null;
+  /** Present only when the request carried that choice and the harness is decided (source
+   *  run_override, effort mode explicit); with an undecided harness each alternative carries its own. */
+  worker_model?: ModelSettingCell;
+  worker_effort?: EffortSettingCell;
   alternatives?: StartPreviewAlternative[];
 }
 
@@ -519,6 +538,9 @@ export interface UserSettings {
    *  creation falls through the D11 resolver. One of claude|codex when set; the web Run
    *  Defaults page writes it. */
   default_harness: Harness | null;
+  /** Per-user "Judge runs on" (PRD #3257); null = same as the run being reviewed. One of
+   *  claude|codex when set. Always present on the wire, like default_harness. */
+  judge_runs_on: Harness | null;
 }
 
 // UserSettingsPatch is the PATCH-like body of PUT /me/settings: a field present
@@ -574,6 +596,9 @@ export interface UserSettingsPatch {
   /** Per-user default harness (PRD #1429 M1 / D3); present-value sets the pin (claude|codex),
    *  present-null clears back to "no preference", absent leaves it unchanged. */
   default_harness?: Harness | null;
+  /** Per-user "Judge runs on" (PRD #3257); same tri-state as default_harness: a value sets the
+   *  judge harness, null clears back to "same as the run", absent leaves it unchanged. */
+  judge_runs_on?: Harness | null;
 }
 
 // AgentTemplateScope mirrors the skill scopes (PRD #18 M6): builtin (shipped),
@@ -1031,6 +1056,23 @@ export interface AdminBlockedRepos {
   requests: GuardrailOverrideRequest[];
 }
 
+// RepoActivity is one row of GET /api/admin/repo-activity (issue #4334): a repo's id, forge
+// path, whether it is enabled and when its newest run of any kind was created (null when it
+// has never run). `path_with_namespace` is user-controlled: sanitize before rendering.
+export interface RepoActivity {
+  id: string;
+  path_with_namespace: string;
+  enabled: boolean;
+  last_run_at: string | null;
+}
+
+// AdminRepoActivity is the GET /api/admin/repo-activity envelope: every enabled repo plus
+// every disabled repo that has a listed non-terminal run. The handler always sends an array
+// (never null), so an empty list is "no repos", not "unknown".
+export interface AdminRepoActivity {
+  repos: RepoActivity[];
+}
+
 // EgressProfileWarning is a note about a stored host entry of an egress profile (PRD
 // #1906 Decision 4), mirroring apitypes.EgressProfileWarningDTO. Codes:
 // "multi_publisher_override" (a multi-publisher host admitted by an explicit override),
@@ -1181,6 +1223,8 @@ export interface LatestRun {
   // 'base_attestation_missing' (issue #3194) reads "base unverified: owner hold" likewise.
   // 'iteration_budget_exhausted' is a nonterminal owner hold: "Iteration limit reached".
   // Resume grants a fresh finite allowance; Extend adds wall time without resuming; Cancel ends it.
+  // 'run_override_unavailable' (issue #3250) reads "model choice unavailable: owner hold". The set of
+  // these non-completion holds is NON_COMPLETION_HOLDS in lib/runBadge.ts.
   // Optional for api/web rollout skew: an absent key reads as no hold.
   hold_reason?: string | null;
   owner_name: string;
@@ -1256,6 +1300,18 @@ export interface Board {
   // Optional: an OLD api replica during a rollout skew may omit it entirely, which the
   // consumer treats as "no bot" (0), the same as unresolved.
   bot_forge_user_id?: number;
+  // The repo's durable first-import status (issue #4399). null for a legacy or disabled
+  // repo. Optional: an OLD api replica during a rollout skew omits it, which the board
+  // treats the same as null (no banner).
+  initial_import?: InitialImport | null;
+}
+
+// InitialImport is a just-enabled repo's first issue import, as the board reports it.
+// error_class is present only when state is "failed".
+export interface InitialImport {
+  state: "waiting" | "running" | "succeeded" | "failed";
+  updated_at: string;
+  error_class?: string;
 }
 
 // BoardPrefs is the current user's per-repo board view preferences (PRD #196 M3),
@@ -1373,6 +1429,15 @@ export interface AppSettings {
   // users can still individually opt in on the Workers page. Web-only surfacing — the
   // key already round-trips through GET/PUT /admin/settings.
   ephemeral_workers_enabled: string;
+  // Worker hibernation instance switch (PRD #4205): "true"/"false", default "false".
+  // Turning it off wakes every hibernated worker (at most 10 per pass); waking
+  // never depends on it. Optional so older responses and fixtures still type-check.
+  worker_hibernation_enabled?: string;
+  // Automatic hibernation of idle workers (PRD #4207): "true"/"false", default "false",
+  // effective only while worker_hibernation_enabled is "true". idle_after is a Go
+  // duration (default "336h", valid 1h..2160h). Optional for older responses.
+  worker_hibernation_auto?: string;
+  worker_hibernation_idle_after?: string;
   // Per-user persistent hosted-worker quota: integer 0..20, default 2. Zero disables provisioning.
   hosted_worker_quota: string;
   // Per-owner custody admission limit: whole number 1..1000, default "8". Lowering it blocks future claims only.
@@ -1830,6 +1895,12 @@ export interface BuildInfo {
     published_at?: string;
     notes_url?: string;
     security?: boolean;
+  };
+  // Uzi tag each public Homebrew tap formula installs; an absent key means
+  // unknown. Not consumed by the web (the CLI reads it).
+  homebrew_formulas?: {
+    uzi_cli?: string;
+    uzi_cli_rc?: string;
   };
   update_available?: boolean;
   far_behind?: boolean;
@@ -2794,6 +2865,23 @@ export interface WorkerRunDisk {
   sampled_at: string;
 }
 
+/**
+ * Controller's retained uzi.dev/image-roll evidence for one hosted worker (issue #4385).
+ * state "unknown" means no fresh report (older controller, expired, or not reported, e.g. while
+ * hibernating); "unavailable" means the controller's cluster snapshot failed; "absent" is a
+ * positively observed "no marker". observed_at is the API's receipt time ("last observed").
+ */
+export interface WorkerRollMarker {
+  state: "present" | "unreadable" | "absent" | "unavailable" | "unknown" | (string & {});
+  canary: boolean | null;
+  completed: boolean | null;
+  target_version: string | null;
+  coverage_group: string | null;
+  reservation: boolean | null;
+  blocked: string | null;
+  observed_at: string | null;
+}
+
 // Fresh, read-only controller diagnostics. The Go DTO carries opaque JSON;
 // members are optional for skew and its recorded empty-object contract fixture.
 export interface WorkerRollPacing {
@@ -2818,6 +2906,12 @@ export interface ForgeOriginCooldown {
   surfaces?: string[];
 }
 
+export interface WorkerHibernationCleanup {
+  state: "none" | "cleaning" | "unknown" | "settled";
+  outcome: "pruned" | "skipped" | "failed" | null;
+  reason: string | null;
+}
+
 export interface Worker {
   forge_origin_cooldowns?: ForgeOriginCooldown[];
   // Optional for compatibility with APIs predating manual owner cordons.
@@ -2826,8 +2920,28 @@ export interface Worker {
   manual_cordoned_by_label?: string | null;
   manual_cordon_reason?: string | null;
   effective_cordoned?: boolean;
+  // Worker hibernation (PRD #4205), always sent. Check hibernation_state before
+  // upgrade_status or cordon state: a non-"none" worker reports upgrade_status "unknown" and
+  // is never outdated/rolling.
+  hibernation_state: "none" | "preparing" | "hibernated" | "waking";
+  hibernation_reason: string | null;
+  hibernated_at: string | null;
+  wake_requested_at: string | null;
+  wake_error: string | null;
+  // The automatic hibernation pass's recorded blocker (issue #4385): the workersvc reason code,
+  // when this reason started holding (restarts only when the reason changes) and when it was
+  // last observed. Null when unset; optional for older APIs.
+  hibernation_blocked_reason?: string | null;
+  hibernation_blocked_since?: string | null;
+  hibernation_blocked_at?: string | null;
+  // Hibernation cache cleanup (PRD #4206). The key is always sent by a current api, null when
+  // no attempt was made; optional here for older APIs and bare fixtures.
+  hibernation_cleanup?: WorkerHibernationCleanup | null;
   // Omitted when absent, invalid or older than the API's independent receipt TTL.
   roll_pacing?: WorkerRollPacing;
+  // Controller's retained roll-marker evidence (issue #4385), hosted workers only; absent for
+  // external workers and older APIs. Display-only.
+  roll_marker?: WorkerRollMarker;
   id: string;
   name: string;
   status: string; // "offline" | "online"
@@ -3070,6 +3184,13 @@ export interface Worker {
 /** The closed set of worker bind modes (PRD #111 M3), mirroring the server's CHECK. */
 export type BindMode = "default" | "pinned" | "auto";
 
+/** 200 body of POST /admin/workers/{id}/hibernate and /wake (PRD #4205). */
+export interface HibernationResult {
+  worker_id: string;
+  state: "none" | "preparing" | "hibernated" | "waking";
+  op_id?: string;
+}
+
 export interface AdminWorker extends Worker {
   owner_email: string;
   disk_pressure_volumes: string[];
@@ -3186,7 +3307,7 @@ export type StopKind =
 export type JudgeVerdict = "ideal" | "ok" | "issues";
 
 export type RunHealth =
-  "ok" | "stalled" | "looping" | "slow" | "waiting_worker" | "approval_idle" | "waiting_account_cooldown";
+  "ok" | "stalled" | "looping" | "slow" | "waiting_worker" | "approval_idle" | "waiting_account_cooldown" | "publication_withheld";
 
 // FixVerdict is a ci_fix run's outcome (PRD #6): verified/fix_failed are stamped
 // server-side from the post-fix pipeline; not_code is the agent's "not a code
@@ -3639,6 +3760,9 @@ export interface Run {
   plan_cross_check_gated?: boolean;
   /** Persisted forced-gate reason; optional for older server and mock responses. */
   plan_cross_check_gate_reason?: string | null;
+  /** Live plan/code cross-check presence, shared by the run list and single-run detail.
+   *  Older APIs omit it; null or absent means no visible live check. */
+  cross_check_active?: "plan" | "code" | null;
   /** Planning-diff refusal sub-code; set only while the gate reason is planning_diff_refused. */
   plan_cross_check_diff_refusal?: string | null;
   /** Owner detail only. Historical findings describe an earlier plan. */
@@ -3653,10 +3777,19 @@ export interface Run {
   trigger_source?: RunTriggerSource;
   worker_id: string | null;
   branch: string | null;
-  /** PRD #300: the per-schedule model a schedule froze onto this run at fire time;
-   *  null = the run inherited the owner's worker model (Run defaults). Applies to all
-   *  schedule targets (unlike guidance). */
+  /** The model frozen onto this run at create time: chosen when the run was started
+   *  (model_source run_override, PRD #3250) or pinned by the schedule that created it
+   *  (schedule_pin, PRD #300); null = the run inherits the owner's worker model at claim. */
   model: string | null;
+  /** PRD #3250: the reasoning effort chosen when the run was started, frozen at create;
+   *  null = the claim-time setting applies. OPTIONAL here only to avoid forcing mock-object
+   *  updates (like trigger_source); the server always sends it. */
+  effort?: string | null;
+  /** Writer of `model`: run_override or schedule_pin; null for no model and for a legacy
+   *  row (display reads a model with no source as schedule_pin). */
+  model_source?: "run_override" | "schedule_pin" | null;
+  /** Writer of `effort`: run_override; null when there is no effort. */
+  effort_source?: "run_override" | null;
   /** PRD #305: the frozen "apply model also to agents" flag; true means this run's
    *  model was applied to every subagent (overriding pins), false is the default. */
   override_subagent_model: boolean;
@@ -4041,10 +4174,26 @@ export interface Run {
    *  claimed worker flight was never witnessed starting or departing within a bounded window;
    *  the claim was released, local work and custody are kept, and only the owner can Resume or
    *  Cancel. Owner-held with no automatic retry, and not an integrity refusal.
+   *  "anthropic_spend_limit" (issue #3767) means a Claude run's Anthropic API key hit its
+   *  organization or workspace spend limit. Owner-held, recovery_retry_not_before is null and
+   *  nothing resumes it automatically. The owner can Resume (the next claim re-selects the
+   *  credential through the run's own selection, which may pick the capped token again),
+   *  switch token (switchable kinds only) or Cancel. A queued run can keep this value stale
+   *  after set-token, so also require status === "recovery_wait".
    *  "empty_turn" remains reserved. Render an unrecognised value honestly (a
    *  newer server may ship a cause this build has not heard of), the same rule as
    *  rate_limit_type. */
   recovery_wait_cause: string | null;
+  /** Issue #4177: closed-set classification of a `retained_recovery_adoption_failed` hold,
+   *  set only for status `recovery_wait` with that cause. "source_end_declined": an earlier
+   *  flight declined source-use end; Resume with unchanged worker registration is refused (409).
+   *  Only after a different registration can the owner request a guarded attempt; Cancel remains
+   *  available. This does not establish source usability. "secret_remediation_active": the
+   *  retained source is held under an active secret-scan remediation, so Resume cannot succeed
+   *  unchanged (the server refuses it with a 409). "remediation_proof_unknown": the remediation
+   *  proof could not be verified; a retry may help. Null, absent or any other value selects the
+   *  generic adoption-failure copy and never permits adoption. Never render the raw string. */
+  recovery_wait_detail?: "source_end_declined" | "secret_remediation_active" | "remediation_proof_unknown" | null;
   /** Issue #1324: which part of the run a `recovery_wait` park interrupted. "publication"
    *  is a forge outage met while publishing: the run keeps its publication intent and
    *  resumes publication only. Null for every other park. Render an unrecognised value
@@ -4221,6 +4370,14 @@ export interface Run {
    *  'iteration_budget_exhausted' is a nonterminal iteration hold: owner Resume or Cancel,
    *  never completed-scope Stop. Extend wall time first only when remaining wall is spent;
    *  Extend leaves it paused, and credential changes never retry it automatically.
+   *  Issue #3250: 'run_override_unavailable' is a nonterminal owner hold: the run's chosen model
+   *  or effort cannot run on its harness; owner Resume retries only if the choice has become available
+   *  on that harness, otherwise Cancel and start a new run with a different choice.
+   *  The non-completion holds (credential_disabled, credentials_reset, provider_unavailable,
+   *  codex_policy_hold, base_attestation_missing, repo_agent_source_unavailable, the two token-switch
+   *  holds, iteration_budget_exhausted and run_override_unavailable; NOT completion_blocked,
+   *  budget_exhausted or weekly_reserve) form one set, NON_COMPLETION_HOLDS in lib/runBadge.ts, which owns their
+   *  tone, label and owner-resumability (fixtures/hold-reasons/presentation.json).
    *  Render an unrecognised value honestly.
    *  `hold_context` is the constant "unavailable(same_worker_only)" ONLY while held, else null:
    *  the UI/CLI state the hold's durability HONESTLY from it — the hold is same-worker-only and
@@ -4372,6 +4529,19 @@ export interface CredentialOverride {
   label: string | null;
 }
 
+/** RunStartBody is the optional start-option part of POST /repos/{id}/runs (PRD #3250 M2),
+ *  shaped by lib/startRun.ts's runStartBody, the one builder. Every key is OPTIONAL and sent
+ *  only when present: an empty object is today's one-click body ({issue_iid} alone).
+ *  credential_override mirrors the Go create handler's write shape ({mode, secret_id?}),
+ *  harness is an explicit pick, and model / effort are sent verbatim (the server does not
+ *  trim them). */
+export interface RunStartBody {
+  credential_override?: { mode: string; secret_id?: string };
+  harness?: Harness;
+  model?: string;
+  effort?: string;
+}
+
 /** CredentialEpoch is one claim's credential attribution (PRD #1247 M1, D7): the
  *  generation, the token it spent (secret_id + label + select_reason, all null-tolerant for
  *  a deleted token's history), and when it was applied. claim_generation is a plain JSON
@@ -4384,6 +4554,34 @@ export interface CredentialEpoch {
   label: string | null;
   select_reason: string | null;
   applied_at: string;
+  /** 0 (or absent on an older API) for a claim's base epoch; n >= 1 for the nth in-place
+   *  switch inside that claim generation (issue #4201). Order epochs by
+   *  (claim_generation, ordinal). */
+  ordinal?: number;
+  /** Seq of the run's credential_switch message for an in-place switch; omitted for a base epoch. */
+  message_seq?: number;
+  /** The epoch's own spend; omitted when the run recorded none. */
+  usage?: CredentialEpochUsage;
+}
+
+/** CredentialSwitchMessagePayload is the body of a `credential_switch` run message (PRD #1247
+ *  M9; api/internal/workersvc/secretchoice.go). label is user-authored (null when unlabelled);
+ *  ordinal is n >= 1 for the nth in-place switch in a claim (issue #4201) and absent on a
+ *  claim-time switch. */
+export interface CredentialSwitchMessagePayload {
+  label: string | null;
+  select_reason: string;
+  secret_id: string;
+  ordinal?: number;
+}
+
+/** CredentialEpochUsage is one credential epoch's spend (issue #4201). */
+export interface CredentialEpochUsage {
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cache_creation_tokens: number;
+  cost_usd: number;
 }
 
 // RunActivity is the server-derived "now" line for a run (PRD #1064 D3): who is acting,
@@ -4565,11 +4763,6 @@ export interface RunListItem extends Run {
    *  render as plain text. */
   pending_question?: string;
 
-  /** Which cross-check is live for this run: "plan" or "code". Non-null only while the
-   *  run's plan or code cross-check is live. Older APIs omit it, and an absent value
-   *  shows no tag. */
-  cross_check_active?: "plan" | "code" | null;
-
   repo_path: string;
   worker_name: string | null;
   owner_email?: string;
@@ -4585,7 +4778,24 @@ export type RunSummaryItem = Omit<
   | "reset_state_digest" | "milestone_reconciliations" | "milestone_reconciliations_next_before_gate_revision"
   | "semantic_gate" | "completion_pending" | "semantic_drift"
   | "capability_provenance" | "lead_config" | "created_issues"
+  // PRD #3250: the start-time choice is on the run page and the list, not the polling shape.
+  | "effort" | "model_source" | "effort_source"
 >;
+
+/** The GET /api/runs/{id}/inputs response (Go RunInputsEnvelopeDTO, issue #4198): the steer
+ *  queue plus, only on an admin run debug read of another user's run, admin_debug_read=true. */
+export interface RunInputsEnvelope {
+  inputs: SteerInput[];
+  admin_debug_read?: boolean;
+}
+
+/** The GET /api/admin/runs?state=all response (Go AdminRunsDebugDTO, issue #4198 admin run
+ *  debug listing): summary rows of every status, newest first. runs is always an array on the
+ *  wire; truncated is true when more matching runs existed than the server's row cap. */
+export interface AdminRunsDebug {
+  runs: RunSummaryItem[];
+  truncated: boolean;
+}
 
 // RunOutcomes is the failed-run rate aggregate for one scope+window (PRD #1293).
 // Counted over `runs` directly, NOT the usage rollup (D1): a run that fails before
@@ -4623,8 +4833,10 @@ export interface RunOutcomes {
 }
 
 // SelfUsage is the caller's own consumption (GET /api/usage, PRD #40): lifetime and
-// last-7-days totals plus the count of their usage-bearing runs. run_count === 0
-// means "nothing yet" — the card renders that state, not fabricated zeros.
+// last-7-days totals plus the count of their primary work runs with recorded usage
+// (issue #4209: helper runs add tokens and cost but not run_count). run_count === 0 alone no
+// longer means "nothing yet": a helper-only user has spend. The card renders the empty state
+// only when tokens, cost and run counts are all zero (hasRecordedUsage).
 export interface SelfUsage {
   lifetime: RunUsage;
   last_7_days: RunUsage;
@@ -4671,9 +4883,9 @@ export interface AdminUsageUser {
   /** Issue #3686: this user's lifetime and seven-day PR counts. Absent on older APIs. */
   pr_count?: number;
   last7_pr_count?: number;
-  /** Issue #3876: this user's lifetime and seven-day runs split by harness. The same runs as
-   *  run_count / last7_run_count, so each split sums to its window's count; a cross-check run
-   *  counts under the harness it ran on. Absent on older APIs. */
+  /** Issue #3876: this user's lifetime and seven-day runs split by harness. The same primary
+   *  work runs as run_count / last7_run_count, so each split sums to its window's count.
+   *  Absent on older APIs. */
   harness_runs?: HarnessRuns;
   last7_harness_runs?: HarnessRuns;
 }
@@ -4690,8 +4902,8 @@ export interface HarnessRuns {
 export interface AdminUsage {
   factory: SelfUsage;
   users: AdminUsageUser[];
-  /** ISO timestamp of the factory's earliest usage-bearing run (for the "since
-   *  <date>" line); null when the factory has no usage yet (PRD #40). */
+  /** ISO timestamp of the factory's earliest usage-bearing run's creation time (helper runs included;
+   *  for the "since <date>" line); null when the factory has no usage yet (PRD #40). */
   earliest_run: string | null;
 }
 
@@ -5075,6 +5287,19 @@ export interface RunReview {
 export interface PendingJudge {
   state: "scheduled" | "running";
   enqueued_at: string;
+}
+
+// JudgeSkip is the recorded reason the AUTOMATIC judge of a run was skipped (issue #3257,
+// apitypes.JudgeSkipDTO): the judge's harness had no usable credential. A third sibling key on
+// the review envelope, always present and null when nothing was skipped; the server sets it
+// only when `review` and `pending_judge` are both null (read precedence review > pending >
+// skip). `harness` and `reason` are fixed server codes, typed as strings on purpose: the panel
+// maps each KNOWN code to fixed copy and renders generic fixed copy for anything else, so a
+// future code never reaches the page as raw text. `at` is when the skip was recorded.
+export interface JudgeSkip {
+  harness: string;
+  reason: string;
+  at: string;
 }
 
 // IssueDraft is the templated, human-editable draft for filing a forge issue from a
@@ -5866,6 +6091,8 @@ export interface RecoveryArchiveSummary {
   has_open_hold: boolean;
   counts: RecoveryArchiveStateCounts;
   archives: RecoveryArchive[];
+  /** True only on an admin run debug read of another user's run (issue #4198); omitted otherwise. */
+  admin_debug_read?: boolean;
 }
 
 // ── Owner-facing custody holds (PRD #1349 M1) ─────────────────────────────────
@@ -5974,6 +6201,8 @@ export interface HeldPublications {
 export interface RecoveryCustodyHolds {
   aggregate: RecoveryCustodyAggregate;
   holds: RecoveryCustodyHold[];
+  /** Whose holds these are; present only when the request named ?user= or ?run= (admin run debug). */
+  owner_id?: string;
 }
 
 /** Explicit owner consent; null binds legacy runs with no completion contract. */

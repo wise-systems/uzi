@@ -603,6 +603,11 @@ func run() error {
 	// profile-bound run says provisioning is off, rather than waiting on a lane worker that the
 	// provisioner will never create.
 	wsvc.SetEphemeralSettings(settingsCache)
+	// Worker hibernation kill-switch (PRD #4205): admission and the disable-wake pass read it.
+	wsvc.SetHibernationSettings(settingsCache)
+	// Automatic idle-worker hibernation (issue #4207): the pass reads worker_hibernation_auto and
+	// worker_hibernation_idle_after on top of the kill-switch above.
+	wsvc.SetHibernationAutoSettings(settingsCache)
 	// Issue #1965: a profile-bound run on a deployment without the lane says so instead of waiting.
 	wsvc.SetIsolatedLaneEnabled(cfg.IsolatedLaneEnabled())
 	// PRD #2006: lease entry on a worker-reported terminal and lease-arm claims (0 disables).
@@ -737,6 +742,9 @@ func run() error {
 	// cancel an in-flight sync call — decouples the tick DEADLINE from the poll cadence
 	// (issue #139).
 	engine.SetForgeTimeout(cfg.ForgeHTTPTimeout)
+	// Durable first-import status (issue #4399): the poller claims and settles the
+	// import a repo enable records, so the enable request never imports itself.
+	engine.SetImportStateStore(q)
 	// Autopilot (PRD #19 M4): the poller's post-sync detector turns an autopilot-label
 	// application on a PRD issue into an auto_approve run for the mapped consenting
 	// user (or one explanatory issue comment). Wired post-construction like the other
@@ -809,6 +817,17 @@ func run() error {
 		// PRD #2006: a finished ephemeral worker's lease (0 disables). The reaper spares a
 		// live lease and provisioning evicts the oldest releasable one at the cap.
 		Lease: cfg.EphemeralLease,
+	})
+
+	// PRD #4205 M5: the demand-wake pass. Shares the claim knobs ClaimRun uses so its demand query
+	// agrees with what a woken worker could claim.
+	hibernationWaker := hostedsvc.NewHibernationWaker(q, wsvc, settingsCache, hostedsvc.HibernationWakerConfig{
+		WorkerAffinityGrace:     cfg.WorkerAffinityGrace,
+		WorkerStaleRequeueGrace: cfg.WorkerStaleRequeueGrace,
+		WorkerAffinityCeiling:   cfg.WorkerAffinityCeiling,
+		WorkerHeartbeatStale:    cfg.WorkerHeartbeatStale,
+		BackgroundGrace:         cfg.WorkerBackgroundGrace,
+		Lease:                   cfg.EphemeralLease,
 	})
 
 	sweep := sweeper.New(wsvc, cfg.SweepInterval,
@@ -895,6 +914,30 @@ func run() error {
 		// and concurrency-safe. Rides this ticker like the passes above rather than a
 		// goroutine of its own. Flag-off footprint is one settings read: the pass returns
 		// immediately unless the instance kill-switch (ephemeral_workers_enabled) is on.
+		// Worker hibernation settle pass (PRD #4205): withdraws overdue preparations, paces
+		// wakes after the setting is switched off, settles waking workers and flags an
+		// unconfirmed wake. Unconditional: waking a sleeper never depends on the setting.
+		sweeper.Pass{
+			Name: "worker_hibernation_settle",
+			Run:  wsvc.HibernationSettlePass,
+		},
+		// Automatic idle-worker hibernation (issue #4207). It sits AFTER the settle pass so a wake that
+		// settled this tick has already stamped last_wake_settled_at (its grace anchor) before idle
+		// workers are listed, and BEFORE the demand wake so a worker admitted here is seen as
+		// preparing by the wake pass rather than racing it. It is gated inside the pass on
+		// worker_hibernation_enabled AND worker_hibernation_auto and runs at most once a minute.
+		sweeper.Pass{
+			Name: "worker_hibernation_auto",
+			Run:  wsvc.HibernationAutoPass,
+		},
+		// Hibernation demand wake (PRD #4205 M5): wakes a sleeping worker for a queued run no online
+		// worker can claim. It MUST run BEFORE ephemeral_workers_provision so sleeping capacity is
+		// used first and provisioning sees the recorded wake that suppresses a duplicate worker.
+		// Unconditional: it runs whatever ephemeral_workers_enabled and worker_hibernation_enabled say.
+		sweeper.Pass{
+			Name: "worker_hibernation_wake",
+			Run:  hibernationWaker.WakePass,
+		},
 		sweeper.Pass{
 			Name: "ephemeral_workers_provision",
 			Run:  ephemeralProv.ProvisionPass,
@@ -952,6 +995,15 @@ func run() error {
 		sweeper.Pass{
 			Name: "held_publication",
 			Run:  wsvc.SweepHeldPublications,
+		},
+		// Terminal preservation (issue #4007): reconcile of unknown publications and stale-bound rows
+		// for the refs/uzi-terminal refs; its retire lane is compiled in but disabled
+		// (terminalRetirementEnabled). ALWAYS registered and effect-inert when nothing is due: one
+		// bounded, indexed due-row query, no credential resolution, no forge call, no row write.
+		// It never touches run_held_publications, which SweepHeldPublications alone owns.
+		sweeper.Pass{
+			Name: "terminal_preservation",
+			Run:  wsvc.SweepTerminalPreservations,
 		},
 		// Prerequisite closure always advances existing rows, regardless of admission knobs.
 		// Its extra share before run liveness is at most a 10s pass plus a 5s in-flight
@@ -1174,6 +1226,7 @@ func run() error {
 		WorkerEligibilityForHealth: wsvc.WorkerEligibilityForHealth,
 		ResidueQuarantine:          wsvc.ResidueQuarantineFor,
 		MemoryAuthorityLost:        wsvc.MemoryAuthorityLostFor,
+		HibernationRetirement:      wsvc.EvaluateHibernationRetirement,
 		Store:                      q,
 		MaintenanceReadout: func(ctx context.Context) (store.MaintenanceReadout, error) {
 			return store.ReadMaintenanceReadout(ctx, pool)
@@ -1470,6 +1523,7 @@ func run() error {
 	// changes (PRD #19 M2). Wired post-construction: the poller is built above but
 	// the signal target is the handler.
 	h.SetReconciler(engine)
+	h.SetInitialImportRequester(engine.RequestImport)
 	// The admin agent-source endpoints (PRD #602 M4) drive the SAME reconciler the
 	// interval loop uses: "Sync now" calls Reconcile, approve-and-apply calls Apply.
 	h.SetAgentSourceReconciler(agentSourceRec)

@@ -291,8 +291,10 @@ changing the run.
   documented wall-release race before delivery, can leave another claim
   unconstrained.
 - Retained custody still counts toward the per-owner custody admission limit
-  (`custody_hold_limit`, default 8). There is no force-clear or capacity
-  exception.
+  (`custody_hold_limit`, default 8) as admission units: a run's open
+  holds on one original worker, from any of its generations, count as one unit. A queued run whose own
+  open holds reach the limit is not started even when its owner is below it. There
+  is no force-clear or capacity exception.
 - A held, assigned worker can defer idle-only image rolls indefinitely (#3103).
 - Policy journals survive a worker process crash, not storage or power loss.
 - Clearing the saved-work requirement after `fresh_from_saved_work` relies on
@@ -331,6 +333,30 @@ state do not block. Each Down is one
 transaction, so a `RAISE` rolls it back fully, and holds `ACCESS EXCLUSIVE` on
 `runs` while it runs. Design rationale:
 [ADR-3607](../adr/3607-compact-policy-hold-m1-isolation.md#consent-and-continuity-m2m3).
+
+## Paused after an uncertain token switch
+
+If you switch a running run's token with `uzi run set-token` and the worker
+cannot prove whether the switch took effect (the confirmation was lost, or the
+token can no longer be handed out), the run **pauses for you**. It is an
+ordinary pause: `hold_reason` is empty, the worker, session and open question
+are kept, and the run feed shows a `credential_switch_uncertain` message, which the
+worker itself posts. Neither
+the old nor the new token is used again until you act.
+
+To continue, **Resume** it (`uzi run resume <id>`, or the run page's
+**Resume**). Resume re-resolves the token from the run's current choice, so the
+token you last set is the one the run spends; to pick a different one first,
+run `uzi run set-token <id> <label>`. Cancel works as always.
+
+This is different from a held switch (`credential_switch_settling` then
+`credential_switch_unsettled`), which means the worker could **not prove its
+processes stopped** and nothing was applied; see
+[Credential-switch holds](run-recovery.md#credential-switch-holds). Settling
+lifts only on the worker's acknowledgement, a stale heartbeat, worker removal
+or re-registration, never on elapsed time. A worker without in-place switching
+keeps the release-and-reclaim path and does not produce this pause.
+Design: [ADR-4201](../adr/4201-in-place-credential-switch.md).
 
 ## Not the same as a completion hold
 

@@ -324,6 +324,50 @@ func TestLoadParsesTheDiskRecyclePolicy(t *testing.T) {
 	})
 }
 
+// The builder-cache prune leg (issue #4291): defaults true when unset or blank, parses
+// with strconv.ParseBool, and a set-but-unparseable value is a boot error.
+func TestLoadParsesTheDinDBuilderPruneToggle(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		set   bool
+		value string
+		want  bool
+	}{
+		{"unset", false, "", true},
+		{"blank", true, "  ", true},
+		{"true", true, "true", true},
+		{"false", true, "false", false},
+		{"1", true, "1", true},
+		{"0", true, "0", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setWorkerEnv(t)
+			t.Setenv("UZI_API_URL", "https://uzi.example.com")
+			t.Setenv("UZI_CONTROLLER_TOKEN_FILE", writeToken(t, "tok"))
+			if tc.set {
+				t.Setenv("UZI_WORKER_DIND_BUILDER_PRUNE_ENABLED", tc.value)
+			}
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if cfg.WorkerDinDBuilderPruneEnabled != tc.want {
+				t.Errorf("WorkerDinDBuilderPruneEnabled = %v, want %v", cfg.WorkerDinDBuilderPruneEnabled, tc.want)
+			}
+		})
+	}
+
+	t.Run("an unparseable value is a boot error", func(t *testing.T) {
+		setWorkerEnv(t)
+		t.Setenv("UZI_API_URL", "https://uzi.example.com")
+		t.Setenv("UZI_CONTROLLER_TOKEN_FILE", writeToken(t, "tok"))
+		t.Setenv("UZI_WORKER_DIND_BUILDER_PRUNE_ENABLED", "yes-please")
+		if _, err := Load(); err == nil || !strings.Contains(err.Error(), "UZI_WORKER_DIND_BUILDER_PRUNE_ENABLED") {
+			t.Fatalf("err = %v, want a boot refusal naming UZI_WORKER_DIND_BUILDER_PRUNE_ENABLED", err)
+		}
+	})
+}
+
 // A malformed or non-positive knob falls back to the default rather than failing
 // boot: these are tuning values, not security controls, which is the same split the
 // api's config package draws.
@@ -684,6 +728,68 @@ func TestLoadKeepsTheCAPEMForRelayToWorkers(t *testing.T) {
 	if string(cfg.APICAPEM) != string(pem) {
 		t.Error("APICAPEM must carry the raw bundle for relay to the worker Secrets")
 	}
+}
+
+// The extra CA is optional, kept raw for relay, and a file with no certificate in it
+// aborts boot rather than leaving workers trusting nothing new.
+func TestLoadWorkerExtraCA(t *testing.T) {
+	base := func(t *testing.T) {
+		setWorkerEnv(t)
+		t.Setenv("UZI_API_URL", "https://api.uzi.svc.cluster.local:8443")
+		t.Setenv("UZI_CONTROLLER_TOKEN_FILE", writeToken(t, "tok"))
+		t.Setenv("UZI_API_CA_FILE", writeCA(t, caPEM(t)))
+	}
+	t.Run("kept raw for relay", func(t *testing.T) {
+		base(t)
+		pem := caPEM(t)
+		t.Setenv("UZI_WORKER_EXTRA_CA_FILE", writeCA(t, pem))
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if string(cfg.WorkerExtraCAPEM) != string(pem) {
+			t.Error("WorkerExtraCAPEM must carry the raw bundle")
+		}
+	})
+	t.Run("unset is empty", func(t *testing.T) {
+		base(t)
+		cfg, err := Load()
+		if err != nil || cfg.WorkerExtraCAPEM != nil {
+			t.Fatalf("Load: err=%v extra=%q", err, cfg.WorkerExtraCAPEM)
+		}
+	})
+	t.Run("no PEM in it", func(t *testing.T) {
+		base(t)
+		t.Setenv("UZI_WORKER_EXTRA_CA_FILE", writeCA(t, []byte("not a certificate")))
+		if _, err := Load(); err == nil || !strings.Contains(err.Error(), "UZI_WORKER_EXTRA_CA_FILE") {
+			t.Fatalf("Load: err = %v, want one naming UZI_WORKER_EXTRA_CA_FILE", err)
+		}
+	})
+	t.Run("missing file", func(t *testing.T) {
+		base(t)
+		t.Setenv("UZI_WORKER_EXTRA_CA_FILE", filepath.Join(t.TempDir(), "absent.crt"))
+		if _, err := Load(); err == nil {
+			t.Fatal("Load: want error for an unreadable extra CA file, got nil")
+		}
+	})
+	// Without the api CA there is no Secret entry for the bundle to ride, and a worker
+	// pointed at a missing CA file does not start.
+	t.Run("needs the api CA", func(t *testing.T) {
+		base(t)
+		t.Setenv("UZI_API_CA_FILE", "")
+		t.Setenv("UZI_WORKER_EXTRA_CA_FILE", writeCA(t, caPEM(t)))
+		if _, err := Load(); err == nil || !strings.Contains(err.Error(), "UZI_API_CA_FILE") {
+			t.Fatalf("Load: err = %v, want one naming UZI_API_CA_FILE", err)
+		}
+	})
+	t.Run("size cap", func(t *testing.T) {
+		base(t)
+		big := append(caPEM(t), make([]byte, maxWorkerExtraCABytes)...)
+		t.Setenv("UZI_WORKER_EXTRA_CA_FILE", writeCA(t, big))
+		if _, err := Load(); err == nil || !strings.Contains(err.Error(), "limit") {
+			t.Fatalf("Load: err = %v, want the size limit", err)
+		}
+	})
 }
 
 // --- docker tier (PRD #83 M3) ----------------------------------------------
@@ -1221,4 +1327,102 @@ func TestLoadParsesTheCommandSandboxMode(t *testing.T) {
 			t.Fatalf("err = %v, want a boot refusal naming UZI_CODEX_COMMAND_SANDBOX", err)
 		}
 	})
+}
+
+func TestRetireScratchOutcomesConfig(t *testing.T) {
+	const key = "UZI_WORKER_RETIRE_SCRATCH_OUTCOMES"
+	for _, raw := range []string{"unset", "", "true", "false", "True", "0", "1", "yes", " true", "null"} {
+		t.Run(raw, func(t *testing.T) {
+			setWorkerEnv(t)
+			t.Setenv("UZI_API_URL", "https://api.example.com")
+			t.Setenv("UZI_CONTROLLER_TOKEN_FILE", writeToken(t, "token"))
+			t.Setenv("UZI_WORKER_DOCKER_NAMESPACE", "")
+			t.Setenv(key, raw)
+			if raw == "unset" {
+				if err := os.Unsetenv(key); err != nil {
+					t.Fatal(err)
+				}
+			}
+			cfg, err := Load()
+			valid := raw == "unset" || raw == "" || raw == "false" || raw == "true"
+			if valid {
+				if err != nil || cfg.WorkerRetireScratchOutcomes != (raw != "false") {
+					t.Fatalf("enabled=%v err=%v", cfg.WorkerRetireScratchOutcomes, err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), key) {
+				t.Fatalf("invalid value accepted: %v", err)
+			}
+		})
+	}
+}
+
+func TestEpochScratchDeletionConfig(t *testing.T) {
+	const key = "UZI_WORKER_EPOCH_SCRATCH_DELETION"
+	for _, raw := range []string{"unset", "", "false", "true", "False", "FALSE", "True", "TRUE", "0", "1", "t", "f", "T", "F", "yes", "no", " true", "true ", "false\n", "\ttrue", "null"} {
+		t.Run(raw, func(t *testing.T) {
+			setWorkerEnv(t)
+			t.Setenv("UZI_API_URL", "https://api.example.com")
+			t.Setenv("UZI_CONTROLLER_TOKEN_FILE", writeToken(t, "token"))
+			t.Setenv("UZI_WORKER_DOCKER_NAMESPACE", "")
+			t.Setenv(key, raw)
+			if raw == "unset" {
+				if err := os.Unsetenv(key); err != nil {
+					t.Fatal(err)
+				}
+			}
+			cfg, err := Load()
+			valid := raw == "unset" || raw == "" || raw == "false" || raw == "true"
+			if valid {
+				if err != nil || cfg.WorkerEpochScratchDeletion != (raw == "true") {
+					t.Fatalf("enabled=%v err=%v", cfg.WorkerEpochScratchDeletion, err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), key) {
+				t.Fatalf("invalid value accepted: %v", err)
+			}
+		})
+	}
+}
+
+// Worker Deployment metadata: JSON objects, validated at boot, and a label may not
+// replace one the controller stamps (its teardown provenance).
+func TestParseDeploymentMetadata(t *testing.T) {
+	const labels, annotations = "UZI_WORKER_DEPLOYMENT_LABELS", "UZI_WORKER_DEPLOYMENT_ANNOTATIONS"
+	t.Setenv(labels, `{"team":"platform"}`)
+	t.Setenv(annotations, `{"policy.example.com/skip-probes":"true","note":"free text, spaces ok"}`)
+	l, err := parseDeploymentMetadata(labels, true)
+	if err != nil || l["team"] != "platform" {
+		t.Fatalf("labels = %v, err = %v", l, err)
+	}
+	a, err := parseDeploymentMetadata(annotations, false)
+	if err != nil || a["note"] != "free text, spaces ok" {
+		t.Fatalf("annotations = %v, err = %v", a, err)
+	}
+	for _, raw := range []string{"", "null", "{}"} {
+		t.Setenv(labels, raw)
+		if got, err := parseDeploymentMetadata(labels, true); err != nil || got != nil {
+			t.Errorf("%q: got %v err %v, want none", raw, got, err)
+		}
+	}
+	for name, raw := range map[string]string{
+		"not an object":    `["a"]`,
+		"null member":      `{"team":null}`,
+		"bad key":          `{"bad key":"x"}`,
+		"bad label value":  `{"team":"has spaces"}`,
+		"controller label": `{"app.kubernetes.io/managed-by":"x"}`,
+		"worker id label":  `{"uzi.dev/hosted-worker-id":"x"}`,
+		"reserved prefix":  `{"uzi.dev/anything":"x"}`,
+	} {
+		t.Setenv(labels, raw)
+		if _, err := parseDeploymentMetadata(labels, true); err == nil {
+			t.Errorf("%s: %s accepted", name, raw)
+		}
+	}
+}
+
+// uzi.dev/ annotations (spec hash, roll marker, generation) are the controller's own.
+func TestDeploymentAnnotationsRefuseTheReservedPrefix(t *testing.T) {
+	t.Setenv("UZI_WORKER_DEPLOYMENT_ANNOTATIONS", `{"uzi.dev/image-roll":"x"}`)
+	if _, err := parseDeploymentMetadata("UZI_WORKER_DEPLOYMENT_ANNOTATIONS", false); err == nil {
+		t.Fatal("a uzi.dev/ annotation was accepted")
+	}
 }

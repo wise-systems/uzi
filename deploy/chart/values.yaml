@@ -77,7 +77,10 @@ imageVerification:
 # One list, two consumers, so they can never diverge (PRD #808): it renders into the
 # api's FORGE_ALLOWED_BASE_URLS env (the SSRF allowlist) AND into the kube-native
 # worker FQDN egress allow-list (worker-fqdn-egress.yaml derives one Allow per host).
-# https base URLs only. Empty (the default) leaves the api on its own built-in default
+# Each entry must be a bare https://host[:port] (an optional trailing / is fine); userinfo,
+# a path, a query or a fragment fails the render (the message never echoes the entry).
+# Values supplied through api.config bypass the chart and fail at api boot instead.
+# Empty (the default) leaves the api on its own built-in default
 # and emits no forge egress FQDN. Set this per-cluster instead of api.config.FORGE_ALLOWED_BASE_URLS
 # (setting BOTH fails the render — see api-configmap.yaml).
 forge:
@@ -86,8 +89,10 @@ forge:
 # --- issueTracker: the API's issue tracker SSRF allowlist (PRD #4173 S3) -----------
 #
 # Renders into the api's ISSUE_TRACKER_ALLOWED_BASE_URLS env. It is SEPARATE from the
-# forge allowlist above: https base URLs only, and empty (the default) means no issue
-# tracker connection can be created. It never feeds the worker egress lists (forge.* does
+# forge allowlist above: each entry must be a bare https://host[:port] (optional trailing /;
+# userinfo, a path, a query, a fragment, a comma or whitespace fails the render, and the
+# message never echoes the entry; a value supplied through api.config fails at api boot
+# instead). Empty (the default) means no issue tracker connection can be created. It never feeds the worker egress lists (forge.* does
 # that), because the worker never calls an issue tracker (S5). Set this per-cluster instead
 # of api.config.ISSUE_TRACKER_ALLOWED_BASE_URLS (setting BOTH fails the render — see
 # api-configmap.yaml).
@@ -218,6 +223,17 @@ api:
   # LATER than we warn, so DO NOT "align" the two — the gap is intentional (reviewer
   # note, PRD Decision context).
   diskPressureThreshold: 0.90
+  # Admin run debug reads (issue #4198). When enabled, a LIVE admin using a Bearer uza_
+  # CLI token whose stored scope is admin_ro can read other users' runs' debug data
+  # through the CLI: steer inputs, recovery capture metadata, fetch logs, recovery
+  # holds, and an all-states admin run listing. All read-only. A browser cookie or a
+  # uzc_ token never qualifies, and admin-ness is re-read live on every request. Each
+  # newly authorized cross-user read writes one audit log line, "admin run debug read".
+  # OFF by default. Rendering it sets UZI_ADMIN_RUN_DEBUG=true in the api ConfigMap.
+  # UZI_ADMIN_RUN_DEBUG is reserved to this value: setting it in api.config or
+  # api.secretEnv fails the render, whatever the value.
+  adminRunDebug:
+    enabled: false
   resources:
     # Requests sized to a live fleet's steady state (~107m CPU / ~280Mi measured
     # 2026-10-06 with 8 hosted workers); running above its request
@@ -428,6 +444,17 @@ api:
     # host->pod probe traffic; CONFIRM at M6 before trusting empty.
     probeCIDRs: []
 
+# Extra metadata on every workload uzi creates: the chart's Deployments and StatefulSet
+# (api, web, controller, fetcher, simple postgres) and every hosted worker Deployment
+# the controller renders. For admission policies that key on workload metadata (an
+# exemption annotation, a required owner label). Values must be strings. Object metadata
+# only, never the pod template, so no worker or app pod rolls (the controller restarts to
+# read them); a hosted worker picks them up on the controller's next update to its
+# Deployment. A label uzi sets, or any uzi.dev/ key, is refused at render and at the
+# controller's boot.
+workloadLabels: {}
+workloadAnnotations: {}
+
 # --- hosted workers: the namespace, its RBAC, its policies, the controller -------
 #
 # M3 built the security ENVELOPE (namespace, RBAC, quotas, policies); M6 added the
@@ -454,6 +481,33 @@ workers:
   # and supplies a pre-created api.tls.secretName. It exists so that deviation is
   # VISIBLE in the values file that chose it, instead of being an inherited default.
   allowPlaintextAPI: false
+  # An extra CA bundle every hosted worker trusts ON TOP of the api's own CA, for
+  # private-CA hosts the worker's Node process and the Claude Code CLI call over HTTPS:
+  # an Anthropic-compatible LLM gateway, or a self-hosted GitHub Enterprise / GitLab /
+  # Forgejo API. The controller appends it to the api CA in each worker's Secret. It does
+  # not change git's or the toolchain's OpenSSL trust, so a private-CA forge still fails
+  # at git clone. Needs api.tls.enabled. Under workers.uidSplit the CLI runs as another
+  # uid that cannot read the Secret, so it covers the worker process only (isolated-lane
+  # workers never take the split, so their CLI still gets it).
+  # Workers verify the api with the same bundle, so the extra CA is ALSO trusted for the
+  # worker-to-api connection, not only for outbound hosts: a broad corporate root here
+  # can vouch for the api too. Prefer the narrowest CA that covers your hosts.
+  # Set ONE of the two:
+  #   pem: the bundle inline; the chart writes it into a ConfigMap.
+  #   configMap: an existing ConfigMap in the RELEASE namespace (e.g. a trust-manager
+  #     Bundle target), by name and key.
+  # Like the api CA, it is written into a worker's Secret when the worker is created:
+  # adding or changing it reaches new workers, so reprovision existing ones. The
+  # controller reads it at boot; an inline pem change restarts the controller, an edit
+  # to an existing ConfigMap needs a controller restart. Without workers.uidSplit,
+  # turning it on also adds UZI_CLI_CA_FILE to the worker pod template, which can start
+  # paced worker rolls; a roll does not rewrite an existing worker's Secret, so
+  # reprovisioning is still what delivers the CA to it.
+  extraCA:
+    pem: ""
+    configMap:
+      name: ""
+      key: ca.crt
   # The DEDICATED namespace, which must contain NOTHING but hosted workers. A Role
   # that can create pods in a namespace can mount any Secret and impersonate any
   # ServiceAccount in it — RBAC cannot scope `create` by label — so this namespace's
@@ -627,7 +681,17 @@ workers:
   #   The same flag also enables the pressure-only anonymous-volume prune leg (issue
   #   #3891) on busy or custody-held workers; false disables that leg too, along with
   #   PVC recycle and the cache prune (it is not leg-only).
+  #   It likewise disables the pressure-only builder-cache prune leg (issue #4291,
+  #   see dindBuilderPruneEnabled below).
   diskRecycleEnabled: true
+  # dindBuilderPruneEnabled: default-on switch for the pressure-only builder-cache
+  #   prune leg (issue #4291): `docker builder prune -f --filter type=regular
+  #   --filter until=24h --max-used-space 4GiB`, run on busy or custody-held docker
+  #   workers. Subordinate to diskRecycleEnabled: false there disables this leg too.
+  #   Setting this false disables only this leg. Flipping it changes docker worker
+  #   pods' spec hash, so they roll through the normal safe drift roll. Strict boolean
+  #   (a string or null refuses to render); always sent explicitly.
+  dindBuilderPruneEnabled: true
   # diskRecycleCooldown: the PVC-age thrash guard (Decision D6). A worker back at pressure
   #   within this window is a CAPACITY problem (working set exceeds nixSize) — it is
   #   capacity-warned and skipped, not recycled in a loop. An ordinary Go duration
@@ -657,7 +721,7 @@ workers:
     # so the fleet rolls as its workers finish their runs. It must be concrete: the
     # controller-deployment template wraps it in `required`, so a blank tag fails the
     # render loudly rather than shipping an empty image reference.
-    tag: "0.87.0-rc.7"
+    tag: "0.87.0-rc.15"
   # The Harbor pull secret IN THE WORKER NAMESPACE. It cannot be the release
   # namespace's copy: a ServiceAccount's imagePullSecrets can only name a Secret in
   # its OWN namespace. Empty = no pull secret (the KinD smoke, where the agent image
@@ -1005,23 +1069,32 @@ workers:
   #     node root, gated behind acknowledgeNonRootlessNodeRoot (see below).
   # sysbox (runtimeClassName: sysbox-runc) remains the documented path to a
   # non-privileged tier once a cluster can run it; it is NOT installed and NOT required.
-  # One-worker epoch-reclaim deletion canary, OFF by default. The controller renders
+  # One-worker epoch-reclaim attempt-deletion canary, OFF by default. The controller renders
   # UZI_EPOCH_RECLAIM_DELETION=1 only into the pod template of the single persistent Docker
   # worker whose id equals this value; no other worker's template changes. It must be empty
   # or one lowercase UUID (no list, wildcard or padding). Clearing it takes effect at the
   # next replacement/startup of that worker. Never move it to another UUID until the prior
   # enabled incarnation is gone or off. See docs/run-recovery.md.
   epochReclaim:
+    # Default-on scratch request for persistent Docker workers; strict boolean.
+    # false omits worker UZI_EPOCH_SCRATCH_DELETION after controller reconciliation.
+    # Startup-only: wait for safe replacement; ForceRoll must stay off.
+    # Supplies no attestation; empty runtime below keeps scratch. Attempt deletion stays canary-only.
+    scratchDeletion: true
+    # Default-on per-startup observation records for `.retire-*` retirement scratch parents
+    # (kept only; no reclaim). false renders worker UZI_RETIRE_SCRATCH_OUTCOMES=0 after
+    # controller reconciliation; takes effect at the next worker startup.
+    retireScratchOutcomes: true
     deletionCanaryWorkerId: ""
   docker:
     podEpochReclaim:
       # The pass runs by default and keeping trees needs no declaration: unset keeps every
       # tree (deferred / runtime_not_declared, no candidate inventory) and still participates
       # in lifetime epoch locking. Setting containerd-runc or crio-crun is
-      # the operator's attestation of the FULL audited runtime/storage contract (a future
-      # hosted-Docker deletion will require it) and is cross-checked against observations.
-      # Deletion runs only on the one worker selected by workers.epochReclaim.deletionCanaryWorkerId
-      # below; every other worker deletes nothing. See deploy/README.md, Pod-epoch shadow reclaim.
+      # the operator's attestation of the FULL audited runtime/storage contract required
+      # for hosted-Docker deletion, and is cross-checked against observations.
+      # Attempt deletion runs only on workers.epochReclaim.deletionCanaryWorkerId;
+      # scratch cleanup is controlled separately by workers.epochReclaim.scratchDeletion.
       runtime: ""
     # Turning this on creates the privileged namespace, its quota/limits, the worker
     # SA + pull secret in it, and the controller's Role there. It also makes the
@@ -1659,6 +1732,41 @@ web:
     # e.g. [{name: shared, namespace: gateway-system}] (Gateway API parentRefs, verbatim)
     parentRefs: []
     annotations: {}
+    # Gateway API HTTPRouteTimeouts for POST /api/v1/files (input-file upload): {request,
+    # backendRequest}, each a Gateway API Duration ("300s", "5m", "1h30m"; quote it). Empty
+    # (the default) renders today's route unchanged and leaves the timeout to the Gateway
+    # implementation, which for Envoy-based gateways is commonly 15s. Set, it renders a
+    # dedicated `Exact /api/v1/files` rule carrying exactly the keys given. HTTPRoute timeouts
+    # are a Gateway API Extended feature: set this only on a gateway that supports them.
+    # Recommended: {request: "300s", backendRequest: "300s"}, sized for a 25 MiB upload on a
+    # slow link. Web nginx buffers the whole request body before the api sees any of it, so
+    # what 300s bounds depends on when the gateway starts its request timer, which Gateway
+    # API leaves to the implementation:
+    # - timer from request start: 300s caps the whole transaction, client upload included.
+    #   A 25 MiB upload at the api's assumed 100 KiB/s floor takes 256s, leaving ~44s for
+    #   forwarding and api processing; a client slower than ~85 KiB/s on average is cut off.
+    # - timer after the body is received: the client upload is not counted against
+    #   `request`, and 300s covers the api's own budget for the buffered body: its upload
+    #   deadline is the larger of the request deadline (UZI_RECOVERY_REQUEST_DEADLINE, 120s)
+    #   and the declared size at 100 KiB/s (256s at 25 MiB), plus a 15s response grace, 271s.
+    #   On a gateway that streams the request body upstream, upload time can still count
+    #   against `backendRequest` even when `request` starts after the body is received.
+    # So 300s is not a portable cap on total upload duration. Raising the per-file cap
+    # (UZI_JOB_INPUT_FILE_MAX_BYTES) needs a larger value.
+    # This value must cover web nginx's /api/v1/files budgets, as web.ingress.annotations do
+    # for Ingress; size it as a TOTAL budget, not by copying nginx's numbers, because nginx's
+    # client_body/proxy_send/proxy_read timeouts (120s/150s/150s) bound inactivity between
+    # operations, not total duration. Set backendRequest too: omitted, the implementation
+    # applies its own backend timeout, which may be shorter. The render fails on a value that
+    # is not a map (false, [], "", 0), an unknown key, a malformed duration, or backendRequest longer than request (compared as parsed
+    # durations, so 300s == 5m; request "0s" disables that timeout and allows any
+    # backendRequest). /api/ws stays on the general rule below, untouched by this value.
+    timeouts: {}
+    # The same HTTPRouteTimeouts shape and validation for the general `PathPrefix /` rule
+    # (SPA, every other /api/ route, and the /api/ws WebSocket). Empty by default; set it only
+    # to override the gateway's default for all of that traffic, and check how your
+    # implementation applies a request timeout to WebSocket upgrades first.
+    rootTimeouts: {}
 
 # --- Runtime secrets via Infisical (opt-in; used only when secrets.mode: infisical) ---
 # When selected, the chart renders InfisicalSecret CRs (from infisicalList) so a cluster
@@ -1777,7 +1885,7 @@ database:
   simple:
     image:
       repository: postgres
-      tag: "17"
+      tag: "17@sha256:846a7ddaa67a4b354ae1d21087b683901aa6113a4ed626d3787cfbf6c85e3e07"
       pullPolicy: IfNotPresent
     # DB name + owning role, created on first boot by the postgres image entrypoint.
     user: uzi

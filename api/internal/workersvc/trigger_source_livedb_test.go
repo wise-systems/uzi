@@ -55,7 +55,7 @@ func TestTriggerSourceStampedLiveDB(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open pool: %v", err)
 	}
-	defer pool.Close()
+	t.Cleanup(pool.Close)
 	q := store.New(pool)
 	svc := New(q, nil, Params{})
 
@@ -67,6 +67,7 @@ func TestTriggerSourceStampedLiveDB(t *testing.T) {
 		}
 	}
 	exec(`INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`, userID, fmt.Sprintf("ts857-%s@e2e", userID))
+	trackLiveDBUser(t, pool, userID)
 	// PRD #1429 M2: every service-level create path now resolves a real D11 harness; give
 	// the user a usable Anthropic token (Claude, byte-identical) — orthogonal to the
 	// trigger_source stamping under test.
@@ -128,7 +129,7 @@ func TestTriggerSourceStampedLiveDB(t *testing.T) {
 	}
 
 	// ── Service-level: the four createRun-family entrypoints, DB-stamped. ──
-	r, err := svc.CreateRun(ctx, userID, repoID, 201, "desc", &waitFalse, nil, false /*force*/, nil, nil, nil, nil)
+	r, err := svc.CreateRun(ctx, userID, repoID, 201, "desc", &waitFalse, nil, false /*force*/, nil, nil, nil, nil, nil, nil)
 	assert(t, "CreateRun", "manual", r, err)
 
 	r, err = svc.CreateScheduledRun(ctx, userID, repoID, 202, "desc", &waitFalse, nil, nil, false, nil, nil, nil)

@@ -12,7 +12,8 @@ import type { AuthorityRuntime } from "./authority-runtime.js";
 import { isRunOwnershipLost } from "./client.js";
 import { parsePodEpochEvidence, assertPodEpochEvidenceBinding } from "./pod-epoch-evidence.js";
 import { openPodEpochDaemonBarrier, PodEpochDaemonError, type PodEpochDaemonGuard } from "./pod-epoch-daemon.js";
-import type { EpochScratchDiscardInput, GitCache, RetainedDiscardResult, RetainedHoldsSnapshot, RetainedLifecycleSnapshot, RetainedSourceSelector } from "./git.js";
+import type { EpochScratchDiscardInput, GitCache, RetainedDiscardResult, RetainedHoldsSnapshot, RetainedLifecycleSnapshot, RetainedSourceSelector, RetainedWorkCounters } from "./git.js";
+import { newRetainedWorkCounters } from "./git.js";
 import type { RecoveryHoldsResponse, RunOwnershipResponse } from "./protocol.js";
 import { censusScratchRoot } from "./rmtree.js";
 import {
@@ -62,17 +63,19 @@ export interface PodEpochDeletionDeps {
   enableForTest?: symbol;
 }
 /**
- * Activation gate for the runner-scratch reclaim (issue #4043), separate from the attempt-deletion activation
- * ({@link PodEpochDeletionDeps.activation}, the one-worker canary of issue #4134)
- * and independent of it: the attempt gate being open never starts scratch work and the reverse. While it is false,
- * production startup does nothing for scratch: no census, no new child and no new path read. Flipping it needs a
- * separate owner decision recorded on issue #4043.
- *
- * Test-only override: the phase also runs when `scratch.scratchTestGate` is exactly the sentinel below, which
- * agent/test/pod-epoch-reclaim-support.ts exports as `ENABLE_SCRATCH_FOR_TEST`. Nothing under agent/src passes
- * `scratchTestGate` (a test asserts it), and the seams in {@link PodEpochScratchDeps.seams} are ignored without it.
+ * Startup opt-in for runner-scratch reclaim, independent of attempt deletion.
+ * It permits phase entry only; every layout, authority and deletion guard still applies.
+ * Test seams remain exclusive to the scratch test sentinel.
  */
-export const EPOCH_SCRATCH_DELETION_ENABLED: boolean = false;
+export function readEpochScratchDeletionActivation(env: NodeJS.ProcessEnv): boolean {
+  const raw = env.UZI_EPOCH_SCRATCH_DELETION;
+  if (raw === undefined || raw === "" || raw === "0") return false;
+  if (raw === "1") {
+    if (env.UZI_EPOCH_LOCK === "1" && dockerSidecarExpected(env)) return true;
+    throw new Error("UZI_EPOCH_SCRATCH_DELETION=1 requires an epoch-locked, Docker-wired worker (UZI_EPOCH_LOCK=1 and DOCKER_HOST or UZI_DIND_SOCKET)");
+  }
+  throw new Error("UZI_EPOCH_SCRATCH_DELETION must be unset, empty, 0 or 1");
+}
 const TEST_SCRATCH_GATE = Symbol.for("uzi.test.pod-epoch-reclaim.scratch-gate");
 
 /** Test seams of the scratch phase; honored only under the test gate sentinel, never passed by main.ts. */
@@ -98,7 +101,9 @@ export interface PodEpochScratchDeps {
   git: Pick<GitCache, "collectEpochScratchProtectedPaths" | "discardEpochScratchLeaf" | "assertNoUnsettledDeletes">;
   /** Worker-wide exclusive-idle proof (bound to terminalMaintenanceProof). */
   quiesce: () => Promise<boolean>;
-  /** Test override sentinel only; see {@link EPOCH_SCRATCH_DELETION_ENABLED}. */
+  /** Startup opt-in parsed by main.ts; permits phase entry, supplies no evidence. */
+  activation?: boolean;
+  /** Test override sentinel only; production uses activation. */
   scratchTestGate?: symbol;
   seams?: PodEpochScratchTestSeams;
 }
@@ -108,7 +113,7 @@ interface Options {
   ownership: PodEpochOwnership;
   consumption: { result: "fresh" | "existing" | "full"; mayEvaluate: boolean };
   dockerHost?: string;
-  git: Pick<GitCache, "discoverEpochRetainedSources" | "inspectRetainedSources">;
+  git: Pick<GitCache, "discoverEpochRetainedSources" | "inspectEpochRetainedGroups">;
   client: {
     listRecoveryHolds(runId: string, signal?: AbortSignal): Promise<RecoveryHoldsResponse>;
     getRunOwnership(runId: string, options: { signal: AbortSignal; deadline: number }): Promise<RunOwnershipResponse>;
@@ -166,6 +171,9 @@ interface Verdict {
   evidence_version: 1 | 2 | null;
   observations?: { kernel: string };
   evidence_wait_ms: number;
+  /** Diagnostic only (no decision reads it): retained gather and tree-walk work per phase. Stays zero
+   *  when the git facade does not honour the `work` option. */
+  inspection_work: { census: RetainedWorkCounters; shadow: RetainedWorkCounters; deletion: RetainedWorkCounters };
   pass_ms: number;
   settlement_reserve_ms: number;
   /** M1b deletion counters (all zero while the phase does not run). Sources positively removed, and their
@@ -547,7 +555,9 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
   let settlementDeadline = Infinity;
   let guard: PodEpochDaemonGuard | undefined;
   let detachVeto = () => {};
+  const inspectionWork = { census: newRetainedWorkCounters(), shadow: newRetainedWorkCounters(), deletion: newRetainedWorkCounters() };
   const result: Verdict = {
+    inspection_work: inspectionWork,
     partial_causes: {}, verdict: "deferred", reason: "not_evaluated", examined: 0, would_delete: 0, would_delete_bytes: 0,
     would_settle: 0, by_basis: { discard: 0, strict_plain: 0 }, kept: 0, journal_extra_fields: 0,
     authority: { result: "unproven", reason: "not_evaluated" }, evidence_version: null,
@@ -714,7 +724,7 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
     if (guard.signal.aborted) veto();
     check();
     const census = await owned(() => options.git.discoverEpochRetainedSources({
-      signal: controller.signal, deadline: hardPass - 5000, maxPhysicalPaths: 200,
+      signal: controller.signal, deadline: hardPass - 5000, maxPhysicalPaths: 200, work: inspectionWork.census,
     }), hardPass);
     check();
     result.inventory_complete = census.inventoryComplete && census.unreadable === 0;
@@ -731,7 +741,18 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
       for (const p of fresh) censusPaths.add(p);
       groups.push(group);
     }
+    // Maximal consecutive runs on one bare share ONE inspection (one lock, one gather). The API reads of every
+    // group in a run happen first (each round trip is a lifecycle read then a holds read), so the gather can
+    // follow group 1's authority reads by up to K-1 extra API round trips (shadow-only; deletion re-reads authority).
+    type CensusGroup = (typeof census.groups)[number];
+    const runs: CensusGroup[][] = [];
     for (const group of groups) {
+      const last = runs[runs.length - 1];
+      if (last && last[0]!.barePath === group.barePath) last.push(group); else runs.push([group]);
+    }
+    for (const run of runs) {
+    const batch: Array<{ group: CensusGroup; holds: RetainedHoldsSnapshot; lifecycle: RetainedLifecycleSnapshot; expected: Set<string> }> = [];
+    for (const group of run) {
       check();
       for (const path of group.paths) examined.add(path);
       // Refuse before either API call: retained metadata is not an HTTP path authority.
@@ -765,14 +786,34 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
           countPartialCause(result.partial_causes, readFailureCause(readStage, error)); partial = true;
         }
       }
-      const expected = new Set(group.paths);
-      const inspected = await owned(() => options.git.inspectRetainedSources({
-        epoch: true, maxDescriptors: 200, maxPhysicalPaths: expected.size,
-        barePath: group.barePath, selector: group.selector, holds, lifecycle,
-        isLivePath: () => false, signal: controller.signal, deadline: hardPass - 5000,
-        budgetMs: Math.max(0, hardPass - 5000 - now()), now,
-        beforeTree: path => { check(); entry(); if (!expected.has(path)) { invalidate("path_set_changed"); stop("path_set_changed"); throw new Refusal("path_set_changed"); } },
-      }), hardPass);
+      batch.push({ group, holds, lifecycle, expected: new Set(group.paths) });
+    }
+    if (batch.length === 0) continue;
+    // Kept so a pass invalidated inside the batch (owned() then rethrows the abort, handled in the .catch below) still
+    // reports each group's causes.
+    let returned: Awaited<ReturnType<Options["git"]["inspectEpochRetainedGroups"]>> | undefined;
+    // Best effort and never throws: a malformed result or a throwing getter must not replace the error being propagated
+    // (a PodEpochSettlementError is fatal and has to reach the caller).
+    const keepDiagnostics = () => {
+      try {
+        if (invalid && Array.isArray(returned)) {
+          for (const inspected of returned) if (typeof inspected === "object" && inspected !== null) mergePartialCauses(result.partial_causes, inspected.partialCauses);
+        }
+      } catch { /* diagnostics never change which error propagates */ }
+    };
+    const inspections = await owned(async () => returned = await options.git.inspectEpochRetainedGroups({
+      barePath: batch[0]!.group.barePath, maxDescriptors: 200, work: inspectionWork.shadow,
+      requests: batch.map(({ group, holds, lifecycle, expected }) => ({
+        selector: group.selector, holds, lifecycle, maxPhysicalPaths: expected.size,
+        beforeTree: (path: string) => { check(); entry(); if (!expected.has(path)) { invalidate("path_set_changed"); stop("path_set_changed"); throw new Refusal("path_set_changed"); } },
+      })),
+      isLivePath: () => false, signal: controller.signal, deadline: hardPass - 5000,
+      budgetMs: Math.max(0, hardPass - 5000 - now()), now,
+    }), hardPass).catch((error: unknown) => { keepDiagnostics(); throw error; });
+    // One result per request, in order; anything else is not evidence about these groups.
+    if (!Array.isArray(inspections) || inspections.length !== batch.length) { invalidate("path_set_changed"); throw new Refusal("path_set_changed"); }
+    for (const [index, { group, holds, lifecycle, expected }] of batch.entries()) {
+      const inspected = inspections[index]!;
       check(); entry();
       const actual = new Set(inspected.sources.flatMap(s => s.sources.map(p => p.clonePath)));
       const drift = actual.size !== expected.size || [...actual].some(p => !expected.has(p));
@@ -823,6 +864,7 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
         }
       }
     }
+    }
     check(); entry();
     if (partial) result.inventory_complete = false;
     result.verdict = partial ? "partial" : "eligible";
@@ -835,7 +877,7 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
     // the guard open. It never reads bytes_state or partial_causes: the #3851 attempt shortfalls are not its
     // authority. Gate closed (production): nothing below this condition executes. ----
     const scratchDeps = options.scratch;
-    if (scratchDeps && (EPOCH_SCRATCH_DELETION_ENABLED || scratchDeps.scratchTestGate === TEST_SCRATCH_GATE) &&
+    if (scratchDeps && (scratchDeps.activation === true || scratchDeps.scratchTestGate === TEST_SCRATCH_GATE) &&
         result.verdict === "eligible" && result.authority.result === "attested" &&
         !invalid && !controller.signal.aborted && typeof ownership.beginReclaim === "function") {
       settleGits.add(scratchDeps.git);
@@ -928,13 +970,18 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
           if (!first) { assertSettled(); refusal(); if (controller.signal.aborted) { skipped = true; break; } continue; }
           // 3. entry and daemon health, then re-inspect this source: it must still be the same candidate.
           check(); entry();
-          const inspected = await owned(() => options.git.inspectRetainedSources({
-            epoch: true, maxDescriptors: 200, maxPhysicalPaths: admit.groupSize, barePath: admit.barePath,
-            selector: admit.selector, holds: first.holds, lifecycle: first.lifecycle, isLivePath: () => false,
+          const reinspected = await owned(() => options.git.inspectEpochRetainedGroups({
+            maxDescriptors: 200, barePath: admit.barePath,
+            requests: [{
+              selector: admit.selector, holds: first.holds, lifecycle: first.lifecycle, maxPhysicalPaths: admit.groupSize,
+              beforeTree: path => { check(); entry(); if (path !== admit.clonePath) throw new Refusal("path_set_changed"); },
+            }],
+            isLivePath: () => false, work: inspectionWork.deletion,
             signal: controller.signal, deadline: hardPass - 5000, budgetMs: Math.max(0, hardPass - 5000 - now()), now,
-            beforeTree: path => { check(); entry(); if (path !== admit.clonePath) throw new Refusal("path_set_changed"); },
           }), hardPass, true);
           check(); entry();
+          const inspected = Array.isArray(reinspected) && reinspected.length === 1 ? reinspected[0] : undefined;
+          if (!inspected) { assertSettled(); refusal(); continue; }
           const only = inspected.sources.length === 1 ? inspected.sources[0]! : undefined;
           const plain = only?.disposition?.kind === "local_discard" || only?.epochSettlement?.disposition.kind === "local_discard";
           if (!only || inspected.partial || inspected.unreadable !== 0 || only.runId !== runId || only.barePath !== admit.barePath ||

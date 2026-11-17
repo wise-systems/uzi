@@ -109,9 +109,9 @@ WHERE id = $1;
 -- Upserted whenever the membership list is fetched. Never touches `enabled`, so
 -- a re-listing does not un-enable a repo the user already turned on. The insert
 -- branch marks a newly discovered repo awaiting_first_enable (PRD #4173 D13), but the
--- repos trigger from 00427 clears it again when a removal marker says the project was
+-- repos trigger from 00467 clears it again when a removal marker says the project was
 -- enabled before it was removed; the conflict branch never touches it, and the repos
--- trigger from 00425 clears it on first enable.
+-- trigger from 00466 clears it on first enable.
 INSERT INTO repos (connection_id, forge_project_id, path_with_namespace, web_url, default_branch, awaiting_first_enable)
 VALUES ($1, $2, $3, $4, $5, true)
 ON CONFLICT (connection_id, forge_project_id) DO UPDATE
@@ -143,6 +143,7 @@ ORDER BY r.path_with_namespace ASC;
 SELECT r.id, r.connection_id, r.forge_project_id, r.path_with_namespace, r.web_url,
        r.default_branch, r.enabled, r.fold_improve_uzi_backlog,
        r.guardrail_override_reason, r.guardrail_override_by, r.guardrail_override_at,
+       r.initial_import_state, r.initial_import_error_class, r.initial_import_updated_at,
        r.issue_tracker_connection_id, r.issue_tracker_project_id, r.issue_tracker_project_short,
        r.eligibility_tag_id, r.eligibility_tag_name, r.issue_tracker_linked_at, r.awaiting_first_enable,
        c.forge_type, c.base_url, c.token_ciphertext, c.user_id, c.bot_forge_user_id
@@ -226,11 +227,72 @@ JOIN users u ON u.id = c.user_id
 LEFT JOIN users ab ON ab.id = r.guardrail_override_by
 ORDER BY u.email ASC, r.path_with_namespace ASC;
 
+-- name: AdminListEnabledRepoActivity :many
+-- Issue #4334: the admin cross-user repo-activity list. UNSCOPED (admin-only,
+-- gated by RequireAdminRO on the route, precedent AdminListReposWithPrivilege). Returns every repo
+-- that is enabled OR has a listed-active run, i.e. a non-terminal run whose kind is
+-- not chat/judge/cross_check. That predicate mirrors the listed-active filter of
+-- ListActiveRunsAll in runtime.sql, minus its LIMIT 500, so the count is exact.
+-- last_run_at is the newest runs.created_at of any kind (NULL when the repo never
+-- ran).
+SELECT r.id, r.path_with_namespace, r.enabled,
+  (SELECT max(ru.created_at) FROM runs ru WHERE ru.repo_id = r.id)::timestamptz AS last_run_at
+FROM repos r
+WHERE r.enabled OR EXISTS (SELECT 1 FROM runs a WHERE a.repo_id = r.id
+  AND a.status NOT IN ('completed','failed','cancelled') AND a.kind NOT IN ('chat','judge','cross_check'))
+ORDER BY r.path_with_namespace, r.id;
+
 -- name: SetRepoEnabledForUser :one
 UPDATE repos SET enabled = $2
 WHERE repos.id = $1
   AND repos.connection_id IN (SELECT forge_connections.id FROM forge_connections WHERE forge_connections.user_id = $3)
 RETURNING *;
+
+-- name: EnableRepoForUser :one
+-- Owner-scoped enable that also records the first-import intent (issue #4399).
+-- A newly enabled repo, or one whose import has not succeeded, gets a new
+-- generation in state 'waiting' for the poller to run; re-enabling an already
+-- enabled repo whose import succeeded changes nothing. The SET expressions read
+-- the OLD row, so `repos.enabled` below is the pre-update value.
+UPDATE repos SET
+  enabled = true,
+  initial_import_generation = CASE
+    WHEN NOT repos.enabled OR repos.initial_import_state IS DISTINCT FROM 'succeeded'
+    THEN repos.initial_import_generation + 1 ELSE repos.initial_import_generation END,
+  initial_import_state = CASE
+    WHEN NOT repos.enabled OR repos.initial_import_state IS DISTINCT FROM 'succeeded'
+    THEN 'waiting' ELSE repos.initial_import_state END,
+  initial_import_error_class = CASE
+    WHEN NOT repos.enabled OR repos.initial_import_state IS DISTINCT FROM 'succeeded'
+    THEN NULL ELSE repos.initial_import_error_class END,
+  initial_import_updated_at = CASE
+    WHEN NOT repos.enabled OR repos.initial_import_state IS DISTINCT FROM 'succeeded'
+    THEN now() ELSE repos.initial_import_updated_at END
+WHERE repos.id = $1
+  AND repos.connection_id IN (SELECT forge_connections.id FROM forge_connections WHERE forge_connections.user_id = $2)
+RETURNING *;
+
+-- name: ClaimRepoInitialImport :execrows
+-- The poller's claim of the repo's owed first import at the generation it read.
+-- Zero rows means the generation moved (disable/enable) or the import is not owed.
+UPDATE repos SET
+  initial_import_state = 'running',
+  initial_import_error_class = NULL,
+  initial_import_updated_at = now()
+WHERE repos.id = $1
+  AND repos.initial_import_generation = $2
+  AND repos.initial_import_state IN ('waiting','running','failed');
+
+-- name: FinishRepoInitialImport :execrows
+-- Settles a claimed import: state 'succeeded' with a NULL class, or 'failed' with
+-- a class. Generation- and state-guarded so a stale finisher writes zero rows.
+UPDATE repos SET
+  initial_import_state = sqlc.arg('state')::text,
+  initial_import_error_class = sqlc.narg('error_class')::text,
+  initial_import_updated_at = now()
+WHERE repos.id = sqlc.arg('id')
+  AND repos.initial_import_generation = sqlc.arg('generation')
+  AND repos.initial_import_state = 'running';
 
 -- name: DeleteRepoForUser :execrows
 -- Owner-scoped hard delete of a single repo (PRD #357). The `AND enabled = false`
@@ -394,6 +456,7 @@ RETURNING *;
 -- engine's poller set.
 SELECT r.id, r.connection_id, r.forge_project_id, r.path_with_namespace, r.web_url,
        r.default_branch, r.enabled,
+       r.initial_import_state, r.initial_import_generation,
        r.issue_tracker_connection_id, r.issue_tracker_project_id, r.issue_tracker_project_short,
        r.eligibility_tag_id, r.eligibility_tag_name, r.issue_tracker_linked_at, r.awaiting_first_enable,
        c.forge_type, c.base_url, c.token_ciphertext, c.user_id

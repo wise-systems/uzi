@@ -1028,6 +1028,7 @@ describe("Worker — codex_harness_v1 conditional advertisement (PRD #1332 D3 / 
     "recovery_prerequisite_closure_v1",
     "recovery_run_open_holds_v1",
     "credential_switch_v1",
+    "credential_switch_in_place_v1",
     "milestone_reconciliation_claim_v1",
     "codex_refresh_recovery_v1",
     "codex_account_park_v1",
@@ -1053,6 +1054,8 @@ describe("Worker — codex_harness_v1 conditional advertisement (PRD #1332 D3 / 
     "issue_key_v1",
     ...(process.platform === "linux" ? ["ci_artifacts_v1"] : []),
   ];
+  // #4007 slice B is production-dark: its capability is never advertised in any permutation below.
+  const TERMINAL_PRESERVATION_CAP = "recovery_terminal_preservation_v1";
   // A client whose register() captures the protocol-capabilities argument (5th param) so a
   // test can assert exactly what the worker advertised, then idles both claim lanes.
   function capturingClient(): { client: WorkerClient; captured: () => string[] | undefined } {
@@ -1093,6 +1096,7 @@ describe("Worker — codex_harness_v1 conditional advertisement (PRD #1332 D3 / 
     for (let i = 0; i < 300 && captured() === undefined; i++) await tick();
     controller.abort();
     await done;
+    assert.ok(!captured()?.includes(TERMINAL_PRESERVATION_CAP), `${TERMINAL_PRESERVATION_CAP} must never be advertised (#4007 slice B is production-dark)`);
     return captured();
   }
 
@@ -1150,6 +1154,8 @@ describe("Worker — codex_harness_v1 conditional advertisement (PRD #1332 D3 / 
       assert.ok(caps?.includes("recovery_archive_v1"), "recovery_archive_v1 always present");
       assert.ok(caps?.includes("recovery_archive_v2"), "recovery_archive_v2 always present (PRD #1349 M1)");
       assert.ok(caps?.includes("credential_switch_v1"), "credential_switch_v1 always present (PRD #1247 M5b)");
+      assert.ok(caps?.includes("credential_switch_in_place_v1"), "credential_switch_in_place_v1 always present (issue #4201): this image applies a pending Claude credential switch in place");
+      assert.ok(caps?.includes("input_receipts_v1"), "the api drains /inputs during a pending switch only for a worker with both input_receipts_v1 and the in-place capability");
       assert.ok(caps?.includes("codex_account_park_v1"), "W7 account park is advertised on registration");
       assert.ok(caps?.includes("codex_refresh_recovery_v1"), "refresh recovery is advertised even when register returns no protocol_features");
       assert.ok(caps?.includes("wall_park_v1"), "wall_park_v1 always present (PRD #1497 M2)");

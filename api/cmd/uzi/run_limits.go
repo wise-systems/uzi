@@ -233,6 +233,9 @@ func newRunResumeCmd(env Env, gf *globalFlags) *cobra.Command {
 			"For retained recovery exhausted (recovery_wait), Resume now requests another attempt; success is not assured. " +
 			"A finite retry stamp means timed retry, even after it is due; NULL means owner-held with no automatic resume. " +
 			"Cancel is terminal. Resume does not reset the retained recovery cap or promise a fresh archive or latest edits.\n\n" +
+			"For an Anthropic API spend limit (recovery_wait, anthropic_spend_limit), the run is owner-held with no automatic resume. " +
+			"Resume re-queues it and the next claim re-selects its credential, which may pick the capped token again, so raise the limit first " +
+			"or switch the credential with the run set-token command (not available for chat, judge, self_improve or job runs). Cancel is terminal.\n\n" +
 			"For worker memory pressure (recovery_wait), only owner Resume starts a fresh memory episode; " +
 			"Cancel is terminal. There is no automatic resume. Source/archive availability and latest edits remain unverified.\n\n" +
 			"For worker recovery exhausted (recovery_wait), only owner Resume starts a fresh recovery episode " +
@@ -312,7 +315,9 @@ func newRunSetTokenCmd(env Env, gf *globalFlags) *cobra.Command {
 			"are mutually exclusive.\n\n" +
 			"On a QUEUED run it takes effect at the next claim; on a PARKED run (limit_wait, " +
 			"pool_wait, recovery_wait, paused) it promotes the run back to `queued` at once so the " +
-			"next claim spends the chosen token. On a RUNNING or gated run held by a capable worker " +
+			"next claim spends the chosen token. A recovery_wait run on an owner hold (for example worker " +
+			"memory pressure, worker requeue exhausted or a retained recovery cause) is refused (409, exit 5) " +
+			"with the hold named and nothing written; use Resume or Cancel. On a RUNNING or gated run held by a capable worker " +
 			"the switch is REQUESTED and takes effect when the worker releases its claim; it is refused " +
 			"(409, exit 5) when no live worker holds the run or the holding worker predates the " +
 			"credential_switch capability. A foreign or unknown run — or an unknown token label — is " +

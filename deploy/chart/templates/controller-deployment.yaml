@@ -25,6 +25,12 @@ metadata:
   labels:
     {{- include "uzi.labels" . | nindent 4 }}
     app.kubernetes.io/component: controller
+    {{- with include "uzi.workloadLabels" . }}
+    {{- . | nindent 4 }}
+    {{- end }}
+  {{- with include "uzi.workloadAnnotations" . }}
+  {{- . | nindent 2 }}
+  {{- end }}
 spec:
   replicas: {{ .Values.workers.controller.replicaCount }}
   strategy:
@@ -67,6 +73,11 @@ spec:
         # and every poll is silently dropped by the default-deny — which looks like an
         # api outage from here, not a policy mismatch.
         app.kubernetes.io/component: controller
+      {{- with (.Values.workers.extraCA | default dict).pem }}
+      annotations:
+        # The controller reads the extra CA once at boot: roll it when the inline bundle changes.
+        checksum/worker-extra-ca: {{ . | sha256sum }}
+      {{- end }}
     spec:
       {{- if .Values.appPriorityClass.enabled }}
       priorityClassName: {{ .Values.appPriorityClass.name | default (printf "%s-app" .Release.Name) }}
@@ -160,6 +171,17 @@ spec:
             - name: UZI_WORKER_NODE_SELECTOR
               value: {{ toJson . | quote }}
             {{- end }}
+            # workloadLabels / workloadAnnotations reach the worker Deployments too, as JSON
+            # objects; the controller validates them at boot (a label may not replace one
+            # it stamps, since those are its teardown provenance).
+            {{- with .Values.workloadLabels }}
+            - name: UZI_WORKER_DEPLOYMENT_LABELS
+              value: {{ toJson . | quote }}
+            {{- end }}
+            {{- with .Values.workloadAnnotations }}
+            - name: UZI_WORKER_DEPLOYMENT_ANNOTATIONS
+              value: {{ toJson . | quote }}
+            {{- end }}
             # The worker pods' tolerations, as a JSON array. An empty list or null renders
             # no env (no tolerations). Anything but a list or null fails the render rather
             # than being silently skipped by `with`.
@@ -212,6 +234,10 @@ spec:
             - name: UZI_WORKER_GO_MAXPROCS
               value: {{ $goMaxProcs | quote }}
             {{- end }}
+            - name: UZI_WORKER_EPOCH_SCRATCH_DELETION
+              value: {{ .Values.workers.epochReclaim.scratchDeletion | quote }}
+            - name: UZI_WORKER_RETIRE_SCRATCH_OUTCOMES
+              value: {{ .Values.workers.epochReclaim.retireScratchOutcomes | quote }}
             - name: UZI_WORKER_POD_EPOCH_RUNTIME
               value: {{ .Values.workers.docker.podEpochReclaim.runtime | quote }}
             # Validated in worker-invariants.yaml: empty or one canonical lowercase UUID.
@@ -253,6 +279,11 @@ spec:
             # values.yaml (workers.diskRecycleEnabled: true) and is always rendered.
             - name: UZI_WORKER_DISK_RECYCLE_ENABLED
               value: {{ .Values.workers.diskRecycleEnabled | quote }}
+            # Issue #4291: the pressure-only DinD builder-cache prune leg, subordinate to the
+            # master above (the agent ANDs them). Always explicit, never `with`-gated, so an
+            # explicit false is honoured; the default lives in values.yaml.
+            - name: UZI_WORKER_DIND_BUILDER_PRUNE_ENABLED
+              value: {{ .Values.workers.dindBuilderPruneEnabled | quote }}
             # The PVC-age thrash guard (Decision D6): a worker back at pressure within
             # this cooldown is a CAPACITY signal (working set exceeds nixSize) — it is
             # capacity-warned and skipped, not recycled again. An ordinary Go duration.
@@ -425,6 +456,11 @@ spec:
             {{- end }}
             {{- end }}
             {{- end }}
+            {{- if include "uzi.workerExtraCAConfigMap" . }}
+            # workers.extraCA: relayed into each worker's Secret after the api's CA.
+            - name: UZI_WORKER_EXTRA_CA_FILE
+              value: {{ printf "%s/ca.crt" (include "uzi.controllerWorkerExtraCADir" .) | quote }}
+            {{- end }}
             {{- if include "uzi.isolatedLaneEnabled" . }}
             # The isolated lane (PRD #1906 M6). All three together or none: the controller
             # renders lane workers into UZI_WORKER_ISOLATED_NAMESPACE and hands each one
@@ -447,6 +483,11 @@ spec:
             {{- if .Values.api.tls.enabled }}
             - name: api-ca
               mountPath: {{ include "uzi.controllerCADir" . }}
+              readOnly: true
+            {{- end }}
+            {{- if include "uzi.workerExtraCAConfigMap" . }}
+            - name: worker-extra-ca
+              mountPath: {{ include "uzi.controllerWorkerExtraCADir" . }}
               readOnly: true
             {{- end }}
             {{- if include "uzi.isolatedLaneEnabled" . }}
@@ -522,6 +563,16 @@ spec:
               - key: ca.crt
                 path: ca.crt
             defaultMode: 0440
+        {{- end }}
+        {{- with include "uzi.workerExtraCAConfigMap" . }}
+        # A CA bundle is public material, so a ConfigMap, projected by key.
+        - name: worker-extra-ca
+          configMap:
+            name: {{ . }}
+            items:
+              {{- $extra := $.Values.workers.extraCA | default dict }}
+              - key: {{ if $extra.pem }}ca.crt{{ else }}{{ ($extra.configMap | default dict).key | default "ca.crt" }}{{ end }}
+                path: ca.crt
         {{- end }}
         - name: tmp
           emptyDir:

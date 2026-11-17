@@ -61,7 +61,7 @@ func TestIssueCommentsSnapshotLiveDB(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open pool: %v", err)
 	}
-	defer pool.Close()
+	t.Cleanup(pool.Close)
 
 	const botID = int64(100)
 	const humanID = int64(42)
@@ -93,6 +93,7 @@ func TestIssueCommentsSnapshotLiveDB(t *testing.T) {
 		}
 	}
 	exec(`INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`, userID, fmt.Sprintf("m2a-comments-%s@e2e", userID))
+	trackLiveDBUser(t, pool, userID)
 	// PRD #1429 M2: CreateRun now resolves a real D11 harness at create time, refusing with
 	// no_usable_credential when neither harness is usable — orthogonal to the comments-snapshot
 	// behaviour under test, so give the user a usable Anthropic token (Claude, byte-identical).
@@ -129,7 +130,7 @@ func TestIssueCommentsSnapshotLiveDB(t *testing.T) {
 	}
 
 	// (1) Human + bot ⇒ stored JSONB carries the human comment and NOT the bot one.
-	run1, err := svc.CreateRun(ctx, userID, repoKnown, 11, "desc", &waitFalse, nil, false, nil, nil, nil, nil)
+	run1, err := svc.CreateRun(ctx, userID, repoKnown, 11, "desc", &waitFalse, nil, false, nil, nil, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("create run for issue 11: %v", err)
 	}
@@ -160,7 +161,7 @@ func TestIssueCommentsSnapshotLiveDB(t *testing.T) {
 	}
 
 	// (2) Only bot comments ⇒ versioned empty thread.
-	run2, err := svc.CreateRun(ctx, userID, repoKnown, 12, "desc", &waitFalse, nil, false, nil, nil, nil, nil)
+	run2, err := svc.CreateRun(ctx, userID, repoKnown, 12, "desc", &waitFalse, nil, false, nil, nil, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("create run for issue 12: %v", err)
 	}
@@ -178,7 +179,7 @@ func TestIssueCommentsSnapshotLiveDB(t *testing.T) {
 	assertEmpty(run2.ID, false)
 
 	// (3) Unknown bot identity ⇒ versioned unknown empty thread.
-	run3, err := svc.CreateRun(ctx, userID, repoZero, 13, "desc", &waitFalse, nil, false, nil, nil, nil, nil)
+	run3, err := svc.CreateRun(ctx, userID, repoZero, 13, "desc", &waitFalse, nil, false, nil, nil, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("create run for issue 13: %v", err)
 	}

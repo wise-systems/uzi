@@ -6,12 +6,22 @@ import {
   formatElapsed,
   hasActiveRun,
   healthBadge,
+  healthHint,
+  isAccountCooldownWaiting,
+  PUBLICATION_WITHHELD_HINT,
   codexAdmissionText,
   healthFlagLabel,
   isAwaitingApproval,
   isAwaitingFollowup,
   isAwaitingInput,
   isHealthFlaggableStatus,
+  isNonCompletionHold,
+  completionPanelEarlyReturn,
+  completionPanelHeld,
+  historyShowsParkLabel,
+  offersOwnerActionsLink,
+  NON_COMPLETION_HOLDS,
+  isOwnerResumableHold,
   isMaintenanceQueued,
   isReserveQueued,
   reserveQueueText,
@@ -31,9 +41,13 @@ import {
   retryHint,
   runBadge,
   runStatusTone,
+  queuedBlockerPrecedesCodexAdmission,
   shouldShowHealthFlag,
 } from "./runBadge";
+import boundFixture from "../../../fixtures/api-contract/run.custody_run_hold_bound.json";
+import withheldFixture from "../../../fixtures/api-contract/run.checkpoint_publication_withheld.json";
 import { RUN_STATUS_TONES } from "../components/ui";
+import holdPresentation from "../../../fixtures/hold-reasons/presentation.json";
 import { credentialSwitchHold } from "./credentialSwitchHold";
 import { isTerminalRun, TERMINAL_RUN_STATUSES } from "./runStatus";
 import type { LatestRun, Run, RunStatus, StopKind } from "./api";
@@ -1595,11 +1609,18 @@ describe("Codex admission read-time projection", () => {
       label: "⚠ waiting for worker", title: `${reason} · ${text}`,
     });
   });
+  it("treats the server's per-run custody hold bound reason (api-contract fixture) as a preceding blocker", () => {
+    // The literal is apitypes.ReasonCustodyRunHoldBound; the fixture is checked against it by api/cmd/uzi TestCustodyRunHoldBoundFixtureRenders.
+    const reason = "this run has reached its own custody hold limit; retained holds still protect its work; resolve or discard this run's own retained holds to let it start";
+    expect(boundFixture.health_reason).toBe(reason);
+    expect(queuedBlockerPrecedesCodexAdmission({ status: boundFixture.status, health_reason: boundFixture.health_reason })).toBe(true);
+  });
   it.each([
     "handoff setup has not finished",
     "your vault is locked, so this run can't start",
     "recovery custody capacity is full; retained holds still protect your work; resolve or discard a retained hold to free capacity",
     "new runs are paused: the custody hold limit setting could not be read; an admin should check Admin → Instance settings",
+    "this run has reached its own custody hold limit; retained holds still protect its work; resolve or discard this run's own retained holds to let it start",
   ])("preserves the higher-priority queued blocker %s", (reason) => {
     const text = codexAdmissionText(held, NOW);
     const r = { ...held, health_reason: reason };
@@ -1682,4 +1703,106 @@ it.each([
   expect(badge).toMatchObject({ label, tone: "warning", pulse: false });
   expect(badge.kind === "badge" && badge.title).not.toMatch(/requeues|episode|Used:|Remaining:/);
   expect(effectiveRunStatus({ ...input, status: "running" })).toBe("running");
+});
+
+describe("checkpoint publication withheld (issue #4257, api-contract fixture)", () => {
+  // The literals are apitypes.ReasonCheckpointPublicationWithheld and
+  // apitypes.HintCheckpointPublicationWithheld; api/cmd/uzi TestCheckpointPublicationWithheldFixtureRenders
+  // checks the fixture against the Go constants.
+  const reason = "checkpoint publication is withheld by a secret-scan restriction; new work stays on the worker until it is resolved";
+  const hint = "an eligible finding reaches the lead at its next work-turn boundary, subject to the existing safety checks and the shared attempt cap; the done-point fallback remains subject to its safety checks and the same cap; `uzi run follow-up` can give the agent owner guidance";
+  const withheld = run({ status: "running", health: "publication_withheld", health_reason: withheldFixture.health_reason, health_since: withheldFixture.health_since });
+
+  it("labels the flag and keeps the fixture reason exact", () => {
+    expect(withheldFixture.health).toBe("publication_withheld");
+    expect(withheldFixture.health_reason).toBe(reason);
+    expect(healthFlagLabel("publication_withheld")).toBe("publication withheld");
+    expect(shouldShowHealthFlag("publication_withheld", "running")).toBe(true);
+  });
+  it("pins the mirrored hint literal and returns it only for this health", () => {
+    expect(PUBLICATION_WITHHELD_HINT).toBe(hint);
+    expect(healthHint(withheld)).toBe(hint);
+    for (const h of ["ok", "stalled", "looping", "slow", "waiting_worker", "approval_idle", "waiting_account_cooldown"] as const) {
+      expect(healthHint({ health: h })).toBeNull();
+    }
+  });
+  it("renders a warning flag on a running run, not a waiting state", () => {
+    const badge = healthBadge(withheld, NOW);
+    expect(badge).toMatchObject({ kind: "badge", tone: "warning", title: reason });
+    expect(badge && badge.kind === "badge" && badge.label).toMatch(/^⚠ publication withheld/);
+    expect(isAccountCooldownWaiting(withheld)).toBe(false);
+  });
+});
+
+// Issue #3250: the non-completion hold set is one table (NON_COMPLETION_HOLDS) pinned against
+// fixtures/hold-reasons/presentation.json, which the Go CLI test reads too.
+describe("non-completion holds (fixtures/hold-reasons/presentation.json)", () => {
+  it("every fixture row agrees on predicates, tone, label and overlay", () => {
+    let visited = 0;
+    for (const c of holdPresentation) {
+      visited++;
+      expect([c.reason, isNonCompletionHold(c.reason)]).toEqual([c.reason, c.non_completion]);
+      expect([c.reason, isOwnerResumableHold(c.reason)]).toEqual([c.reason, c.owner_resumable]);
+      expect([c.reason, runStatusTone(c.reason, null)]).toEqual([c.reason, c.tone]);
+      expect([c.reason, RUN_STATUS_TONES[c.reason]?.tone]).toEqual([c.reason, c.tone]);
+      const held = { status: "paused", hold_reason: c.reason };
+      expect([c.reason, effectiveRunStatus(held)]).toEqual([c.reason, c.reason]);
+      expect([c.reason, parkLabel(held)]).toEqual([c.reason, c.web_label]);
+      // Per-surface behavior of each pre-existing reason, pinned (the old sites disagreed on membership).
+      expect([c.reason, completionPanelEarlyReturn(held)]).toEqual([c.reason, c.completion_panel_early_return]);
+      expect([c.reason, historyShowsParkLabel(held)]).toEqual([c.reason, c.history_park_label]);
+      expect([c.reason, offersOwnerActionsLink(held)]).toEqual([c.reason, c.owner_actions_link]);
+      const heldPaused = completionPanelHeld(held);
+      const heldQueued = completionPanelHeld({ status: "queued", hold_reason: c.reason });
+      expect([c.reason, heldPaused, heldQueued]).toEqual([
+        c.reason,
+        c.completion_panel_held_deny === "never",
+        c.completion_panel_held_deny !== "always",
+      ]);
+    }
+    expect(visited).toBe(holdPresentation.length);
+    expect(visited).toBeGreaterThan(0);
+    // The table and the fixture name the same reasons, so neither can grow alone.
+    expect(Object.keys(NON_COMPLETION_HOLDS).sort()).toEqual(holdPresentation.map((c) => c.reason).sort());
+  });
+
+  it("a hold_reason on a non-paused run is not overlaid, and unlisted holds are not in the set", () => {
+    expect(effectiveRunStatus({ status: "running", hold_reason: "run_override_unavailable" })).toBe("running");
+    for (const r of ["completion_blocked", "budget_exhausted", "weekly_reserve", "provider_outage", "", null, undefined]) {
+      expect(isNonCompletionHold(r)).toBe(false);
+      expect(isOwnerResumableHold(r)).toBe(false);
+    }
+  });
+
+  it("run_override_unavailable is a static warning badge that needs the owner", () => {
+    const b = runBadge(run({ status: "paused", hold_reason: "run_override_unavailable" }), NOW);
+    expect(b).toMatchObject({
+      kind: "badge",
+      label: "model choice unavailable: owner hold",
+      tone: "warning",
+      pulse: false,
+    });
+    expect(needsHumanAttention("run_override_unavailable")).toBe(true);
+    // The credential holds clear by Enable or a credential add, so they are not a needs-you state.
+    expect(needsHumanAttention("credential_disabled")).toBe(false);
+    expect(needsHumanAttention("credentials_reset")).toBe(false);
+  });
+});
+
+it.each(["source_end_declined", "private-unknown-detail", null] as const)("board badge renders only closed source-end detail %s", detail => {
+  const input = { ...run({ status: "recovery_wait" }), recovery_wait_cause: "retained_recovery_adoption_failed", recovery_wait_detail: detail, recovery_retry_not_before: "2099-01-01T00:00:00Z" };
+  const badge = runBadge(input as unknown as Parameters<typeof runBadge>[0], NOW);
+  expect(badge.kind).toBe("badge");
+  if (badge.kind !== "badge") throw new Error("expected badge");
+  expect(badge.pulse).toBe(false);
+  if (detail === "source_end_declined") {
+    expect(badge.title).toMatch(/earlier flight declined source-use end/);
+    expect(badge.title).toMatch(/unchanged worker registration is refused \(409\)/);
+    expect(badge.title).toMatch(/guarded attempt/);
+    expect(badge.title).toMatch(/verified backup/);
+  } else {
+    expect(badge.title).toMatch(/retained adoption failed/);
+    expect(badge.title).not.toContain("private-unknown-detail");
+  }
+  expect(badge.title).toMatch(/no scheduled retry/);
 });

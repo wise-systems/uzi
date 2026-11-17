@@ -6,13 +6,16 @@ import "@fontsource/ibm-plex-sans/latin-600.css";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cdp, page, userEvent } from "vitest/browser";
 import { cleanup, render, screen, within } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { OverviewNext } from "./OverviewNext";
-import { api } from "../lib/api";
-import { healthySilentDoc } from "../mocks/data";
+import { Dashboard } from "./Dashboard";
+import { AppShell } from "../components/AppShell";
+import { api, type AgentTemplate } from "../lib/api";
+import { healthySilentDoc, incidentDoc, mockAgentSource, overviewNextDoc } from "../mocks/data";
 import { overviewNextOwnerWorkers } from "../mocks/data/overviewNext";
 import { aRun, aUser, aWorker, authValue, emptySelf } from "./overviewFixtures";
 import { useAuth } from "../auth/AuthContext";
+import { CommandMenuContext } from "../components/CommandMenuContext";
 
 // PRD #3878 M3: the preview's cards stack and never scroll sideways on a phone. Layout
 // needs a real engine, so this runs in Chromium; jsdom cannot see an overflow.
@@ -33,6 +36,18 @@ vi.mock("../lib/api", async (importOriginal) => {
       getRecoveryHolds: vi.fn(),
       getAdminHealth: vi.fn(),
       listUsers: vi.fn(),
+      workerUpgradeSummary: vi.fn(),
+      getJudgeStats: vi.fn(),
+      runsInProgressCount: vi.fn(),
+      listSchedules: vi.fn(),
+      getFindingsStats: vi.fn(),
+      getMyRateLimits: vi.fn(),
+      getMyCodexRateLimits: vi.fn(),
+      getMySettings: vi.fn(),
+      version: vi.fn(),
+      adminRepoActivity: vi.fn(),
+      getTemplateAllocations: vi.fn(),
+      getAgentSource: vi.fn(),
     },
   };
 });
@@ -71,12 +86,24 @@ beforeEach(() => {
   mockApi.listWorkers.mockResolvedValue({ workers: [aWorker({ status: "online" })] });
   mockApi.listRepos.mockResolvedValue({ repos: [{ enabled: true } as never] });
   mockApi.listAgentTemplates.mockResolvedValue({ templates: [] });
+  mockApi.getTemplateAllocations.mockResolvedValue({ templates: [] });
+  mockApi.getAgentSource.mockResolvedValue({ agent_source: structuredClone(mockAgentSource) });
   mockApi.listSecrets.mockResolvedValue({ secrets: [{ kind: "anthropic_token" } as never] });
   mockApi.listConnections.mockResolvedValue({ connections: [{} as never] });
   mockApi.getUsage.mockResolvedValue(emptySelf());
   mockApi.getAdminUsage.mockResolvedValue({ factory: emptySelf(), users: [], earliest_run: null });
   mockApi.getAdminHealth.mockResolvedValue(healthySilentDoc());
+  mockApi.workerUpgradeSummary.mockResolvedValue({ attention: 0, target_release: "0.6.0" });
+  mockApi.getJudgeStats.mockResolvedValue({ total: 0, todo: 0, filed: 0, done: 0, dismissed: 0, false_positives: 0 });
+  mockApi.runsInProgressCount.mockResolvedValue({ count: 0 });
+  mockApi.listSchedules.mockResolvedValue([]);
+  mockApi.getFindingsStats.mockResolvedValue({ total: 0, todo: 0, filed: 0, done: 0, dismissed: 0, false_positives: 0 });
+  mockApi.getMyRateLimits.mockResolvedValue({ status: "no_token" } as never);
+  mockApi.getMyCodexRateLimits.mockResolvedValue({ accounts: [] } as never);
+  mockApi.getMySettings.mockResolvedValue({ settings: { default_harness: null } } as never);
+  mockApi.version.mockResolvedValue({ version: "9.9.9-test", founded: "2026-07-03" } as never);
   mockApi.listUsers.mockResolvedValue({ users: [] });
+  mockApi.adminRepoActivity.mockResolvedValue({ repos: [] });
   mockApi.getRecoveryHolds.mockResolvedValue({
     aggregate: { open_holds: 0, admission_counted_holds: 0, custody_hold_limit: 8, decision_needed: 0, blocked_runs: 0 },
     holds: [],
@@ -88,11 +115,293 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
+describe("compact Overview header (#4366)", () => {
+  async function mountHeader(width: number) {
+    await page.viewport(width, 900);
+    render(
+      <MemoryRouter initialEntries={["/dashboard"]}>
+        <AppShell>
+          <OverviewNext />
+        </AppShell>
+      </MemoryRouter>,
+    );
+    const title = await screen.findByRole("heading", { name: /Welcome/ });
+    const back = screen.getByRole("link", { name: "Back to the old Overview" });
+    const health = await screen.findByRole("button", { name: /^System health:/ });
+    const people = await screen.findByRole("button", { name: /^People:/ });
+    const repos = await screen.findByRole("button", { name: /^Repos:/ });
+    const agents = await screen.findByRole("button", { name: /^Agents:/ });
+    const search = screen.getByRole("button", { name: /^Search/ });
+    await document.fonts.ready;
+    return { title, back, chips: [health, people, repos, agents, search] };
+  }
+
+  const populatedLabels = [
+    "26 of 26 checks passing",
+    "3 active now of 5",
+    "3 repos active of 6",
+    "10 agents · 4 changes to review",
+  ];
+  function setPopulatedLabels(chips: HTMLElement[]) {
+    for (let i = 0; i < populatedLabels.length; i++) {
+      const text = chips[i].querySelector<HTMLElement>(".truncate");
+      expect(text).not.toBeNull();
+      text!.textContent = populatedLabels[i];
+    }
+  }
+  function expectFullLabels(chips: HTMLElement[]) {
+    for (const chip of chips) {
+      const text = chip.querySelector<HTMLElement>(".truncate");
+      if (text) expect(text.scrollWidth, text.textContent ?? "chip label").toBeLessThanOrEqual(text.clientWidth + 1);
+    }
+  }
+
+  it("keeps populated chips on the title row at 1440px without truncation, with Back first in tab order", async () => {
+    const { title, back, chips } = await mountHeader(1440);
+    setPopulatedLabels(chips);
+    const titleRect = title.getBoundingClientRect();
+    const backRect = back.getBoundingClientRect();
+    expect(backRect.top).toBeGreaterThan(titleRect.top);
+    for (const chip of chips) {
+      const rect = chip.getBoundingClientRect();
+      expect(rect.top, chip.getAttribute("aria-label") ?? chip.textContent ?? "chip").toBeLessThan(titleRect.bottom + 2);
+    }
+    expectFullLabels(chips);
+    back.focus();
+    expect(document.activeElement).toBe(back);
+    for (const chip of chips) {
+      await userEvent.tab();
+      expect(document.activeElement).toBe(chip);
+    }
+  });
+
+  it("wraps below a long greeting at 1440px instead of truncating chip labels", async () => {
+    vi.mocked(useAuth).mockReturnValue(authValue({ ...aUser, is_admin: true, display_name: "Alexandra-Margareta Constantinescu" }));
+    const { title, chips } = await mountHeader(1440);
+    setPopulatedLabels(chips);
+    expect(chips[0].getBoundingClientRect().top).toBeGreaterThanOrEqual(title.getBoundingClientRect().bottom);
+    expectFullLabels(chips);
+    expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(1440);
+  });
+
+  it("lets crowded status labels wrap at 1440px without clipping their text", async () => {
+    const { title, chips } = await mountHeader(1440);
+    const labels = [
+      "3 checks need attention",
+      "at least 123 active now of 456",
+      "at least 321 repos active of 500",
+      "150 agents · 20 changes to review",
+    ];
+    for (let i = 0; i < labels.length; i++) chips[i].querySelector<HTMLElement>(".truncate")!.textContent = labels[i];
+    expect(chips[0].getBoundingClientRect().top).toBeGreaterThanOrEqual(title.getBoundingClientRect().bottom);
+    expectFullLabels(chips);
+    expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(1440);
+  });
+
+  it("wraps the chips below the title at 400px without horizontal page overflow", async () => {
+    const { title, back, chips } = await mountHeader(400);
+    const backRect = back.getBoundingClientRect();
+    expect(backRect.top).toBeGreaterThan(title.getBoundingClientRect().top);
+    expect(chips[0].getBoundingClientRect().top).toBeGreaterThanOrEqual(backRect.bottom);
+    for (const chip of chips) {
+      const rect = chip.getBoundingClientRect();
+      expect(rect.left).toBeGreaterThanOrEqual(0);
+      expect(rect.right).toBeLessThanOrEqual(400);
+    }
+    expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(400);
+  });
+});
+
+describe("sticky Overview chips (#4370)", () => {
+  beforeEach(() => localStorage.removeItem("uzi.sidebar.collapsed"));
+  afterEach(() => localStorage.removeItem("uzi.sidebar.collapsed"));
+
+  async function mountAt(width: number) {
+    await page.viewport(width, 900);
+    render(
+      <MemoryRouter initialEntries={["/dashboard"]}>
+        <AppShell><OverviewNext /></AppShell>
+      </MemoryRouter>,
+    );
+    const title = await screen.findByRole("heading", { name: /Welcome/ });
+    const chip = await screen.findByRole("button", { name: /^System health:/ });
+    await screen.findByRole("region", { name: "Issue work" });
+    await document.fonts.ready;
+    const row = document.querySelector<HTMLElement>("[data-overview-chip-row]")!;
+    return { title, chip, row };
+  }
+
+  for (const width of [1280, 1440]) {
+    it(`pins one chip row above scrolling content without a layout jump at ${width}px`, async () => {
+      const { title, row } = await mountAt(width);
+      const content = screen.getByRole("region", { name: "Issue work" });
+      const contentDocumentTop = content.getBoundingClientRect().top + window.scrollY;
+      window.scrollTo(0, 650);
+      await expect.poll(() => row.dataset.stuck).toBe("true");
+      expect(title.getBoundingClientRect().bottom).toBeLessThan(0);
+      expect(row.getBoundingClientRect().top).toBe(0);
+      expect(row.getBoundingClientRect().height).toBeLessThanOrEqual(50);
+      expect(getComputedStyle(row).borderBottomWidth).toBe("1px");
+      await expect.poll(() => parseFloat(document.documentElement.style.scrollPaddingTop))
+        .toBeGreaterThanOrEqual(Math.ceil(row.getBoundingClientRect().height) + 12);
+      expect(Math.abs(content.getBoundingClientRect().top + window.scrollY - contentDocumentTop)).toBeLessThanOrEqual(1);
+      expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(width);
+      window.scrollTo(0, 0);
+      await expect.poll(() => row.dataset.stuck).toBe("false");
+      expect(document.documentElement.style.scrollPaddingTop).toBe("");
+    });
+  }
+
+  it("pins without shifting content after a long greeting wraps the chips below the title", async () => {
+    vi.mocked(useAuth).mockReturnValue(authValue({ ...aUser, is_admin: true, display_name: "Alexandra-Margareta Constantinescu" }));
+    const { title, row } = await mountAt(1440);
+    expect(row.getBoundingClientRect().top).toBeGreaterThanOrEqual(title.getBoundingClientRect().bottom);
+    const content = screen.getByRole("region", { name: "Issue work" });
+    const before = content.getBoundingClientRect().top + window.scrollY;
+    window.scrollTo(0, 650);
+    await expect.poll(() => row.dataset.stuck).toBe("true");
+    expect(row.getBoundingClientRect().top).toBe(0);
+    expect(Math.abs(content.getBoundingClientRect().top + window.scrollY - before)).toBeLessThanOrEqual(1);
+    await expect.poll(() => parseFloat(document.documentElement.style.scrollPaddingTop))
+      .toBeGreaterThanOrEqual(Math.ceil(row.getBoundingClientRect().height) + 12);
+  });
+
+  it("keeps a wrapped pinned row and its focus clearance when chip labels grow", async () => {
+    const { row } = await mountAt(1280);
+    const chips = [...row.querySelectorAll<HTMLElement>("button[aria-haspopup='dialog']")];
+    expect(chips.length).toBeGreaterThanOrEqual(2);
+    for (const chip of chips.slice(0, 2)) chip.parentElement!.style.flex = "0 0 500px";
+    await expect.poll(() => row.getBoundingClientRect().height).toBeGreaterThan(50);
+    window.scrollTo(0, 650);
+    await expect.poll(() => row.dataset.stuck).toBe("true");
+    expect(row.getBoundingClientRect().height).toBeGreaterThan(50);
+    await expect.poll(() => parseFloat(document.documentElement.style.scrollPaddingTop))
+      .toBeGreaterThanOrEqual(Math.ceil(row.getBoundingClientRect().height) + 12);
+    expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(1280);
+  });
+
+  it("updates the flow placeholder when chips wrap while pinned, then unsticks without a jump", async () => {
+    const { row } = await mountAt(1280);
+    const content = screen.getByRole("region", { name: "Issue work" });
+    window.scrollTo(0, 650);
+    await expect.poll(() => row.dataset.stuck).toBe("true");
+    const chips = [...row.querySelectorAll<HTMLElement>("button[aria-haspopup='dialog']")];
+    for (const chip of chips.slice(0, 2)) chip.parentElement!.style.flex = "0 0 500px";
+    await expect.poll(() => row.getBoundingClientRect().height).toBeGreaterThan(50);
+    await expect.poll(() => parseFloat(document.documentElement.style.scrollPaddingTop))
+      .toBeGreaterThanOrEqual(Math.ceil(row.getBoundingClientRect().height) + 12);
+    const afterGrowth = content.getBoundingClientRect().top + window.scrollY;
+    window.scrollTo(0, 0);
+    await expect.poll(() => row.dataset.stuck).toBe("false");
+    expect(Math.abs(content.getBoundingClientRect().top + window.scrollY - afterGrowth)).toBeLessThanOrEqual(1);
+  });
+
+  for (const width of [1024, 400]) {
+    it(`lets the chips scroll away at ${width}px`, async () => {
+      const { row } = await mountAt(width);
+      window.scrollTo(0, 650);
+      await expect.poll(() => window.scrollY).toBeGreaterThan(100);
+      expect(row.dataset.stuck).toBe("false");
+      expect(row.getBoundingClientRect().bottom).toBeLessThan(0);
+      expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(width);
+    });
+  }
+
+  it("keeps a popover visible from the pinned row and restores focus on Escape", async () => {
+    const { chip, row } = await mountAt(1440);
+    window.scrollTo(0, 650);
+    await expect.poll(() => row.dataset.stuck).toBe("true");
+    await userEvent.click(chip);
+    const dialog = await screen.findByRole("dialog", { name: "System health" });
+    const rect = dialog.getBoundingClientRect();
+    expect(rect.top).toBeGreaterThanOrEqual(row.getBoundingClientRect().bottom);
+    expect(rect.left).toBeGreaterThanOrEqual(0);
+    expect(rect.right).toBeLessThanOrEqual(1440);
+    await userEvent.keyboard("{Escape}");
+    expect(screen.queryByRole("dialog", { name: "System health" })).toBeNull();
+    expect(document.activeElement).toBe(chip);
+    await userEvent.click(chip);
+    await screen.findByRole("dialog", { name: "System health" });
+    const outside = document.createElement("button");
+    outside.textContent = "Outside popover";
+    outside.style.cssText = "position:fixed;left:300px;bottom:20px;z-index:40";
+    document.body.appendChild(outside);
+    await userEvent.click(outside);
+    outside.remove();
+    expect(screen.queryByRole("dialog", { name: "System health" })).toBeNull();
+  });
+
+  it("tracks the content column when the desktop sidebar collapses while stuck", async () => {
+    const { row } = await mountAt(1440);
+    window.scrollTo(0, 650);
+    await expect.poll(() => row.dataset.stuck).toBe("true");
+    const before = row.getBoundingClientRect().left;
+    await userEvent.click(screen.getByRole("button", { name: "Collapse sidebar" }));
+    const column = document.querySelector<HTMLElement>("[data-page-content-column]")!;
+    await expect.poll(() => row.getBoundingClientRect().left).toBe(column.getBoundingClientRect().left);
+    expect(row.getBoundingClientRect().left).not.toBe(before);
+    expect(row.getBoundingClientRect().width).toBe(column.getBoundingClientRect().width);
+  });
+
+  it("scrolls the next focused control below the pinned bar", async () => {
+    const { row } = await mountAt(1440);
+    window.scrollTo(0, 650);
+    await expect.poll(() => row.dataset.stuck).toBe("true");
+    const probe = document.createElement("button");
+    probe.textContent = "Focus clearance probe";
+    probe.style.cssText = `position:absolute;left:320px;top:${window.scrollY + row.getBoundingClientRect().height / 2}px`;
+    const content = row.closest<HTMLElement>("[data-page-content-column]")!;
+    content.firstElementChild!.insertAdjacentElement("afterend", probe);
+    expect(probe.getBoundingClientRect().top).toBeGreaterThan(0);
+    expect(probe.getBoundingClientRect().top).toBeLessThan(row.getBoundingClientRect().bottom);
+    const search = screen.getByRole("button", { name: /^Search/ });
+    search.focus();
+    await userEvent.tab();
+    expect(document.activeElement).toBe(probe);
+    expect(probe.getBoundingClientRect().top).toBeGreaterThanOrEqual(row.getBoundingClientRect().bottom);
+    probe.remove();
+  });
+});
+
+describe("promoted Overview routes in the real shell (PRD #3877 M1)", () => {
+  const follows = (a: Node, b: Node) => (a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
+
+  async function mountAt(path: string) {
+    render(
+      <MemoryRouter initialEntries={[path]}>
+        <AppShell>
+          <Routes>
+            <Route path="/dashboard" element={<OverviewNext />} />
+            <Route path="/overview/classic" element={<Dashboard />} />
+          </Routes>
+        </AppShell>
+      </MemoryRouter>,
+    );
+    const header = await screen.findByRole("heading", { name: /Welcome/ });
+    const banner = await screen.findByRole("alert", { name: "Instance health" });
+    return { header, banner };
+  }
+
+  it("places the banner after the default header and before the classic header", async () => {
+    await page.viewport(1280, 900);
+    mockApi.getAdminHealth.mockResolvedValue(incidentDoc());
+
+    const promoted = await mountAt("/dashboard");
+    expect(follows(promoted.header, promoted.banner)).toBe(true);
+    expect(follows(promoted.banner, screen.getByRole("region", { name: "Issue work" }))).toBe(true);
+
+    cleanup();
+    const classic = await mountAt("/overview/classic");
+    expect(follows(classic.banner, classic.header)).toBe(true);
+    expect(screen.getByRole("link", { name: "Overview", current: "page" })).toBeTruthy();
+  });
+});
+
 describe("OverviewNext at 400px", () => {
   it("stacks its cards inside the viewport with no horizontal scroll", async () => {
     await page.viewport(400, 900);
     render(
-      <MemoryRouter initialEntries={["/overview/next"]}>
+      <MemoryRouter initialEntries={["/dashboard"]}>
         <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8">
           <OverviewNext />
         </main>
@@ -149,7 +458,7 @@ describe("OverviewNext issue work line", () => {
       ],
     });
     render(
-      <MemoryRouter initialEntries={["/overview/next"]}>
+      <MemoryRouter initialEntries={["/dashboard"]}>
         <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8">
           <OverviewNext />
         </main>
@@ -178,6 +487,36 @@ describe("OverviewNext issue work line", () => {
     expect(bays[0].top).toBeGreaterThanOrEqual(Math.max(...rects.map((r) => r.bottom)));
   });
 
+  it("fits completion tags and the longest Building caption at desktop and phone widths", async () => {
+    for (const width of [1280, 400]) {
+      cleanup();
+      await page.viewport(width, 900);
+      mockApi.listRuns.mockResolvedValue({ runs: [
+        aRun({ id: "checking", status: "running", issue_iid: 4198, completion_phase: "checking" }),
+        aRun({ id: "reworking", status: "running", issue_iid: 4201, completion_phase: "reworking" }),
+        aRun({ id: "both", status: "running", issue_iid: 4230, completion_phase: "checking", cross_check_active: "code" }),
+        aRun({ id: "plain", status: "running", issue_iid: 4209 }),
+      ] });
+      render(
+        <MemoryRouter initialEntries={["/dashboard"]}>
+          <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8"><OverviewNext /></main>
+        </MemoryRouter>,
+      );
+      const card = await screen.findByRole("region", { name: "Issue work" });
+      const building = card.querySelector<HTMLElement>('[data-stage="building"]')!;
+      await expect.poll(() => building.textContent ?? "").toContain("1 building · 2 checking completion · 1 reworking");
+      await document.fonts.ready;
+      const edge = building.getBoundingClientRect().right;
+      for (const label of ["#4198", "#4201", "#4230"]) {
+        const chip = within(building).getByText(label);
+        expect(chip.getBoundingClientRect().right, `${label} at ${width}px`).toBeLessThanOrEqual(edge + 1);
+      }
+      const caption = within(building).getByText("1 building · 2 checking completion · 1 reworking");
+      expect(caption.getBoundingClientRect().right).toBeLessThanOrEqual(edge + 1);
+      expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(window.innerWidth);
+    }
+  });
+
   for (const width of [400, 320]) {
     it(`stacks the line vertically at ${width}px with no horizontal overflow`, async () => {
       await page.viewport(width, 900);
@@ -201,6 +540,32 @@ describe("OverviewNext issue work line", () => {
       );
       for (let i = 1; i < bays.length; i++) expect.soft(bays[i].top, `bay ${i} below the previous`).toBeGreaterThanOrEqual(bays[i - 1].bottom - 1);
       expect(document.documentElement.scrollWidth, "document stays inside the viewport").toBeLessThanOrEqual(window.innerWidth);
+    });
+  }
+
+  // #4167: an older run's stale "opened" must not put a merged PR at the PR open station.
+  for (const width of [1280, 375]) {
+    it(`leaves a PR merged per its newest run off the PR open station at ${width}px`, async () => {
+      await page.viewport(width, 900);
+      mockApi.listRuns.mockResolvedValue({
+        runs: [
+          aRun({ id: "stale", status: "completed", issue_iid: 3644, mr_iid: 4100, mr_state: "opened", finished_at: "2026-11-08T00:00:00Z" }),
+          aRun({ id: "merged", status: "completed", issue_iid: 3644, mr_iid: 4100, mr_state: "merged", finished_at: "2026-11-09T00:00:00Z" }),
+          aRun({ id: "open", status: "completed", issue_iid: 3700, mr_iid: 4200, mr_state: "opened", finished_at: "2026-11-09T00:00:00Z" }),
+        ],
+      });
+      render(
+        <MemoryRouter initialEntries={["/dashboard"]}>
+          <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8">
+            <OverviewNext />
+          </main>
+        </MemoryRouter>,
+      );
+      const card = await screen.findByRole("region", { name: "Issue work" });
+      const station = card.querySelector(`[data-stage="pr"]`) as HTMLElement;
+      await expect.poll(() => station.textContent ?? "").toContain("#3700");
+      expect(window.innerWidth).toBe(width);
+      expect(station.textContent ?? "").not.toContain("#3644");
     });
   }
 
@@ -356,7 +721,7 @@ describe("OverviewNext issue work scope switch", () => {
       ],
     });
     render(
-      <MemoryRouter initialEntries={["/overview/next"]}>
+      <MemoryRouter initialEntries={["/dashboard"]}>
         <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8">
           <OverviewNext />
         </main>
@@ -511,7 +876,7 @@ describe("OverviewNext issue work cross-check tags", () => {
       ],
     });
     render(
-      <MemoryRouter initialEntries={["/overview/next"]}>
+      <MemoryRouter initialEntries={["/dashboard"]}>
         <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8">
           <OverviewNext />
         </main>
@@ -756,7 +1121,7 @@ describe("OverviewNext capacity rail", () => {
       ],
     });
     render(
-      <MemoryRouter initialEntries={["/overview/next"]}>
+      <MemoryRouter initialEntries={["/dashboard"]}>
         <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8">
           <OverviewNext />
         </main>
@@ -833,7 +1198,7 @@ describe("OverviewNext capacity rail worker rows", () => {
       runs: [aRun({ id: "run-mr-rework", status: "running", issue_iid: 77, issue_title: "Rework the cost cap" })],
     });
     render(
-      <MemoryRouter initialEntries={["/overview/next"]}>
+      <MemoryRouter initialEntries={["/dashboard"]}>
         <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8">
           <OverviewNext />
         </main>
@@ -919,7 +1284,7 @@ describe("OverviewNext held work card", () => {
       holds: [],
     });
     render(
-      <MemoryRouter initialEntries={["/overview/next"]}>
+      <MemoryRouter initialEntries={["/dashboard"]}>
         <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8">
           <OverviewNext />
         </main>
@@ -932,7 +1297,7 @@ describe("OverviewNext held work card", () => {
     await page.viewport(400, 900);
     mountWithHolds();
     await screen.findByText("Capacity");
-    await screen.findByText("custody slots used");
+    await screen.findByText("custody units used");
     await document.fonts.ready;
     expect(window.innerWidth).toBe(400);
     const capacity = cardOf(/Capacity/).getBoundingClientRect();
@@ -955,7 +1320,7 @@ describe("OverviewNext held work card", () => {
     await page.viewport(1100, 900);
     mountWithHolds();
     await screen.findByText("Capacity");
-    await screen.findByText("custody slots used");
+    await screen.findByText("custody units used");
     await document.fonts.ready;
     const capacity = cardOf(/Capacity/).getBoundingClientRect();
     const held = cardOf(/Held work/).getBoundingClientRect();
@@ -1008,7 +1373,7 @@ describe("OverviewNext decision card layout", () => {
   async function mountCard(runs: ReturnType<typeof aRun>[]) {
     mockApi.listRuns.mockResolvedValue({ runs });
     render(
-      <MemoryRouter initialEntries={["/overview/next"]}>
+      <MemoryRouter initialEntries={["/dashboard"]}>
         <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8">
           <OverviewNext />
         </main>
@@ -1270,7 +1635,7 @@ describe("OverviewNext People chip", () => {
 
   async function mountChip() {
     render(
-      <MemoryRouter initialEntries={["/overview/next"]}>
+      <MemoryRouter initialEntries={["/dashboard"]}>
         <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8">
           <OverviewNext />
         </main>
@@ -1408,4 +1773,444 @@ describe("OverviewNext People chip", () => {
     expect(within(screen.getByRole("group", { name: "Usage scope" })).getByRole("button", { name: "All users" }).getAttribute("aria-pressed")).toBe("true");
     await expect.poll(() => document.activeElement?.id).toBe("overview-usage-by-user");
   });
+});
+
+// #4334: the admin Repos chip's popover stays inside the viewport (below the chip on desktop, a
+// bottom sheet on a phone), Escape hands focus back to the chip, and the page never scrolls sideways.
+describe("OverviewNext Repos chip", () => {
+  const LONG_PATH = "an-organisation-with-a-long-name/a-repository-with-an-exceedingly-long-name-for-layout";
+  const hoursAgo = (h: number) => new Date(Date.now() - h * 3600_000).toISOString();
+
+  beforeEach(() => {
+    localStorage.clear();
+    document.documentElement.dataset.font = "plex";
+    mockApi.adminListRuns.mockResolvedValue({
+      runs: [
+        aRun({ id: "p1", status: "running", repo_id: "repo-1", repo_path: LONG_PATH, owner_email: "priya@uzi.local" }),
+        aRun({ id: "p2", status: "queued", repo_id: "repo-1", repo_path: LONG_PATH, owner_email: "sam@uzi.local" }),
+        aRun({ id: "p3", status: "awaiting_input", repo_id: "repo-2", repo_path: "org/short", owner_email: "sam@uzi.local" }),
+        aRun({ id: "p4", status: "running", repo_id: "repo-off", repo_path: "org/disabled", owner_email: "lena@uzi.local" }),
+      ],
+    });
+    mockApi.adminRepoActivity.mockResolvedValue({
+      repos: [
+        { id: "repo-1", path_with_namespace: LONG_PATH, enabled: true, last_run_at: hoursAgo(1) },
+        { id: "repo-2", path_with_namespace: "org/short", enabled: true, last_run_at: hoursAgo(2) },
+        { id: "repo-3", path_with_namespace: LONG_PATH + "-recent", enabled: true, last_run_at: hoursAgo(50) },
+        { id: "repo-4", path_with_namespace: "org/old", enabled: true, last_run_at: hoursAgo(24 * 12) },
+        { id: "repo-5", path_with_namespace: "org/never", enabled: true, last_run_at: null },
+      ],
+    });
+  });
+  afterEach(() => {
+    delete document.documentElement.dataset.font;
+  });
+
+  // 641 and 650 are where the header actions wrap in this fixture and the chip starts its own row
+  // at the left edge, so a right-aligned panel would hang off the left of the viewport.
+  for (const [width, height] of [
+    [1280, 900],
+    [641, 900],
+    [650, 900],
+    [400, 900],
+  ] as const) {
+    it(`opens inside the viewport and closes on Escape back to the chip at ${width}x${height}`, async () => {
+      await page.viewport(width, height);
+      render(
+        <MemoryRouter initialEntries={["/dashboard"]}>
+          <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8">
+            <OverviewNext />
+          </main>
+        </MemoryRouter>,
+      );
+      const chip = await screen.findByRole("button", { name: /^Repos: \d+ active now of \d+$/ });
+      await document.fonts.ready;
+      expect(window.innerWidth).toBe(width);
+      await userEvent.click(chip);
+      const dialog = await screen.findByRole("dialog", { name: "Repos in uzi" });
+      expect(chip.getAttribute("aria-expanded")).toBe("true");
+      expect(within(dialog).getByText("org/disabled")).toBeTruthy();
+      expect(within(dialog).getByText(/never ran/)).toBeTruthy();
+      const r = dialog.getBoundingClientRect();
+      if (width === 641 || width === 650) {
+        // Wrapped desktop header: RepoChip switches the shared shell to left alignment.
+        // Measuring only viewport containment can miss a panel that drifts while still fitting.
+        expect.soft(Math.abs(r.left - chip.parentElement!.getBoundingClientRect().left), "left-aligned to the chip").toBeLessThanOrEqual(1);
+      }
+      if (width === 400) {
+        expect.soft(Math.abs(r.left - 16), "phone sheet left inset").toBeLessThanOrEqual(1);
+        expect.soft(Math.abs(r.right - 384), "phone sheet right inset").toBeLessThanOrEqual(1);
+      }
+      expect.soft(r.left, "dialog left").toBeGreaterThanOrEqual(0);
+      expect.soft(r.top, "dialog top").toBeGreaterThanOrEqual(0);
+      expect.soft(r.right, "dialog right").toBeLessThanOrEqual(window.innerWidth);
+      expect.soft(r.bottom, "dialog bottom").toBeLessThanOrEqual(window.innerHeight);
+      for (const li of dialog.querySelectorAll<HTMLElement>("li")) {
+        expect.soft(li.getBoundingClientRect().right, li.textContent?.slice(0, 30)).toBeLessThanOrEqual(r.right + 1);
+      }
+      expect(document.documentElement.scrollWidth, "no horizontal scroll").toBeLessThanOrEqual(
+        document.documentElement.clientWidth,
+      );
+
+      await userEvent.keyboard("{Escape}");
+      expect(screen.queryByRole("dialog", { name: "Repos in uzi" })).toBeNull();
+      expect(chip.getAttribute("aria-expanded")).toBe("false");
+      expect(document.activeElement).toBe(chip);
+    });
+  }
+});
+
+describe("OverviewNext health chip popover", () => {
+  function mountChip() {
+    mockApi.getAdminHealth.mockResolvedValue(overviewNextDoc());
+    render(
+      <MemoryRouter initialEntries={["/dashboard"]}>
+        <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8">
+          <OverviewNext />
+        </main>
+      </MemoryRouter>,
+    );
+    return screen.findByRole("button", { name: /System health/ });
+  }
+
+  async function mountInColumn(width: number, sidebarWidth: number, passing = false) {
+    await page.viewport(width, 900);
+    mockApi.getAdminHealth.mockResolvedValue(passing ? healthySilentDoc() : overviewNextDoc());
+    render(
+      <MemoryRouter initialEntries={["/dashboard"]}>
+        <div style={{ paddingLeft: sidebarWidth }}>
+          <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8">
+            <div data-page-content-column className="mx-auto w-full max-w-[68rem]">
+              <CommandMenuContext.Provider value={{ open: () => {} }}>
+                <OverviewNext />
+              </CommandMenuContext.Provider>
+            </div>
+          </main>
+        </div>
+      </MemoryRouter>,
+    );
+    return screen.findByRole("button", { name: /System health/ });
+  }
+
+  const column = () => document.querySelector<HTMLElement>("[data-page-content-column]")!;
+  const edgeError = (panel: HTMLElement) => {
+    const c = column().getBoundingClientRect();
+    const p = panel.getBoundingClientRect();
+    return Math.max(Math.abs(p.left - c.left), Math.abs(p.right - c.right));
+  };
+
+  it("opens a passing panel across the content column, with four desktop areas", async () => {
+    const passingDoc = healthySilentDoc();
+    const chip = await mountInColumn(1280, 240, true);
+    await userEvent.click(chip);
+    const panel = await screen.findByRole("dialog", { name: "System health" });
+    await expect.poll(() => edgeError(panel)).toBeLessThanOrEqual(1);
+    expect(within(panel).getByText(`System health: all ${passingDoc.checks.length - passingDoc.counts.na} checks passing`)).toBeTruthy();
+    const grid = panel.querySelector<HTMLElement>("[data-health-passing-grid]")!;
+    expect(getComputedStyle(grid).gridTemplateColumns.split(" ")).toHaveLength(4);
+    expect(within(panel).getByRole("link", { name: "Open health" }).getAttribute("href")).toBe("/admin/health");
+  });
+
+  it("keeps the passing panel as a one-column bottom sheet at 400px", async () => {
+    const chip = await mountInColumn(400, 0, true);
+    await userEvent.click(chip);
+    const panel = await screen.findByRole("dialog", { name: "System health" });
+    const r = panel.getBoundingClientRect();
+    expect(Math.abs(r.left - 16)).toBeLessThanOrEqual(1);
+    expect(Math.abs(window.innerWidth - r.right - 16)).toBeLessThanOrEqual(1);
+    expect(getComputedStyle(panel.querySelector<HTMLElement>("[data-health-passing-grid]")!).gridTemplateColumns.split(" ")).toHaveLength(1);
+    expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(window.innerWidth);
+  });
+
+  it("opens and closes the passing-check disclosure with Enter and Space", async () => {
+    const attentionDoc = overviewNextDoc();
+    const chip = await mountInColumn(1280, 240);
+    await userEvent.click(chip);
+    const panel = await screen.findByRole("dialog", { name: "System health" });
+    const passingCount = attentionDoc.checks.filter((check) => check.severity === "ok").length;
+    const summary = within(panel).getByText(`${passingCount} other checks passing`) as HTMLElement;
+    const details = summary.closest("details")!;
+    expect(details.open).toBe(false);
+    summary.focus();
+    await userEvent.keyboard("{Enter}");
+    expect(details.open).toBe(true);
+    await userEvent.keyboard(" ");
+    expect(details.open).toBe(false);
+  });
+
+  it("spans the content column at sm+ with the sidebar expanded or collapsed", async () => {
+    for (const [width, sidebar] of [
+      [640, 0], [768, 0], [1024, 240], [1280, 240], [1440, 240], [1920, 240], [1280, 56],
+    ]) {
+      cleanup();
+      const chip = await mountInColumn(width, sidebar);
+      await userEvent.click(chip);
+      const panel = await screen.findByRole("dialog", { name: "System health" });
+      await document.fonts.ready;
+      await expect.poll(() => edgeError(panel)).toBeLessThanOrEqual(1);
+      expect(panel.getBoundingClientRect().top).toBeGreaterThanOrEqual(chip.getBoundingClientRect().bottom);
+      const details = panel.querySelector<HTMLElement>("[data-health-evidence-grid]")!;
+      expect(getComputedStyle(details).display).toBe("grid");
+      expect(getComputedStyle(details).gridTemplateColumns.split(" ")).toHaveLength(2);
+    }
+  });
+
+  it("keeps the panel on the column when the header reflows without a window resize", async () => {
+    const chip = await mountInColumn(1280, 240);
+    const host = chip.parentElement!;
+    const preceding = document.createElement("span");
+    preceding.setAttribute("aria-hidden", "true");
+    preceding.style.cssText = "display:block;flex:0 0 auto;width:0;height:1px";
+    host.parentElement!.insertBefore(preceding, host);
+    await userEvent.click(chip);
+    const panel = await screen.findByRole("dialog", { name: "System health" });
+    await expect.poll(() => edgeError(panel)).toBeLessThanOrEqual(1);
+    const before = chip.getBoundingClientRect().left;
+    preceding.style.width = "720px";
+    await expect.poll(() => chip.getBoundingClientRect().left - before).toBeGreaterThan(400);
+    await expect.poll(() => edgeError(panel)).toBeLessThanOrEqual(1);
+  });
+
+  it("keeps the bottom sheet when the column anchor exists below sm", async () => {
+    const chip = await mountInColumn(375, 0);
+    await userEvent.click(chip);
+    const panel = await screen.findByRole("dialog", { name: "System health" });
+    const r = panel.getBoundingClientRect();
+    expect(Math.abs(r.left - 16)).toBeLessThanOrEqual(1);
+    expect(Math.abs(window.innerWidth - r.right - 16)).toBeLessThanOrEqual(1);
+    expect(panel.style.left).toBe("");
+    expect(panel.style.width).toBe("");
+    expect(getComputedStyle(panel.querySelector<HTMLElement>("[data-health-evidence-grid]")!).display).toBe("contents");
+  });
+
+  it("opens on click, closes on Escape and on a click elsewhere, and returns focus to the chip", async () => {
+    await page.viewport(1280, 900);
+    const chip = await mountChip();
+    await userEvent.click(chip);
+    const dialog = await screen.findByRole("dialog", { name: "System health" });
+    expect(dialog.checkVisibility(), "panel visible").toBe(true);
+    expect(chip.getAttribute("aria-expanded")).toBe("true");
+
+    await userEvent.keyboard("{Escape}");
+    expect(screen.queryByRole("dialog", { name: "System health" })).toBeNull();
+    expect(document.activeElement).toBe(chip);
+
+    await userEvent.click(chip);
+    await screen.findByRole("dialog", { name: "System health" });
+    // Click on empty page: the greeting heading is inert text (not focusable) above the panel,
+    // so focus falls to <body> and the chip takes it back a frame later.
+    const heading = screen.getByRole("heading", { level: 1 });
+    expect(heading.tabIndex, "click target is not focusable").toBe(-1);
+    await userEvent.click(heading);
+    expect(screen.queryByRole("dialog", { name: "System health" })).toBeNull();
+    await expect.poll(() => document.activeElement).toBe(chip);
+  });
+
+  it("stays inside the viewport and below the chip at sm and wider", async () => {
+    for (const width of [640, 768, 1024, 1280, 1440]) {
+      cleanup();
+      await page.viewport(width, 900);
+      const chip = await mountChip();
+      await userEvent.click(chip);
+      const dialog = await screen.findByRole("dialog", { name: "System health" });
+      await document.fonts.ready;
+      const r = dialog.getBoundingClientRect();
+      const visibleWidth = document.documentElement.clientWidth;
+      expect.soft(r.left, `left edge at ${width}px`).toBeGreaterThanOrEqual(15);
+      expect.soft(r.right, `right edge at ${width}px`).toBeLessThanOrEqual(visibleWidth - 15);
+      const c = chip.getBoundingClientRect();
+      expect.soft(r.top, `below the chip at ${width}px`).toBeGreaterThanOrEqual(c.bottom);
+      // Attached to the chip: right-aligned when that fits, otherwise left-aligned when that fits.
+      if (c.right - r.width >= 16) {
+        expect.soft(Math.abs(r.right - c.right), `right-aligned to the chip at ${width}px`).toBeLessThanOrEqual(1);
+      } else if (c.left + r.width <= visibleWidth - 16) {
+        expect.soft(Math.abs(r.left - c.left), `left-aligned to the chip at ${width}px`).toBeLessThanOrEqual(1);
+      }
+    }
+  });
+
+  it("never covers a fixed sidebar left of the content column", async () => {
+    for (const width of [1280, 1440, 1600]) {
+      cleanup();
+      await page.viewport(width, 900);
+      mockApi.getAdminHealth.mockResolvedValue(overviewNextDoc());
+      // The shell's lg sidebar is a fixed 240px aside beside <main> (AppShell lg:pl-60).
+      render(
+        <MemoryRouter initialEntries={["/dashboard"]}>
+          <div style={{ paddingLeft: 240 }}>
+            <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8">
+              {/* AppShell's content column bounds the actions beside the fixed sidebar. A
+                  test-owned item before the chip below puts its right-aligned panel over
+                  the sidebar if the content-column floor is removed. */}
+              <div className="mx-auto w-full max-w-[68rem]">
+                <CommandMenuContext.Provider value={{ open: () => {} }}>
+                  <OverviewNext />
+                </CommandMenuContext.Provider>
+              </div>
+            </main>
+          </div>
+        </MemoryRouter>,
+      );
+      const chip = await screen.findByRole("button", { name: /System health/ });
+      const host = chip.parentElement!;
+      const preceding = document.createElement("span");
+      preceding.setAttribute("aria-hidden", "true");
+      preceding.style.cssText = "display:block;flex:0 0 auto;width:220px;height:1px";
+      host.parentElement!.insertBefore(preceding, host);
+      await userEvent.click(chip);
+      const dialog = await screen.findByRole("dialog", { name: "System health" });
+      await document.fonts.ready;
+      const mainLeft = document.querySelector("main")!.getBoundingClientRect().left;
+      const r = dialog.getBoundingClientRect();
+      expect.soft(r.left, `clear of the sidebar at ${width}px`).toBeGreaterThanOrEqual(mainLeft);
+      expect.soft(r.right, `inside the viewport at ${width}px`).toBeLessThanOrEqual(document.documentElement.clientWidth - 15);
+    }
+  });
+
+  it("re-places the open panel when the header reflows without a window resize", async () => {
+    await page.viewport(1280, 900);
+    mockApi.getAdminHealth.mockResolvedValue(overviewNextDoc());
+    render(
+      <MemoryRouter initialEntries={["/dashboard"]}>
+        <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8">
+          <CommandMenuContext.Provider value={{ open: () => {} }}>
+            <OverviewNext />
+          </CommandMenuContext.Provider>
+        </main>
+      </MemoryRouter>,
+    );
+    const chip = await screen.findByRole("button", { name: /System health/ });
+    // Search now follows the health chip (#4248). Add a test-owned flex item before the chip
+    // before opening, so the panel's ResizeObserver sees this sibling change size later.
+    const host = chip.parentElement!;
+    const actions = host.parentElement!;
+    const preceding = document.createElement("span");
+    preceding.setAttribute("aria-hidden", "true");
+    preceding.style.cssText = "display:block;flex:0 0 auto;width:0;height:1px";
+    actions.insertBefore(preceding, host);
+    await userEvent.click(chip);
+    const dialog = await screen.findByRole("dialog", { name: "System health" });
+    await document.fonts.ready;
+    const before = chip.getBoundingClientRect().left;
+    // #4366 moved Back under the title; 720px then moved this chip only 378px.
+    // 800px still forces the >400px reflow that discriminates a stale placement.
+    preceding.style.width = "800px";
+    await expect.poll(() => chip.getBoundingClientRect().left - before).toBeGreaterThan(400);
+    // Re-placed against the chip's new position: attached to it and inside the viewport.
+    await expect
+      .poll(() => {
+        const r = dialog.getBoundingClientRect();
+        const c = chip.getBoundingClientRect();
+        const attached = Math.abs(r.right - c.right) <= 1 || Math.abs(r.left - c.left) <= 1;
+        return attached && r.left >= 15 && r.right <= document.documentElement.clientWidth - 15;
+      })
+      .toBe(true);
+  });
+
+  it("re-places the open panel on resize, switching to the bottom sheet below sm", async () => {
+    await page.viewport(1280, 900);
+    const chip = await mountChip();
+    await userEvent.click(chip);
+    const dialog = await screen.findByRole("dialog", { name: "System health" });
+    await page.viewport(700, 900);
+    // At 700 the panel (640 wide) must stay inside the viewport; the 500 step below proves re-placement.
+    await expect
+      .poll(() => {
+        const r = dialog.getBoundingClientRect();
+        return r.left >= 15 && r.right <= document.documentElement.clientWidth - 15;
+      })
+      .toBe(true);
+    await page.viewport(500, 900);
+    await expect
+      .poll(() => Math.abs(dialog.getBoundingClientRect().left - 16))
+      .toBeLessThanOrEqual(1);
+    expect(dialog.style.left, "no inline placement on the bottom sheet").toBe("");
+  });
+
+  it("stays inside the viewport as a bottom sheet at 375px", async () => {
+    await page.viewport(375, 900);
+    const chip = await mountChip();
+    await userEvent.click(chip);
+    const dialog = await screen.findByRole("dialog", { name: "System health" });
+    await document.fonts.ready;
+    expect(window.innerWidth).toBe(375);
+    const r = dialog.getBoundingClientRect();
+    // Bottom sheet with 1rem (16px) insets on the sides and bottom, fully inside the viewport.
+    expect.soft(Math.abs(r.left - 16), "left inset").toBeLessThanOrEqual(1);
+    expect.soft(Math.abs(window.innerWidth - r.right - 16), "right inset").toBeLessThanOrEqual(1);
+    expect.soft(Math.abs(window.innerHeight - r.bottom - 16), "bottom inset").toBeLessThanOrEqual(1);
+    expect.soft(r.top, "top inside the viewport").toBeGreaterThanOrEqual(0);
+    expect(document.documentElement.scrollWidth, "document stays inside the viewport").toBeLessThanOrEqual(
+      window.innerWidth,
+    );
+  });
+});
+
+// #4367: the configured Agents chip's popover, like the People and health popovers, opens below the chip
+// on desktop and as a bottom sheet on a phone, never pushes the page sideways, and Escape
+// returns focus to the chip.
+describe("OverviewNext Agents chip", () => {
+  const tmpl = (id: string, name: string, scope: AgentTemplate["scope"], userId: string | null = null): AgentTemplate => ({
+    id,
+    name,
+    scope,
+    description: "",
+    model: null,
+    codex_model: null,
+    tools: null,
+    prompt_body: "body",
+    is_builtin: scope === "builtin",
+    user_id: scope === "user" ? userId : null,
+    updated_by: null,
+    differs_from_builtin: false,
+    created_at: "2026-01-01T00:00:00Z",
+    updated_at: "2026-01-01T00:00:00Z",
+  });
+
+  // 12 builtins, 1 global and 1 of the viewer's own: 14 configured agents.
+  const rows = [
+    ...Array.from({ length: 12 }, (_, i) => tmpl(`b${i}`, `builtin-agent-${i}`, "builtin")),
+    tmpl("g0", "global-agent", "global"),
+    tmpl("m0", "my-agent", "user", aUser.id),
+  ];
+  for (const width of [1280, 400]) {
+    it(`opens inside the viewport, closes on Escape and returns focus at ${width}px`, async () => {
+      await page.viewport(width, 900);
+      mockApi.listAgentTemplates.mockResolvedValue({ templates: rows });
+      render(
+        <MemoryRouter initialEntries={["/dashboard"]}>
+          <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8">
+            <OverviewNext />
+          </main>
+        </MemoryRouter>,
+      );
+      const chip = await screen.findByRole("button", { name: "Agents: 14 configured, 4 changes to review" });
+      await document.fonts.ready;
+      expect(window.innerWidth).toBe(width);
+      expect(chip.getBoundingClientRect().right, "chip inside the viewport").toBeLessThanOrEqual(window.innerWidth);
+
+      await userEvent.click(chip);
+      const dialog = await screen.findByRole("dialog", { name: "Agents configured" });
+      expect(dialog.checkVisibility()).toBe(true);
+      expect(within(dialog).getByRole("heading", { name: "14 agents configured" })).toBeTruthy();
+      expect(within(dialog).getByText("From your agent source")).toBeTruthy();
+      expect(within(dialog).getByRole("link", { name: "Review in Settings" })).toBeTruthy();
+      const r = dialog.getBoundingClientRect();
+      expect.soft(r.left, "dialog left").toBeGreaterThanOrEqual(0);
+      expect.soft(r.right, "dialog right").toBeLessThanOrEqual(document.documentElement.clientWidth);
+      expect.soft(r.top, "dialog top").toBeGreaterThanOrEqual(0);
+      expect.soft(r.bottom, "dialog bottom").toBeLessThanOrEqual(window.innerHeight);
+      for (const el of dialog.querySelectorAll<HTMLElement>("*")) {
+        expect.soft(el.getBoundingClientRect().right, `${el.tagName} ${el.textContent?.slice(0, 24)}`).toBeLessThanOrEqual(r.right + 1);
+      }
+      expect(document.documentElement.scrollWidth, "document stays inside the viewport").toBeLessThanOrEqual(
+        document.documentElement.clientWidth,
+      );
+
+      await userEvent.keyboard("{Escape}");
+      expect(screen.queryByRole("dialog", { name: "Agents configured" })).toBeNull();
+      expect(document.activeElement).toBe(chip);
+      expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(document.documentElement.clientWidth);
+    });
+  }
 });

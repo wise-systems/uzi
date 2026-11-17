@@ -17,7 +17,7 @@ import { StrictMode } from "react";
 
 import { AdminHealth } from "./AdminHealth";
 import { likelyCause } from "../components/WorkerUpgradeBadge";
-import { api, type AdminWorker, type HealthDoc } from "../lib/api";
+import { api, ApiError, type AdminWorker, type HealthDoc } from "../lib/api";
 import {
   ownerOnlyDoc,
   ownerOnlyWaitingOwnerId,
@@ -31,10 +31,10 @@ import {
 } from "../mocks/data/health";
 
 // The page reads GET /api/admin/health (via the shared useAdminHealth hook, used by both the
-// page and AdminShell's tab pip) and GET /api/admin/workers. Mock only those two.
+// page and AdminShell's tab pip) and GET /api/admin/workers, plus the hibernate/wake writes.
 vi.mock("../lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../lib/api")>();
-  return { ...actual, api: { getAdminHealth: vi.fn(), adminListWorkers: vi.fn() } };
+  return { ...actual, api: { getAdminHealth: vi.fn(), adminListWorkers: vi.fn(), adminHibernateWorker: vi.fn(), adminWakeWorker: vi.fn() } };
 });
 const mockApi = vi.mocked(api);
 
@@ -188,7 +188,7 @@ describe("AdminHealth — attention card and all-clear line (M3)", () => {
 
   it("shows both Codex pricing reasons and operator docs without blocking work", async () => {
     const doc = healthySilentDoc();
-    expect(doc.checks).toHaveLength(24);
+    expect(doc.checks).toHaveLength(28);
     const pricing = doc.checks.find((c) => c.id === "pricing.codex")!;
     pricing.severity = "warn";
     pricing.summary = "2 Codex models lack usable pricing";
@@ -214,8 +214,8 @@ describe("AdminHealth — attention card and all-clear line (M3)", () => {
     expect(container.querySelector('[role="alert"], [role="status"]')).toBeNull();
     expect(screen.queryByRole("heading", { name: /blocking|attention/ })).toBeNull();
     expect(attentionIds(container)).toEqual([]);
-    // Every check's shape carries its word; all 24 read OK, none Warn/Danger.
-    expect(screen.getAllByText("OK").length).toBe(24);
+    // The 27 applicable checks read OK; automatic hibernation is N/A while off.
+    expect(screen.getAllByText("OK").length).toBe(27);
     expect(screen.queryByText(/^(Warn|Danger|Unknown)$/)).toBeNull();
     expect(screen.queryByLabelText(/health checks? needs? attention/)).toBeNull();
   });
@@ -472,21 +472,21 @@ describe("AdminHealth — copy feedback lifecycle", () => {
 describe("AdminHealth — All checks inventory (M4)", () => {
   it("counts: header and per-group status, na excluded from every denominator", async () => {
     await renderHealth(healthySilentDoc());
-    expect(screen.getByText("24 of 24 passing")).toBeTruthy();
-    // workers (6, fleet.rundisk, fleet.quarantine and fleet.memory_authority included), queue (2), control (4),
+    expect(screen.getByText("27 of 27 passing, 1 not applicable")).toBeTruthy();
+    // workers (10, including wake, cleanup, automatic policy and retirement), queue (2), control (4),
     // integrations (4, issue_tracker.sync included), housekeeping (8, maintenance.active included).
     // Exact per-string tallies: integrations and control both read "all 4 passing".
-    expect(screen.getAllByText("all 6 passing").length).toBe(1);
-    expect(screen.getByText("all 8 passing")).toBeTruthy();
+    expect(screen.getByText("all 9 passing, 1 not applicable")).toBeTruthy(); // workers
+    expect(screen.getByText("all 8 passing")).toBeTruthy(); // housekeeping
     expect(screen.getAllByText("all 2 passing").length).toBe(1);
     expect(screen.getAllByText("all 4 passing").length).toBe(2);
-    expect(screen.getAllByText(/^all \d passing$/).length).toBe(5);
+    expect(screen.getAllByText(/^all \d passing$/).length).toBe(4);
   });
 
   it("incident: attention groups read 'K of N need attention'", async () => {
     await renderHealth(incidentDoc());
-    expect(screen.getByText("20 of 24 passing")).toBeTruthy();
-    expect(screen.getByText("2 of 6 need attention")).toBeTruthy(); // workers: fleet.rundisk, fleet.quarantine and fleet.memory_authority stay ok
+    expect(screen.getByText("23 of 27 passing, 1 not applicable")).toBeTruthy();
+    expect(screen.getByText("2 of 9 need attention, 1 not applicable")).toBeTruthy(); // workers: fleet.rundisk, fleet.quarantine and fleet.memory_authority stay ok
     expect(screen.getByText("1 of 2 need attention")).toBeTruthy(); // queue
     expect(screen.getByText("1 of 4 need attention")).toBeTruthy(); // integrations
     expect(screen.getByText("all 4 passing")).toBeTruthy(); // control
@@ -554,27 +554,27 @@ describe("AdminHealth — All checks inventory (M4)", () => {
   it("na (no hosted workers): N/A chips with their word, 'not applicable' in the counts, still all clear", async () => {
     await renderHealth(noHostedWorkersDoc());
     expect(screen.getByText("All systems normal.")).toBeTruthy();
-    // fleet.roll, controller.report, db.size and slack.socket are N/A (never green, never gone).
-    expect(screen.getAllByText("N/A").length).toBe(4);
-    expect(screen.getByText("20 of 20 passing, 4 not applicable")).toBeTruthy();
-    expect(screen.getByText("all 5 passing, 1 not applicable")).toBeTruthy(); // workers (fleet.rundisk, fleet.quarantine and fleet.memory_authority apply)
+    // fleet.roll, fleet.hibernation_wake, fleet.hibernation_cleanup, fleet.hibernation, fleet.hibernation_retirement, controller.report, db.size and slack.socket are N/A (never green, never gone).
+    expect(screen.getAllByText("N/A").length).toBe(8);
+    expect(screen.getByText("20 of 20 passing, 8 not applicable")).toBeTruthy();
+    expect(screen.getByText("all 5 passing, 5 not applicable")).toBeTruthy(); // workers (fleet.rundisk, fleet.quarantine and fleet.memory_authority apply)
     expect(screen.getAllByText("all 3 passing, 1 not applicable").length).toBe(1); // integrations
     expect(screen.getAllByText("all 2 passing, 2 not applicable").length).toBe(1); // control
     expect(screen.queryByLabelText(/health checks? needs? attention/)).toBeNull();
   });
 
   it("a group with both attention and N/A checks counts N/A out of the denominator", async () => {
-    // Workers group on the no-hosted fixture: fleet.roll N/A, fleet.capacity (now danger),
+    // Workers group on the no-hosted fixture: fleet.roll, fleet.hibernation_wake and fleet.hibernation_cleanup fleet.hibernation and fleet.hibernation_retirement N/A, fleet.capacity (now danger),
     // fleet.disk, fleet.rundisk, fleet.quarantine and fleet.memory_authority OK. Applicable = 5, so "1 of 5", never "1 of 6".
     await renderHealth(withSeverity(noHostedWorkersDoc(), { "fleet.capacity": "danger" }));
-    expect(screen.getByText("1 of 5 need attention, 1 not applicable")).toBeTruthy();
+    expect(screen.getByText("1 of 5 need attention, 5 not applicable")).toBeTruthy();
     expect(screen.queryByText(/^1 of 6 need attention/)).toBeNull();
   });
 
   it("a group whose checks are all N/A reads 'not applicable'", async () => {
     await renderHealth(withSeverity(noHostedWorkersDoc(), { "forge.ciwatch": "na", "forge.sync": "na", "issue_tracker.sync": "na" }));
     expect(screen.getByText("not applicable")).toBeTruthy();
-    expect(screen.getByText("17 of 17 passing, 7 not applicable")).toBeTruthy();
+    expect(screen.getByText("17 of 17 passing, 11 not applicable")).toBeTruthy();
   });
 
   it("no interactive element is nested inside another", async () => {
@@ -671,7 +671,8 @@ it("keeps offline fleet manual attribution beside automatic fences and blocking 
   expect(row.querySelector("time")?.getAttribute("datetime")).toBe("2026-10-21T12:00:00.000Z");
   expect(within(row).getByText("worker: ImagePullBackOff")).toBeTruthy();
   expect(within(row).getByText("roll blocked")).toBeTruthy();
-  expect(row.querySelectorAll("button, input")).toHaveLength(0);
+  // No cordon control; the only control is the hibernate action (PRD #4205).
+  expect(Array.from(row.querySelectorAll("button, input"), (el) => el.getAttribute("aria-label"))).toEqual(["Hibernate manual-fleet"]);
   expect(row.querySelector("b")).toBeNull();
 });
 
@@ -878,5 +879,175 @@ describe("AdminHealth — Fleet card (M5)", () => {
     await waitFor(() => expect(mockApi.adminListWorkers.mock.calls.length).toBeGreaterThan(calls));
     expect(within(fleetCard()).getByTitle("w-kept")).toBeTruthy();
     expect(within(fleetCard()).queryByText("No workers across any user.")).toBeNull();
+  });
+});
+
+describe("AdminHealth — Fleet card hibernation (PRD #4205)", () => {
+  const hib = (over: Partial<AdminWorker>) => fleetWorker({ kind: "hosted", ephemeral: false, busy: false, active_runs: 0, draining_since: null, manual_cordoned_at: null, ...over });
+
+  it("shows a hibernated worker as hibernated, not offline or cordoned, with the wake error as text", async () => {
+    await renderHealth(healthySilentDoc(), [hib({
+      name: "sleepy", status: "offline", effective_cordoned: true, hibernation_state: "hibernated",
+      wake_error: "<b>pod did not start</b>\u202e",
+    })]);
+    const row = await fleetRow("sleepy");
+    expect(within(row).getByText("hibernated")).toBeTruthy();
+    expect(within(row).queryByText("offline")).toBeNull();
+    expect(within(row).queryByText("intake fenced")).toBeNull();
+    expect(within(row).queryByText("cordoned")).toBeNull();
+    expect(within(row).getByText("Wake failed: <b>pod did not start</b>")).toBeTruthy();
+    expect(within(row).getByText("wake failed").getAttribute("title")).toBe("<b>pod did not start</b>");
+    expect(row.querySelector("b")).toBeNull();
+  });
+
+  it("shows the hibernation cache cleanup outcome as sanitized text (PRD #4206)", async () => {
+    await renderHealth(healthySilentDoc(), [
+      hib({ name: "cleaned", status: "offline", hibernation_state: "hibernated", hibernation_cleanup: { state: "settled", outcome: "pruned", reason: null } }),
+      hib({ name: "stuck", status: "offline", hibernation_state: "waking", hibernation_cleanup: { state: "unknown", outcome: null, reason: null } }),
+      hib({ name: "skipper", status: "offline", hibernation_state: "hibernated", hibernation_cleanup: { state: "settled", outcome: "skipped", reason: "<i>odd\u202e</i>" } }),
+    ]);
+    expect(within(await fleetRow("cleaned")).getByText("cache pruned")).toBeTruthy();
+    expect(within(await fleetRow("stuck")).getByText("cleanup settlement unknown")).toBeTruthy();
+    const skipper = await fleetRow("skipper");
+    expect(within(skipper).getByText("cleanup skipped: <i>odd</i>")).toBeTruthy();
+    expect(skipper.querySelector("i")).toBeNull();
+  });
+
+  it.each([
+    ["preparing", "hibernating"],
+    ["hibernated", "hibernated"],
+    ["waking", "waking"],
+  ] as const)("labels the %s state as %s and offers Wake only", async (state, label) => {
+    await renderHealth(healthySilentDoc(), [hib({ name: "w-state", status: "offline", hibernation_state: state })]);
+    const row = await fleetRow("w-state");
+    expect(within(row).getByText(label)).toBeTruthy();
+    expect(within(row).getByRole("button", { name: "Wake w-state" })).toBeTruthy();
+    expect(within(row).queryByRole("button", { name: "Hibernate w-state" })).toBeNull();
+  });
+
+  it("offers no Hibernate for an external or ephemeral worker", async () => {
+    await renderHealth(healthySilentDoc(), [
+      hib({ name: "ext-w", kind: "external" }),
+      hib({ id: "w-eph", name: "eph-w", ephemeral: true }),
+    ]);
+    const ext = await fleetRow("ext-w");
+    const eph = await fleetRow("eph-w");
+    expect(ext.querySelectorAll("button")).toHaveLength(0);
+    expect(eph.querySelectorAll("button")).toHaveLength(0);
+  });
+
+  it("hibernates, disables the button while pending, then refreshes the fleet", async () => {
+    let finish!: (v: { worker_id: string; state: "hibernated"; op_id: string }) => void;
+    mockApi.adminHibernateWorker.mockReturnValue(new Promise((r) => (finish = r)));
+    await renderHealth(healthySilentDoc(), [hib({ id: "w-h", name: "idle-w" })]);
+    const row = await fleetRow("idle-w");
+    fireEvent.click(within(row).getByRole("button", { name: "Hibernate idle-w" }));
+    await waitFor(() => expect((within(row).getByRole("button", { name: "Hibernate idle-w" }) as HTMLButtonElement).disabled).toBe(true));
+    expect(mockApi.adminHibernateWorker).toHaveBeenCalledWith("w-h");
+    const calls = mockApi.adminListWorkers.mock.calls.length;
+    mockApi.adminListWorkers.mockResolvedValue({ workers: [hib({ id: "w-h", name: "idle-w", status: "offline", hibernation_state: "hibernated" })] });
+    await act(async () => finish({ worker_id: "w-h", state: "hibernated", op_id: "op" }));
+    await waitFor(() => expect(mockApi.adminListWorkers.mock.calls.length).toBeGreaterThan(calls));
+    const after = await fleetRow("idle-w");
+    expect(await within(after).findByText("hibernated")).toBeTruthy();
+    expect(within(after).getByRole("button", { name: "Wake idle-w" })).toBeTruthy();
+  });
+
+  it("shows the mapped refusal inline for a 409 and keeps the worker row", async () => {
+    mockApi.adminHibernateWorker.mockRejectedValue(
+      new ApiError(409, "worker cannot be hibernated", { error: "worker cannot be hibernated", reason_code: "busy" }),
+    );
+    await renderHealth(healthySilentDoc(), [hib({ name: "busy-w" })]);
+    const row = await fleetRow("busy-w");
+    fireEvent.click(within(row).getByRole("button", { name: "Hibernate busy-w" }));
+    const alert = await within(row).findByRole("alert");
+    expect(alert.textContent).toBe("The worker is busy with runs. Wait for it to go idle.");
+    expect((within(row).getByRole("button", { name: "Hibernate busy-w" }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it("wakes a hibernated worker", async () => {
+    mockApi.adminWakeWorker.mockResolvedValue({ worker_id: "w-z", state: "waking", op_id: "op" });
+    await renderHealth(healthySilentDoc(), [hib({ id: "w-z", name: "zzz", status: "offline", hibernation_state: "hibernated" })]);
+    const row = await fleetRow("zzz");
+    fireEvent.click(within(row).getByRole("button", { name: "Wake zzz" }));
+    await waitFor(() => expect(mockApi.adminWakeWorker).toHaveBeenCalledWith("w-z"));
+  });
+});
+
+describe("AdminHealth — Fleet card blocker and roll marker (issue #4385)", () => {
+  const hosted = (over: Partial<AdminWorker>) => fleetWorker({ kind: "hosted", ephemeral: false, busy: false, active_runs: 0, draining_since: null, manual_cordoned_at: null, ...over });
+  const agoIso = (ms: number) => new Date(Date.now() - ms).toISOString();
+  const marker = (over: Partial<NonNullable<AdminWorker["roll_marker"]>>): NonNullable<AdminWorker["roll_marker"]> => ({
+    state: "present", canary: null, completed: null, target_version: null, coverage_group: null, reservation: null, blocked: null, observed_at: null, ...over,
+  });
+
+  it("names the controller refusal, how long, and when last observed", async () => {
+    await renderHealth(healthySilentDoc(), [hosted({
+      name: "refused-w", hibernation_reason: "roll_reservation", hibernation_blocked_reason: "controller_refused",
+      hibernation_blocked_since: agoIso(42 * 60_000), hibernation_blocked_at: agoIso(2 * 60_000),
+    })]);
+    const row = await fleetRow("refused-w");
+    expect(within(row).getByText("Hibernation blocker (last recorded): controller refused (roll reservation) for 42m, last observed 2m ago")).toBeTruthy();
+  });
+
+  it("renders an unknown blocker code and refusal code stripped, as text", async () => {
+    await renderHealth(healthySilentDoc(), [hosted({
+      name: "odd-w", hibernation_reason: "<i>weird‮</i>", hibernation_blocked_reason: "controller_refused",
+      hibernation_blocked_at: agoIso(60_000),
+    }), hosted({ id: "w-2", name: "odd-2", hibernation_blocked_reason: "<b>new‮</b>" })]);
+    const odd = await fleetRow("odd-w");
+    expect(within(odd).getByText("Hibernation blocker (last recorded): controller refused (<i>weird</i>), last observed 1m ago")).toBeTruthy();
+    expect(odd.querySelector("i")).toBeNull();
+    const odd2 = await fleetRow("odd-2");
+    expect(within(odd2).getByText("Hibernation blocker (last recorded): <b>new</b>")).toBeTruthy();
+    expect(odd2.querySelector("b")).toBeNull();
+  });
+
+  it("omits the controller label for a non-refusal blocker and renders no blocker line without fields", async () => {
+    await renderHealth(healthySilentDoc(), [
+      hosted({ name: "cord-w", hibernation_reason: "roll_reservation", hibernation_blocked_reason: "manual_cordon" }),
+      hosted({ id: "w-3", name: "plain-w" }),
+    ]);
+    expect(within(await fleetRow("cord-w")).getByText("Hibernation blocker (last recorded): manual cordon")).toBeTruthy();
+    expect((await fleetRow("plain-w")).textContent).not.toContain("Hibernation blocker");
+  });
+
+  it("renders a present canary completed marker with target, group and last observed", async () => {
+    await renderHealth(healthySilentDoc(), [hosted({
+      name: "mark-w", roll_marker: marker({ canary: true, completed: true, target_version: "0.9.0", coverage_group: "base", observed_at: agoIso(5 * 60_000) }),
+    })]);
+    const row = await fleetRow("mark-w");
+    expect(within(row).getByText("Roll marker: present · canary · completed · target 0.9.0 · group base, last observed 5m ago")).toBeTruthy();
+  });
+
+  it("renders reservation and a stripped blocked text", async () => {
+    await renderHealth(healthySilentDoc(), [hosted({
+      name: "res-w", roll_marker: marker({ reservation: true, blocked: "<u>held‮</u>" }),
+    })]);
+    const row = await fleetRow("res-w");
+    expect(within(row).getByText("Roll marker: present · reservation · blocked: <u>held</u>")).toBeTruthy();
+    expect(row.querySelector("u")).toBeNull();
+  });
+
+  it.each([
+    ["unknown", "Roll marker: unknown"],
+    ["absent", "Roll marker: none"],
+    ["unavailable", "Roll marker: snapshot unavailable"],
+    ["unreadable", "Roll marker: unreadable"],
+    ["<s>new‮</s>", "Roll marker: <s>new</s>"],
+  ])("renders marker state %s as distinct text", async (state, text) => {
+    await renderHealth(healthySilentDoc(), [hosted({ name: "st-w", roll_marker: marker({ state }) })]);
+    const row = await fleetRow("st-w");
+    expect(within(row).getByText(text)).toBeTruthy();
+    expect(row.querySelector("s")).toBeNull();
+  });
+
+  it("renders no roll marker line for an external worker or a worker without a marker", async () => {
+    await renderHealth(healthySilentDoc(), [
+      fleetWorker({ name: "ext-m", kind: "external", roll_marker: marker({}) }),
+      hosted({ id: "w-4", name: "nomark-w" }),
+    ]);
+    expect((await fleetRow("ext-m")).textContent).not.toContain("Roll marker");
+    expect((await fleetRow("nomark-w")).textContent).not.toContain("Roll marker");
   });
 });

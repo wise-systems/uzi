@@ -202,6 +202,10 @@ production except on the one hosted Docker worker an operator selects with
 
 ## Amendment 2026-11-10 — issue #4043: gated runner-`TMPDIR` scratch reclaim
 
+Historical activation decision: the constant-off gate and pre-activation owner
+decision below were superseded by #4182 on 2026-11-11. The mechanism protections
+and residuals remain; hosted acceptance is still pending.
+
 Issue #4043 adds a scratch-only reclaim phase to the [PRD #3431](../prds/3431-pod-epoch-reclaim.md)
 pod-epoch pass. It narrows D4 ("no new cleanup authority") and D5 ("automatic retention deletion
 stays off") for the runner-`TMPDIR` scratch root only; clones, `.retire-*` leftovers, retained
@@ -267,3 +271,77 @@ binding. The amendment of 2026-11-06 above is unaffected.
   accept these.
 - **Not verified.** No hosted before/after-byte acceptance on a real `runner-shared` PVC; that is
   owner-owned, like the list above.
+
+## Amendment 2026-11-11 — issue #4182: default-on scratch startup request
+
+Replace the historical constant-off scratch gate with worker startup
+`UZI_EPOCH_SCRATCH_DELETION`: unset, empty or `0` is off; `1` requires
+`UZI_EPOCH_LOCK=1` and Docker wiring; other values refuse boot. It is read once
+before pod-epoch creation. Chart `workers.epochReclaim.scratchDeletion` is a
+strict boolean, default `true`, rendered as quoted controller env
+`UZI_WORKER_EPOCH_SCRATCH_DELETION="true"` or `"false"` with false preserved.
+The controller accepts unset/empty/`false` as off, only `true` as on, and refuses
+other values; it emits worker literal `1` only when enabled, `withDinD(w)` and
+not ephemeral, omitting it otherwise. Attempt deletion remains independent,
+selector-gated and off by default.
+
+This changes activation policy, not exclusion authority, mechanism protections
+or residuals above. Runtime declaration stays empty by default; an undeclared
+or unattested pass keeps scratch. A startup request is not deletion evidence:
+`pod_epoch_reclaim_activation` logs boolean `deletion_requested` and
+`scratch_requested`. Older controllers or absent env leave scratch off; older
+workers ignore the env. The image must include #4171 (`7cd46526`, merged).
+
+Disable via false, controller reconciliation, desired Deployment template env
+omission and safe paced replacement with busy/custody guards, keeping ForceRoll
+off. Confirm the new pod/image/epoch, `scratch_requested: false` and actual
+scratch result. Old-template restarts/evictions can still carry `1`; this cannot
+stop an active pass or restore bytes. See the [operational procedure](../docs/run-recovery.md#runner-tmpdir-scratch-reclaim-startup-disable-and-observation).
+Post-release owner observation, hosted acceptance and the keep-default decision
+remain pending on #4043, without a pre-enable canary/approval gate. Record image,
+pod, epoch, requested state and actual deleted/kept reasons or fatal result;
+keep allocated-byte estimates, unattributed statfs delta and independent physical
+reclaim separate. No hosted evidence is claimed by this amendment.
+
+## Amendment 2026-11-13 — issue #4143: `.retire-*` scratch outcome records (observation only)
+
+Worker startup now observes every `.retire-*` retirement scratch parent the
+bounded root listing reaches under `<dataDir>/runner` (4096-entry budget;
+`enumeration_incomplete` marks a truncated listing) and emits bounded
+per-parent `runner retire scratch outcome` rows (at most 10, sorted, parents
+only) and exactly one `runner retire scratch total` line per startup (one per
+pod epoch on epoch workers) whenever records are on and the runner root exists
+and was listed, including with zero parents. A missing, non-directory or
+symlink runner root logs none; if the step throws,
+`runner retire scratch outcomes failed` replaces the total. With zero parents
+`retained_source_read` is `not_attempted` (no journal read or walk) and
+`bytes_state` is `measured` unless the listing was incomplete (`unknown`).
+Every parent is kept (`reclaimed` is always 0); nothing is deleted, chowned or
+moved, and the existing `runner retire scratch retained` warning is unchanged.
+A parent is `protected_by_retained_source` when a decoded recovery or restore
+journal's `clonePath` (predecessor, successor or tombstone) or
+`retainedSources[].clonePath` names it or a path under it; otherwise
+`no_disposition_evidence`. Bytes are allocated bytes from a
+read-only descriptor-relative walk (hard links once, no symlink following);
+`bytes_state` is `measured` only when every parent was measured completely and
+the listing was complete. One 30 s startup budget covers the journal read and
+the walk; an uninterruptible syscall has no hard real-time bound. Synthetic
+local-disk cost: median 970 ms (max 1639) for 10 parents of 1000 small files
+plus 3 bares, against 13 ms off; not a production measurement.
+
+Switches: worker `UZI_RETIRE_SCRATCH_OUTCOMES` (unset, empty or `1` on; `0`
+off; other values refuse startup), controller
+`UZI_WORKER_RETIRE_SCRATCH_OUTCOMES` (empty or `true` on; `false` off; other
+values a boot error) and strict-boolean chart
+`workers.epochReclaim.retireScratchOutcomes` (default `true`; `false` renders
+worker `UZI_RETIRE_SCRATCH_OUTCOMES=0` on every worker). Default renders are
+unchanged. Off restores the count-only inspector exactly.
+
+No reclaim, deliberately: no ordinary durable disposition binding proves the
+moved footprint (rollback repair can persist a protected moved-clone pointer);
+the rename into the scratch parent precedes the journal clear and the
+retired-ledger write, and the ledger names only the canonical clone path; a
+retired ledger, emptiness, age or the parent name grant nothing. The legacy
+stderr-proof repair (#4141, landed via #4152) does not certify remnants created
+by older code retroactively, and #4137 is a distinct residual. Reclaim remains
+open on #4143 pending a durable parent-binding design.

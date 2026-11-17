@@ -360,6 +360,7 @@
   "plan_cross_check_required": true,
   "plan_cross_check_gated": true,
   "plan_cross_check_gate_reason": "x",
+  "cross_check_active": "x",
   "plan_cross_check_diff_refusal": "x",
   "plan_cross_check_summary": {
     "checker_model_source": "x",
@@ -760,6 +761,7 @@
   "limit_wait_count": 1,
   "rate_limit_type": "x",
   "recovery_wait_cause": "x",
+  "recovery_wait_detail": "x",
   "recovery_wait_phase": "x",
   "publication_wait_started_at": "2020-01-02T03:04:05Z",
   "publication_wait_limit_seconds": 1,
@@ -816,6 +818,9 @@
     ]
   },
   "model": "x",
+  "effort": "x",
+  "model_source": "x",
+  "effort_source": "x",
   "override_subagent_model": true,
   "priority": "x",
   "required_capabilities": [
@@ -848,10 +853,19 @@
   "credential_epochs": [
     {
       "claim_generation": 1,
+      "ordinal": 1,
       "secret_id": "x",
       "label": "x",
       "select_reason": "x",
-      "applied_at": "2020-01-02T03:04:05Z"
+      "applied_at": "2020-01-02T03:04:05Z",
+      "message_seq": 1,
+      "usage": {
+        "input_tokens": 1,
+        "output_tokens": 1,
+        "cache_read_tokens": 1,
+        "cache_creation_tokens": 1,
+        "cost_usd": 1.5
+      }
     }
   ],
   "outcome_pending": {
@@ -862,6 +876,5 @@
   "owner_email": "x",
   "judge_verdict": "x",
   "judge_todo_count": 1,
-  "pending_question": "x",
-  "cross_check_active": "x"
+  "pending_question": "x"
 }

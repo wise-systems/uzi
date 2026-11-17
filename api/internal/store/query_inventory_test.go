@@ -419,6 +419,15 @@ var inventoryQueryFiles = []string{
 	"findings.sql",
 	// PRD #3454 instance maintenance mode
 	"intake_pause.sql",
+	// PRD #3250: widened for the run_override_unavailable park and its message
+	"credential_disabled.sql",
+	// Issue #4007 slice A — the terminal preservation store
+	"terminal_preservation.sql",
+	// Issue #4257 — the checkpoint-publication-withheld fact
+	"checkpoint_publication.sql",
+	// Issue #4207 — automatic hibernation of idle workers (its own file: the rest of
+	// hibernation.sql is not inventoried)
+	"hibernation_auto.sql",
 }
 
 // inventoryPackages are the directories, relative to this one, whose *_test.go files are
@@ -458,6 +467,14 @@ var inventoryPackages = []string{".", "../handler", "../workersvc"}
 // queryInventory is the declaration. Every row was verified by opening the call site named in
 // `why`; none was inferred.
 var queryInventory = []queryPin{
+	{"RecordRunCheckpointWithheld", "checkpoint_publication.sql", "TestCheckpointWithheldOrderRuleLiveDB",
+		"issue #4257; the fence refusals are TestCheckpointWithheldFenceRefusalsLiveDB and the delayed-older-report " +
+			"race is TestCheckpointPublicationServerOrderingLiveDB (../handler). Direct call through the f.set helper " +
+			"(../workersvc checkpoint_publication_livedb_test.go)"},
+	{"ClearRunCheckpointWithheld", "checkpoint_publication.sql", "TestCheckpointWithheldOrderRuleLiveDB",
+		"issue #4257; direct call through the f.clear helper (../workersvc checkpoint_publication_livedb_test.go), " +
+			"fence refusals in TestCheckpointWithheldFenceRefusalsLiveDB, delayed old clear in " +
+			"TestCheckpointPublicationServerOrderingLiveDB (../handler)"},
 	{"UpsertRecommendationDisposition", "dispositions.sql", "TestRecommendationDispositionsLiveDB",
 		"direct call, recommendation_dispositions_integration_test.go:108"},
 	{"SystemDismissDeniedCLIRecommendation", "dispositions.sql", "TestPostReviewAutoDismissesDeniedCLILiveDB",
@@ -527,6 +544,23 @@ var queryInventory = []queryPin{
 			"run_usage_totals LEFT JOIN yields NULL usage for a judge with no run_usage row"},
 	{"ListRecommendationsForReview", "judge.sql", "TestJudgeQueriesLiveDB",
 		"direct call, judge_integration_test.go:147"},
+	{"RecordJudgeSkip", "judge.sql", "TestJudgeSkipRecordedOnCredentialRefusalLiveDB",
+		"issue #3257: reached through svc.maybeEnqueueJudge -> recordJudgeSkip in ../workersvc; the " +
+			"test asserts the harness/reason row per refusal. Its NOT EXISTS (no row once any judge " +
+			"exists) is pinned by TestJudgeSkipLateWriterLiveDB in the same file"},
+	{"DeleteJudgeSkipForTarget", "judge.sql", "TestJudgeRerunClearsSkipInSameCommitLiveDB",
+		"issue #3257: reached through svc.RerunJudge -> lockJudgeTargetForCreate in ../workersvc; " +
+			"the test asserts zero judge_skips rows once the rerun's judge exists"},
+	{"GetJudgeSkipForTarget", "judge.sql", "TestJudgeSkipRecordedOnCredentialRefusalLiveDB",
+		"issue #3257: direct call in the wantSkip helper of ../workersvc/judge_skip_livedb_test.go, " +
+			"which asserts the harness and reason read back"},
+	{"LockRunForJudge", "judge.sql", "TestJudgeTargetLockIsAdvisoryLiveDB",
+		"issue #3257: reached through lockJudgeTargetForCreate in ../workersvc; the test asserts the " +
+			"granted advisory lock on the target key in pg_locks while the judge insert is open. " +
+			"TestJudgeSkipLateWriterLiveDB pins that the skip writer blocks on it"},
+	{"CurrentTransactionIsolation", "judge.sql", "TestJudgeCreateIsolationGuardFailsClosedLiveDB",
+		"issue #3257: reached through lockJudgeTargetForCreate in ../workersvc; the test runs both " +
+			"creation paths at REPEATABLE READ and asserts no judge and errJudgeCreateIsolation"},
 	{"ListOwnedRecommendationsForCoords", "judge_bulk_disposition.sql", "TestBulkDispositionFiledMemberIsNotOpenLiveDB",
 		"named in NO test source: reached via handler.BulkSetDispositions -> workersvc. This pin is " +
 			"the one whose folds are recorded — dropping the filed-issues join's coordinate half " +
@@ -1055,6 +1089,119 @@ var queryInventory = []queryPin{
 	{"ListRunQueueReasons", "intake_pause.sql", "TestQueueReasonLiveDB",
 		"../handler: runs_dto.go batch lookup behind the run reads; asserts queue_reason for queued " +
 			"runs while paused and its absence once lifted. Also called from workersvc/jobs.go"},
+	{"ParkCredentialDisabledRun", "credential_disabled.sql", "TestCredentialDisabledParkPromoteLiveDB",
+		"store-level park then promote; the workersvc finisher tests (TestFinishRunClaimCredentialDisabledStaleLiveDB) drive it through finishRunClaim"},
+	{"ParkRunOverrideUnavailableRun", "credential_disabled.sql", "TestClaimRunOverrideUnavailableClaudeLiveDB",
+		"../workersvc: Service.Claim -> finishRunClaim parks the exact claim; TestRunOverrideParkRestoresFreshGrantLiveDB asserts the Fresh restore and TestFinishRunOverrideNonExactClaimWritesNothingLiveDB the fence"},
+	{"InsertRunOverrideUnavailableMessage", "credential_disabled.sql", "TestClaimRunOverrideUnavailableClaudeLiveDB",
+		"../workersvc: written inside the park transaction; the test reads the message payload back, counts exactly one per park and checks runs.last_seq covers it"},
+	{"ParkCredentialDisabledChatRun", "credential_disabled.sql", unpinnedPin,
+		"declared when this file joined the inventory for PRD #3250; only the fake store in workersvc/service_test.go references it, so no live test executes it"},
+	{"ListCredentialDisabledRuns", "credential_disabled.sql", "TestCredentialDisabledWorklistCursorLiveDB",
+		"keyset paging of the held-run worklist"},
+	{"PromoteCredentialDisabledRun", "credential_disabled.sql", "TestCredentialDisabledParkPromoteLiveDB",
+		"store-level promote of a held run; the workersvc promoter tests reach it through the promoter pass"},
+	{"ReassignCredentialDisabledRun", "credential_disabled.sql", "TestCredentialPromoterLockOrderVsReassignmentLiveDB",
+		"../workersvc: reached through the owner reassignment"},
+	{"LockSecretEnablementForShareNowait", "credential_disabled.sql", unpinnedPin,
+		"declared when this file joined the inventory for PRD #3250; no test names this query. It runs inside the credential finisher or promoter path, which no test asserts statement by statement, so it is not observed here"},
+	{"ListCredentialDisabledUsers", "credential_disabled.sql", "TestCredentialDisabledUsersWorklistLiveDB",
+		"the promoter sweep's owner worklist"},
+	{"LockCredentialDisabledRunForPromotion", "credential_disabled.sql", "TestCredentialPromoterTriggersLiveDB",
+		"../workersvc: the promoter's candidate lock"},
+	{"LockRunForCredentialSwitch", "credential_disabled.sql", unpinnedPin,
+		"declared when this file joined the inventory for PRD #3250; no test names this query. It runs inside the credential finisher or promoter path, which no test asserts statement by statement, so it is not observed here"},
+	{"LockWorkerBindingForShare", "credential_disabled.sql", unpinnedPin,
+		"declared when this file joined the inventory for PRD #3250; no test names this query. It runs inside the credential finisher or promoter path, which no test asserts statement by statement, so it is not observed here"},
+	{"LockUserJudgeBindingForShare", "credential_disabled.sql", unpinnedPin,
+		"declared when this file joined the inventory for PRD #3250; no test names this query. It runs inside the credential finisher or promoter path, which no test asserts statement by statement, so it is not observed here"},
+	{"LockSecretForPromotion", "credential_disabled.sql", unpinnedPin,
+		"declared when this file joined the inventory for PRD #3250; no test names this query. It runs inside the credential finisher or promoter path, which no test asserts statement by statement, so it is not observed here"},
+	{"LockDefaultAnthropicSecretForShare", "credential_disabled.sql", unpinnedPin,
+		"declared when this file joined the inventory for PRD #3250; no test names this query. It runs inside the credential finisher or promoter path, which no test asserts statement by statement, so it is not observed here"},
+	{"HasEnabledAnthropicForJudgeAuto", "credential_disabled.sql", "TestCodexPooledAliasInvisibleToAnthropicReadersLiveDB",
+		"asserts the pooled Codex alias is invisible to it"},
+	{"SettleCredentialDisabledPause", "credential_disabled.sql", "TestCredentialPromoterUntimedRunsIgnoreSpentBudgetLiveDB",
+		"../workersvc: the promoter's pending-pause settle arm"},
+	{"SettleCredentialDisabledSpentBudget", "credential_disabled.sql", "TestCredentialPromoterUntimedRunsIgnoreSpentBudgetLiveDB",
+		"../workersvc: the promoter's spent-budget settle arm"},
+	{"RecordScheduleHeldFire", "credential_disabled.sql", "TestRunScheduleLastFireLiveDB",
+		"records last_fire for a held one-time schedule"},
+	// Issue #4007 slice A, M1: the terminal preservation store. Later milestones add their writers.
+	{"HasOpenGuardedHoldForWorker", "terminal_preservation.sql", "TestTerminalPreservationGateLiveDB",
+		"../workersvc: the TerminalPreservationGate hold predicate; asserts an open guarded hold of this worker " +
+			"passes and a run with no hold of this worker is refused with no write"},
+	{"InsertTerminalPreservation", "terminal_preservation.sql", "TestTerminalPreservationQueriesLiveDB",
+		"direct call; asserts the insert-or-load contract on a repeated insert"},
+	{"GetTerminalPreservationByRun", "terminal_preservation.sql", "TestTerminalPreservationQueriesLiveDB",
+		"direct call; asserts the ref and lifetime of the loaded row"},
+	{"InsertTerminalContribution", "terminal_preservation.sql", "TestTerminalPreservationQueriesLiveDB",
+		"direct call; asserts the prepared and recorded births and the nullable hold and prior tip"},
+	{"GetTerminalContributionByRunGeneration", "terminal_preservation.sql", "TestTerminalPreservationQueriesLiveDB",
+		"direct call; asserts the generation selects its own row"},
+	{"ListTerminalContributionsForRun", "terminal_preservation.sql", "TestTerminalPreservationQueriesLiveDB",
+		"direct call; asserts the newest-generation-first order"},
+	{"ListTerminalPreservationsDue", "terminal_preservation.sql", "TestTerminalPreservationDueListLiveDB",
+		"direct call; asserts the state filter, the future exclusion, the (next_check_at, id) order and the limit"},
+	{"CountLiveTerminalPreservationsForRepo", "terminal_preservation.sql", "TestDeleteWithLiveTerminalPreservationIs409LiveDB",
+		"../handler: the DELETE /api/repos/{id} pre-check; asserts a pointer-bearing row blocks and a bound row does not"},
+	{"ListLiveTerminalRefsForRepo", "terminal_preservation.sql", "TestDeleteWithLiveTerminalPreservationIs409LiveDB",
+		"../handler: names the refs/uzi-terminal ref in the repo-removal 409"},
+	{"CountLiveTerminalPreservationsForConnection", "terminal_preservation.sql", "TestDeleteWithLiveTerminalPreservationIs409LiveDB",
+		"../handler: the DELETE /api/forge/connections/{id} pre-check"},
+	{"ListLiveTerminalRefsForConnection", "terminal_preservation.sql", "TestDeleteWithLiveTerminalPreservationIs409LiveDB",
+		"../handler: names the refs/uzi-terminal ref in the connection-removal 409"},
+	// Issue #4007 slice A, M3: the worker route's writers. Each is a CAS on the expected state.
+	{"GetTerminalPreservationForUpdate", "terminal_preservation.sql", "TestTerminalPreservationWritersLiveDB",
+		"direct call; asserts the locked read returns the run's preservation"},
+	// Issue #4007 slice A, M5: the completed-publication gate's authoritative reads.
+	{"GetTerminalPreservationForShare", "terminal_preservation.sql", "TestCompletedPublicationTerminalGateLiveDB",
+		"../workersvc: verifyCompletedPublication takes it FOR SHARE before the contribution; the gate cases pass through it"},
+	{"GetTerminalContributionForShare", "terminal_preservation.sql", "TestCompletedPublicationTerminalGateLiveDB",
+		"../workersvc: the pending, refused, published, recorded and other-generation cases decide the hold release"},
+	{"MarkTerminalPreservationPublishing", "terminal_preservation.sql", "TestTerminalPreservationWritersLiveDB",
+		"direct call; asserts the live pointer is set and a wrong expected state or tip changes no row"},
+	{"MarkTerminalPreservationNotPublished", "terminal_preservation.sql", "TestTerminalPreservationWritersLiveDB",
+		"direct call; asserts bound -> not_published once and a refused repeat"},
+	{"SettleTerminalPreservationLive", "terminal_preservation.sql", "TestTerminalPreservationWritersLiveDB",
+		"direct call; asserts the tip advance needs a published contribution and the old tip, and first_published_at is kept"},
+	{"SettleTerminalPreservationRefused", "terminal_preservation.sql", "TestTerminalPreservationWritersLiveDB",
+		"direct call; asserts back to live with a tip, to not_published without one, and refusal while a push may exist"},
+	{"ScheduleTerminalPreservationCheck", "terminal_preservation.sql", "TestTerminalPreservationWritersLiveDB",
+		"direct call; asserts the single-row scheduling write"},
+	{"MarkTerminalContributionInvoked", "terminal_preservation.sql", "TestTerminalInvokeVersusNotPublishedLiveDB",
+		"direct and two-session; asserts the marker needs a publishing preservation in both interleavings"},
+	{"RecordTerminalContributionPublished", "terminal_preservation.sql", "TestTerminalPreservationWritersLiveDB",
+		"direct call; asserts invoked and publish_unknown -> published and a wrong expected state changes no row"},
+	{"RecordTerminalContributionRefused", "terminal_preservation.sql", "TestTerminalPreservationWritersLiveDB",
+		"direct call; asserts a refusal needs its reason and the expected state"},
+	{"RecordTerminalContributionUnknown", "terminal_preservation.sql", "TestTerminalPreservationWritersLiveDB",
+		"direct call; asserts invoked -> publish_unknown once"},
+	// Issue #4007 slice A, M4: the sweep's lanes (reconcile, stale-bound, retire).
+	{"GetTerminalSweepClock", "terminal_preservation.sql", "TestTerminalSweepRetireLiveDB",
+		"../workersvc: the retire observation's database-clock stamp; asserts a stale observation is discarded " +
+			"with no write and a fresh one retires"},
+	{"DeferTerminalPreservation", "terminal_preservation.sql", "TestTerminalSweepReconcileLiveDB",
+		"../workersvc: the sweep's backoff and skip write; asserts attempts and next_check_at move on a listing error " +
+			"and the state does not"},
+	{"MarkTerminalPreservationAbandoned", "terminal_preservation.sql", "TestTerminalSweepReconcileLiveDB",
+		"../workersvc: a foreign tip found by the reconcile lane; asserts publishing -> abandoned, the pointer cleared " +
+			"and the ref never deleted"},
+	{"MarkTerminalPreservationRetiring", "terminal_preservation.sql", "TestTerminalSweepRetireLiveDB",
+		"../workersvc: tx-R1; asserts the stamped decision, and no row for a stale observation or a moved tip"},
+	{"MarkTerminalPreservationDeleted", "terminal_preservation.sql", "TestTerminalSweepRetireIrrevocableLiveDB",
+		"../workersvc: tx-R2; asserts retiring -> deleted with the pointer cleared and deleted_at set"},
+	{"GetTerminalRetireBlocker", "terminal_preservation.sql", "TestTerminalSweepRetireLiveDB",
+		"../workersvc: the independent protections re-checked under the run lock; asserts each keeps the ref and " +
+			"writes its typed reason"},
+	{"GetWorkerIdleness", "hibernation_auto.sql", "TestHibernationAutoIdlenessLiveDB",
+		"issue #4207; reached through svc.HibernationAutoPass (../workersvc); the test asserts the count and anchor for every run kind and status, including a run that finished just now"},
+	{"ListAutoHibernationCandidates", "hibernation_auto.sql", "TestHibernationAutoCandidateOrderingLiveDB",
+		"issue #4207; reached through svc.HibernationAutoPass (../workersvc); the test asserts a pile of recently blocked workers cannot starve a clean one"},
+	{"SetWorkerHibernationBlocked", "hibernation_auto.sql", "TestHibernationAutoRefusalRecordedLiveDB",
+		"issue #4207; reached through svc.HibernationAutoPass (../workersvc); the test asserts the recorded reason, the since-on-change rule and the clear on admission"},
+	{"ListAutoHibernationBlockers", "hibernation_auto.sql", "TestAdminHealthHibernationAutoLiveDB",
+		"issue #4207; reached through GET /api/admin/health (../handler health_hibernation_auto_livedb_test.go), which asserts the listed idle and parked workers by name, the stale-marker, young-park and mixed-run exclusions; TestListAutoHibernationBlockersExactTotalLiveDB asserts the exact total and oldest since under the row limit"},
 }
 
 var sqlQueryNameRe = regexp.MustCompile(`(?m)^-- name: (\w+) `)
