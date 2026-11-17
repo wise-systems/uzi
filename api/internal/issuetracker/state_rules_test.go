@@ -18,7 +18,9 @@ func TestClosableState(t *testing.T) {
 		{"Can't Reproduce", State{Name: "Can't Reproduce", Resolved: true}, false},
 		{"archived Fixed", State{Name: "Fixed", Resolved: true, Archived: true}, false},
 		{"unresolved Done", State{Name: "Done", Resolved: false}, false},
-		{"localized name only", State{Name: "Erledigt", LocalizedName: "Fixed", Resolved: true}, true},
+		{"non-ASCII name, localized Fixed", State{Name: "Готово", LocalizedName: "Fixed", Resolved: true}, true},
+		{"Won't fix localized as Fixed", State{Name: "Won't fix", LocalizedName: "Fixed", Resolved: true}, false},
+		{"ASCII name, localized Fixed", State{Name: "Erledigt", LocalizedName: "Fixed", Resolved: true}, false},
 		{"Erledigt", State{Name: "Erledigt", Resolved: true}, false},
 		{"empty", State{Resolved: true}, false},
 	} {

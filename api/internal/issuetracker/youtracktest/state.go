@@ -358,7 +358,16 @@ func (m *model) issueJSON(i *issue) map[string]any {
 // name of the State field and of the State value, as YouTrack lists it.
 func (m *model) customFieldsJSON(i *issue) []map[string]any {
 	v := m.stateByID(i.stateID)
-	if v == nil && len(m.states) > 0 {
+	if v == nil && i.resolved != nil {
+		// A resolved issue with no recorded State value reads as the first
+		// resolved one, so it never reads as open.
+		for k := range m.states {
+			if m.states[k].resolved && !m.states[k].archived {
+				v = &m.states[k]
+				break
+			}
+		}
+	} else if v == nil && len(m.states) > 0 {
 		v = &m.states[0]
 	}
 	var value any

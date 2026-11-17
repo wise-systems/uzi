@@ -66,6 +66,10 @@ var errCustomFieldCeiling = errors.New("issuetracker: an issue carries more cust
 // object, refused before decoding so a bad element costs no error value.
 var errTagNotObject = errors.New("issuetracker: a tag is not a JSON object")
 
+// errCustomFieldNotObject is returned when a customFields array holds an
+// element that is not an object.
+var errCustomFieldNotObject = errors.New("issuetracker: a custom field is not a JSON object")
+
 // ytTags is a nested tag array. Its UnmarshalJSON counts the elements with a
 // byte scan and refuses above maxNestedItems before anything is decoded, so one
 // object cannot make the decoder allocate a slice as large as the response. It
@@ -412,7 +416,7 @@ func (c *ytCustomFields) UnmarshalJSON(b []byte) error {
 		return errCustomFieldCeiling
 	}
 	if !onlyObjects(b) {
-		return errTagNotObject
+		return errCustomFieldNotObject
 	}
 	return json.Unmarshal(b, (*[]ytCustomField)(c))
 }

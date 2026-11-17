@@ -57,9 +57,9 @@ func (y *youTrack) ListIssuesWithState(ctx context.Context, projectID int64, opt
 		}
 	}
 	byTag := len(opts.Labels) > 0
-	path, query := []string{"issues"}, url.Values{"query": {issueQuery(p.ShortName, opts)}, "fields": {issueFields}}
+	path, query := []string{"issues"}, url.Values{"query": {issueQuery(p.ShortName, opts)}, "fields": {listingIssueFields}}
 	if byTag {
-		path, query = []string{"tags", y.listingTagID(opts.Labels, tagIDs), "issues"}, url.Values{"fields": {issueFields}}
+		path, query = []string{"tags", y.listingTagID(opts.Labels, tagIDs), "issues"}, url.Values{"fields": {listingIssueFields}}
 	}
 	var matched []ytIssue
 	seen := map[string]bool{}

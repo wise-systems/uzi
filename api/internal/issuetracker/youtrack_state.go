@@ -29,14 +29,15 @@ func (y *youTrack) SetIssueState(ctx context.Context, projectID, issueIID int64,
 	if value == "" {
 		return y.red.sentinel(ErrStateMappingUnset, 0, "no value configured for "+string(state))
 	}
-	if err := y.checkTargetState(ctx, value, closing); err != nil {
+	target, err := y.checkTargetState(ctx, value, closing)
+	if err != nil {
 		return err
 	}
 	w, err := y.resolveIssue(ctx, projectID, issueIID)
 	if err != nil {
 		return err
 	}
-	return y.writeState(ctx, w, value)
+	return y.writeState(ctx, w, target)
 }
 
 // MoveToColumn moves the issue to a board column by writing the State value the
@@ -66,18 +67,20 @@ func (y *youTrack) moveToColumn(ctx context.Context, projectID, issueIID int64, 
 		}
 		value = v
 	}
-	if err := y.checkTargetState(ctx, value, false); err != nil {
+	target, err := y.checkTargetState(ctx, value, false)
+	if err != nil {
 		return err
 	}
 	w, err := y.resolveIssue(ctx, projectID, issueIID)
 	if err != nil {
 		return err
 	}
-	return y.writeState(ctx, w, value)
+	return y.writeState(ctx, w, target)
 }
 
-// writeState sets the State field of issue w to the value named value.
-func (y *youTrack) writeState(ctx context.Context, w ytIssue, value string) error {
+// writeState sets the State field of issue w to s, the value checkTargetState
+// approved, addressed by its id so the write cannot land on another value.
+func (y *youTrack) writeState(ctx context.Context, w ytIssue, s State) error {
 	_, _, err := y.do(ctx, ytCall{
 		method: http.MethodPost,
 		path:   []string{"issues", w.ID},
@@ -85,7 +88,7 @@ func (y *youTrack) writeState(ctx context.Context, w ytIssue, value string) erro
 		body: map[string]any{"customFields": []any{map[string]any{
 			"name":  y.stateField,
 			"$type": "StateIssueCustomField",
-			"value": map[string]string{"name": value},
+			"value": map[string]string{"id": s.ID},
 		}}},
 		limit: objectBytes,
 		prov:  forge.ResponseSuccess,
@@ -97,20 +100,21 @@ func (y *youTrack) writeState(ctx context.Context, w ytIssue, value string) erro
 // path) and refuses, with ErrStateNotAllowed, a target that the bundle lacks, or
 // that is not closable when closing, or not openable otherwise. It runs before
 // every State write, so a bundle edited after the mapping was saved is caught.
+// It returns the matched State, which is the one to write.
 // The error quotes the name through quoteName, which bounds it.
-func (y *youTrack) checkTargetState(ctx context.Context, name string, closing bool) error {
+func (y *youTrack) checkTargetState(ctx context.Context, name string, closing bool) (State, error) {
 	states, err := y.ListStates(ctx, y.project.ID)
 	if err != nil {
-		return err
+		return State{}, err
 	}
 	for _, s := range states {
 		if s.Name != name {
 			continue
 		}
 		if closing && ClosableState(s) || !closing && OpenableState(s) {
-			return nil
+			return s, nil
 		}
-		return y.red.sentinel(ErrStateNotAllowed, 0, "the state is not allowed in this role: "+quoteName(name))
+		return State{}, y.red.sentinel(ErrStateNotAllowed, 0, "the state is not allowed in this role: "+quoteName(name))
 	}
-	return y.red.sentinel(ErrStateNotAllowed, 0, "the project's state bundle has no such state: "+quoteName(name))
+	return State{}, y.red.sentinel(ErrStateNotAllowed, 0, "the project's state bundle has no such state: "+quoteName(name))
 }

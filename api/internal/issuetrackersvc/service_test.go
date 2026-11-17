@@ -491,7 +491,7 @@ func TestDriverForOpensTokenAndPassesOptions(t *testing.T) {
 		BaseURL: testHost, Token: tok, Project: binding.Project, ProjectID: 4173, EligibilityTag: binding.EligibilityTag,
 		StateField: "State", OpenState: "Open", ClosedState: "Done",
 	}
-	if len(h.built) != 1 || h.built[0] != want {
+	if len(h.built) != 1 || !reflect.DeepEqual(h.built[0], want) {
 		t.Errorf("built = %+v, want %+v", h.built, want)
 	}
 	_, err = h.svc.DriverFor(ctx, uuid.New(), c.ID, binding, "", "", "")

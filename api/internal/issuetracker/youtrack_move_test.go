@@ -2,6 +2,7 @@ package issuetracker
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -350,5 +351,110 @@ func TestListIssuesWithStateRefusesTooManyCustomFields(t *testing.T) {
 				t.Errorf("got %+v, %v; want one issue in Open", got, err)
 			}
 		})
+	}
+}
+
+func TestSetIssueStateRefusesAWontFixRelabelledByLocalizedName(t *testing.T) {
+	y, srv := columnDriver(t, func(o *Options) { o.ClosedState = "Won't fix" })
+	srv.SetStateLocalizedName("Won't fix", "Fixed")
+	n := srv.SeedIssue("t", "")
+	srv.ResetRequests()
+	err := y.SetIssueState(context.Background(), testProjectID, n, forge.StateClosed)
+	if !errors.Is(err, ErrStateNotAllowed) {
+		t.Fatalf("SetIssueState = %v, want ErrStateNotAllowed", err)
+	}
+	if w := writesOf(srv); len(w) != 0 {
+		t.Errorf("writes sent: %v", w)
+	}
+}
+
+func TestStateChecksRunBeforeTheIssueIsRead(t *testing.T) {
+	// A moved-away issue and a disallowed target: the state check comes first.
+	y, srv := columnDriver(t, func(o *Options) { o.ClosedState = "Won't fix" })
+	n := srv.SeedIssue("t", "")
+	srv.MoveIssue(n, youtracktest.OtherProjectID)
+	srv.ResetRequests()
+	ctx := context.Background()
+	for name, err := range map[string]error{
+		"SetIssueState": y.SetIssueState(ctx, testProjectID, n, forge.StateClosed),
+		"MoveToColumn":  y.MoveToColumn(ctx, testProjectID, n, "Lost"),
+	} {
+		if !errors.Is(err, ErrStateNotAllowed) || isNotFound(err) {
+			t.Errorf("%s = %v, want ErrStateNotAllowed and not an IssueNotFoundError", name, err)
+		}
+	}
+	if w := writesOf(srv); len(w) != 0 {
+		t.Errorf("writes sent: %v", w)
+	}
+}
+
+func TestOnlyTheListingAsksForCustomFields(t *testing.T) {
+	y, srv := columnDriver(t, nil)
+	n := srv.SeedIssue("t", "")
+	ctx := context.Background()
+	srv.ResetRequests()
+	if _, err := y.GetIssue(ctx, testProjectID, n); err != nil {
+		t.Fatal(err)
+	}
+	if err := y.MoveToColumn(ctx, testProjectID, n, "In Progress"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := y.CreateIssue(ctx, testProjectID, "c", "", nil); err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range srv.Requests() {
+		if r.Method == http.MethodGet && strings.HasPrefix(r.Path, "/api/issues/") || r.Method == http.MethodPost && r.Path == "/api/issues" {
+			if strings.Contains(r.RawQuery, "customFields") {
+				t.Errorf("%s %s asked for custom fields: %s", r.Method, r.Path, r.RawQuery)
+			}
+		}
+	}
+	srv.ResetRequests()
+	if _, err := y.ListIssuesWithState(ctx, testProjectID, forge.ListIssuesOptions{State: forge.StateAll}); err != nil {
+		t.Fatal(err)
+	}
+	if rs := srv.Requests(); len(rs) != 1 || !strings.Contains(rs[0].RawQuery, "customFields") {
+		t.Errorf("the listing sent %v, want one request asking for customFields", rs)
+	}
+}
+
+func TestListIssuesWithStateReadsAStateMachineField(t *testing.T) {
+	field := func(typ string) string {
+		return `{"$type":"` + typ + `","name":"State","value":{"$type":"StateBundleElement","name":"Review"}}`
+	}
+	for typ, want := range map[string]string{
+		"StateIssueCustomField":        "Review",
+		"StateMachineIssueCustomField": "Review",
+		"SimpleIssueCustomField":       "",
+	} {
+		body := "[" + strings.TrimSuffix(rawIssue("2-1", "UZI-1", 1, "0-1", ""), `}`) + `,"customFields":[` + field(typ) + `]}]`
+		y, _ := loggedDriver(t, func(w http.ResponseWriter, _ *http.Request) { writeRaw(w, body) })
+		got, err := y.ListIssuesWithState(context.Background(), testProjectID, forge.ListIssuesOptions{State: forge.StateAll})
+		if err != nil || len(got) != 1 || got[0].State != want {
+			t.Errorf("%s: got %+v, %v; want State %q", typ, got, err, want)
+		}
+	}
+}
+
+func TestRepeatedCustomFieldsKeyLeavesNoStaleState(t *testing.T) {
+	// The second "customFields" key reuses the first one's backing array and
+	// omits the value; the first key's State name must not survive.
+	const state = `{"$type":"StateIssueCustomField","name":"State"`
+	raw := strings.TrimSuffix(rawIssue("2-1", "UZI-1", 1, "0-1", ""), `}`) +
+		`,"customFields":[` + state + `,"value":{"name":"Open"}}],"customFields":[` + state + `}]}`
+	var w ytIssue
+	if err := json.Unmarshal([]byte(raw), &w); err != nil {
+		t.Fatal(err)
+	}
+	y := &youTrack{stateField: "State"}
+	if got := y.stateName(w); got != "" {
+		t.Errorf("stateName = %q, want empty after the later key omitted the value", got)
+	}
+}
+
+func TestCustomFieldNotObjectHasItsOwnError(t *testing.T) {
+	var c ytCustomFields
+	if err := c.UnmarshalJSON([]byte(`[1]`)); !errors.Is(err, errCustomFieldNotObject) {
+		t.Errorf("err = %v, want errCustomFieldNotObject", err)
 	}
 }

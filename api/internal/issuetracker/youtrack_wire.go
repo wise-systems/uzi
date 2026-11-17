@@ -10,13 +10,16 @@ import (
 
 // fields parameters. YouTrack returns only what is asked for.
 const (
-	issueFields     = "id,idReadable,numberInProject,summary,description,created,updated,resolved,reporter(id,login),tags(id,name,owner(id)),project(id,shortName),customFields(name,$type,value(name))"
-	tagFields       = "id,name"
-	ownedTagFields  = "id,name,owner(id)"
-	sharingFields   = "permittedGroups(id,name,allUsersGroup,usersCount),permittedUsers(id,login)"
-	sharedTagFields = "id,name,owner(id,login),readSharingSettings(" + sharingFields + "),tagSharingSettings(" + sharingFields + ")"
-	commentFields   = "id,text,created,deleted,author(id,login)"
-	activityFields  = "id,timestamp,author(id,login),added(id,name,owner(id)),removed(id,name,owner(id))"
+	issueFields = "id,idReadable,numberInProject,summary,description,created,updated,resolved,reporter(id,login),tags(id,name,owner(id)),project(id,shortName)"
+	// listingIssueFields adds the custom fields the listing reads the State from;
+	// the single-issue reads do not ask for them.
+	listingIssueFields = issueFields + ",customFields(name,$type,value(name))"
+	tagFields          = "id,name"
+	ownedTagFields     = "id,name,owner(id)"
+	sharingFields      = "permittedGroups(id,name,allUsersGroup,usersCount),permittedUsers(id,login)"
+	sharedTagFields    = "id,name,owner(id,login),readSharingSettings(" + sharingFields + "),tagSharingSettings(" + sharingFields + ")"
+	commentFields      = "id,text,created,deleted,author(id,login)"
+	activityFields     = "id,timestamp,author(id,login),added(id,name,owner(id)),removed(id,name,owner(id))"
 )
 
 // idReadableRE matches an id-readable such as "UZI-15"; it ends up in WebURL.
@@ -85,13 +88,14 @@ type ytIssue struct {
 	CustomFields ytCustomFields `json:"customFields"`
 }
 
-func (w ytIssue) nestedCount() int { return len(w.Tags) + len(w.CustomFields) }
+func (w ytIssue) nestedCount() int { return len(w.Tags) }
 
-// stateName returns the name of the issue's State field value, or "" when the
+// stateName returns the name (a state-machine field is read like a state one;
+// writes use StateIssueCustomField only) of the issue's State field value, or "" when the
 // issue has none or the name is one stateNameProblem refuses.
 func (y *youTrack) stateName(w ytIssue) string {
 	for _, f := range w.CustomFields {
-		if f.Name == y.stateField && f.Type == "StateIssueCustomField" {
+		if f.Name == y.stateField && (f.Type == "StateIssueCustomField" || f.Type == "StateMachineIssueCustomField") {
 			if stateNameProblem(f.Value.Name) {
 				return ""
 			}

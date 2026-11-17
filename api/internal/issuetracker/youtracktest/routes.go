@@ -402,6 +402,7 @@ func (s *Server) updateIssue(w http.ResponseWriter, r *http.Request) {
 			Name  string `json:"name"`
 			Type  string `json:"$type"`
 			Value struct {
+				ID   string `json:"id"`
 				Name string `json:"name"`
 			} `json:"value"`
 		} `json:"customFields"`
@@ -415,7 +416,14 @@ func (s *Server) updateIssue(w http.ResponseWriter, r *http.Request) {
 		i.activities = append(i.activities, &activity{id: s.m.textActivityID(), category: catDescription, timestamp: i.updated, author: BotLogin})
 	}
 	for _, cf := range body.CustomFields {
-		v := s.m.stateByName(cf.Value.Name)
+		// A State value is addressed by id, or by name when no id is sent;
+		// anything the bundle lacks is refused below.
+		var v *stateValue
+		if cf.Value.ID != "" {
+			v = s.m.stateByID(cf.Value.ID)
+		} else {
+			v = s.m.stateByName(cf.Value.Name)
+		}
 		if cf.Name != s.m.stateField || cf.Type != "StateIssueCustomField" || v == nil {
 			writeError(w, http.StatusBadRequest, "Bad Request", "unsupported custom field update")
 			return

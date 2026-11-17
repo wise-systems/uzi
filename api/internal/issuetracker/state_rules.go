@@ -18,13 +18,28 @@ var closableNames = map[string]bool{
 }
 
 // ClosableState reports whether s may be written as the closed state: it is
-// resolved, not archived, and its name or localized name is one of closableNames
-// once normalised.
+// resolved, not archived, and its name is one of closableNames once
+// normalised, or its localized name is when the name is not pure ASCII.
 func ClosableState(s State) bool {
 	if !s.Resolved || s.Archived {
 		return false
 	}
-	return closableNames[normaliseStateName(s.Name)] || closableNames[normaliseStateName(s.LocalizedName)]
+	if closableNames[normaliseStateName(s.Name)] {
+		return true
+	}
+	// The localized name is consulted only for a name that is not pure ASCII (a
+	// non-English name with an English localized one). For an ASCII name it
+	// could otherwise relabel "Won't fix" as "Fixed".
+	return !isASCII(s.Name) && closableNames[normaliseStateName(s.LocalizedName)]
+}
+
+func isASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= 0x80 {
+			return false
+		}
+	}
+	return true
 }
 
 // OpenableState reports whether s may be written as the open state or as a
