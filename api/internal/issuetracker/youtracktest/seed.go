@@ -112,6 +112,19 @@ func (s *Server) SeedIssue(summary, description string, tagIDs ...string) int64 
 	return i.number
 }
 
+// SeedResolvedIssue creates an issue in the main project that is resolved but
+// has no State value recorded, as an issue resolved before the State field
+// existed, and returns its number.
+func (s *Server) SeedResolvedIssue(summary string) int64 {
+	s.t.Helper()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	i := s.m.newIssue(s.m.projectByID(ProjectID), summary, "")
+	ts := s.m.now()
+	i.resolved = &ts
+	return i.number
+}
+
 // SetReporter makes login the reporter of issue number n. A seeded issue is
 // reported by BotLogin (the account the token authenticates as) until this says
 // otherwise, so a test of an author that is not the connection's account sets it.

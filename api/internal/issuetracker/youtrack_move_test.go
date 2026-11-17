@@ -413,8 +413,65 @@ func TestOnlyTheListingAsksForCustomFields(t *testing.T) {
 	if _, err := y.ListIssuesWithState(ctx, testProjectID, forge.ListIssuesOptions{State: forge.StateAll}); err != nil {
 		t.Fatal(err)
 	}
-	if rs := srv.Requests(); len(rs) != 1 || !strings.Contains(rs[0].RawQuery, "customFields") {
-		t.Errorf("the listing sent %v, want one request asking for customFields", rs)
+	rs := srv.Requests()
+	if len(rs) == 0 {
+		t.Fatal("the listing sent no request")
+	}
+	for _, r := range rs {
+		if !strings.Contains(r.RawQuery, "customFields") {
+			t.Errorf("listing request %s %s did not ask for customFields: %s", r.Method, r.Path, r.RawQuery)
+		}
+	}
+}
+
+func TestListIssuesWithStateReadsTheFirstResolvedStateOfAResolvedIssue(t *testing.T) {
+	y, srv := columnDriver(t, nil)
+	n := srv.SeedResolvedIssue("old")
+	srv.SetStateArchived("Fixed", true)
+	srv.SeedState("Done", true)
+	got, err := y.ListIssuesWithState(context.Background(), testProjectID, forge.ListIssuesOptions{State: forge.StateAll})
+	if err != nil || len(got) != 1 || got[0].Issue.IID != n {
+		t.Fatalf("listed %+v, %v", got, err)
+	}
+	// Open is unresolved and Fixed archived; "Won't fix" is the first resolved,
+	// non-archived state in the bundle.
+	if got[0].State != "Won't fix" {
+		t.Errorf("State = %q, want the first resolved, non-archived state", got[0].State)
+	}
+}
+
+func TestSetIssueStateRefusesAWontFixRelabelledWithACurlyApostrophe(t *testing.T) {
+	y, srv := columnDriver(t, nil)
+	curly := "Won\u2019t fix"
+	srv.RenameState("Won't fix", curly)
+	srv.SetStateLocalizedName(curly, "Fixed")
+	y.closedState = curly
+	n := srv.SeedIssue("t", "")
+	srv.ResetRequests()
+	err := y.SetIssueState(context.Background(), testProjectID, n, forge.StateClosed)
+	if !errors.Is(err, ErrStateNotAllowed) {
+		t.Fatalf("SetIssueState = %v, want ErrStateNotAllowed", err)
+	}
+	if w := writesOf(srv); len(w) != 0 {
+		t.Errorf("writes sent: %v", w)
+	}
+}
+
+func TestAFillerInAStateNameIsDroppedAndNotClosable(t *testing.T) {
+	y, srv := columnDriver(t, nil)
+	name := "Won't fix\u3164"
+	srv.RenameState("Won't fix", name)
+	states, err := y.ListStates(context.Background(), "0-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range states {
+		if s.Name == name {
+			t.Errorf("ListStates kept %q", name)
+		}
+	}
+	if ClosableState(State{Name: name, Resolved: true}) {
+		t.Error("ClosableState accepted a name with a filler")
 	}
 }
 

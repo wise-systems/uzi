@@ -416,13 +416,11 @@ func (s *Server) updateIssue(w http.ResponseWriter, r *http.Request) {
 		i.activities = append(i.activities, &activity{id: s.m.textActivityID(), category: catDescription, timestamp: i.updated, author: BotLogin})
 	}
 	for _, cf := range body.CustomFields {
-		// A State value is addressed by id, or by name when no id is sent;
-		// anything the bundle lacks is refused below.
+		// A State value must be addressed by id: a write by name is refused, so
+		// a driver that sends only a name fails its tests.
 		var v *stateValue
 		if cf.Value.ID != "" {
 			v = s.m.stateByID(cf.Value.ID)
-		} else {
-			v = s.m.stateByName(cf.Value.Name)
 		}
 		if cf.Name != s.m.stateField || cf.Type != "StateIssueCustomField" || v == nil {
 			writeError(w, http.StatusBadRequest, "Bad Request", "unsupported custom field update")

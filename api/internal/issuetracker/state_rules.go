@@ -18,33 +18,24 @@ var closableNames = map[string]bool{
 }
 
 // ClosableState reports whether s may be written as the closed state: it is
-// resolved, not archived, and its name is one of closableNames once
-// normalised, or its localized name is when the name is not pure ASCII.
+// resolved, not archived, its name passes stateNameProblem, and its name is one
+// of closableNames once normalised. Only Name decides. LocalizedName is display
+// text that the same bundle administrator sets freely, so consulting it would
+// let a won't-fix state relabelled "Fixed" through; a done state named only in
+// another language is therefore refused.
 func ClosableState(s State) bool {
-	if !s.Resolved || s.Archived {
+	if !s.Resolved || s.Archived || stateNameProblem(s.Name) {
 		return false
 	}
-	if closableNames[normaliseStateName(s.Name)] {
-		return true
-	}
-	// The localized name is consulted only for a name that is not pure ASCII (a
-	// non-English name with an English localized one). For an ASCII name it
-	// could otherwise relabel "Won't fix" as "Fixed".
-	return !isASCII(s.Name) && closableNames[normaliseStateName(s.LocalizedName)]
-}
-
-func isASCII(s string) bool {
-	for i := 0; i < len(s); i++ {
-		if s[i] >= 0x80 {
-			return false
-		}
-	}
-	return true
+	return closableNames[normaliseStateName(s.Name)]
 }
 
 // OpenableState reports whether s may be written as the open state or as a
-// board column's state: it is unresolved and not archived.
-func OpenableState(s State) bool { return !s.Resolved && !s.Archived }
+// board column's state: it is unresolved, not archived, and its name passes
+// stateNameProblem.
+func OpenableState(s State) bool {
+	return !s.Resolved && !s.Archived && !stateNameProblem(s.Name)
+}
 
 // normaliseStateName lower-cases name, trims it and collapses each run of
 // whitespace, '-' and '_' to one space.
@@ -57,18 +48,30 @@ func normaliseStateName(name string) string {
 
 // stateNameProblem reports whether a State name read from the issue tracker is
 // one the driver will not pass on: blank, over maxLabelNameLen bytes, or
-// carrying an invisible or control character. Any user who administers a bundle
+// carrying an invisible or control character, a default-ignorable code point or
+// a blank filler (Hangul and Braille fillers). Any user who administers a bundle
 // can name a state, and the name ends up in errors and in the board.
 func stateNameProblem(name string) bool {
 	if strings.TrimSpace(name) == "" || len(name) > maxLabelNameLen {
 		return true
 	}
 	for _, c := range name {
-		if InvisibleRune(c) {
+		if InvisibleRune(c) || stateNameFiller(c) {
 			return true
 		}
 	}
 	return false
+}
+
+// stateNameFiller reports whether c is a default-ignorable code point or one of
+// the fillers that render blank: U+115F, U+1160, U+2800, U+3164 and U+FFA0.
+// InvisibleRune is shared with other callers and is left as it is.
+func stateNameFiller(c rune) bool {
+	switch c {
+	case 0x115F, 0x1160, 0x2800, 0x3164, 0xFFA0:
+		return true
+	}
+	return unicode.Is(unicode.Other_Default_Ignorable_Code_Point, c)
 }
 
 // maxQuotedNameLen bounds the name quoteName puts in an error.
