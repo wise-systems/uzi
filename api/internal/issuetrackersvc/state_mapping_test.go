@@ -179,3 +179,15 @@ func TestSetStateMappingAcceptsABracedState(t *testing.T) {
 		t.Fatalf("SetStateMapping with a braced State: %v", err)
 	}
 }
+
+// A brace in a column label is refused even when the label is a board column (one set
+// before the repo was linked): the label rule is the driver's tag-name rule.
+func TestSetStateMappingRefusesABracedColumnLabel(t *testing.T) {
+	h := newYTHarness(t)
+	repo := linkedMappingRepo(t, h)
+	h.q.setBoardColumns(repo, "In {Progress}", "Review")
+	m := validMapping()
+	m.Columns[0].LabelName = "In {Progress}"
+	_, err := h.svc.SetStateMapping(context.Background(), h.user, repo, m)
+	wantMappingErr(t, err, KindBadRequest, "brace")
+}

@@ -46,16 +46,16 @@ func normaliseStateName(name string) string {
 	return strings.Join(fields, " ")
 }
 
+// StateNameProblem is stateNameProblem for callers outside the package: a caller that
+// stores a State name the driver listed checks it with the same rule.
+func StateNameProblem(name string) bool { return stateNameProblem(name) }
+
 // stateNameProblem reports whether a State name read from the issue tracker is
 // one the driver will not pass on: blank, over maxLabelNameLen bytes, or
 // carrying an invisible or control character, an ignorable code point, a
 // variation selector or a blank filler (Hangul and Braille fillers). Any user
 // who administers a bundle can name a state, and the name ends up in errors and
 // in the board.
-// StateNameProblem is stateNameProblem for callers outside the package: a caller that
-// stores a State name the driver listed checks it with the same rule.
-func StateNameProblem(name string) bool { return stateNameProblem(name) }
-
 func stateNameProblem(name string) bool {
 	if strings.TrimSpace(name) == "" || len(name) > maxLabelNameLen {
 		return true
