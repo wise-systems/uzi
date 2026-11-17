@@ -16,9 +16,15 @@ import (
 // the method name plus its arguments, formatted by formatArg. It exists so a
 // test can pin the exact set of forge calls a code path makes (a golden
 // record, see AssertGolden) and notice when a later refactor changes it.
-// Only calls are recorded, never results; the wrapped Forge supplies those.
+// Only calls are recorded, never results; the wrapped Forge supplies the
+// results of every method except MoveToColumn.
 //
-// Safe for concurrent use. Calls() keeps call order.
+// MoveToColumn is the exception: its line goes to Moves(), not Calls(), and it
+// runs forge.MoveByLabels over the Recorder, so the wrapped Forge's own
+// MoveToColumn is never called; only the EnsureLabels and UpdateIssueLabels
+// calls reach it.
+//
+// Safe for concurrent use. Calls() and Moves() keep call order.
 //
 // Recorder implements only forge.Forge. It hides any optional interface the
 // wrapped value also implements (for example ProjectBoardSyncer), so code that

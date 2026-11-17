@@ -21,6 +21,7 @@ const contractProjectID = 4173
 func TestYouTrackContract(t *testing.T) {
 	issuetrackertest.RunContract(t, func(t *testing.T) issuetrackertest.Subject {
 		srv := youtracktest.NewServer(t)
+		const openState = "Open"
 		// Two columns mapped to unresolved State values the fake's bundle holds.
 		columns := []string{"contract-column-a", "contract-column-b"}
 		stateOf := map[string]string{columns[0]: "Contract State A", columns[1]: "Contract State B"}
@@ -32,7 +33,7 @@ func TestYouTrackContract(t *testing.T) {
 			Token:        srv.Token,
 			Project:      issuetracker.ProjectRef{ID: youtracktest.ProjectID, ShortName: youtracktest.ProjectShortName},
 			ProjectID:    contractProjectID,
-			OpenState:    "Open",
+			OpenState:    openState,
 			ClosedState:  "Fixed",
 			ColumnStates: stateOf,
 			EligibilityTag: issuetracker.TagRef{
@@ -56,7 +57,11 @@ func TestYouTrackContract(t *testing.T) {
 						return column, nil
 					}
 				}
-				return "", nil
+				if state == openState {
+					return "", nil
+				}
+				// Any other unmapped State is a failure, not the Open column.
+				return "unmapped State " + state, nil
 			},
 			SeedHumanComment: func(t *testing.T, iid int64, username, body string) {
 				srv.SeedComment(iid, username, body)

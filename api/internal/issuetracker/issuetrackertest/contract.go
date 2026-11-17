@@ -327,6 +327,19 @@ func (c *contract) guardedMove() forge.ColumnMove {
 	return forge.ColumnMove{Column: column, Ensure: []forge.Label{{Name: column}}, Add: []string{column}}
 }
 
+// columnOf is ColumnOf for issue iid, or "" when the subject has no ColumnOf.
+func (c *contract) columnOf(t *testing.T, iid int64) string {
+	t.Helper()
+	if c.ColumnOf == nil {
+		return ""
+	}
+	column, err := c.ColumnOf(c.ctx, iid)
+	if err != nil {
+		t.Fatalf("ColumnOf: %v", err)
+	}
+	return column
+}
+
 func caseSetState(t *testing.T, c *contract) {
 	label := unique("contract-label")
 	c.ensure(t, label)
@@ -483,6 +496,7 @@ func caseProjectGuard(t *testing.T, c *contract) {
 	c.ensure(t, label)
 	issue := c.create(t, "guarded", label)
 	it, pid, iid := c.IssueTracker, c.OtherProjectID, issue.IID
+	columnBefore := c.columnOf(t, iid)
 	calls := map[string]func() error{
 		"ListLabels":   func() error { _, err := it.ListLabels(c.ctx, pid); return err },
 		"EnsureLabels": func() error { return it.EnsureLabels(c.ctx, pid, []forge.Label{{Name: unique("contract-label")}}) },
@@ -514,6 +528,9 @@ func caseProjectGuard(t *testing.T, c *contract) {
 	got := c.get(t, iid)
 	if got.Description != "guarded" || got.State != string(forge.StateOpened) || !sameSet(got.Labels, []string{label}) {
 		t.Errorf("a guarded call changed the issue: %+v", got)
+	}
+	if columnAfter := c.columnOf(t, iid); columnAfter != columnBefore {
+		t.Errorf("a refused MoveToColumn changed the column from %q to %q", columnBefore, columnAfter)
 	}
 	comments, err := it.ListIssueComments(c.ctx, c.ProjectID, iid)
 	if err != nil {

@@ -895,6 +895,45 @@ func TestAutoMoveEnsuresTargetColumnLabel(t *testing.T) {
 	})
 }
 
+// moveRecordingForge records the ColumnMove each MoveToColumn receives, then
+// delegates to fakeForge's label-backed move.
+type moveRecordingForge struct {
+	fakeForge
+	moves []forge.ColumnMove
+}
+
+func (f *moveRecordingForge) MoveToColumn(ctx context.Context, p, i int64, m forge.ColumnMove) error {
+	f.moves = append(f.moves, m)
+	return f.fakeForge.MoveToColumn(ctx, p, i, m)
+}
+
+// TestAutoMovePassesTargetAsMoveColumn pins the Column AutoMove hands to the
+// issue tracker: the target column's name, and "" for the Open target. An issue
+// tracker with its own workflow field reads only this field.
+func TestAutoMovePassesTargetAsMoveColumn(t *testing.T) {
+	for _, tc := range []struct {
+		name, target string
+		labels       []string
+	}{
+		{"named column", "Planned", nil},
+		{"open target", "", []string{"Planned"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			svc := newTestService(&fakeStore{})
+			f := &moveRecordingForge{}
+			if _, err := svc.AutoMove(context.Background(), f, 7, autoMoveIssue(t, tc.labels...), boardColumns(), tc.target); err != nil {
+				t.Fatalf("AutoMove: %v", err)
+			}
+			if len(f.moves) != 1 {
+				t.Fatalf("MoveToColumn calls = %d, want 1: %+v", len(f.moves), f.moves)
+			}
+			if f.moves[0].Column != tc.target {
+				t.Fatalf("ColumnMove.Column = %q, want %q", f.moves[0].Column, tc.target)
+			}
+		})
+	}
+}
+
 // assertBound compares one fetch's UpdatedAfter against a want, where nil means
 // "this fetch must carry no lower bound at all". Split out so the nil case is
 // asserted as deliberately as the set case: `got != nil` on its own reads as a
