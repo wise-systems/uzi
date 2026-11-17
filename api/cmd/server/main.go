@@ -1195,6 +1195,7 @@ func run() error {
 		CIWatchRunWindow:             cfg.CIWatchRunWindow,
 		Registry:                     healthBeats,
 		ForgeSyncRegistry:            forgeHealth.ForgeSyncRegistry,
+		IssueTrackerSyncRegistry:     forgeHealth.IssueTrackerSyncRegistry,
 		ForgeSyncInterval:            forgeHealth.ForgeSyncInterval,
 	})
 	// M6 wires the notice fan-out into the SAME reconciler: the persist-first notifysvc

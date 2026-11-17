@@ -310,3 +310,28 @@ func TestListTagsWithVerdicts(t *testing.T) {
 
 // errOf drops a value and keeps the error, so a refusal reads as one expression.
 func errOf[T any](_ T, err error) error { return err }
+
+// The store caps both ids at 128 characters; a longer one is a bad request, not
+// a check violation surfacing as an internal error.
+func TestLinkRepoRefusesIDsLongerThanTheStoreHolds(t *testing.T) {
+	over := "1-" + strings.Repeat("9", 127) // 129 characters
+	t.Run("project id", func(t *testing.T) {
+		h := newLinkHarness(t)
+		h.template.projects = append(h.template.projects, issuetracker.Project{ID: over, ShortName: "LONG", Name: "Long"})
+		repo := h.q.addRepo(h.user, true)
+		_ = wantKind(t, errOf(h.link(repo, over, "5-1")), KindBadRequest)
+		if h.q.repo(repo).linkedConn != uuid.Nil {
+			t.Error("the repo was linked")
+		}
+	})
+	t.Run("tag id", func(t *testing.T) {
+		h := newLinkHarness(t)
+		h.template.tags = append(h.template.tags, issuetracker.Tag{ID: over, Name: "long", Owner: linkBot,
+			Use: issuetracker.SharingSettings{Groups: []issuetracker.Group{linkAll}}})
+		repo := h.q.addRepo(h.user, true)
+		_ = wantKind(t, errOf(h.link(repo, "0-1", over)), KindBadRequest)
+		if h.q.repo(repo).linkedConn != uuid.Nil {
+			t.Error("the repo was linked")
+		}
+	})
+}

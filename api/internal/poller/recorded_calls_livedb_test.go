@@ -40,7 +40,16 @@ import (
 
 // recordedPollForge answers the reads and accepts the writes the seeded repo
 // makes. The MR states are keyed by MR iid: 13 closed, 21 opened, 31 merged.
-type recordedPollForge struct{ forgetest.BaseFake }
+type recordedPollForge struct {
+	forgetest.BaseFake
+	// getProjectErr is what GetProject returns (nil: the project reads fine), the linked
+	// repo's code-host probe.
+	getProjectErr error
+}
+
+func (f *recordedPollForge) GetProject(context.Context, int64) (forge.Project, error) {
+	return forge.Project{}, f.getProjectErr
+}
 
 var recordedPollAt = time.Date(2026, 5, 6, 7, 8, 9, 0, time.UTC)
 

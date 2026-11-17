@@ -1025,6 +1025,32 @@ func (q *Queries) ListBoardFreeMRStateWatchCandidates(ctx context.Context, repoI
 	return items, nil
 }
 
+const listEnabledLinkedRepoIDs = `-- name: ListEnabledLinkedRepoIDs :many
+SELECT id FROM repos WHERE enabled = true AND issue_tracker_connection_id IS NOT NULL
+`
+
+// Enabled repos linked to an issue tracker connection: the issue_tracker.sync health
+// check's enumeration.
+func (q *Queries) ListEnabledLinkedRepoIDs(ctx context.Context) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, listEnabledLinkedRepoIDs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listEnabledRepoIDs = `-- name: ListEnabledRepoIDs :many
 SELECT id FROM repos WHERE enabled = true
 `
@@ -3315,8 +3341,10 @@ type UpsertRepoParams struct {
 // Repos --------------------------------------------------------------------
 // Upserted whenever the membership list is fetched. Never touches `enabled`, so
 // a re-listing does not un-enable a repo the user already turned on. The insert
-// branch marks a newly discovered repo awaiting_first_enable (PRD #4173 D13); the
-// conflict branch never touches it, and the repos trigger clears it on first enable.
+// branch marks a newly discovered repo awaiting_first_enable (PRD #4173 D13), but the
+// repos trigger from 00427 clears it again when a removal marker says the project was
+// enabled before it was removed; the conflict branch never touches it, and the repos
+// trigger from 00425 clears it on first enable.
 func (q *Queries) UpsertRepo(ctx context.Context, arg UpsertRepoParams) (Repo, error) {
 	row := q.db.QueryRow(ctx, upsertRepo,
 		arg.ConnectionID,

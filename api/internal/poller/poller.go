@@ -115,6 +115,9 @@ type Engine struct {
 	// must NOT import healthsvc (the registry is a leaf; the loop only receives a callback).
 	beat        func()
 	syncAttempt func(uuid.UUID) func(bool, forge.ErrorClass)
+	// itSyncAttempt observes a linked repo's issue sync result (the issue_tracker.sync
+	// health check); the forge.sync observation of a linked repo is a code-host probe.
+	itSyncAttempt func(uuid.UUID) func(bool, forge.ErrorClass)
 }
 
 // repoState is one repo's in-memory sync state. marks holds a SEPARATE
@@ -202,6 +205,12 @@ func (e *Engine) SetBeat(beat func()) { e.beat = beat }
 // SetSyncAttempt wires issue-sync observations before Run or PollOnce.
 func (e *Engine) SetSyncAttempt(begin func(uuid.UUID) func(bool, forge.ErrorClass)) {
 	e.syncAttempt = begin
+}
+
+// SetIssueTrackerSyncAttempt wires linked-repo issue sync observations before Run or
+// PollOnce. A linked repo's forge sync observation is a code-host probe instead.
+func (e *Engine) SetIssueTrackerSyncAttempt(begin func(uuid.UUID) func(bool, forge.ErrorClass)) {
+	e.itSyncAttempt = begin
 }
 
 // Interval reports the poll cadence the loop actually ticks at (after New's clamp), so
@@ -386,6 +395,7 @@ func (e *Engine) syncRepo(ctx context.Context, r store.ListEnabledReposWithConne
 	if e.syncAttempt != nil {
 		complete = e.syncAttempt(r.ID)
 	}
+	var itComplete func(bool, forge.ErrorClass)
 	finished := false
 	report := func(ok bool, class forge.ErrorClass) {
 		if !finished {
@@ -395,11 +405,23 @@ func (e *Engine) syncRepo(ctx context.Context, r store.ListEnabledReposWithConne
 			}
 		}
 	}
+	// itReport is the issue tracker attempt of a linked repo, begun only once the linked
+	// issue sync is about to run; itBegun/itFinished make it complete exactly once.
+	itBegun, itFinished := false, false
+	itReport := func(ok bool, class forge.ErrorClass) {
+		if itBegun && !itFinished {
+			itFinished = true
+			if itComplete != nil {
+				itComplete(ok, class)
+			}
+		}
+	}
 	// A panic before issue-sync succeeds reports Other; guardPanic still owns recovery.
 	defer func() {
 		if !finished {
 			report(false, forge.ErrorClassOther)
 		}
+		itReport(false, forge.ErrorClassOther)
 	}()
 	f, err := e.svc.ForgeForConnection(r.ForgeType, r.BaseUrl, r.TokenCiphertext)
 	if err != nil {
@@ -430,21 +452,33 @@ func (e *Engine) syncRepo(ctx context.Context, r store.ListEnabledReposWithConne
 	if linked {
 		// A linked repo's issue sync failing (issue tracker unreachable or its link
 		// unresolvable) must never skip the code-host steps below: its MRs, pipelines
-		// and CI do not depend on the issue tracker. The attempt reports ok only when
-		// the linked sync succeeded, as the unlinked branch does, and reports the
-		// failure otherwise; unlike the unlinked branch it then carries on. The class is
-		// always Other: forge.Class would read an issue tracker's 401 as a forge auth
-		// failure, whose health action tells the user to re-check the forge connection,
-		// and it is the issue tracker connection that needs the attention.
+		// and CI do not depend on the issue tracker. The linked sync result feeds the
+		// issue_tracker.sync attempt (class from forge.Class: its health action names the
+		// issue tracker connection, so an auth class is right there), and the forge.sync
+		// attempt is a code-host probe instead, so a revoked forge token turns forge.sync
+		// red and an issue tracker outage does not. Unlike the unlinked branch this
+		// carries on whatever either result. Cost: one extra GetProject per linked repo
+		// per tick.
+		if e.itSyncAttempt != nil {
+			itComplete = e.itSyncAttempt(r.ID)
+		}
+		// Boundary: when the forge client cannot be built (the early return above) this
+		// attempt is never started for the tick, and forge.sync is red then.
+		itBegun = true
 		if trErr != nil {
 			slog.Error("poller: build linked issue tracker", "repo", r.PathWithNamespace, "error", trErr)
-			report(false, forge.ErrorClassOther)
+			itReport(false, forge.Class(trErr))
 		} else if err := e.syncLinkedIssues(ctx, r, tr, st); err != nil {
 			slog.Error("poller: linked issue sync", "repo", r.PathWithNamespace, "error", err)
-			report(false, forge.ErrorClassOther)
+			itReport(false, forge.Class(err))
 		} else {
-			report(true, forge.ErrorClassOther)
+			itReport(true, forge.ErrorClassOther)
 		}
+		_, perr := f.GetProject(ctx, r.ForgeProjectID)
+		if perr != nil {
+			slog.Error("poller: code host probe", "repo", r.PathWithNamespace, "error", perr)
+		}
+		report(perr == nil, forge.Class(perr))
 	} else {
 		if reconcileDue(st.pollCount, e.reconcileEvery) {
 			observed, err := e.svc.FullSync(ctx, r.ID, r.ForgeProjectID, f)

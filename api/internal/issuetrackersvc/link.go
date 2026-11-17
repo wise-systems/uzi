@@ -200,6 +200,9 @@ func (s *Service) checkLinkTarget(ctx context.Context, userID, connID uuid.UUID,
 	if !found {
 		return noAccount, noProject, noTag, &Error{Kind: KindBadRequest, Message: "tag not found among the tags this connection's account can see"}
 	}
+	if !issuetracker.ValidTagID(tag.ID) {
+		return noAccount, noProject, noTag, &Error{Kind: KindBadRequest, Message: "the tag's id is too long or malformed to store as an eligibility tag"}
+	}
 	if utf8.RuneCountInString(tag.Name) > maxTagNameLen ||
 		issuetracker.ValidTagRef(issuetracker.TagRef{ID: tag.ID, Name: tag.Name}) != nil {
 		return noAccount, noProject, noTag, &Error{Kind: KindBadRequest, Message: "the tag's name cannot be used as an eligibility tag: rename it in the issue tracker (no braces, no control characters)"}

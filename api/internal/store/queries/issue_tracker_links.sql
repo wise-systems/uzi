@@ -28,6 +28,25 @@ JOIN forge_connections c ON c.id = r.connection_id
 WHERE r.id = $1 AND c.user_id = $2
 FOR UPDATE OF r;
 
+-- name: LockRepoForEnableForUser :one
+-- The enable's half of the D13 row lock, scoped to the owning user. Call inside a
+-- transaction before the enable's forge label work; the markers are read after the lock,
+-- so a link that committed first is visible. FOR NO KEY UPDATE conflicts with the link's
+-- FOR UPDATE, so one of the two waits for the other, but it does not block inserts of
+-- rows that reference the repo by foreign key (board columns, cards).
+-- source_locked: the project was linked before it was removed and this row is not linked, so
+-- its issue source cannot change and the enable is refused before any board or label work
+-- (the repos trigger from 00427 refuses it too, later and less cheaply).
+SELECT r.awaiting_first_enable, r.issue_tracker_connection_id,
+       (r.issue_tracker_connection_id IS NULL AND EXISTS (
+           SELECT 1 FROM repo_removal_markers m
+           WHERE m.user_id = c.user_id AND m.forge_type = c.forge_type AND m.base_url = c.base_url
+             AND m.forge_project_id = r.forge_project_id AND m.was_linked))::boolean AS source_locked
+FROM repos r
+JOIN forge_connections c ON c.id = r.connection_id
+WHERE r.id = $1 AND c.user_id = $2
+FOR NO KEY UPDATE OF r;
+
 -- name: RepoStoresIssueNumber :one
 -- True when any table that stores an issue number for the repo has such a row. The
 -- guard triggers (migration 00425) make this false for an awaiting repo; the link
