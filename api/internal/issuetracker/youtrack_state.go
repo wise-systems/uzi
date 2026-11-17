@@ -46,8 +46,8 @@ func (y *youTrack) SetIssueState(ctx context.Context, projectID, issueIID int64,
 // neither case sends a request before the check. The target is then checked
 // against the project's State bundle and the issue against the bound project, as
 // SetIssueState does.
-func (y *youTrack) MoveToColumn(ctx context.Context, projectID, issueIID int64, column string) error {
-	return y.moveToColumn(ctx, projectID, issueIID, column)
+func (y *youTrack) MoveToColumn(ctx context.Context, projectID, issueIID int64, move forge.ColumnMove) error {
+	return y.moveToColumn(ctx, projectID, issueIID, move.Column)
 }
 
 func (y *youTrack) moveToColumn(ctx context.Context, projectID, issueIID int64, column string) error {

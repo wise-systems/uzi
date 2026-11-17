@@ -104,7 +104,7 @@ func TestMoveToColumnUnmappedSendsNothing(t *testing.T) {
 	y, srv := columnDriver(t, nil)
 	n := srv.SeedIssue("t", "")
 	srv.ResetRequests()
-	err := y.MoveToColumn(context.Background(), testProjectID, n, "Review")
+	err := y.MoveToColumn(context.Background(), testProjectID, n, forge.ColumnMove{Column: "Review"})
 	if !errors.Is(err, ErrColumnNotMapped) {
 		t.Fatalf("MoveToColumn = %v, want ErrColumnNotMapped", err)
 	}
@@ -116,7 +116,7 @@ func TestMoveToColumnUnmappedSendsNothing(t *testing.T) {
 func TestMoveToColumnWritesTheMappedState(t *testing.T) {
 	y, srv := columnDriver(t, nil)
 	n := srv.SeedIssue("t", "")
-	if err := y.MoveToColumn(context.Background(), testProjectID, n, "In Progress"); err != nil {
+	if err := y.MoveToColumn(context.Background(), testProjectID, n, forge.ColumnMove{Column: "In Progress"}); err != nil {
 		t.Fatalf("MoveToColumn: %v", err)
 	}
 	if got := srv.IssueState(n); got != "In Progress" {
@@ -128,10 +128,10 @@ func TestMoveToColumnEmptyUsesTheOpenState(t *testing.T) {
 	y, srv := columnDriver(t, nil)
 	n := srv.SeedIssue("t", "")
 	ctx := context.Background()
-	if err := y.MoveToColumn(ctx, testProjectID, n, "In Progress"); err != nil {
+	if err := y.MoveToColumn(ctx, testProjectID, n, forge.ColumnMove{Column: "In Progress"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := y.MoveToColumn(ctx, testProjectID, n, ""); err != nil {
+	if err := y.MoveToColumn(ctx, testProjectID, n, forge.ColumnMove{Column: ""}); err != nil {
 		t.Fatalf("MoveToColumn(\"\"): %v", err)
 	}
 	if got := srv.IssueState(n); got != "Open" {
@@ -140,7 +140,7 @@ func TestMoveToColumnEmptyUsesTheOpenState(t *testing.T) {
 	y2, srv2 := columnDriver(t, func(o *Options) { o.OpenState = "" })
 	n2 := srv2.SeedIssue("t", "")
 	srv2.ResetRequests()
-	if err := y2.MoveToColumn(ctx, testProjectID, n2, ""); !errors.Is(err, ErrStateMappingUnset) {
+	if err := y2.MoveToColumn(ctx, testProjectID, n2, forge.ColumnMove{Column: ""}); !errors.Is(err, ErrStateMappingUnset) {
 		t.Errorf("with no open state: %v, want ErrStateMappingUnset", err)
 	}
 	if got := srv2.Requests(); len(got) != 0 {
@@ -153,7 +153,7 @@ func TestMoveToColumnRefusesAResolvedColumnState(t *testing.T) {
 	n := srv.SeedIssue("t", "")
 	for _, col := range []string{"Done", "Lost"} {
 		srv.ResetRequests()
-		if err := y.MoveToColumn(context.Background(), testProjectID, n, col); !errors.Is(err, ErrStateNotAllowed) {
+		if err := y.MoveToColumn(context.Background(), testProjectID, n, forge.ColumnMove{Column: col}); !errors.Is(err, ErrStateNotAllowed) {
 			t.Errorf("MoveToColumn(%q) = %v, want ErrStateNotAllowed", col, err)
 		}
 		if w := writesOf(srv); len(w) != 0 {
@@ -167,12 +167,12 @@ func TestMoveToColumnRefusesABundleEditedAfterMapping(t *testing.T) {
 	n := srv.SeedIssue("t", "")
 	srv.SetStateResolved("In Progress", true)
 	srv.ResetRequests()
-	if err := y.MoveToColumn(context.Background(), testProjectID, n, "In Progress"); !errors.Is(err, ErrStateNotAllowed) {
+	if err := y.MoveToColumn(context.Background(), testProjectID, n, forge.ColumnMove{Column: "In Progress"}); !errors.Is(err, ErrStateNotAllowed) {
 		t.Fatalf("MoveToColumn = %v, want ErrStateNotAllowed", err)
 	}
 	srv.SetStateResolved("In Progress", false)
 	srv.RenameState("In Progress", "Doing")
-	if err := y.MoveToColumn(context.Background(), testProjectID, n, "In Progress"); !errors.Is(err, ErrStateNotAllowed) {
+	if err := y.MoveToColumn(context.Background(), testProjectID, n, forge.ColumnMove{Column: "In Progress"}); !errors.Is(err, ErrStateNotAllowed) {
 		t.Fatalf("after a rename: %v, want ErrStateNotAllowed", err)
 	}
 	if w := writesOf(srv); len(w) != 0 {
@@ -185,7 +185,7 @@ func TestMoveToColumnOnAMovedIssueIsNotFound(t *testing.T) {
 	n := srv.SeedIssue("t", "")
 	srv.MoveIssue(n, youtracktest.OtherProjectID)
 	srv.ResetRequests()
-	err := y.MoveToColumn(context.Background(), testProjectID, n, "In Progress")
+	err := y.MoveToColumn(context.Background(), testProjectID, n, forge.ColumnMove{Column: "In Progress"})
 	var nf *forge.IssueNotFoundError
 	if !errors.As(err, &nf) {
 		t.Fatalf("MoveToColumn = %v, want *forge.IssueNotFoundError", err)
@@ -199,7 +199,7 @@ func TestMoveToColumnProjectMismatchSendsNothing(t *testing.T) {
 	y, srv := columnDriver(t, nil)
 	n := srv.SeedIssue("t", "")
 	srv.ResetRequests()
-	if err := y.MoveToColumn(context.Background(), testProjectID+1, n, "In Progress"); !errors.Is(err, ErrProjectMismatch) {
+	if err := y.MoveToColumn(context.Background(), testProjectID+1, n, forge.ColumnMove{Column: "In Progress"}); !errors.Is(err, ErrProjectMismatch) {
 		t.Fatalf("MoveToColumn = %v, want ErrProjectMismatch", err)
 	}
 	if got := srv.Requests(); len(got) != 0 {
@@ -220,8 +220,8 @@ func TestNewSentinelsRedactTheToken(t *testing.T) {
 		want error
 	}{
 		"closed":   {y.SetIssueState(ctx, testProjectID, n, forge.StateClosed), ErrStateNotAllowed},
-		"column":   {y.MoveToColumn(ctx, testProjectID, n, "c"), ErrStateNotAllowed},
-		"unmapped": {y.MoveToColumn(ctx, testProjectID, n, "nope"), ErrColumnNotMapped},
+		"column":   {y.MoveToColumn(ctx, testProjectID, n, forge.ColumnMove{Column: "c"}), ErrStateNotAllowed},
+		"unmapped": {y.MoveToColumn(ctx, testProjectID, n, forge.ColumnMove{Column: "nope"}), ErrColumnNotMapped},
 	} {
 		if !errors.Is(tc.err, tc.want) {
 			t.Errorf("%s: %v, want %v", name, tc.err, tc.want)
@@ -255,7 +255,7 @@ func TestListIssuesWithStateReturnsTheStateNames(t *testing.T) {
 	a := srv.SeedIssue("a", "")
 	b := srv.SeedIssue("b", "")
 	ctx := context.Background()
-	if err := y.MoveToColumn(ctx, testProjectID, b, "In Progress"); err != nil {
+	if err := y.MoveToColumn(ctx, testProjectID, b, forge.ColumnMove{Column: "In Progress"}); err != nil {
 		t.Fatal(err)
 	}
 	got, err := y.ListIssuesWithState(ctx, testProjectID, forge.ListIssuesOptions{State: forge.StateAll})
@@ -377,7 +377,7 @@ func TestStateChecksRunBeforeTheIssueIsRead(t *testing.T) {
 	ctx := context.Background()
 	for name, err := range map[string]error{
 		"SetIssueState": y.SetIssueState(ctx, testProjectID, n, forge.StateClosed),
-		"MoveToColumn":  y.MoveToColumn(ctx, testProjectID, n, "Lost"),
+		"MoveToColumn":  y.MoveToColumn(ctx, testProjectID, n, forge.ColumnMove{Column: "Lost"}),
 	} {
 		if !errors.Is(err, ErrStateNotAllowed) || isNotFound(err) {
 			t.Errorf("%s = %v, want ErrStateNotAllowed and not an IssueNotFoundError", name, err)
@@ -396,7 +396,7 @@ func TestOnlyTheListingAsksForCustomFields(t *testing.T) {
 	if _, err := y.GetIssue(ctx, testProjectID, n); err != nil {
 		t.Fatal(err)
 	}
-	if err := y.MoveToColumn(ctx, testProjectID, n, "In Progress"); err != nil {
+	if err := y.MoveToColumn(ctx, testProjectID, n, forge.ColumnMove{Column: "In Progress"}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := y.CreateIssue(ctx, testProjectID, "c", "", nil); err != nil {

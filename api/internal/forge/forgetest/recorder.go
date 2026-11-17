@@ -27,8 +27,9 @@ import (
 type Recorder struct {
 	inner forge.Forge
 
-	mu    sync.Mutex // guards calls
+	mu    sync.Mutex // guards calls and moves
 	calls []string
+	moves []string
 }
 
 var _ forge.Forge = (*Recorder)(nil)
@@ -44,15 +45,41 @@ func (r *Recorder) Calls() []string {
 	return append([]string(nil), r.calls...)
 }
 
-func (r *Recorder) record(method string, args ...any) {
+// Moves returns a copy of the recorded MoveToColumn lines in call order. They are
+// kept apart from Calls so the recorded-call goldens stay byte-identical.
+func (r *Recorder) Moves() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.moves...)
+}
+
+func formatCall(method string, args ...any) string {
 	parts := make([]string, len(args))
 	for i, a := range args {
 		parts[i] = formatArg(reflect.ValueOf(a))
 	}
-	line := method + "(" + strings.Join(parts, ", ") + ")"
+	return method + "(" + strings.Join(parts, ", ") + ")"
+}
+
+func (r *Recorder) record(method string, args ...any) {
+	line := formatCall(method, args...)
 	r.mu.Lock()
 	r.calls = append(r.calls, line)
 	r.mu.Unlock()
+}
+
+// MoveToColumn records the move in Moves, not Calls, then performs the
+// label-backed move over the Recorder itself, so the EnsureLabels and
+// UpdateIssueLabels calls land in Calls and are delegated to the wrapped Forge
+// exactly as before. It never calls the wrapped Forge's MoveToColumn: the
+// recorded-call goldens stay byte-identical, and the Recorder records the
+// label-backed move.
+func (r *Recorder) MoveToColumn(ctx context.Context, a0 int64, a1 int64, move forge.ColumnMove) error {
+	line := formatCall("MoveToColumn", a0, a1, move)
+	r.mu.Lock()
+	r.moves = append(r.moves, line)
+	r.mu.Unlock()
+	return forge.MoveByLabels(ctx, r, a0, a1, move)
 }
 
 var timeType = reflect.TypeOf(time.Time{})

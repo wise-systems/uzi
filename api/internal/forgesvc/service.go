@@ -537,20 +537,19 @@ func (s *Service) AutoMove(ctx context.Context, f forge.IssueTracker, forgeProje
 	// be missing or drifted (e.g. the Upcoming→Planned rename, #176). add is the
 	// target column and has at most one element; an empty add (already in the target
 	// column, or a move to Open) ensures nothing and keeps the cheap no-forge-call path.
+	move := forge.ColumnMove{Column: target, Add: add, Remove: remove}
 	if len(add) > 0 {
-		labels := make([]forge.Label, 0, len(add))
+		move.Ensure = make([]forge.Label, 0, len(add))
 		for _, name := range add {
-			labels = append(labels, forge.Label{Name: name, Color: ColumnColor(name)})
-		}
-		if err := f.EnsureLabels(ctx, forgeProjectID, labels); err != nil {
-			return store.Issue{}, err
+			move.Ensure = append(move.Ensure, forge.Label{Name: name, Color: ColumnColor(name)})
 		}
 	}
 
-	// Forge-first: apply the label change remotely before touching the cache. On
-	// failure the cache is untouched (UpdateIssueLabels no-ops on empty sets, so a
-	// move to a column the card already sits in costs no forge call).
-	if err := f.UpdateIssueLabels(ctx, forgeProjectID, issue.ForgeIssueIid, add, remove); err != nil {
+	// Forge-first: apply the move remotely before touching the cache. On failure
+	// the cache is untouched (a label-backed issue tracker's UpdateIssueLabels
+	// no-ops on empty sets, so a move to a column the card already sits in costs
+	// no forge call).
+	if err := f.MoveToColumn(ctx, forgeProjectID, issue.ForgeIssueIid, move); err != nil {
 		return store.Issue{}, err
 	}
 

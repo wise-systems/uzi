@@ -118,6 +118,11 @@ func (g *issueWriteGuard) UpdateIssueLabels(context.Context, int64, int64, []str
 	return g.refuse("update issue labels")
 }
 
+// MoveToColumn is refused for now; a later unit of PRD #4173 M5 offers it.
+func (g *issueWriteGuard) MoveToColumn(context.Context, int64, int64, forge.ColumnMove) error {
+	return g.refuse("move to column")
+}
+
 func (g *issueWriteGuard) UpdateIssueDescription(context.Context, int64, int64, string) error {
 	return g.refuse("update issue description")
 }
@@ -158,6 +163,9 @@ func (u unavailableIssueTracker) CreateIssue(context.Context, int64, string, str
 	return forge.Issue{}, u.cause
 }
 func (u unavailableIssueTracker) UpdateIssueLabels(context.Context, int64, int64, []string, []string) error {
+	return u.cause
+}
+func (u unavailableIssueTracker) MoveToColumn(context.Context, int64, int64, forge.ColumnMove) error {
 	return u.cause
 }
 func (u unavailableIssueTracker) UpdateIssueDescription(context.Context, int64, int64, string) error {

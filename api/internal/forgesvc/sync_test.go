@@ -271,6 +271,12 @@ func (f *fakeForge) UpdateIssueLabels(_ context.Context, _, _ int64, add, remove
 	}
 	return f.updateErr
 }
+
+// MoveToColumn performs the label-backed move over this fake's own label
+// methods; the embedded BaseFake cannot dispatch to them.
+func (f *fakeForge) MoveToColumn(ctx context.Context, p, i int64, m forge.ColumnMove) error {
+	return forge.MoveByLabels(ctx, f, p, i, m)
+}
 func (f *fakeForge) GetMergeRequest(_ context.Context, _, mrIID int64) (forge.MergeRequest, error) {
 	f.mrCalls = append(f.mrCalls, mrIID)
 	if err, ok := f.mrErrByIID[mrIID]; ok {
