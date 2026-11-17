@@ -115,6 +115,15 @@ func TestIssueTrackerStateMappingChecksLiveDB(t *testing.T) {
 	if err := col("Review", strings.Repeat("y", 201)); sqlState(err) != checkViolation {
 		t.Errorf("an overlong column State: %v, want a check violation", err)
 	}
+	if err := col("Re\tview", "Reviewing"); sqlState(err) != checkViolation {
+		t.Errorf("a control character in a column label: %v, want a check violation", err)
+	}
+	if err := col(strings.Repeat("y", 201), "Reviewing"); sqlState(err) != checkViolation {
+		t.Errorf("an overlong column label: %v, want a check violation", err)
+	}
+	if err := col("", "Reviewing"); sqlState(err) != checkViolation {
+		t.Errorf("an empty column label: %v, want a check violation", err)
+	}
 	// A column row needs the states row.
 	if err := q.InsertRepoIssueTrackerColumnState(f.ctx, store.InsertRepoIssueTrackerColumnStateParams{RepoID: uuid.New(), LabelName: "a", StateName: "b"}); sqlState(err) != foreignKeyViolation {
 		t.Errorf("a column row with no states row: %v, want a foreign key violation", err)

@@ -41,14 +41,23 @@ CREATE TABLE repo_issue_tracker_column_states (
     CONSTRAINT repo_issue_tracker_column_states_state_unique UNIQUE (repo_id, state_name),
     CONSTRAINT repo_issue_tracker_column_states_shape CHECK (
         char_length(state_name) BETWEEN 1 AND 200
-        AND state_name !~ '[[:cntrl:]]')
+        AND state_name !~ '[[:cntrl:]]'
+        AND char_length(label_name) BETWEEN 1 AND 200
+        AND label_name !~ '[[:cntrl:]]')
 );
 
 -- The board column a linked issue was last placed in, as uzi moved or synced it. NULL for every
 -- issue of a repo that is not linked, and until a linked issue has a mapped State. Nullable and
 -- additive, so an older worker that does not know it keeps reading issues unchanged.
-ALTER TABLE issues ADD COLUMN issue_tracker_column text
-    CONSTRAINT issues_issue_tracker_column_len CHECK (char_length(issue_tracker_column) <= 200);
+--
+-- The CHECK is added NOT VALID, as 00415 and 00416 do: a CHECK added with the column makes
+-- Postgres scan all of issues under ACCESS EXCLUSIVE, and NOT VALID skips that scan. No
+-- VALIDATE step follows because every existing value is NULL, which the CHECK passes, and new
+-- writes are checked either way. The Open lane is stored as NULL, never '' (the CHECK refuses
+-- the empty string).
+ALTER TABLE issues ADD COLUMN issue_tracker_column text;
+ALTER TABLE issues ADD CONSTRAINT issues_issue_tracker_column_len
+    CHECK (char_length(issue_tracker_column) BETWEEN 1 AND 200) NOT VALID;
 
 -- +goose Down
 SET LOCAL lock_timeout = '5s';

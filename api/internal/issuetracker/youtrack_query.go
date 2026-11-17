@@ -31,6 +31,11 @@ func labelNameProblem(name string) bool {
 	return bad
 }
 
+// LabelNameProblem reports whether name is empty, over 200 bytes, or holds a brace or an
+// invisible character: the names the YouTrack driver refuses as a tag name. A caller that
+// stores a name it will later send as a tag checks it with this.
+func LabelNameProblem(name string) bool { return labelNameProblem(name) }
+
 func (y *youTrack) checkLabelNames(names ...[]string) error {
 	for _, list := range names {
 		for _, n := range list {

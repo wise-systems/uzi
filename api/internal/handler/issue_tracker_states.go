@@ -35,7 +35,7 @@ func toIssueTrackerStateMappingDTO(m issuetrackersvc.StateMapping) issueTrackerS
 		Columns: make([]issueTrackerColumnStateDTO, 0, len(m.Columns)),
 	}
 	for _, c := range m.Columns {
-		out.Columns = append(out.Columns, issueTrackerColumnStateDTO{LabelName: c.LabelName, State: c.State})
+		out.Columns = append(out.Columns, issueTrackerColumnStateDTO{LabelName: cleanTrackerText(c.LabelName), State: c.State})
 	}
 	return out
 }

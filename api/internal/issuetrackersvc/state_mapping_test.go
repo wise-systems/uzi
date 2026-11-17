@@ -126,6 +126,8 @@ func TestSetStateMappingRefusals(t *testing.T) {
 		{"duplicate label", edit(func(m *StateMapping) { m.Columns[1].LabelName = "In Progress" }), KindBadRequest, "more than once"},
 		{"empty name", edit(func(m *StateMapping) { m.OpenState = "" }), KindBadRequest, "empty"},
 		{"control character", edit(func(m *StateMapping) { m.Columns[0].LabelName = "a\nb" }), KindBadRequest, "control"},
+		{"zero-width label", edit(func(m *StateMapping) { m.Columns[0].LabelName = "In\u200bProgress" }), KindBadRequest, "control"},
+		{"bidi state", edit(func(m *StateMapping) { m.OpenState = "Op\u202een" }), KindBadRequest, "control"},
 		{"too long", edit(func(m *StateMapping) { m.ClosedState = strings.Repeat("x", 201) }), KindBadRequest, "200"},
 		{"too many columns", edit(func(m *StateMapping) { m.Columns = make([]ColumnState, 11) }), KindBadRequest, "too many"},
 	}

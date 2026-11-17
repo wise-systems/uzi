@@ -21,6 +21,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/forgesvc"
 	"github.com/vtmocanu/uzi/api/internal/httpx"
+	"github.com/vtmocanu/uzi/api/internal/issuetracker"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/schedsvc"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -803,6 +804,14 @@ func (h *Handler) ConfigureColumns(w http.ResponseWriter, r *http.Request) {
 	// A linked repo's columns are uzi's own: the issue tracker has no column labels to
 	// ensure, so no issue tracker is resolved and nothing is sent to it (PRD #4173 M5).
 	if repo.IssueTrackerConnectionID.Valid {
+		// The labels are stored and shown back, so they get the rule the driver applies to a
+		// tag name: no braces, no invisible character, at most 200 bytes.
+		for _, n := range names {
+			if issuetracker.LabelNameProblem(n) {
+				httpx.Error(w, http.StatusBadRequest, "a column name is too long (max 200 bytes) or has a brace or an invisible character")
+				return
+			}
+		}
 		if !h.replaceLinkedBoardColumns(w, r, repo, names) {
 			return
 		}

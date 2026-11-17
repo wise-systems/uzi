@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"slices"
 	"strings"
-	"unicode"
 	"unicode/utf8"
 
 	"github.com/google/uuid"
@@ -25,7 +24,7 @@ const (
 	maxMappedColumns    = 10
 	stateMappingNoLink  = "this repo is not linked to an issue tracker project"
 	stateMappingNoConn  = "the repo's issue tracker connection is missing; it cannot be read"
-	stateMappingBadName = "a state or column name is empty, longer than 200 characters or holds a control character"
+	stateMappingBadName = "a state or column name is empty, longer than 200 characters or holds a control or invisible character"
 )
 
 // ColumnState maps one board column, by its label name, to the State it stands for.
@@ -193,15 +192,16 @@ func (s *Service) SetStateMapping(ctx context.Context, userID, repoID uuid.UUID,
 	return in, nil
 }
 
-// validNameBounds mirrors the CHECKs of migration 00468: 1 to 200 characters and no
-// control character.
+// validNameBounds holds a name to what migration 00468 checks (1 to 200 characters, no control
+// character) and also refuses the invisible characters issuetracker.InvisibleRune names, which
+// the CHECKs cannot say.
 func validNameBounds(name string) bool {
 	n := utf8.RuneCountInString(name)
 	if n < 1 || n > maxStateNameLen {
 		return false
 	}
 	for _, r := range name {
-		if unicode.IsControl(r) {
+		if issuetracker.InvisibleRune(r) {
 			return false
 		}
 	}

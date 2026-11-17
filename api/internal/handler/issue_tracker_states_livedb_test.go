@@ -246,3 +246,33 @@ func TestConfigureColumnsOnALinkedRepoPrunesTheMappingLiveDB(t *testing.T) {
 		t.Fatalf("column mapping rows after clearing the columns = %d (%v), want 0", n, err)
 	}
 }
+
+// A linked repo's column labels are stored and shown back, so ConfigureColumns refuses one the
+// YouTrack driver would refuse as a tag name: bidi or zero-width characters, braces, an
+// overlong label. Nothing is stored and nothing is sent.
+func TestConfigureColumnsOnALinkedRepoRefusesBadLabelsLiveDB(t *testing.T) {
+	f := newStateMappingFixture(t)
+	var before int
+	if err := f.pool.QueryRow(context.Background(), `SELECT count(*) FROM board_columns WHERE repo_id = $1`, f.repo).Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+	for name, label := range map[string]string{
+		"bidi override": "Do\u202eing",
+		"zero width":    "Do\u200bing",
+		"line sep":      "Do\u2028ing",
+		"brace":         "Do{ing",
+		"overlong":      strings.Repeat("x", 201),
+	} {
+		t.Run(name, func(t *testing.T) {
+			rr := f.call(f.h.ConfigureColumns, http.MethodPut, map[string]any{"columns": []map[string]string{{"label_name": label}}})
+			if rr.Code != http.StatusBadRequest {
+				t.Fatalf("ConfigureColumns = %d, want 400\n%s", rr.Code, rr.Body.String())
+			}
+		})
+	}
+	var after int
+	if err := f.pool.QueryRow(context.Background(), `SELECT count(*) FROM board_columns WHERE repo_id = $1`, f.repo).Scan(&after); err != nil || after != before {
+		t.Fatalf("board columns after the refusals = %d (%v), want the %d it had", after, err, before)
+	}
+	f.assertNothingSent(t)
+}
