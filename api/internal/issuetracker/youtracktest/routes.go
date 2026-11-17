@@ -156,7 +156,11 @@ func (s *Server) listBundleValues(w http.ResponseWriter, r *http.Request) {
 	}
 	var items []map[string]any
 	for _, v := range s.m.states {
-		items = append(items, map[string]any{"$type": "StateBundleElement", "id": v.id, "name": v.name, "isResolved": v.resolved, "ordinal": v.ordinal})
+		var localized any
+		if v.localizedName != "" {
+			localized = v.localizedName
+		}
+		items = append(items, map[string]any{"$type": "StateBundleElement", "id": v.id, "name": v.name, "isResolved": v.resolved, "archived": v.archived, "localizedName": localized, "ordinal": v.ordinal})
 	}
 	writePage(w, r, spec, items)
 }
@@ -418,6 +422,7 @@ func (s *Server) updateIssue(w http.ResponseWriter, r *http.Request) {
 		}
 		ts := s.m.now()
 		i.updated = ts
+		i.stateID = v.id
 		if v.resolved {
 			if i.resolved == nil {
 				i.resolved = &ts

@@ -1,6 +1,9 @@
 package youtracktest
 
-import "slices"
+import (
+	"fmt"
+	"slices"
+)
 
 // Sharing says who a tag is shared with, by group id and user id.
 type Sharing struct {
@@ -267,4 +270,69 @@ func (s *Server) SeedCommentEdit(n int64, login, text, newText string) {
 		}
 	}
 	s.t.Fatalf("youtracktest: no comment %q on issue %d", text, n)
+}
+
+// SeedState adds an unarchived State value to the bundle and returns its id.
+func (s *Server) SeedState(name string, resolved bool) string {
+	s.t.Helper()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// Not nextID: its counter would hand out an id the default states hold.
+	id := fmt.Sprintf("10-%d", 100+len(s.m.states))
+	s.m.states = append(s.m.states, stateValue{id: id, name: name, resolved: resolved, ordinal: len(s.m.states)})
+	return id
+}
+
+// RenameState renames the State value called from, as a bundle administrator
+// would after a mapping was saved. Issues in that state follow the new name.
+func (s *Server) RenameState(from, to string) {
+	s.t.Helper()
+	s.editState(from, func(v *stateValue) { v.name = to })
+}
+
+// SetStateResolved sets the resolved flag of the State value called name.
+func (s *Server) SetStateResolved(name string, resolved bool) {
+	s.t.Helper()
+	s.editState(name, func(v *stateValue) { v.resolved = resolved })
+}
+
+// SetStateArchived sets the archived flag of the State value called name.
+func (s *Server) SetStateArchived(name string, archived bool) {
+	s.t.Helper()
+	s.editState(name, func(v *stateValue) { v.archived = archived })
+}
+
+// SetStateLocalizedName sets the localized name of the State value called name.
+func (s *Server) SetStateLocalizedName(name, localized string) {
+	s.t.Helper()
+	s.editState(name, func(v *stateValue) { v.localizedName = localized })
+}
+
+func (s *Server) editState(name string, edit func(*stateValue)) {
+	s.t.Helper()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	v := s.m.stateByName(name)
+	if v == nil {
+		s.t.Fatalf("youtracktest: no state %q", name)
+	}
+	edit(v)
+}
+
+// IssueState returns the name of the State value of issue number n in the main
+// project, for assertions on server-side state.
+func (s *Server) IssueState(n int64) string {
+	s.t.Helper()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	i := s.m.byNumber(n)
+	if i == nil {
+		s.t.Fatalf("youtracktest: no issue %d", n)
+	}
+	for _, cf := range s.m.customFieldsJSON(i) {
+		if v, ok := cf["value"].(map[string]any); ok {
+			return v["name"].(string)
+		}
+	}
+	return ""
 }

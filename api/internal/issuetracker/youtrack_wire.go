@@ -10,7 +10,7 @@ import (
 
 // fields parameters. YouTrack returns only what is asked for.
 const (
-	issueFields     = "id,idReadable,numberInProject,summary,description,created,updated,resolved,reporter(id,login),tags(id,name,owner(id)),project(id,shortName)"
+	issueFields     = "id,idReadable,numberInProject,summary,description,created,updated,resolved,reporter(id,login),tags(id,name,owner(id)),project(id,shortName),customFields(name,$type,value(name))"
 	tagFields       = "id,name"
 	ownedTagFields  = "id,name,owner(id)"
 	sharingFields   = "permittedGroups(id,name,allUsersGroup,usersCount),permittedUsers(id,login)"
@@ -80,9 +80,26 @@ type ytIssue struct {
 	Reporter        *ytUser    `json:"reporter"`
 	Tags            ytTags     `json:"tags"`
 	Project         *ytProject `json:"project"`
+	// CustomFields is the issue's custom fields, capped at maxCustomFields
+	// while decoding (ytCustomFields).
+	CustomFields ytCustomFields `json:"customFields"`
 }
 
-func (w ytIssue) nestedCount() int { return len(w.Tags) }
+func (w ytIssue) nestedCount() int { return len(w.Tags) + len(w.CustomFields) }
+
+// stateName returns the name of the issue's State field value, or "" when the
+// issue has none or the name is one stateNameProblem refuses.
+func (y *youTrack) stateName(w ytIssue) string {
+	for _, f := range w.CustomFields {
+		if f.Name == y.stateField && f.Type == "StateIssueCustomField" {
+			if stateNameProblem(f.Value.Name) {
+				return ""
+			}
+			return f.Value.Name
+		}
+	}
+	return ""
+}
 
 func (a ytActivity) nestedCount() int { return len(a.Added) + len(a.Removed) }
 

@@ -14,6 +14,13 @@ var (
 	// ErrStateMappingUnset is returned when open/closed state mapping is needed
 	// but the connection has not configured it.
 	ErrStateMappingUnset = errors.New("issuetracker: state mapping not configured")
+	// ErrColumnNotMapped is returned by MoveToColumn for a board column that has
+	// no issue tracker State mapped to it.
+	ErrColumnNotMapped = errors.New("issuetracker: board column has no state mapped")
+	// ErrStateNotAllowed is returned before a State write whose target the
+	// project's State bundle does not allow: the value is missing, archived, or
+	// has the wrong resolved flag or meaning for the role it is written in.
+	ErrStateNotAllowed = errors.New("issuetracker: state value is not allowed for this write")
 	// ErrInvalidLabelName is returned for a label name the issue tracker cannot carry.
 	ErrInvalidLabelName = errors.New("issuetracker: invalid label name")
 	// ErrRedirectRefused is returned when the server answers with a redirect.
@@ -23,4 +30,4 @@ var (
 
 // packageSentinels lists every sentinel above. redactor.sentinel keeps only
 // these in an error chain, so a new sentinel must be added here too.
-var packageSentinels = []error{ErrUnsupportedKind, ErrProjectNotBound, ErrProjectMismatch, ErrStateMappingUnset, ErrInvalidLabelName, ErrRedirectRefused}
+var packageSentinels = []error{ErrUnsupportedKind, ErrProjectNotBound, ErrProjectMismatch, ErrStateMappingUnset, ErrColumnNotMapped, ErrStateNotAllowed, ErrInvalidLabelName, ErrRedirectRefused}
