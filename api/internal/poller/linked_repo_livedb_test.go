@@ -46,7 +46,7 @@ func trustFake(t *testing.T, srv *youtracktest.Server) {
 
 type refusingDrivers struct{ calls int }
 
-func (r *refusingDrivers) DriverFor(context.Context, uuid.UUID, uuid.UUID, issuetracker.Binding, string, string, string) (issuetracker.Driver, error) {
+func (r *refusingDrivers) DriverFor(context.Context, uuid.UUID, uuid.UUID, issuetracker.Binding, issuetracker.StateMapping) (issuetracker.Driver, error) {
 	r.calls++
 	return nil, errors.New("base URL is not in the allowed issue tracker list")
 }

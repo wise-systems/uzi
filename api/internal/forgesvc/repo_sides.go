@@ -2,6 +2,7 @@ package forgesvc
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 
@@ -16,7 +17,7 @@ import (
 // one repo binding. *issuetrackersvc.Service satisfies it. Optional on a Service:
 // without it a linked repo fails closed (PRD #4173 DL-5).
 type IssueTrackerDrivers interface {
-	DriverFor(ctx context.Context, userID, connID uuid.UUID, binding issuetracker.Binding, stateField, open, closed string) (issuetracker.Driver, error)
+	DriverFor(ctx context.Context, userID, connID uuid.UUID, binding issuetracker.Binding, states issuetracker.StateMapping) (issuetracker.Driver, error)
 }
 
 // SetIssueTrackerDrivers wires the linked-issue-tracker driver source.
@@ -61,11 +62,17 @@ func (s *Service) IssueTrackerForRepo(ctx context.Context, userID, repoID uuid.U
 		!src.EligibilityTagID.Valid || !src.EligibilityTagName.Valid {
 		return nil, ErrLinkedRepoUnresolvable
 	}
+	var columns map[string]string
+	if len(src.ColumnStates) > 0 {
+		if err := json.Unmarshal(src.ColumnStates, &columns); err != nil {
+			return nil, fmt.Errorf("decode stored column states: %w", err)
+		}
+	}
 	d, err := s.itDrivers.DriverFor(ctx, userID, uuid.UUID(src.LinkedConnectionID.Bytes), issuetracker.Binding{
 		Project:        issuetracker.ProjectRef{ID: src.IssueTrackerProjectID.String, ShortName: src.IssueTrackerProjectShort.String},
 		ProjectID:      src.ForgeProjectID,
 		EligibilityTag: issuetracker.TagRef{ID: src.EligibilityTagID.String, Name: src.EligibilityTagName.String},
-	}, "", "", "")
+	}, issuetracker.StateMapping{Open: src.OpenState.String, Closed: src.ClosedState.String, Columns: columns})
 	if err != nil {
 		return nil, fmt.Errorf("build linked issue tracker: %w", err)
 	}

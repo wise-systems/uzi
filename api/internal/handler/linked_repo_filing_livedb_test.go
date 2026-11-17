@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/google/uuid"
@@ -14,9 +15,10 @@ import (
 
 // linkedDrivers hands out the BaseFake-backed driver; every write is refused by the
 // guard before it could reach it.
-type linkedDrivers struct{}
+type linkedDrivers struct{ built *atomic.Int32 }
 
-func (linkedDrivers) DriverFor(_ context.Context, _, _ uuid.UUID, _ issuetracker.Binding, _, _, _ string) (issuetracker.Driver, error) {
+func (d linkedDrivers) DriverFor(_ context.Context, _, _ uuid.UUID, _ issuetracker.Binding, _ issuetracker.StateMapping) (issuetracker.Driver, error) {
+	d.built.Add(1)
 	return &itDriver{}, nil
 }
 
@@ -25,7 +27,8 @@ func (linkedDrivers) DriverFor(_ context.Context, _, _ uuid.UUID, _ issuetracker
 func TestLinkedRepoFilingRoutesAreRefusedAndReleaseTheirClaimLiveDB(t *testing.T) {
 	f := seedNeverEnabledFixture(t)
 	ctx := context.Background()
-	f.h.svc.SetIssueTrackerDrivers(linkedDrivers{})
+	var built atomic.Int32
+	f.h.svc.SetIssueTrackerDrivers(linkedDrivers{built: &built})
 	itConn := uuid.New()
 	mustExecT(ctx, t, f.pool, `INSERT INTO issue_tracker_connections (id, user_id, kind, base_url, account_id, account_login, token_ciphertext)
 	      VALUES ($1, $2, 'youtrack', $3, '1-1', 'bot', $4)`, itConn, f.admin.ID, "https://"+uuid.NewString()+".yt.test", []byte{1})
@@ -33,7 +36,6 @@ func TestLinkedRepoFilingRoutesAreRefusedAndReleaseTheirClaimLiveDB(t *testing.T
 	mustExecT(ctx, t, f.pool, `UPDATE repos SET enabled = true, awaiting_first_enable = false,
 	        issue_tracker_connection_id = $2, issue_tracker_project_id = '0-1', issue_tracker_project_short = 'UZI',
 	        eligibility_tag_id = '5-1', eligibility_tag_name = 'uzi', issue_tracker_linked_at = now() WHERE id = $1`, f.repoID, itConn)
-	repoParam := map[string]string{"id": f.repoID.String()}
 
 	cases := []struct {
 		name string
@@ -54,9 +56,6 @@ func TestLinkedRepoFilingRoutesAreRefusedAndReleaseTheirClaimLiveDB(t *testing.T
 				Category: "improve_agent", Target: "ne-" + f.repoID.String(), RepoID: f.repoID.String(), Title: "t", Description: "d",
 			}, nil))
 		}},
-		{"ConfigureColumns", func(w http.ResponseWriter) {
-			f.h.ConfigureColumns(w, f.request(http.MethodPut, map[string]any{"columns": []map[string]string{{"label_name": "a"}}}, repoParam))
-		}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -70,6 +69,29 @@ func TestLinkedRepoFilingRoutesAreRefusedAndReleaseTheirClaimLiveDB(t *testing.T
 			}
 		})
 	}
+
+	// Reconfiguring the columns is the one board write a linked repo is offered: it writes
+	// the board_columns rows and no label, so it neither resolves an issue tracker driver nor
+	// reaches the forge.
+	t.Run("ConfigureColumns", func(t *testing.T) {
+		before := built.Load()
+		rr := httptest.NewRecorder()
+		f.h.ConfigureColumns(rr, f.request(http.MethodPut, map[string]any{"columns": []map[string]string{{"label_name": "a"}}},
+			map[string]string{"id": f.repoID.String()}))
+		if rr.Code != http.StatusOK {
+			t.Fatalf("status = %d body = %s, want 200", rr.Code, rr.Body.String())
+		}
+		if n := f.hits.Load(); n != 0 {
+			t.Errorf("the forge saw %d request(s), want 0", n)
+		}
+		if n := built.Load() - before; n != 0 {
+			t.Errorf("ConfigureColumns resolved %d issue tracker driver(s), want 0", n)
+		}
+		var cols int
+		if err := f.pool.QueryRow(ctx, `SELECT count(*) FROM board_columns WHERE repo_id = $1 AND label_name = 'a'`, f.repoID).Scan(&cols); err != nil || cols != 1 {
+			t.Errorf("board column rows = %d (%v), want 1", cols, err)
+		}
+	})
 
 	var status string
 	if err := f.pool.QueryRow(ctx, `SELECT status FROM finding_dispositions WHERE repo_id = $1`, f.repoID).Scan(&status); err != nil || status != "open" {

@@ -84,18 +84,18 @@ func (d *stubDriver) CreateIssueNote(context.Context, int64, int64, string) (for
 }
 
 type fakeDrivers struct {
-	driver                  *stubDriver
-	err                     error
-	calls                   int
-	gotUser, gotConn        uuid.UUID
-	gotBinding              issuetracker.Binding
-	gotState, gotOpen, gotC string
+	driver           *stubDriver
+	err              error
+	calls            int
+	gotUser, gotConn uuid.UUID
+	gotBinding       issuetracker.Binding
+	gotStates        issuetracker.StateMapping
 }
 
-func (f *fakeDrivers) DriverFor(_ context.Context, userID, connID uuid.UUID, b issuetracker.Binding, stateField, open, closed string) (issuetracker.Driver, error) {
+func (f *fakeDrivers) DriverFor(_ context.Context, userID, connID uuid.UUID, b issuetracker.Binding, states issuetracker.StateMapping) (issuetracker.Driver, error) {
 	f.calls++
 	f.gotUser, f.gotConn, f.gotBinding = userID, connID, b
-	f.gotState, f.gotOpen, f.gotC = stateField, open, closed
+	f.gotStates = states
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -232,8 +232,8 @@ func TestIssueTrackerForRepoLinkedBuildsTheBoundDriverBehindTheGuard(t *testing.
 	if d.calls != 1 || d.gotUser != h.user || d.gotConn != conn || d.gotBinding != want {
 		t.Fatalf("DriverFor got (calls %d, user %v, conn %v, binding %+v), want the repo row's binding for its owner", d.calls, d.gotUser, d.gotConn, d.gotBinding)
 	}
-	if d.gotState != "" || d.gotOpen != "" || d.gotC != "" {
-		t.Errorf("state mapping arguments must be empty until M5, got %q %q %q", d.gotState, d.gotOpen, d.gotC)
+	if d.gotStates.Field != "" || d.gotStates.Open != "" || d.gotStates.Closed != "" || len(d.gotStates.Columns) != 0 {
+		t.Errorf("a repo with no saved state mapping must pass the zero mapping, got %+v", d.gotStates)
 	}
 	if h.built != 0 {
 		t.Errorf("a linked repo's issue side must not build the forge driver")
@@ -256,6 +256,40 @@ func TestIssueTrackerForRepoLinkedBuildsTheBoundDriverBehindTheGuard(t *testing.
 	}
 	if len(d.driver.reads) != 1 {
 		t.Fatalf("reads must pass through, got %v", d.driver.reads)
+	}
+}
+
+// The stored open, closed and column States of the repo row reach DriverFor (PRD #4173 M5);
+// the State field stays empty so the driver's default applies.
+func TestIssueTrackerForRepoPassesTheStoredStateMapping(t *testing.T) {
+	h, src := newSidesHarness(t)
+	h.svc.SetIssueTrackerDrivers(h.drivers)
+	repo := h.addRepo(t, src, h.user, func(r *store.GetRepoIssueSourceForUserRow) {
+		linkTo(uuid.New(), true)(r)
+		r.OpenState = pgtype.Text{String: "To Do", Valid: true}
+		r.ClosedState = pgtype.Text{String: "Done", Valid: true}
+		r.ColumnStates = []byte(`{"In Progress":"Doing","Review":"In Review"}`)
+	})
+	if _, err := h.svc.IssueTrackerForRepo(context.Background(), h.user, repo); err != nil {
+		t.Fatal(err)
+	}
+	got := h.drivers.gotStates
+	if got.Field != "" || got.Open != "To Do" || got.Closed != "Done" ||
+		len(got.Columns) != 2 || got.Columns["In Progress"] != "Doing" || got.Columns["Review"] != "In Review" {
+		t.Fatalf("DriverFor got %+v, want the stored mapping", got)
+	}
+}
+
+// A malformed stored column map fails closed rather than building a driver without it.
+func TestIssueTrackerForRepoRefusesAMalformedColumnMap(t *testing.T) {
+	h, src := newSidesHarness(t)
+	h.svc.SetIssueTrackerDrivers(h.drivers)
+	repo := h.addRepo(t, src, h.user, func(r *store.GetRepoIssueSourceForUserRow) {
+		linkTo(uuid.New(), true)(r)
+		r.ColumnStates = []byte(`[1]`)
+	})
+	if _, err := h.svc.IssueTrackerForRepo(context.Background(), h.user, repo); err == nil || h.drivers.calls != 0 {
+		t.Fatalf("err = %v, DriverFor calls = %d, want an error before any driver is built", err, h.drivers.calls)
 	}
 }
 

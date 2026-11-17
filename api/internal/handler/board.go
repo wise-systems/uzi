@@ -751,7 +751,9 @@ type configureColumnsRequest struct {
 // ConfigureColumns replaces a repo's column set. Positions are taken from array
 // order. Each column name is ensured to exist as a label on the forge (so a
 // newly typed column becomes a real, addressable label), then the board_columns
-// rows are replaced wholesale.
+// rows are replaced wholesale. A repo linked to an issue tracker has no column labels to
+// ensure: only the rows are replaced, and the state mapping of a removed column is pruned
+// (replaceLinkedBoardColumns).
 func (h *Handler) ConfigureColumns(w http.ResponseWriter, r *http.Request) {
 	repo, ok := h.repoForRequest(w, r)
 	if !ok {
@@ -798,6 +800,20 @@ func (h *Handler) ConfigureColumns(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A linked repo's columns are uzi's own: the issue tracker has no column labels to
+	// ensure, so no issue tracker is resolved and nothing is sent to it (PRD #4173 M5).
+	if repo.IssueTrackerConnectionID.Valid {
+		if !h.replaceLinkedBoardColumns(w, r, repo, names) {
+			return
+		}
+		b, ok := h.buildBoard(w, r, repo)
+		if !ok {
+			return
+		}
+		httpx.JSON(w, http.StatusOK, map[string]any{"board": b})
+		return
+	}
+
 	tr, err := h.issueTrackerForRepo(r.Context(), repo.UserID, repo.ID, repo.IssueTrackerConnectionID, repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
 	if err != nil {
 		slog.Error("build forge for connection", "error", err)
@@ -840,6 +856,50 @@ func (h *Handler) ConfigureColumns(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"board": b})
+}
+
+// replaceLinkedBoardColumns replaces the board_columns rows of a linked repo and prunes the
+// state mapping rows of every column that is gone, in one transaction that first takes the repo
+// row lock the state mapping route takes, so a mapping save and a reconfigure serialise. It
+// writes the response itself on failure and reports whether it succeeded.
+func (h *Handler) replaceLinkedBoardColumns(w http.ResponseWriter, r *http.Request, repo store.GetRepoForUserRow, names []string) bool {
+	ctx := r.Context()
+	fail := func(msg string, err error) bool {
+		slog.Error(msg, "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return false
+	}
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		return fail("begin linked board columns tx", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // no-op after a successful Commit
+	qtx := h.q.WithTx(tx)
+	if _, err := qtx.LockRepoForStateMappingForUser(ctx, store.LockRepoForStateMappingForUserParams{ID: repo.ID, UserID: repo.UserID}); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			httpx.Error(w, http.StatusNotFound, "repo not found")
+			return false
+		}
+		return fail("lock linked repo for board columns", err)
+	}
+	if err := qtx.DeleteBoardColumnsByRepo(ctx, repo.ID); err != nil {
+		return fail("delete board columns", err)
+	}
+	for i, n := range names {
+		if err := qtx.InsertBoardColumn(ctx, store.InsertBoardColumnParams{RepoID: repo.ID, LabelName: n, Position: int32(i)}); err != nil {
+			return fail("insert board column", err)
+		}
+	}
+	// No column left prunes every mapping row, which is right. The keep list is never nil: a
+	// nil slice is sent as NULL, and "<> ALL(NULL)" matches nothing, so nothing would be pruned.
+	keep := append([]string{}, names...)
+	if err := qtx.PruneRepoIssueTrackerColumnStates(ctx, store.PruneRepoIssueTrackerColumnStatesParams{RepoID: repo.ID, Keep: keep}); err != nil {
+		return fail("prune issue tracker column states", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fail("commit linked board columns tx", err)
+	}
+	return true
 }
 
 // ── Manual order ────────────────────────────────────────────────────────────

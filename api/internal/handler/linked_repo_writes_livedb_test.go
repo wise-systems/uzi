@@ -30,6 +30,7 @@ type linkedHandlerFixture struct {
 	h      *Handler
 	pool   *pgxpool.Pool
 	srv    *youtracktest.Server
+	itSvc  *issuetrackersvc.Service
 	rec    *forgetest.Recorder
 	user   store.User
 	repo   uuid.UUID
@@ -61,7 +62,7 @@ func newLinkedHandlerFixture(t *testing.T, withColumns bool) *linkedHandlerFixtu
 	if err != nil {
 		t.Fatal(err)
 	}
-	f := &linkedHandlerFixture{h: h, pool: pool, srv: srv, rec: rec, repo: uuid.New(),
+	f := &linkedHandlerFixture{h: h, pool: pool, srv: srv, itSvc: itSvc, rec: rec, repo: uuid.New(),
 		user: store.User{ID: uuid.New(), Email: fmt.Sprintf("lw-%s@e2e", uuid.NewString()[:8])}}
 	exec := func(sql string, args ...any) {
 		t.Helper()

@@ -692,7 +692,7 @@ func (q *Queries) GetForgeConnectionForUser(ctx context.Context, arg GetForgeCon
 }
 
 const getIssueByIID = `-- name: GetIssueByIID :one
-SELECT id, repo_id, forge_issue_iid, title, state, labels, web_url, author, has_prd_link, forge_updated_at, synced_at, board_position, assignee_ids, issue_key FROM issues WHERE repo_id = $1 AND forge_issue_iid = $2
+SELECT id, repo_id, forge_issue_iid, title, state, labels, web_url, author, has_prd_link, forge_updated_at, synced_at, board_position, assignee_ids, issue_key, issue_tracker_column FROM issues WHERE repo_id = $1 AND forge_issue_iid = $2
 `
 
 type GetIssueByIIDParams struct {
@@ -718,6 +718,7 @@ func (q *Queries) GetIssueByIID(ctx context.Context, arg GetIssueByIIDParams) (I
 		&i.BoardPosition,
 		&i.AssigneeIds,
 		&i.IssueKey,
+		&i.IssueTrackerColumn,
 	)
 	return i, err
 }
@@ -1494,7 +1495,7 @@ func (q *Queries) ListForgeConnectionsByUser(ctx context.Context, userID uuid.UU
 }
 
 const listIssuesByRepo = `-- name: ListIssuesByRepo :many
-SELECT id, repo_id, forge_issue_iid, title, state, labels, web_url, author, has_prd_link, forge_updated_at, synced_at, board_position, assignee_ids, issue_key FROM issues WHERE repo_id = $1
+SELECT id, repo_id, forge_issue_iid, title, state, labels, web_url, author, has_prd_link, forge_updated_at, synced_at, board_position, assignee_ids, issue_key, issue_tracker_column FROM issues WHERE repo_id = $1
 ORDER BY board_position ASC NULLS LAST, forge_issue_iid ASC
 `
 
@@ -1541,6 +1542,7 @@ func (q *Queries) ListIssuesByRepo(ctx context.Context, repoID uuid.UUID) ([]Iss
 			&i.BoardPosition,
 			&i.AssigneeIds,
 			&i.IssueKey,
+			&i.IssueTrackerColumn,
 		); err != nil {
 			return nil, err
 		}
@@ -2032,7 +2034,7 @@ SET labels = COALESCE((SELECT jsonb_agg(value ORDER BY ordinal)
     FROM jsonb_array_elements(labels) WITH ORDINALITY AS item(value, ordinal)
     WHERE value <> to_jsonb($1::text)), '[]'::jsonb)
 WHERE repo_id = $2 AND forge_issue_iid = $3
-RETURNING id, repo_id, forge_issue_iid, title, state, labels, web_url, author, has_prd_link, forge_updated_at, synced_at, board_position, assignee_ids, issue_key
+RETURNING id, repo_id, forge_issue_iid, title, state, labels, web_url, author, has_prd_link, forge_updated_at, synced_at, board_position, assignee_ids, issue_key, issue_tracker_column
 `
 
 type RemoveCachedIssueLabelParams struct {
@@ -2061,6 +2063,7 @@ func (q *Queries) RemoveCachedIssueLabel(ctx context.Context, arg RemoveCachedIs
 		&i.BoardPosition,
 		&i.AssigneeIds,
 		&i.IssueKey,
+		&i.IssueTrackerColumn,
 	)
 	return i, err
 }
@@ -2069,7 +2072,7 @@ const reopenIssueState = `-- name: ReopenIssueState :one
 UPDATE issues
 SET state = 'opened', board_position = NULL, synced_at = now()
 WHERE repo_id = $1 AND forge_issue_iid = $2
-RETURNING id, repo_id, forge_issue_iid, title, state, labels, web_url, author, has_prd_link, forge_updated_at, synced_at, board_position, assignee_ids, issue_key
+RETURNING id, repo_id, forge_issue_iid, title, state, labels, web_url, author, has_prd_link, forge_updated_at, synced_at, board_position, assignee_ids, issue_key, issue_tracker_column
 `
 
 type ReopenIssueStateParams struct {
@@ -2103,6 +2106,7 @@ func (q *Queries) ReopenIssueState(ctx context.Context, arg ReopenIssueStatePara
 		&i.BoardPosition,
 		&i.AssigneeIds,
 		&i.IssueKey,
+		&i.IssueTrackerColumn,
 	)
 	return i, err
 }
@@ -3227,7 +3231,7 @@ const updateIssueState = `-- name: UpdateIssueState :one
 UPDATE issues
 SET state = $3, synced_at = now()
 WHERE repo_id = $1 AND forge_issue_iid = $2
-RETURNING id, repo_id, forge_issue_iid, title, state, labels, web_url, author, has_prd_link, forge_updated_at, synced_at, board_position, assignee_ids, issue_key
+RETURNING id, repo_id, forge_issue_iid, title, state, labels, web_url, author, has_prd_link, forge_updated_at, synced_at, board_position, assignee_ids, issue_key, issue_tracker_column
 `
 
 type UpdateIssueStateParams struct {
@@ -3263,6 +3267,7 @@ func (q *Queries) UpdateIssueState(ctx context.Context, arg UpdateIssueStatePara
 		&i.BoardPosition,
 		&i.AssigneeIds,
 		&i.IssueKey,
+		&i.IssueTrackerColumn,
 	)
 	return i, err
 }
@@ -3369,7 +3374,7 @@ SET title            = EXCLUDED.title,
     -- A forge-only writer passes NULL; it must not erase the key of a linked row.
     issue_key        = COALESCE(EXCLUDED.issue_key, issues.issue_key),
     synced_at        = now()
-RETURNING id, repo_id, forge_issue_iid, title, state, labels, web_url, author, has_prd_link, forge_updated_at, synced_at, board_position, assignee_ids, issue_key
+RETURNING id, repo_id, forge_issue_iid, title, state, labels, web_url, author, has_prd_link, forge_updated_at, synced_at, board_position, assignee_ids, issue_key, issue_tracker_column
 `
 
 type UpsertIssueParams struct {
@@ -3427,6 +3432,7 @@ func (q *Queries) UpsertIssue(ctx context.Context, arg UpsertIssueParams) (Issue
 		&i.BoardPosition,
 		&i.AssigneeIds,
 		&i.IssueKey,
+		&i.IssueTrackerColumn,
 	)
 	return i, err
 }
@@ -3521,7 +3527,7 @@ SET title            = EXCLUDED.title,
     has_prd_link     = EXCLUDED.has_prd_link,
     forge_updated_at = EXCLUDED.forge_updated_at,
     synced_at        = now()
-RETURNING id, repo_id, forge_issue_iid, title, state, labels, web_url, author, has_prd_link, forge_updated_at, synced_at, board_position, assignee_ids, issue_key
+RETURNING id, repo_id, forge_issue_iid, title, state, labels, web_url, author, has_prd_link, forge_updated_at, synced_at, board_position, assignee_ids, issue_key, issue_tracker_column
 `
 
 type UpsertIssueLabelsParams struct {
@@ -3588,6 +3594,7 @@ func (q *Queries) UpsertIssueLabels(ctx context.Context, arg UpsertIssueLabelsPa
 		&i.BoardPosition,
 		&i.AssigneeIds,
 		&i.IssueKey,
+		&i.IssueTrackerColumn,
 	)
 	return i, err
 }
