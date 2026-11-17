@@ -193,19 +193,14 @@ func (s *Service) SetStateMapping(ctx context.Context, userID, repoID uuid.UUID,
 }
 
 // validNameBounds holds a name to what migration 00468 checks (1 to 200 characters, no control
-// character) and also refuses the invisible characters issuetracker.InvisibleRune names, which
-// the CHECKs cannot say.
+// character) and also refuses what issuetracker.LabelNameProblem refuses (braces, invisible
+// characters, blank fillers, variation selectors), which the CHECKs cannot say.
 func validNameBounds(name string) bool {
 	n := utf8.RuneCountInString(name)
 	if n < 1 || n > maxStateNameLen {
 		return false
 	}
-	for _, r := range name {
-		if issuetracker.InvisibleRune(r) {
-			return false
-		}
-	}
-	return true
+	return !issuetracker.LabelNameProblem(name)
 }
 
 // validateMappingShape is the part of the validation that needs no issue tracker read:

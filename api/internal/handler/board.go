@@ -805,7 +805,8 @@ func (h *Handler) ConfigureColumns(w http.ResponseWriter, r *http.Request) {
 	// ensure, so no issue tracker is resolved and nothing is sent to it (PRD #4173 M5).
 	if repo.IssueTrackerConnectionID.Valid {
 		// The labels are stored and shown back, so they get the rule the driver applies to a
-		// tag name: no braces, no invisible character, at most 200 bytes.
+		// tag name and a State name: no braces, no invisible, blank-filler or
+		// variation-selector character, at most 200 bytes.
 		for _, n := range names {
 			if issuetracker.LabelNameProblem(n) {
 				httpx.Error(w, http.StatusBadRequest, "a column name is too long (max 200 bytes) or has a brace or an invisible character")

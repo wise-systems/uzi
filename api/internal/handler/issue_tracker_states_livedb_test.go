@@ -261,6 +261,9 @@ func TestConfigureColumnsOnALinkedRepoRefusesBadLabelsLiveDB(t *testing.T) {
 		"zero width":    "Do\u200bing",
 		"line sep":      "Do\u2028ing",
 		"brace":         "Do{ing",
+		"hangul filler": "Review\u3164",
+		"blank filler":  "\u2800",
+		"variation sel": "Review\uFE0F",
 		"overlong":      strings.Repeat("x", 201),
 	} {
 		t.Run(name, func(t *testing.T) {
