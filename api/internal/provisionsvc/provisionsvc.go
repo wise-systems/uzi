@@ -382,8 +382,8 @@ func (s *Service) EnableRepo(ctx context.Context, userID, repoID uuid.UUID) (sto
 			return removedLinkedRepoError()
 		}
 		// PRD #4173 D3: board columns are labels, on the issue-tracker half. A repo linked to an
-		// external issue tracker records the column rows only: uzi creates no labels or tags
-		// there (writes arrive in M5), and the forge's project is not where its issues live.
+		// external issue tracker records the column rows only: uzi creates no column labels or
+		// tags there (a column is not a tag, D9), and the forge's project is not where its issues live.
 		// The choice reads the locked row, not the one read before the guard.
 		if lock.IssueTrackerConnectionID.Valid {
 			if err := forgesvc.EnsureBoardColumnRows(ctx, q, row.ID); err != nil {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 
 	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/issueinput"
@@ -12,9 +13,11 @@ import (
 )
 
 // ErrIssueWriteNotOffered is returned by the write guard for the writes to a linked
-// external issue tracker that are not offered yet (EnsureLabels, CreateIssue,
-// UpdateIssueLabels, UpdateIssueDescription, CreateIssueNote): no request is sent.
-// MoveToColumn and SetIssueState pass through (PRD #4173 M5).
+// external issue tracker that are not offered: UpdateIssueDescription and
+// CreateIssueNote until their unit lifts them, and an UpdateIssueLabels that removes
+// the eligibility name (the eligibility tag is never stripped). No request is sent.
+// MoveToColumn, SetIssueState, CreateIssue, EnsureLabels and the other label writes
+// pass through (PRD #4173 M5).
 //
 // It is the issuesource sentinel itself, so a package that cannot import forgesvc
 // (workersvc) can wrap and match the same value.
@@ -59,10 +62,14 @@ func ColumnMoveRefused(err error) bool {
 }
 
 // issueWriteGuard wraps a linked repo's issue tracker driver. Reads pass
-// through, as do the move and State writes (PRD #4173 M5); every other write is
-// refused before any request until its own unit lifts it.
+// through, as do the move, State, create and label writes (PRD #4173 M5); every other
+// write is refused before any request until its own unit lifts it, and so is a label
+// write that removes the eligibility name.
 type issueWriteGuard struct {
 	inner forge.IssueTracker
+	// eligibility is the link's stored eligibility tag name; "" when none is known
+	// (UnavailableIssueTracker), where the inner driver returns its cause instead.
+	eligibility string
 }
 
 var (
@@ -142,16 +149,26 @@ func (g *issueWriteGuard) refuse(op string) error {
 	return fmt.Errorf("%s: %w", op, ErrIssueWriteNotOffered)
 }
 
-func (g *issueWriteGuard) EnsureLabels(context.Context, int64, []forge.Label) error {
-	return g.refuse("ensure labels")
+// EnsureLabels passes through (PRD #4173 M5). The driver never creates the eligibility
+// tag; the handler's explicit label-ensure endpoint refuses a linked repo before this.
+func (g *issueWriteGuard) EnsureLabels(ctx context.Context, projectID int64, labels []forge.Label) error {
+	return markNotFound(g.inner.EnsureLabels(ctx, projectID, labels))
 }
 
-func (g *issueWriteGuard) CreateIssue(context.Context, int64, string, string, []string) (forge.Issue, error) {
-	return forge.Issue{}, g.refuse("create issue")
+// CreateIssue passes through (PRD #4173 M5); the caller has already rewritten the label
+// set with issuesource.LinkedLabels.
+func (g *issueWriteGuard) CreateIssue(ctx context.Context, projectID int64, title, description string, labels []string) (forge.Issue, error) {
+	iss, err := g.inner.CreateIssue(ctx, projectID, title, description, labels)
+	return iss, markNotFound(err)
 }
 
-func (g *issueWriteGuard) UpdateIssueLabels(context.Context, int64, int64, []string, []string) error {
-	return g.refuse("update issue labels")
+// UpdateIssueLabels passes through unless the removal set contains the eligibility name:
+// that is refused before any request, so the eligibility tag is never stripped.
+func (g *issueWriteGuard) UpdateIssueLabels(ctx context.Context, projectID, issueIID int64, add, remove []string) error {
+	if g.eligibility != "" && slices.Contains(remove, g.eligibility) {
+		return g.refuse("update issue labels")
+	}
+	return markNotFound(g.inner.UpdateIssueLabels(ctx, projectID, issueIID, add, remove))
 }
 
 // MoveToColumn passes through to the issue tracker driver (PRD #4173 M5). The
@@ -178,7 +195,8 @@ func (g *issueWriteGuard) CreateIssueNote(context.Context, int64, int64, string)
 // UnavailableIssueTracker is the issue side handed to a linked repo whose resolver
 // failed (for example a connection removed from the allowlist): every read returns
 // cause, which is NOT skippable so no marker is settled over an outage, as does a
-// move or State write; every other write is refused by the write guard. It lets
+// move, State, create or label write; the writes still refused by the write guard stay
+// refused. It lets
 // the poller's issue-side steps fail or skip per candidate while the code-host steps carry on, instead of dereferencing
 // a nil tracker.
 func UnavailableIssueTracker(cause error) forge.IssueTracker {

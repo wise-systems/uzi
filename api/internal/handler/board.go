@@ -475,8 +475,8 @@ func (h *Handler) seedBoard(w http.ResponseWriter, r *http.Request, repo store.G
 	linked := repo.IssueTrackerConnectionID.Valid
 	var boardErr error
 	if linked {
-		// No labels are created on a linked issue tracker (writes arrive in M5): the
-		// column rows are seeded from the store alone.
+		// No column labels are created on a linked issue tracker (a column is not a tag
+		// there, D9): the column rows are seeded from the store alone.
 		boardErr = forgesvc.EnsureBoardColumnRows(r.Context(), h.q, repo.ID)
 	} else {
 		boardErr = forgesvc.EnsureBoardColumns(r.Context(), h.q, tr, repo.ID, repo.ForgeProjectID)
@@ -1259,6 +1259,11 @@ func (h *Handler) PromoteIssue(w http.ResponseWriter, r *http.Request) {
 	// UziLabel already falls back to the compiled-in default when unset, so label is
 	// never empty here.
 	label, _ := h.settings.UziLabel(r.Context())
+	// On a repo linked to an issue tracker the label is the link's stored eligibility
+	// name (PRD #4173 D14), which the driver resolves to the stored tag id.
+	if eligibility, linked := linkedEligibility(repo); linked {
+		label = eligibility
+	}
 
 	issue, err := h.q.GetIssueByIID(r.Context(), store.GetIssueByIIDParams{RepoID: repo.ID, ForgeIssueIid: iid})
 	if err != nil {

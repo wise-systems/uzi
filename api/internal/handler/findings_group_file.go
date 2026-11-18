@@ -209,7 +209,7 @@ func (h *Handler) FileFindingGroup(w http.ResponseWriter, r *http.Request) {
 		writeStoppedFindingGroup(w, op.ID, dispositionIDs, "pre_call")
 		return
 	}
-	filedLabels, requiredLabels := h.findingFilingLabels(callCtx, marker, req.Labels, req.SendToUzi)
+	filedLabels, requiredLabels := h.findingFilingLabels(callCtx, repo, marker, req.Labels, req.SendToUzi)
 	if err := tr.EnsureLabels(callCtx, repo.ForgeProjectID, requiredLabels); err != nil {
 		if callCtx.Err() != nil {
 			writeStoppedFindingGroup(w, op.ID, dispositionIDs, "pre_call")

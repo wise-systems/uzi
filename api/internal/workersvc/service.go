@@ -8561,6 +8561,20 @@ func (s *Service) uziLabel(ctx context.Context) string {
 	return settings.DefaultUziLabel
 }
 
+// autopilotLabel is the configured autopilot label, falling back to the compiled-in
+// default when the settings reader is unwired, cannot say, or has it blank. It reads the
+// label through an optional interface so a SettingsReader implementation need not carry it.
+func (s *Service) autopilotLabel(ctx context.Context) string {
+	if r, ok := s.settings.(interface {
+		AutopilotLabel(ctx context.Context) (string, error)
+	}); ok {
+		if l, _ := r.AutopilotLabel(ctx); l != "" {
+			return l
+		}
+	}
+	return settings.DefaultAutopilotLabel
+}
+
 // isEligibleIssue reports whether a cached issue's labels jsonb carries ANY of the
 // given eligible labels (PRD #764 M1: the single-element uzi_label set). A row whose
 // labels cannot be decoded is NOT eligible: the gate has no basis for letting it

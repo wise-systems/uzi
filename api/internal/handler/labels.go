@@ -53,6 +53,13 @@ func (h *Handler) EnsureRepoLabels(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	// A linked repo's eligibility tag is chosen at link time and column and autopilot tags
+	// are not wanted, so the endpoint is refused before any forge or tracker request
+	// (PRD #4173 D14).
+	if repo.IssueTrackerConnectionID.Valid {
+		httpx.Error(w, http.StatusConflict, issueWriteNotOfferedMessage)
+		return
+	}
 	var req apitypes.LabelEnsureRequest
 	if err := httpx.DecodeJSONLimited(w, r, &req); err != nil {
 		httpx.RespondDecodeError(w, err, "invalid request body")

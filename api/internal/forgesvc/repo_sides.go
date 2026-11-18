@@ -85,7 +85,7 @@ func (s *Service) IssueTrackerForRepo(ctx context.Context, userID, repoID uuid.U
 	if err != nil {
 		return nil, fmt.Errorf("build linked issue tracker: %w", err)
 	}
-	return &issueWriteGuard{inner: d}, nil
+	return &issueWriteGuard{inner: d, eligibility: src.EligibilityTagName.String}, nil
 }
 
 // CodeHostForRepo returns the code-host side of a repo: always the repo's own

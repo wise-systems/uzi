@@ -26,6 +26,25 @@ type movingDriver struct {
 	moves              []forge.ColumnMove
 	states             []forge.IssueState
 	err                error
+	// The create and label writes PRD #4173 M5 lifts through the guard.
+	creates  [][]string
+	ensured  [][]forge.Label
+	labelOps [][2][]string
+}
+
+func (d *movingDriver) CreateIssue(_ context.Context, _ int64, _, _ string, labels []string) (forge.Issue, error) {
+	d.creates = append(d.creates, labels)
+	return forge.Issue{IID: 5}, d.err
+}
+
+func (d *movingDriver) EnsureLabels(_ context.Context, _ int64, labels []forge.Label) error {
+	d.ensured = append(d.ensured, labels)
+	return d.err
+}
+
+func (d *movingDriver) UpdateIssueLabels(_ context.Context, _, _ int64, add, remove []string) error {
+	d.labelOps = append(d.labelOps, [2][]string{add, remove})
+	return d.err
 }
 
 func (d *movingDriver) MoveToColumn(_ context.Context, _, _ int64, m forge.ColumnMove) error {
@@ -114,23 +133,71 @@ func TestGuardPassesMovesAndStateWritesThroughAndMarksNotFound(t *testing.T) {
 		}
 	})
 
-	t.Run("every other write is still refused without reaching the driver", func(t *testing.T) {
+	// Converted from "every other write is still refused without reaching the driver": create,
+	// ensure and label writes are lifted by PRD #4173 M5; the description and note writes stay
+	// refused until their unit.
+	t.Run("create and label writes reach the driver", func(t *testing.T) {
 		d := &movingDriver{}
-		g := &issueWriteGuard{inner: d}
-		for name, err := range map[string]error{
-			"labels": g.UpdateIssueLabels(ctx, 1, 2, []string{"a"}, nil),
-			"ensure": g.EnsureLabels(ctx, 1, []forge.Label{{Name: "x"}}),
-			"desc":   g.UpdateIssueDescription(ctx, 1, 2, "d"),
-		} {
-			if !errors.Is(err, ErrIssueWriteNotOffered) {
-				t.Errorf("%s: %v, want ErrIssueWriteNotOffered", name, err)
-			}
+		g := &issueWriteGuard{inner: d, eligibility: "ready"}
+		if err := g.EnsureLabels(ctx, 1, []forge.Label{{Name: "x"}}); err != nil {
+			t.Fatalf("ensure: %v", err)
 		}
-		if _, err := g.CreateIssue(ctx, 1, "t", "d", nil); !errors.Is(err, ErrIssueWriteNotOffered) {
-			t.Errorf("create: %v", err)
+		if iss, err := g.CreateIssue(ctx, 1, "t", "d", []string{"ready"}); err != nil || iss.IID != 5 {
+			t.Fatalf("create: %v %v", iss, err)
+		}
+		if err := g.UpdateIssueLabels(ctx, 1, 2, []string{"ready"}, []string{"other"}); err != nil {
+			t.Fatalf("labels: %v", err)
+		}
+		if len(d.ensured) != 1 || len(d.creates) != 1 || len(d.labelOps) != 1 {
+			t.Fatalf("driver saw ensure=%d create=%d labels=%d, want 1 each", len(d.ensured), len(d.creates), len(d.labelOps))
+		}
+	})
+
+	t.Run("a moved-away issue on a label write is a skippable linked error", func(t *testing.T) {
+		g := &issueWriteGuard{inner: &movingDriver{err: &forge.IssueNotFoundError{Err: errors.New("404")}}, eligibility: "ready"}
+		err := g.UpdateIssueLabels(ctx, 1, 2, []string{"a"}, nil)
+		if !LinkedIssueGone(err) || !IssueWriteSkippable(err) {
+			t.Fatalf("%v must be a marked, skippable not-found", err)
+		}
+	})
+
+	t.Run("removing the eligibility name is refused without reaching the driver", func(t *testing.T) {
+		d := &movingDriver{}
+		g := &issueWriteGuard{inner: d, eligibility: "ready"}
+		err := g.UpdateIssueLabels(ctx, 1, 2, nil, []string{"other", "ready"})
+		if !errors.Is(err, ErrIssueWriteNotOffered) || !IssueWriteSkippable(err) {
+			t.Fatalf("err = %v, want the skippable ErrIssueWriteNotOffered", err)
+		}
+		if len(d.labelOps) != 0 {
+			t.Fatalf("the driver saw %v", d.labelOps)
+		}
+		// Adding it, or removing another label, is not a removal of the eligibility name.
+		if err := g.UpdateIssueLabels(ctx, 1, 2, []string{"ready"}, []string{"other"}); err != nil {
+			t.Fatalf("add eligibility: %v", err)
+		}
+	})
+
+	t.Run("description and note writes are still refused without reaching the driver", func(t *testing.T) {
+		g := &issueWriteGuard{inner: &movingDriver{}}
+		if err := g.UpdateIssueDescription(ctx, 1, 2, "d"); !errors.Is(err, ErrIssueWriteNotOffered) {
+			t.Errorf("desc: %v, want ErrIssueWriteNotOffered", err)
 		}
 		if _, err := g.CreateIssueNote(ctx, 1, 2, "n"); !errors.Is(err, ErrIssueWriteNotOffered) {
-			t.Errorf("note: %v", err)
+			t.Errorf("note: %v, want ErrIssueWriteNotOffered", err)
+		}
+	})
+
+	t.Run("an unavailable driver's create and label writes return its cause", func(t *testing.T) {
+		cause := errors.New("connection removed")
+		g := UnavailableIssueTracker(cause)
+		if _, err := g.CreateIssue(ctx, 1, "t", "d", nil); !errors.Is(err, cause) || IssueWriteSkippable(err) {
+			t.Errorf("create: %v", err)
+		}
+		if err := g.EnsureLabels(ctx, 1, nil); !errors.Is(err, cause) || IssueWriteSkippable(err) {
+			t.Errorf("ensure: %v", err)
+		}
+		if err := g.UpdateIssueLabels(ctx, 1, 2, []string{"a"}, nil); !errors.Is(err, cause) || IssueWriteSkippable(err) {
+			t.Errorf("labels: %v", err)
 		}
 	})
 }
