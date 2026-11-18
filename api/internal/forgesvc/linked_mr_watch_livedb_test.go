@@ -321,10 +321,10 @@ func TestLinkedMRWatchMatchesTheBoardLaneLiveDB(t *testing.T) {
 		if err := f.pool.QueryRow(ctx, `SELECT labels FROM issues WHERE repo_id = $1 AND forge_issue_iid = 7`, plain).Scan(&labels); err != nil {
 			t.Fatal(err)
 		}
-		switch s := string(labels); {
-		case s == `["Human Review"]`:
+		switch s := string(labels); s {
+		case `["Human Review"]`:
 			return board.ColumnHumanReview
-		case s == `["In Progress"]`:
+		case `["In Progress"]`:
 			return board.ColumnInProgress
 		default:
 			return s

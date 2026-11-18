@@ -4,7 +4,7 @@
 
 **Priority:** Medium
 
-**Status:** In progress, r11 2026-11-17. M1–M4 delivered; M5 in progress; M6 pending. r3 narrowed scope to one real issue tracker; r4 fixed a repo's issue source before first enable (D13); r4 and r5 fixed the YouTrack id, tag and author decisions before the driver; r6 records the M3 rework that follows them; r7 records the M4 preconditions from the maintainer's M3 approval (id-scoped intake, `ListLabels` limited to usable tags) and the M4 design decisions; r8 records M4's completion; r9 (2026-11-16) records the M4 follow-ups (the enable and link race, forge health on linked repos, removed and re-listed repos, the autopilot D11 guard, small items); r10 (2026-11-17) records the port of M4 and the M4 follow-ups onto the final M3 and the current upstream main. r11 (2026-11-17) records the M5 design decisions before code.
+**Status:** In progress, r12 2026-11-18. M1–M5 delivered; M6 pending. r3 narrowed scope to one real issue tracker; r4 fixed a repo's issue source before first enable (D13); r4 and r5 fixed the YouTrack id, tag and author decisions before the driver; r6 records the M3 rework that follows them; r7 records the M4 preconditions from the maintainer's M3 approval (id-scoped intake, `ListLabels` limited to usable tags) and the M4 design decisions; r8 records M4's completion; r9 (2026-11-16) records the M4 follow-ups (the enable and link race, forge health on linked repos, removed and re-listed repos, the autopilot D11 guard, small items); r10 (2026-11-17) records the port of M4 and the M4 follow-ups onto the final M3 and the current upstream main. r11 (2026-11-17) records the M5 design decisions before code. r12 (2026-11-18) records M5's delivery: the board and issue writes on YouTrack; the web and CLI surfaces, docs and the live pass remain M6.
 
 **Delivery:** one PR per milestone, each merged before the next starts. No implementation or validation step touches `.github/workflows/**`.
 
@@ -140,7 +140,7 @@ Progress (one PR per milestone, each merged before the next starts):
 - [x] **M2:** every caller on its half. The type-checked inventory shows 45 issue-side calls through `IssueTracker`, 66 code-host calls through `CodeHost` and none through `forge.Forge`, and handing `privcheck` an `IssueTracker`-only value fails to compile.
 - [x] **M3:** issue tracker connections and the YouTrack driver. The contract suite, with the `ProjectGuard` and `SameNameTagUsesEligibilityTag` cases, runs on the real YouTrack driver and the three real forge drivers; the tag sharing settings parse is tested against a response recorded from a real YouTrack; the chart renders `issueTracker.allowedBaseURLs` and refuses a non-https entry.
 - [x] **M4:** issue identity, the repo link and issue intake from YouTrack. Live-DB acceptance tests with the YouTrack fake cover linked intake, D11 author mapping and eviction; the linked claim golden is read by the agent contract test; the recorded-call golden of the repo handlers changed in the 2026-11-17 port (the three `ListIssues` calls after a repo enable are gone, because upstream moved the first import from the enable request to the poller, issue #4399); every other recorded call is unchanged.
-- [ ] **M5:** the board and issue writes on YouTrack
+- [x] **M5:** the board and issue writes on YouTrack
 - [ ] **M6:** web and CLI surfaces, docs and live acceptance
 
 ### M1: the `IssueTracker` and `CodeHost` interfaces
