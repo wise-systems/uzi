@@ -273,7 +273,7 @@ func (s *Service) guardedMRMove(ctx context.Context, repoID uuid.UUID, forgeProj
 			// A person resolved the issue in the issue tracker since the last sync, so the
 			// cache still shows it open. Their resolution wins: consume the edge without a
 			// move, as for a closed issue in the cache.
-			slog.Info("forgesvc: MR-state move skipped, the issue is resolved in the issue tracker", "repo", repoID, "issue", issueIID, "target", target)
+			slog.Info("forgesvc: MR-state move skipped, the issue is resolved in the issue tracker", "repo", repoID, "issue", issueIID, "target", target, "reason", err)
 			return moveSkipped
 		}
 		if ColumnMoveRefused(err) {

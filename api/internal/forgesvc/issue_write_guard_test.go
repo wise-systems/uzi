@@ -133,7 +133,7 @@ func TestGuardedMRMoveForgeFailureStillDefers(t *testing.T) {
 }
 
 // Converted from TestPRDLinkPatchSettlesWhenWritesAreNotOffered (PRD #4173 M5 U6): the
-// description write is offered on a linked repo, so it reaches the tracker and the marker
+// description write is offered on a linked repo, so it reaches the issue tracker and the marker
 // settles because the patch landed.
 func TestPRDLinkPatchWritesTheDescriptionOnALinkedRepo(t *testing.T) {
 	s, st, f, id := newPRDFixture(t, nil)
@@ -143,7 +143,7 @@ func TestPRDLinkPatchWritesTheDescriptionOnALinkedRepo(t *testing.T) {
 	}
 	enumerated(t, st)
 	if len(f.descriptionUpdates) != 1 {
-		t.Fatalf("description writes = %+v, want exactly one to reach the tracker", f.descriptionUpdates)
+		t.Fatalf("description writes = %+v, want exactly one to reach the issue tracker", f.descriptionUpdates)
 	}
 	if len(st.prdSettled) != 1 || st.prdSettled[0] != id {
 		t.Fatalf("settled = %v, want the run %v", st.prdSettled, id)
@@ -206,7 +206,7 @@ func TestPRDLinkPatchKeepsTheMarkerOnAPlainForgeNotFound(t *testing.T) {
 // An unresolvable linked repo's issue side must never be nil and must not settle any
 // marker: reads and writes fail with the cause (not skippable).
 func TestUnavailableIssueTrackerReadsAndWritesFailWithTheCause(t *testing.T) {
-	cause := errors.New("tracker unavailable")
+	cause := errors.New("issue tracker unavailable")
 	tr := UnavailableIssueTracker(cause)
 	ctx := context.Background()
 	if _, err := tr.GetIssue(ctx, 1, 2); !errors.Is(err, cause) || IssueWriteSkippable(err) {
@@ -219,7 +219,7 @@ func TestUnavailableIssueTrackerReadsAndWritesFailWithTheCause(t *testing.T) {
 		t.Fatalf("a write must fail with the cause and not be skippable, got %v", err)
 	}
 	if !isLinkedTracker(tr) {
-		t.Fatal("the unavailable tracker must dispatch as linked")
+		t.Fatal("the unavailable issue tracker must dispatch as linked")
 	}
 	if isLinkedTracker(&fakeForge{}) {
 		t.Fatal("a forge driver must not dispatch as linked")

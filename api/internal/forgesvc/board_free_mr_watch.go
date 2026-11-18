@@ -40,7 +40,7 @@ func (s *Service) SyncBoardFreeMRStates(ctx context.Context, repoID uuid.UUID, f
 }
 
 // SyncBoardFreeMRStatesWithIssueSide is SyncBoardFreeMRStates for a repo whose issue side
-// may be a linked issue tracker (PRD #4173 M5). When tr is a real linked tracker, a candidate
+// may be a linked issue tracker (PRD #4173 M5). When tr is a real linked issue tracker, a candidate
 // that is an issue-lane run (issue_iid set, kind not prompt/self_improve) is reconciled
 // through syncOneMRState, the board lane's edge switch, so a linked card moves Human Review
 // -> In Progress when its MR closes and back when it reopens, exactly as an unlinked card
@@ -49,7 +49,7 @@ func (s *Service) SyncBoardFreeMRStates(ctx context.Context, repoID uuid.UUID, f
 // real linked driver defers the edge and retries it next tick, like the board lane.
 //
 // Every other candidate goes through recordBoardFreeMRState unchanged: that is every
-// candidate when tr is nil or is not a linked tracker (an unlinked repo's forge driver, whose
+// candidate when tr is nil or is not a linked issue tracker (an unlinked repo's forge driver, whose
 // issue-lane runs the candidate query keeps out anyway), and every candidate when tr is the
 // UnavailableIssueTracker the poller hands a linked repo whose resolver failed. Recording
 // consumes the close edge (mr_state advances, so no later tick sees it and the card is

@@ -430,7 +430,7 @@ func (l *Lifecycle) apply(ctx context.Context, runID uuid.UUID, mc moveContext, 
 			// A person resolved the issue in the issue tracker and the cache has not caught
 			// up. Their resolution wins: no State was written, and retrying cannot help
 			// (same outcome as the cached closed-issue guard above).
-			slog.Info("run lifecycle: issue move skipped, the issue is resolved in the issue tracker", "run", runID, "target", dec.target)
+			slog.Info("run lifecycle: issue move skipped, the issue is resolved in the issue tracker", "run", runID, "target", dec.target, "reason", err)
 			l.clearPending(ctx, runID)
 			return
 		}

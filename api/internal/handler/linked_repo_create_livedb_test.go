@@ -236,3 +236,59 @@ func TestLinkedRepoPromoteAddsTheStoredEligibilityTagLiveDB(t *testing.T) {
 		t.Errorf("the forge saw calls %v, want none", c)
 	}
 }
+
+// PRD #4173 M5: an issue uzi creates without the eligibility tag (a finding filed without
+// send-to-uzi) lives in the linked project but is not on the board after the linked full
+// sync, while the board's own new issue (which carries the tag) is.
+func TestLinkedRepoUntaggedCreateIsNotOnTheBoardAfterTheFullSyncLiveDB(t *testing.T) {
+	f := seedNeverEnabledFixture(t)
+	srv := linkNeverEnabledFixture(t, f)
+	params := map[string]string{"id": f.repoID.String()}
+
+	rr := httptest.NewRecorder()
+	f.h.FileFinding(rr, f.request(http.MethodPost, apitypes.FileFindingRequest{SendToUzi: false}, map[string]string{"id": f.findID.String()}))
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("file finding: status = %d body = %s", rr.Code, rr.Body.String())
+	}
+	untagged := createdIID(t, rr.Body.Bytes())
+	wantTags(t, srv, untagged, false, "agent-found")
+
+	rr = httptest.NewRecorder()
+	f.h.CreateIssue(rr, f.request(http.MethodPost, map[string]string{"title": "board card", "description": "d"}, params))
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("create issue: status = %d body = %s", rr.Code, rr.Body.String())
+	}
+	tagged := createdIID(t, rr.Body.Bytes())
+	wantTags(t, srv, tagged, true, youtracktest.EligibilityTagName)
+
+	rr = httptest.NewRecorder()
+	f.h.SyncRepo(rr, f.request(http.MethodPost, nil, params))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("sync: status = %d body = %s", rr.Code, rr.Body.String())
+	}
+	rr = httptest.NewRecorder()
+	f.h.GetBoard(rr, f.request(http.MethodGet, nil, params))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("board: status = %d body = %s", rr.Code, rr.Body.String())
+	}
+	var body struct {
+		Board struct {
+			Cards []struct {
+				IID int64 `json:"iid"`
+			} `json:"cards"`
+		} `json:"board"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode board: %v", err)
+	}
+	var onBoard []int64
+	for _, c := range body.Board.Cards {
+		onBoard = append(onBoard, c.IID)
+	}
+	if slices.Contains(onBoard, untagged) {
+		t.Errorf("the issue created without the eligibility tag (%d) is on the board: %v", untagged, onBoard)
+	}
+	if !slices.Contains(onBoard, tagged) {
+		t.Errorf("the issue created with the eligibility tag (%d) is not on the board: %v", tagged, onBoard)
+	}
+}

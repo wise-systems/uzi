@@ -60,9 +60,11 @@ func ColumnMoveRefused(err error) bool {
 		errors.Is(err, issuetracker.ErrStateNotAllowed)
 }
 
-// LinkedIssueResolved reports whether err is the issue tracker driver refusing an
-// automatic card move because the issue is resolved in the issue tracker
-// (issuetracker.ErrIssueResolved). It is deliberately not part of IssueWriteSkippable
+// LinkedIssueResolved reports whether err is the issue tracker driver refusing a
+// card move because the issue is resolved in the issue tracker
+// (issuetracker.ErrIssueResolved). Any move other than an explicit reopen of a
+// closed card is refused this way, an automatic move or a board drag of a card the
+// cache shows open. It is deliberately not part of IssueWriteSkippable
 // or ColumnMoveRefused: retrying cannot help, and the person's resolution wins until
 // the next sync brings it into the cache.
 func LinkedIssueResolved(err error) bool {

@@ -67,7 +67,8 @@ func writeIssueWriteNotOffered(w http.ResponseWriter, err error) bool {
 // writeLinkedMoveError answers a failed card move or State write on a repo linked
 // to an issue tracker (PRD #4173 M5) and reports whether it did. A column or State
 // the driver refused before any request is a 409, and a moved-away issue is a 404
-// (D10); in both the cache is unchanged, so the card snaps back. Any other error
+// (D10); an issue the issue tracker shows as resolved is a 409 too, refused after the
+// reads and before any write. In each the cache is unchanged, so the card snaps back. Any other error
 // is left to the caller's 502.
 func writeLinkedMoveError(w http.ResponseWriter, err error) bool {
 	switch {

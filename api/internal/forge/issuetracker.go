@@ -125,9 +125,10 @@ type ColumnMove struct {
 	// Add and Remove are the label delta, exactly board.PlanLabelMove's output.
 	Add    []string
 	Remove []string
-	// Reopen is set only by an explicit reopen of a closed card. An automatic
-	// move leaves it false, so an issue tracker that keeps its own resolved
-	// state refuses to write over an issue a person resolved there. A
+	// Reopen is set only by an explicit reopen of a closed card. Any other
+	// move (an automatic one, or a drag of a card the cache shows open) leaves it
+	// false, so an issue tracker that keeps its own resolved state refuses to
+	// write over an issue a person resolved there. A
 	// label-backed forge ignores it: a forge label move never reopens.
 	Reopen bool
 }

@@ -440,7 +440,7 @@ func TestLinkedMRCloseIsRecordedWhenTheIssueSideIsUnavailableLiveDB(t *testing.T
 		t.Fatalf("State = %q, want it untouched", got)
 	}
 	if reqs := f.srv.Requests(); len(reqs) != 0 {
-		t.Fatalf("requests reached the tracker: %+v", reqs)
+		t.Fatalf("requests reached the issue tracker: %+v", reqs)
 	}
 	rows, err := f.q.ListBoardFreeMRStateWatchCandidates(context.Background(), f.repo)
 	if err != nil {
@@ -467,7 +467,7 @@ func TestLinkedMRCloseIsDeferredOnATransientRepoSourceReadFailureLiveDB(t *testi
 		t.Fatalf("mr_state = %q, want opened (edge deferred, not consumed)", got)
 	}
 	if reqs := f.srv.Requests(); len(reqs) != 0 {
-		t.Fatalf("requests reached the tracker: %+v", reqs)
+		t.Fatalf("requests reached the issue tracker: %+v", reqs)
 	}
 
 	// The read recovers: the same edge is seen again and moves the card.

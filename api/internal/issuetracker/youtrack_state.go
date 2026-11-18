@@ -46,8 +46,11 @@ func (y *youTrack) SetIssueState(ctx context.Context, projectID, issueIID int64,
 // neither case sends a request before the check. The target is then checked
 // against the project's State bundle and the issue against the bound project, as
 // SetIssueState does. An issue the issue tracker already shows as resolved is
-// ErrIssueResolved with no write unless move.Reopen is set, so an automatic move
-// never reopens an issue a person resolved there between two syncs.
+// ErrIssueResolved with no write unless move.Reopen is set: the move refuses when
+// the issue tracker already shows the issue resolved. The resolved read (GET) and
+// the State write (POST) are separate requests, so a resolution landing between
+// them is still overwritten; that window is accepted, like the check-then-write
+// window of checkTargetState.
 func (y *youTrack) MoveToColumn(ctx context.Context, projectID, issueIID int64, move forge.ColumnMove) error {
 	return y.moveToColumn(ctx, projectID, issueIID, move.Column, move.Reopen)
 }
