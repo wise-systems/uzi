@@ -239,8 +239,10 @@ func (h *Handler) FileFindingGroup(w http.ResponseWriter, r *http.Request) {
 	}
 	created, err := tr.CreateIssue(callCtx, repo.ForgeProjectID, title, description, filedLabels)
 	if err != nil {
-		// The write guard refuses before any request, so nothing was created: release the
-		// group like a definitive rejection instead of marking it uncertain.
+		// A definitive rejection created nothing: release the group instead of marking it
+		// uncertain. The ErrIssueWriteNotOffered branch is defence only, since the guard
+		// passes a create through. On a linked repo every other create failure is treated
+		// as uncertain, because the YouTrack driver returns no definitive rejection.
 		if errors.Is(err, forgesvc.ErrIssueWriteNotOffered) || forge.IsCreateIssueDefinitiveRejection(err) {
 			if !h.releaseDefinitiveFindingGroup(user.ID, op.ID) {
 				writeStoppedFindingGroup(w, op.ID, dispositionIDs, "in_flight")

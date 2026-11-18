@@ -196,9 +196,8 @@ func (g *issueWriteGuard) CreateIssueNote(context.Context, int64, int64, string)
 // failed (for example a connection removed from the allowlist): every read returns
 // cause, which is NOT skippable so no marker is settled over an outage, as does a
 // move, State, create or label write; the writes still refused by the write guard stay
-// refused. It lets
-// the poller's issue-side steps fail or skip per candidate while the code-host steps carry on, instead of dereferencing
-// a nil tracker.
+// refused. It lets the poller's issue-side steps fail or skip per candidate while the
+// code-host steps carry on, instead of dereferencing a nil tracker.
 func UnavailableIssueTracker(cause error) forge.IssueTracker {
 	return &issueWriteGuard{inner: unavailableIssueTracker{cause: cause}}
 }

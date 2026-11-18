@@ -25,7 +25,6 @@ import (
 // no forge user ids, as the YouTrack driver's do.
 type ytTracker struct {
 	forgetest.BaseFake
-	createErr error
 }
 
 func (*ytTracker) GetIssue(_ context.Context, _, iid int64) (forge.Issue, error) {
@@ -34,9 +33,6 @@ func (*ytTracker) GetIssue(_ context.Context, _, iid int64) (forge.Issue, error)
 }
 func (*ytTracker) ListIssueComments(context.Context, int64, int64) ([]forge.IssueComment, error) {
 	return []forge.IssueComment{{Body: "yt comment"}}, nil
-}
-func (y *ytTracker) CreateIssue(context.Context, int64, string, string, []string) (forge.Issue, error) {
-	return forge.Issue{}, y.createErr
 }
 
 // createRecorder is a linked repo's issue tracker that records the CreateIssue it receives.

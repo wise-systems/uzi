@@ -175,6 +175,27 @@ func TestGuardPassesMovesAndStateWritesThroughAndMarksNotFound(t *testing.T) {
 		if err := g.UpdateIssueLabels(ctx, 1, 2, []string{"ready"}, []string{"other"}); err != nil {
 			t.Fatalf("add eligibility: %v", err)
 		}
+		// The comparison is exact: a different case or a longer name is not the eligibility name.
+		d.labelOps = nil
+		if err := g.UpdateIssueLabels(ctx, 1, 2, nil, []string{"Ready", "ready-x", "other"}); err != nil {
+			t.Fatalf("near-miss removal: %v", err)
+		}
+		if len(d.labelOps) != 1 || len(d.labelOps[0][1]) != 3 {
+			t.Fatalf("the driver saw %v, want the near-miss removal passed through", d.labelOps)
+		}
+	})
+
+	t.Run("a moved-away issue on create and ensure is a marked not-found", func(t *testing.T) {
+		g := &issueWriteGuard{inner: &movingDriver{err: &forge.IssueNotFoundError{Err: errors.New("404")}}, eligibility: "ready"}
+		_, createErr := g.CreateIssue(ctx, 1, "t", "d", []string{"ready"})
+		for name, err := range map[string]error{
+			"create": createErr,
+			"ensure": g.EnsureLabels(ctx, 1, []forge.Label{{Name: "x"}}),
+		} {
+			if !LinkedIssueGone(err) || !IssueWriteSkippable(err) {
+				t.Errorf("%s: %v must be a marked, skippable not-found", name, err)
+			}
+		}
 	})
 
 	t.Run("description and note writes are still refused without reaching the driver", func(t *testing.T) {

@@ -25,9 +25,10 @@ type Sources interface {
 var ErrNotWired = errors.New("repo is linked to an issue tracker but no issue tracker source is wired")
 
 // ErrIssueWriteNotOffered is returned for every write to a linked external issue
-// tracker that is not offered: after PRD #4173 M5 only a label write that removes the
-// eligibility name. forgesvc.ErrIssueWriteNotOffered is this same value; it lives here so a package that cannot import forgesvc can
-// wrap and match it.
+// tracker that is not offered: a label write that removes the eligibility name and, until
+// the comments unit (PRD #4173 M5 U6), a description or note write.
+// forgesvc.ErrIssueWriteNotOffered is this same value; it lives here so a package that
+// cannot import forgesvc can wrap and match it.
 var ErrIssueWriteNotOffered = errors.New("this issue write is not offered on a repo linked to an issue tracker")
 
 // For returns the issue side a caller should use for one repo row. linked is
