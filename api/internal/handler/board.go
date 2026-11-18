@@ -350,7 +350,7 @@ func (h *Handler) GetBoard(w http.ResponseWriter, r *http.Request) {
 	}
 	// PRD 4173 D13: a never-enabled repo is neither seeded nor synced; the board opens
 	// only after the first enable.
-	if refuseNeverEnabled(w, repo.AwaitingFirstEnable) {
+	if refuseNeverEnabled(w, repo.AwaitingFirstEnable, repo.IssueSourceLocked) {
 		return
 	}
 
@@ -761,7 +761,7 @@ func (h *Handler) ConfigureColumns(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// PRD 4173 D13: no label seeding on a never-enabled repo.
-	if refuseNeverEnabled(w, repo.AwaitingFirstEnable) {
+	if refuseNeverEnabled(w, repo.AwaitingFirstEnable, repo.IssueSourceLocked) {
 		return
 	}
 	var req configureColumnsRequest
@@ -963,6 +963,11 @@ func (h *Handler) SetBoardOrder(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	// PRD 4173 D13: refused for a repo that was never enabled or whose issue source is locked
+	// after a removal, before any forge call.
+	if refuseNeverEnabled(w, repo.AwaitingFirstEnable, repo.IssueSourceLocked) {
+		return
+	}
 	var req setBoardOrderRequest
 	if err := httpx.DecodeJSON(r, &req); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
@@ -1077,6 +1082,11 @@ type moveIssueRequest struct {
 func (h *Handler) MoveIssue(w http.ResponseWriter, r *http.Request) {
 	repo, ok := h.repoForRequest(w, r)
 	if !ok {
+		return
+	}
+	// PRD 4173 D13: refused for a repo that was never enabled or whose issue source is locked
+	// after a removal, before any forge call.
+	if refuseNeverEnabled(w, repo.AwaitingFirstEnable, repo.IssueSourceLocked) {
 		return
 	}
 	iid, err := parseInt64(chi.URLParam(r, "iid"))
@@ -1250,6 +1260,11 @@ func (h *Handler) PromoteIssue(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	// PRD 4173 D13: refused for a repo that was never enabled or whose issue source is locked
+	// after a removal, before any forge call.
+	if refuseNeverEnabled(w, repo.AwaitingFirstEnable, repo.IssueSourceLocked) {
+		return
+	}
 	iid, err := parseInt64(chi.URLParam(r, "iid"))
 	if err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid issue id")
@@ -1373,7 +1388,7 @@ func (h *Handler) SyncRepo(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if refuseNeverEnabled(w, repo.AwaitingFirstEnable) {
+	if refuseNeverEnabled(w, repo.AwaitingFirstEnable, repo.IssueSourceLocked) {
 		return
 	}
 	tr, err := h.issueTrackerForRepo(r.Context(), repo.UserID, repo.ID, repo.IssueTrackerConnectionID, repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
