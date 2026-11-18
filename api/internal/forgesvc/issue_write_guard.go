@@ -11,9 +11,10 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/issuetracker"
 )
 
-// ErrIssueWriteNotOffered is returned by the write guard for every write to a
-// linked external issue tracker: YouTrack writes arrive in PRD #4173 M5, so until
-// then no request is sent (S1: uzi stays read-only against the tracker).
+// ErrIssueWriteNotOffered is returned by the write guard for the writes to a linked
+// external issue tracker that are not offered yet (EnsureLabels, CreateIssue,
+// UpdateIssueLabels, UpdateIssueDescription, CreateIssueNote): no request is sent.
+// MoveToColumn and SetIssueState pass through (PRD #4173 M5).
 //
 // It is the issuesource sentinel itself, so a package that cannot import forgesvc
 // (workersvc) can wrap and match the same value.

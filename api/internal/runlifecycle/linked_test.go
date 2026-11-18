@@ -156,23 +156,30 @@ func TestLinkedMoveUncachedIssueProbe(t *testing.T) {
 		name      string
 		tracker   func() forge.IssueTracker
 		wantClear bool
+		noTagName bool // the link carries no eligibility tag name
 	}{
-		{"moved away (not found) clears the marker", func() forge.IssueTracker { return forgesvc.UnavailableIssueTracker(missing) }, true},
+		{"moved away (not found) clears the marker", func() forge.IssueTracker { return forgesvc.UnavailableIssueTracker(missing) }, true, false},
 		{"found without the eligibility tag clears the marker", func() forge.IssueTracker {
 			return &probeTracker{issue: forge.Issue{IID: 4, Labels: []string{"other"}}}
-		}, true},
+		}, true, false},
 		{"found and eligible keeps the marker", func() forge.IssueTracker {
 			return &probeTracker{issue: forge.Issue{IID: 4, Labels: []string{"other", "uzi-ready"}}}
-		}, false},
+		}, false, false},
+		{"found with no eligibility tag name keeps the marker", func() forge.IssueTracker {
+			return &probeTracker{issue: forge.Issue{IID: 4, Labels: []string{"other"}}}
+		}, false, true},
 		{"a read error keeps the marker", func() forge.IssueTracker {
 			return &probeTracker{err: errors.New("youtrack unreachable")}
-		}, false},
+		}, false, false},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			fs, sm, src, l, runID, _, _ := linkedFixture("queued", nil)
 			fs.issueErr = pgx.ErrNoRows // not in the cache
 			fs.moveCtx.EligibilityTagName = txt("uzi-ready")
+			if tc.noTagName {
+				fs.moveCtx.EligibilityTagName = pgtype.Text{}
+			}
 			src.tr = tc.tracker()
 
 			l.notifyOnce(context.Background(), runID, "queued")

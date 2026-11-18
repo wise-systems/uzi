@@ -336,8 +336,8 @@ func TestLinkedSyncCachesTheColumnOfEachStatesMapping(t *testing.T) {
 	closed := issueAt(9, recordedMarkBase)
 	closed.State = "closed"
 	f := &fakeForge{
-		issues: []forge.Issue{issueAt(7, recordedMarkBase), issueAt(8, recordedMarkBase), closed, issueAt(10, recordedMarkBase), issueAt(11, recordedMarkBase)},
-		states: map[int64]string{7: "In Progress", 8: "Some Custom State", 9: "In Progress", 10: "Open", 11: ""},
+		issues: []forge.Issue{issueAt(7, recordedMarkBase), issueAt(8, recordedMarkBase), closed, issueAt(10, recordedMarkBase), issueAt(11, recordedMarkBase), issueAt(12, recordedMarkBase)},
+		states: map[int64]string{7: "In Progress", 8: "Some Custom State", 9: "In Progress", 10: "Open", 11: "", 12: "In Review"},
 	}
 	st := newLinkedSyncStore()
 	st.row.ColumnStates = []byte(`{"In Progress":"In Progress","Human Review":"In Review"}`)
@@ -345,7 +345,7 @@ func TestLinkedSyncCachesTheColumnOfEachStatesMapping(t *testing.T) {
 	if _, err := newTestService(st).SyncIssues(context.Background(), user, repo, testProjectID, linkedTracker(f)); err != nil {
 		t.Fatal(err)
 	}
-	want := map[int64]string{7: "In Progress", 8: "", 9: "", 10: "", 11: ""}
+	want := map[int64]string{7: "In Progress", 8: "", 9: "", 10: "", 11: "", 12: "Human Review"}
 	if len(st.upserts) != len(want) {
 		t.Fatalf("upserts = %d", len(st.upserts))
 	}

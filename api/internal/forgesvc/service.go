@@ -1065,8 +1065,10 @@ func (s *Service) upsertIssues(ctx context.Context, repoID uuid.UUID, issues []f
 		}
 		if issueKeyShort != "" {
 			// The linked sync re-reads every tagged issue each tick, so it writes only rows
-			// that changed; the forge sync keeps the unconditional write. It alone writes the
-			// cached board column; an empty column (the Open lane) is stored as NULL.
+			// that changed; the forge sync keeps the unconditional write. The cached board
+			// column has three writers: this linked upsert, SetIssueTrackerColumn (a move) and
+			// ClearIssueTrackerColumnsNotIn (a linked ConfigureColumns); an empty column (the
+			// Open lane) is stored as NULL.
 			changed := store.UpsertIssueIfChangedParams{
 				RepoID:         params.RepoID,
 				ForgeIssueIid:  params.ForgeIssueIid,

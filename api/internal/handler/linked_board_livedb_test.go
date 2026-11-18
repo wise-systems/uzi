@@ -48,6 +48,25 @@ func (f *linkedHandlerFixture) assertCache(t *testing.T, wantState, wantColumn s
 	}
 }
 
+// labelsAndPosition reads the card's labels and board_position.
+func (f *linkedHandlerFixture) labelsAndPosition(t *testing.T) (labels string, position pgtype.Int8) {
+	t.Helper()
+	if err := f.pool.QueryRow(context.Background(), `SELECT labels::text, board_position FROM issues WHERE repo_id = $1 AND forge_issue_iid = $2`, f.repo, f.issueN).Scan(&labels, &position); err != nil {
+		t.Fatal(err)
+	}
+	return labels, position
+}
+
+// assertOnlyColumnChanged fails when labels or board_position differ from the values read
+// before the move.
+func (f *linkedHandlerFixture) assertOnlyColumnChanged(t *testing.T, wantLabels string, wantPosition pgtype.Int8) {
+	t.Helper()
+	labels, position := f.labelsAndPosition(t)
+	if labels != wantLabels || position != wantPosition || !position.Valid {
+		t.Fatalf("labels %s position %+v after the move, want %s %+v (a move writes only the column)", labels, position, wantLabels, wantPosition)
+	}
+}
+
 // boardCard reads the card of the fixture's issue off the board the handler serves.
 func (f *linkedHandlerFixture) boardCard(t *testing.T) (column string, closed bool) {
 	t.Helper()
@@ -88,6 +107,11 @@ func (f *linkedHandlerFixture) assertNoYouTrackWrites(t *testing.T) {
 func TestLinkedBoardMoveWritesTheStateAndCachesTheColumnLiveDB(t *testing.T) {
 	f := newStateMappingFixture(t)
 	f.boardMapping(t)
+	// A move writes only the column: give the row labels and a position to prove they survive.
+	if _, err := f.pool.Exec(context.Background(), `UPDATE issues SET labels = '["uzi-ready","keep-me"]'::jsonb, board_position = 7 WHERE repo_id = $1 AND forge_issue_iid = $2`, f.repo, f.issueN); err != nil {
+		t.Fatal(err)
+	}
+	labels, position := f.labelsAndPosition(t)
 
 	code, body := f.move("In Progress")
 	if code != http.StatusOK {
@@ -97,6 +121,7 @@ func TestLinkedBoardMoveWritesTheStateAndCachesTheColumnLiveDB(t *testing.T) {
 		t.Fatalf("YouTrack State = %q, want Doing", got)
 	}
 	f.assertCache(t, "opened", "In Progress")
+	f.assertOnlyColumnChanged(t, labels, position)
 	if col, closed := f.boardCard(t); col != "In Progress" || closed {
 		t.Fatalf("board card in %q closed=%v, want In Progress", col, closed)
 	}
