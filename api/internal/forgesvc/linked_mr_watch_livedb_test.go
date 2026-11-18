@@ -451,6 +451,33 @@ func TestLinkedMRCloseIsRecordedWhenTheIssueSideIsUnavailableLiveDB(t *testing.T
 	}
 }
 
+// A failed repo-source read is the one transient unavailable cause: the linked issue-lane
+// close edge is deferred (mr_state stays opened, so the next tick sees it again), while a
+// permanent cause is recorded as in the test above.
+func TestLinkedMRCloseIsDeferredOnATransientRepoSourceReadFailureLiveDB(t *testing.T) {
+	f := newLinkedMRWatch(t, humanReviewMapping)
+	n := f.card(t, board.ColumnHumanReview)
+	run := f.run(t, n, 13, "opened", time.Minute)
+	real := f.tr
+	f.tr = UnavailableIssueTracker(fmt.Errorf("read repo issue source: %w: %w", errRepoSourceRead, errors.New("conn reset")))
+	f.srv.ResetRequests()
+
+	f.sync(t, map[int64]string{13: forge.MRStateClosed})
+	if got := f.mrState(t, run); got != forge.MRStateOpened {
+		t.Fatalf("mr_state = %q, want opened (edge deferred, not consumed)", got)
+	}
+	if reqs := f.srv.Requests(); len(reqs) != 0 {
+		t.Fatalf("requests reached the tracker: %+v", reqs)
+	}
+
+	// The read recovers: the same edge is seen again and moves the card.
+	f.tr = real
+	f.sync(t, map[int64]string{13: forge.MRStateClosed})
+	if got := f.mrState(t, run); got != forge.MRStateClosed {
+		t.Fatalf("mr_state = %q after recovery, want closed", got)
+	}
+}
+
 // A self_improve run carries an issue_iid but is not an issue-lane run: its close edge is
 // recorded and moves no card, even over a Human Review card. (A prompt run cannot carry an
 // issue_iid: runs_kind_shape refuses it, so only self_improve can reach the kind check.)

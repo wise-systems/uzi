@@ -19,7 +19,8 @@ import (
 // preserved) and, on the opened->closed / ->merged edge, cancels an in-flight rework via the
 // existing cancelReworkOnClosedMR (issue #853 contract, reused verbatim). It is
 // SyncBoardFreeMRStatesWithIssueSide with no issue tracker, which is the whole of its
-// behaviour on an unlinked repo. Reads the run set
+// behaviour on an unlinked repo; it is the tr=nil seam kept for the board-free tests and
+// equals the pre-M5 behaviour. Reads the run set
 // from ListBoardFreeMRStateWatchCandidates, which self-evicts a run once its mr_state is
 // terminal, except a linked repo's closed issue-lane run (below).
 //
@@ -50,10 +51,14 @@ func (s *Service) SyncBoardFreeMRStates(ctx context.Context, repoID uuid.UUID, f
 // Every other candidate goes through recordBoardFreeMRState unchanged: that is every
 // candidate when tr is nil or is not a linked tracker (an unlinked repo's forge driver, whose
 // issue-lane runs the candidate query keeps out anyway), and every candidate when tr is the
-// UnavailableIssueTracker the poller hands a linked repo whose resolver failed. The
-// unavailable cause can be permanent (a connection removed from the allowlist), and a move
-// that fails with it would defer the close edge forever, leaving mr_state opened and the
-// rework gate open on a closed MR; recording without a move keeps the edge.
+// UnavailableIssueTracker the poller hands a linked repo whose resolver failed. Recording
+// consumes the close edge (mr_state advances, so no later tick sees it and the card is
+// never moved for it). That is the trade-off: the cause can be permanent (a connection
+// removed from the allowlist), and deferring would leave mr_state opened and the rework gate
+// open on a closed MR forever, so the edge is recorded without a move. The one exception is a
+// failed repo-source database read (errRepoSourceRead), which is transient: the linked
+// issue-lane candidates are skipped this tick, neither recorded nor moved, and retried next
+// tick. Candidates that are not linked issue-lane runs are recorded as usual.
 //
 // A missing cached issue row skips the move (the MR state is still recorded) rather than
 // deferring it: this lane's candidates do not JOIN the issue cache, so deferring would poll
@@ -65,6 +70,8 @@ func (s *Service) SyncBoardFreeMRStatesWithIssueSide(ctx context.Context, repoID
 		return err
 	}
 	movesCard := tr != nil && isLinkedTracker(tr) && !isUnavailableTracker(tr)
+	deferLinked := tr != nil && isTransientUnavailableTracker(tr)
+	deferLogged := false
 	for _, c := range candidates {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -73,6 +80,13 @@ func (s *Service) SyncBoardFreeMRStatesWithIssueSide(ctx context.Context, repoID
 			s.syncOneMRState(ctx, repoID, forgeProjectID, f, tr, mrWatchCandidate{
 				RunID: c.ID, IssueIID: c.IssueIid.Int64, MrIID: c.MrIid.Int64, MrState: c.MrState,
 			}, mrLane{missingRow: moveSkipped, noMove: !c.IsLatest})
+			continue
+		}
+		if deferLinked && c.IssueIid.Valid && c.Kind != "prompt" && c.Kind != "self_improve" {
+			if !deferLogged {
+				slog.Warn("forgesvc: repo issue source unreadable, deferring linked MR edges to the next tick", "repo", repoID)
+				deferLogged = true
+			}
 			continue
 		}
 		s.recordBoardFreeMRState(ctx, repoID, forgeProjectID, f, c)

@@ -1204,7 +1204,7 @@ type ListBoardFreeMRStateWatchCandidatesRow struct {
 // ListMRWatchCandidates), not a sqlc param, so zero Go signature change. A repo linked to an
 // external issue tracker (PRD #4173 M4) is widened IN whole: every issue-lane run of such a repo
 // belongs here (the board lane excludes the repo), so linked runs record mr_state and cancel
-// rework with no board card; an unlinked repo matches exactly as before. On a linked repo the
+// rework, and the issue's latest run moves the linked card on a close or reopen (M5); an unlinked repo matches exactly as before. On a linked repo the
 // lane also keeps watching an issue-lane run recorded mr_state='closed', so a reopen is recorded
 // back to 'opened' (the board lane's Lane A reopen-edge watch, Decision 10), bounded as Lane A is:
 // only the issue's LATEST run (no newer non-scheduled run of the issue, so a superseded rework
@@ -1775,9 +1775,9 @@ JOIN issues i ON i.repo_id = $1 AND i.forge_issue_iid = l.issue_iid
 WHERE l.status = 'completed'
   AND l.mr_iid IS NOT NULL
   -- A repo linked to an external issue tracker (PRD #4173 M4) is owned by
-  -- ListBoardFreeMRStateWatchCandidates entirely: uzi moves no card there (writes arrive
-  -- in M5), so its MR state must not depend on the issue cache or a column label. Excluding
-  -- the repo here keeps the two lanes disjoint.
+  -- ListBoardFreeMRStateWatchCandidates entirely: that lane moves the card through the
+  -- issue tracker (PRD #4173 M5), so its MR state must not depend on the issue cache or a
+  -- column label. Excluding the repo here keeps the two lanes disjoint.
   AND NOT EXISTS (SELECT 1 FROM repos lr WHERE lr.id = $1 AND lr.issue_tracker_connection_id IS NOT NULL)
   AND (
     -- Lane A (UNCHANGED): open-issue board-move watch — card in Human Review

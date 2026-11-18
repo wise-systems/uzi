@@ -221,6 +221,9 @@ func TestLinkedBoardCloseWithNoMappingIs409LiveDB(t *testing.T) {
 	if code != http.StatusConflict {
 		t.Fatalf("close = %d %s, want 409", code, body)
 	}
+	if !strings.Contains(body, "open and closed issue tracker States are not set") {
+		t.Fatalf("close body = %s, want the unset open/closed States message", body)
+	}
 	f.assertNoYouTrackWrites(t)
 	f.assertCache(t, "opened", "")
 }

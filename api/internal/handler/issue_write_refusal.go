@@ -30,6 +30,8 @@ func writeLinkedMoveError(w http.ResponseWriter, err error) bool {
 	switch {
 	case errors.Is(err, issuetracker.ErrStateNotAllowed):
 		httpx.Error(w, http.StatusConflict, "the target issue tracker State is not allowed for this move")
+	case errors.Is(err, issuetracker.ErrStateMappingUnset):
+		httpx.Error(w, http.StatusConflict, "the open and closed issue tracker States are not set for this repo")
 	case forgesvc.ColumnMoveRefused(err):
 		httpx.Error(w, http.StatusConflict, "map this column to an issue tracker State first")
 	case forgesvc.LinkedIssueGone(err):

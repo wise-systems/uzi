@@ -250,3 +250,15 @@ func isUnavailableTracker(tr forge.IssueTracker) bool {
 	_, unavailable := g.inner.(unavailableIssueTracker)
 	return unavailable
 }
+
+// isTransientUnavailableTracker reports whether tr is the UnavailableIssueTracker built
+// from a failed repo-source database read (errRepoSourceRead), the only unavailable cause
+// expected to clear on its own.
+func isTransientUnavailableTracker(tr forge.IssueTracker) bool {
+	g, ok := tr.(*issueWriteGuard)
+	if !ok {
+		return false
+	}
+	u, unavailable := g.inner.(unavailableIssueTracker)
+	return unavailable && errors.Is(u.cause, errRepoSourceRead)
+}

@@ -7,6 +7,7 @@ import (
 	"fmt"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/issuetracker"
@@ -26,6 +27,11 @@ func (s *Service) SetIssueTrackerDrivers(d IssueTrackerDrivers) { s.itDrivers = 
 // errNoRepoStore is returned by the resolvers on a Service built without queries: a
 // resolver must fail, not dereference a nil store.
 var errNoRepoStore = errors.New("forgesvc: no repo store wired")
+
+// errRepoSourceRead marks a failed database read of the repo's issue source (not a missing
+// row, which is permanent). It is the one UnavailableIssueTracker cause the board-free MR
+// watch treats as transient, see SyncBoardFreeMRStatesWithIssueSide.
+var errRepoSourceRead = errors.New("forgesvc: repo issue source read failed")
 
 // repoSource reads the one owner-scoped row both resolvers use.
 func (s *Service) repoSource(ctx context.Context, userID, repoID uuid.UUID) (store.GetRepoIssueSourceForUserRow, error) {
@@ -48,7 +54,10 @@ var ErrLinkedRepoUnresolvable = errors.New("repo is linked to an issue tracker t
 func (s *Service) IssueTrackerForRepo(ctx context.Context, userID, repoID uuid.UUID) (forge.IssueTracker, error) {
 	src, err := s.repoSource(ctx, userID, repoID)
 	if err != nil {
-		return nil, fmt.Errorf("read repo issue source: %w", err)
+		if errors.Is(err, pgx.ErrNoRows) || errors.Is(err, errNoRepoStore) {
+			return nil, fmt.Errorf("read repo issue source: %w", err)
+		}
+		return nil, fmt.Errorf("read repo issue source: %w: %w", errRepoSourceRead, err)
 	}
 	if !src.IssueTrackerConnectionID.Valid {
 		f, err := s.ForgeForConnection(src.ForgeType, src.BaseUrl, src.TokenCiphertext)
