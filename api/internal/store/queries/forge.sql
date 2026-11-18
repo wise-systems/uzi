@@ -970,9 +970,20 @@ LIMIT 100;
 -- MR is not watched) and only while the cached issue exists AND is opened (an evicted or closed
 -- issue is not polled forever). Live rows (NULL/opened/locked mr_state) sort ahead of closed
 -- reopen-watch rows so the latter can never starve them under the LIMIT; among live rows the
--- order is created_at DESC as before, so an unlinked repo's order is unchanged. Keep this rationale
--- ABOVE the statement — a comment trailing after the `;` is grabbed by sqlc as the NEXT query's doc.
-SELECT id, branch, mr_iid, mr_state
+-- order is created_at DESC as before, so an unlinked repo's order is unchanged. The output also
+-- carries issue_iid, kind and is_latest (PRD #4173 M5): the caller tells an issue-lane run from a
+-- scheduled or issue-less one by the first two, and is_latest is true iff no newer run of the same
+-- repo and issue_iid with kind NOT IN ('prompt','self_improve') exists, regardless of its status
+-- (the board lane's DISTINCT ON (issue_iid) ORDER BY created_at DESC semantics: every status
+-- counts), so a linked card moves only for its issue's latest run. They add no filter and change
+-- no ordering. Keep this rationale ABOVE the statement — a comment trailing after the `;` is
+-- grabbed by sqlc as the NEXT query's doc.
+SELECT id, branch, mr_iid, mr_state, issue_iid, kind,
+       (issue_iid IS NULL OR kind IN ('prompt', 'self_improve')
+        OR NOT EXISTS (SELECT 1 FROM runs nl
+                       WHERE nl.repo_id = runs.repo_id AND nl.issue_iid = runs.issue_iid
+                         AND nl.kind NOT IN ('prompt', 'self_improve')
+                         AND nl.created_at > runs.created_at))::boolean AS is_latest
 FROM runs
 WHERE repo_id = @repo_id::uuid
   AND (issue_iid IS NULL OR kind IN ('prompt', 'self_improve')
