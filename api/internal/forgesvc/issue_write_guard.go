@@ -239,3 +239,14 @@ func isLinkedTracker(tr forge.IssueTracker) bool {
 	_, ok := tr.(interface{ LinkedIssueSource() })
 	return ok
 }
+
+// isUnavailableTracker reports whether tr is the UnavailableIssueTracker placeholder, a
+// linked issue side whose every read, move and State write fails with its cause.
+func isUnavailableTracker(tr forge.IssueTracker) bool {
+	g, ok := tr.(*issueWriteGuard)
+	if !ok {
+		return false
+	}
+	_, unavailable := g.inner.(unavailableIssueTracker)
+	return unavailable
+}

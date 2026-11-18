@@ -39,13 +39,21 @@ func (s *Service) SyncBoardFreeMRStates(ctx context.Context, repoID uuid.UUID, f
 }
 
 // SyncBoardFreeMRStatesWithIssueSide is SyncBoardFreeMRStates for a repo whose issue side
-// may be a linked issue tracker (PRD #4173 M5). A candidate that is an issue-lane run
-// (issue_iid set, kind not prompt/self_improve) is reconciled through syncOneMRState, the
-// board lane's edge switch, so a linked card moves Human Review -> In Progress when its MR
-// closes and back when it reopens, exactly as an unlinked card does. The card moves only for
-// the issue's latest such run (the board lane's DISTINCT ON semantics): a superseded run
-// records its MR state with no move. Every other candidate, and every candidate when tr is
-// nil, goes through recordBoardFreeMRState unchanged.
+// may be a linked issue tracker (PRD #4173 M5). When tr is a real linked tracker, a candidate
+// that is an issue-lane run (issue_iid set, kind not prompt/self_improve) is reconciled
+// through syncOneMRState, the board lane's edge switch, so a linked card moves Human Review
+// -> In Progress when its MR closes and back when it reopens, exactly as an unlinked card
+// does. The card moves only for the issue's latest such run (the board lane's DISTINCT ON
+// semantics): a superseded run records its MR state with no move. A transient error from the
+// real linked driver defers the edge and retries it next tick, like the board lane.
+//
+// Every other candidate goes through recordBoardFreeMRState unchanged: that is every
+// candidate when tr is nil or is not a linked tracker (an unlinked repo's forge driver, whose
+// issue-lane runs the candidate query keeps out anyway), and every candidate when tr is the
+// UnavailableIssueTracker the poller hands a linked repo whose resolver failed. The
+// unavailable cause can be permanent (a connection removed from the allowlist), and a move
+// that fails with it would defer the close edge forever, leaving mr_state opened and the
+// rework gate open on a closed MR; recording without a move keeps the edge.
 //
 // A missing cached issue row skips the move (the MR state is still recorded) rather than
 // deferring it: this lane's candidates do not JOIN the issue cache, so deferring would poll
@@ -56,11 +64,12 @@ func (s *Service) SyncBoardFreeMRStatesWithIssueSide(ctx context.Context, repoID
 	if err != nil {
 		return err
 	}
+	movesCard := tr != nil && isLinkedTracker(tr) && !isUnavailableTracker(tr)
 	for _, c := range candidates {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		if tr != nil && c.IssueIid.Valid && c.Kind != "prompt" && c.Kind != "self_improve" {
+		if movesCard && c.IssueIid.Valid && c.Kind != "prompt" && c.Kind != "self_improve" {
 			s.syncOneMRState(ctx, repoID, forgeProjectID, f, tr, mrWatchCandidate{
 				RunID: c.ID, IssueIID: c.IssueIid.Int64, MrIID: c.MrIid.Int64, MrState: c.MrState,
 			}, mrLane{missingRow: moveSkipped, noMove: !c.IsLatest})

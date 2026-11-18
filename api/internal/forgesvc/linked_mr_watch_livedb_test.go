@@ -2,6 +2,7 @@ package forgesvc
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -413,5 +414,64 @@ func TestBoardFreeCandidatesReportLatestnessLiveDB(t *testing.T) {
 		if got := (view{r.IssueIid, r.Kind, r.IsLatest}); got != w.v {
 			t.Errorf("row %d = %+v, want %+v", i, got, w.v)
 		}
+	}
+}
+
+// When the poller could not build the linked issue side it hands over the
+// UnavailableIssueTracker. The close edge is still recorded (a permanent cause would
+// otherwise leave mr_state opened and the rework gate open on a closed MR), nothing is
+// moved or written, and the closed run stays a reopen-watch candidate like any linked
+// issue-lane run whose cached issue is still opened.
+func TestLinkedMRCloseIsRecordedWhenTheIssueSideIsUnavailableLiveDB(t *testing.T) {
+	f := newLinkedMRWatch(t, humanReviewMapping)
+	n := f.card(t, board.ColumnHumanReview)
+	run := f.run(t, n, 13, "opened", time.Minute)
+	f.tr = UnavailableIssueTracker(errors.New("down"))
+	f.srv.ResetRequests()
+
+	f.sync(t, map[int64]string{13: forge.MRStateClosed})
+	if got := f.mrState(t, run); got != forge.MRStateClosed {
+		t.Fatalf("mr_state = %q, want closed recorded despite the unavailable issue side", got)
+	}
+	if got := f.column(t, n); got != board.ColumnHumanReview {
+		t.Fatalf("cached column = %q, want it untouched", got)
+	}
+	if got := f.srv.IssueState(n); got != "In Review" {
+		t.Fatalf("State = %q, want it untouched", got)
+	}
+	if reqs := f.srv.Requests(); len(reqs) != 0 {
+		t.Fatalf("requests reached the tracker: %+v", reqs)
+	}
+	rows, err := f.q.ListBoardFreeMRStateWatchCandidates(context.Background(), f.repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].ID != run || rows[0].MrState.String != forge.MRStateClosed {
+		t.Fatalf("candidates = %+v, want only the closed run, watched for a reopen", rows)
+	}
+}
+
+// A self_improve run carries an issue_iid but is not an issue-lane run: its close edge is
+// recorded and moves no card, even over a Human Review card. (A prompt run cannot carry an
+// issue_iid: runs_kind_shape refuses it, so only self_improve can reach the kind check.)
+func TestLinkedMRSelfImproveRunNeverMovesTheCardLiveDB(t *testing.T) {
+	f := newLinkedMRWatch(t, humanReviewMapping)
+	n := f.card(t, board.ColumnHumanReview)
+	run := f.run(t, n, 13, "opened", time.Minute)
+	f.exec(t, `UPDATE runs SET kind = 'self_improve' WHERE id = $1`, run)
+	f.srv.ResetRequests()
+
+	f.sync(t, map[int64]string{13: forge.MRStateClosed})
+	if got := f.mrState(t, run); got != forge.MRStateClosed {
+		t.Fatalf("mr_state = %q, want closed recorded", got)
+	}
+	if got := f.column(t, n); got != board.ColumnHumanReview {
+		t.Fatalf("cached column = %q, want it untouched", got)
+	}
+	if got := f.srv.IssueState(n); got != "In Review" {
+		t.Fatalf("State = %q, want it untouched", got)
+	}
+	if w := f.writes(); len(w) != 0 {
+		t.Fatalf("a self_improve run wrote to the issue tracker: %+v", w)
 	}
 }
