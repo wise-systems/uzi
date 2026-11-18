@@ -515,3 +515,46 @@ func TestCustomFieldNotObjectHasItsOwnError(t *testing.T) {
 		t.Errorf("err = %v, want errCustomFieldNotObject", err)
 	}
 }
+
+func TestMoveToColumnRefusesAnIssueResolvedInTheIssueTrackerWithoutAReopen(t *testing.T) {
+	y, srv := columnDriver(t, nil)
+	ctx := context.Background()
+	n := srv.SeedIssue("t", "")
+	if err := y.SetIssueState(ctx, testProjectID, n, forge.StateClosed); err != nil {
+		t.Fatalf("resolve the issue: %v", err)
+	}
+	before := srv.IssueState(n)
+	srv.ResetRequests()
+	err := y.MoveToColumn(ctx, testProjectID, n, forge.ColumnMove{Column: "In Progress"})
+	if !errors.Is(err, ErrIssueResolved) {
+		t.Fatalf("MoveToColumn = %v, want ErrIssueResolved", err)
+	}
+	if w := writesOf(srv); len(w) != 0 {
+		t.Errorf("writes sent for a resolved issue: %v", w)
+	}
+	if got := srv.IssueState(n); got != before {
+		t.Errorf("issue state = %q, want it untouched (%q)", got, before)
+	}
+}
+
+func TestMoveToColumnWithReopenWritesOverAResolvedIssue(t *testing.T) {
+	y, srv := columnDriver(t, nil)
+	ctx := context.Background()
+	n := srv.SeedIssue("t", "")
+	if err := y.SetIssueState(ctx, testProjectID, n, forge.StateClosed); err != nil {
+		t.Fatalf("resolve the issue: %v", err)
+	}
+	if err := y.MoveToColumn(ctx, testProjectID, n, forge.ColumnMove{Column: "In Progress", Reopen: true}); err != nil {
+		t.Fatalf("MoveToColumn with Reopen: %v", err)
+	}
+	if got := srv.IssueState(n); got != "In Progress" {
+		t.Errorf("issue state = %q, want In Progress", got)
+	}
+	iss, err := y.GetIssue(ctx, testProjectID, n)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if iss.State != string(forge.StateOpened) {
+		t.Errorf("issue state after the reopen = %q, want opened", iss.State)
+	}
+}

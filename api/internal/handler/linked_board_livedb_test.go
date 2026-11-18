@@ -164,6 +164,31 @@ func TestLinkedBoardMoveToAnUnmappedColumnIsRefusedLiveDB(t *testing.T) {
 	}
 }
 
+// A card a person resolved in YouTrack while the cache still shows it open is not moved by a
+// drag: 409, no State write, the cache unchanged so the card snaps back.
+func TestLinkedBoardDragOfAnIssueResolvedInYouTrackIs409LiveDB(t *testing.T) {
+	f := newStateMappingFixture(t)
+	f.boardMapping(t)
+	// Resolve the issue in YouTrack, then put the cache back as it was before the next sync.
+	if code, body := f.move("closed"); code != http.StatusOK {
+		t.Fatalf("close = %d %s", code, body)
+	}
+	if _, err := f.pool.Exec(context.Background(), `UPDATE issues SET state = 'opened' WHERE repo_id = $1 AND forge_issue_iid = $2`, f.repo, f.issueN); err != nil {
+		t.Fatal(err)
+	}
+	f.srv.ResetRequests()
+
+	code, body := f.move("In Progress")
+	if code != http.StatusConflict || !strings.Contains(body, "resolved in the issue tracker") {
+		t.Fatalf("move = %d %s, want 409 naming the resolved issue", code, body)
+	}
+	f.assertNoYouTrackWrites(t)
+	if got := f.srv.IssueState(f.issueN); got != "Fixed" {
+		t.Fatalf("YouTrack State = %q, want Fixed untouched", got)
+	}
+	f.assertCache(t, "opened", "")
+}
+
 // A failing issue tracker answers 502 and leaves the cache as it was.
 func TestLinkedBoardMoveWhenYouTrackFailsIs502LiveDB(t *testing.T) {
 	f := newStateMappingFixture(t)

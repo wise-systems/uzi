@@ -125,6 +125,11 @@ type ColumnMove struct {
 	// Add and Remove are the label delta, exactly board.PlanLabelMove's output.
 	Add    []string
 	Remove []string
+	// Reopen is set only by an explicit reopen of a closed card. An automatic
+	// move leaves it false, so an issue tracker that keeps its own resolved
+	// state refuses to write over an issue a person resolved there. A
+	// label-backed forge ignores it: a forge label move never reopens.
+	Reopen bool
 }
 
 // MoveByLabels is the label-backed implementation of IssueTracker.MoveToColumn:

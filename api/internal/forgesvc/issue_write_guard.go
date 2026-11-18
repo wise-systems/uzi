@@ -60,6 +60,15 @@ func ColumnMoveRefused(err error) bool {
 		errors.Is(err, issuetracker.ErrStateNotAllowed)
 }
 
+// LinkedIssueResolved reports whether err is the issue tracker driver refusing an
+// automatic card move because the issue is resolved in the issue tracker
+// (issuetracker.ErrIssueResolved). It is deliberately not part of IssueWriteSkippable
+// or ColumnMoveRefused: retrying cannot help, and the person's resolution wins until
+// the next sync brings it into the cache.
+func LinkedIssueResolved(err error) bool {
+	return errors.Is(err, issuetracker.ErrIssueResolved)
+}
+
 // issueWriteGuard wraps a linked repo's issue tracker driver. Reads pass
 // through, as do all writes (PRD #4173 M5), each marked when the issue moved away; the
 // only write refused before any request is a label write that removes the eligibility

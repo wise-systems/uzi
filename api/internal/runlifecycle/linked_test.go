@@ -126,6 +126,24 @@ func TestLinkedMoveSkippableWriteClearsMarker(t *testing.T) {
 	}
 }
 
+// A person resolved the issue in the issue tracker and the cache still shows it open: the
+// driver refuses the write and the marker is cleared, like the cached closed-issue guard.
+func TestLinkedMoveIssueResolvedInTheIssueTrackerClearsMarker(t *testing.T) {
+	fs, sm, _, l, runID, _, _ := linkedFixture("queued", fmt.Errorf("move: %w", issuetracker.ErrIssueResolved))
+
+	l.notifyOnce(context.Background(), runID, "queued")
+
+	if len(sm.moves) != 1 {
+		t.Fatalf("expected one move attempt, got %v", sm.moves)
+	}
+	if len(fs.cleared) != 1 || fs.cleared[0] != runID {
+		t.Fatalf("a resolved issue clears the marker once, got %v", fs.cleared)
+	}
+	if len(fs.recorded) != 0 {
+		t.Fatal("board_column must not be recorded for a refused move")
+	}
+}
+
 func TestLinkedMoveOtherErrorStillRetries(t *testing.T) {
 	fs, _, _, l, runID, _, _ := linkedFixture("queued", errors.New("youtrack unreachable"))
 

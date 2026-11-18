@@ -7,9 +7,11 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/board"
 	"github.com/vtmocanu/uzi/api/internal/forge"
+	"github.com/vtmocanu/uzi/api/internal/issuetracker"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -90,6 +92,28 @@ func TestGuardedMRMoveOnALinkedRepoRecordsTheMRState(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertNoMove(t, f)
+	assertRecorded(t, st, runID, "closed")
+}
+
+// A card a person resolved in the issue tracker (cache still open) is not moved: the
+// edge is consumed, the MR state is recorded, and nothing is retried.
+func TestGuardedMRMoveOnAnIssueResolvedInTheIssueTrackerRecordsAndSkips(t *testing.T) {
+	runID, repoID := uuid.New(), uuid.New()
+	st := &fakeStore{
+		candidates: []store.ListMRWatchCandidatesRow{candidate(runID, 9, 13, mrTxt("opened"))},
+		issue:      mrIssue(repoID, 9, "opened", "PRD", board.ColumnHumanReview),
+		columns:    mrCols(),
+	}
+	st.issue.IssueTrackerColumn = pgtype.Text{String: board.ColumnHumanReview, Valid: true}
+	f := &fakeForge{mr: forgeMR(13, "closed")}
+	d := &movingDriver{err: fmt.Errorf("move: %w", issuetracker.ErrIssueResolved)}
+
+	if err := newTestService(st).SyncMRStates(context.Background(), repoID, testProjectID, f, &issueWriteGuard{inner: d}); err != nil {
+		t.Fatal(err)
+	}
+	if len(d.moves) != 1 {
+		t.Fatalf("move attempts = %v, want exactly one (no retry)", d.moves)
+	}
 	assertRecorded(t, st, runID, "closed")
 }
 

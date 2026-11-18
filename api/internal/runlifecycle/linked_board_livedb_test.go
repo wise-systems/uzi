@@ -256,6 +256,38 @@ func TestLinkedRefusedMoveKeepsTheMarkerUntilTheMappingIsSavedLiveDB(t *testing.
 	}
 }
 
+// A person resolved the issue in YouTrack and the cache still shows it open: a run
+// transition writes no State and clears the marker, so the resolution stands.
+func TestLinkedMoveOfAnIssueResolvedInYouTrackWritesNothingLiveDB(t *testing.T) {
+	f := newLinkedLifecycleLive(t)
+	ctx := context.Background()
+	saveStateMapping(t, f.pool, f.repo)
+	n := f.srv.SeedIssue("a card", "b", youtracktest.EligibilityTagID)
+	f.cacheIssue(t, n)
+	runID := f.completedRun(t, n)
+	tr, err := f.svc.IssueTrackerForRepo(ctx, f.user, f.repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tr.SetIssueState(ctx, 77, n, forge.StateClosed); err != nil {
+		t.Fatalf("resolve the issue in YouTrack: %v", err)
+	}
+	resolved := f.srv.IssueState(n)
+	f.srv.ResetRequests()
+
+	f.lifecycle().notifyOnce(ctx, runID, "completed")
+
+	if w := f.writes(); len(w) != 0 {
+		t.Fatalf("a write reached the resolved issue: %+v", w)
+	}
+	if got := f.srv.IssueState(n); got != resolved {
+		t.Fatalf("issue State = %q, want the resolved %q untouched", got, resolved)
+	}
+	if pending, col := f.pending(t, runID); pending || col.Valid {
+		t.Fatalf("pending=%v board_column=%+v, want the marker cleared and nothing recorded", pending, col)
+	}
+}
+
 // A moved-away cached issue is skipped: the write is attempted (the mapping is saved) and
 // answers not-found, the marker is cleared, and the cache is untouched.
 func TestLinkedMovedAwayCachedIssueClearsTheMarkerLiveDB(t *testing.T) {

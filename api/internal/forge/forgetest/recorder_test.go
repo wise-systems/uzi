@@ -98,7 +98,7 @@ func TestRecorderMoveToColumnRecordsTheLabelBackedMove(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	wantMoves := []string{`MoveToColumn(42, 7, {Column:"In Progress" Ensure:[{Name:"In Progress" Color:"#123456"}] Add:["In Progress"] Remove:["Planned"]})`}
+	wantMoves := []string{`MoveToColumn(42, 7, {Column:"In Progress" Ensure:[{Name:"In Progress" Color:"#123456"}] Add:["In Progress"] Remove:["Planned"] Reopen:false})`}
 	if got := rec.Moves(); !slices.Equal(got, wantMoves) {
 		t.Fatalf("moves = %q, want %q", got, wantMoves)
 	}

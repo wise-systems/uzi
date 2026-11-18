@@ -70,6 +70,24 @@ func (d *movingDriver) SetIssueState(_ context.Context, _, _ int64, s forge.Issu
 	return d.err
 }
 
+func TestLinkedIssueResolvedNamesOnlyTheResolvedRefusal(t *testing.T) {
+	if !LinkedIssueResolved(fmt.Errorf("move: %w", issuetracker.ErrIssueResolved)) {
+		t.Error("a wrapped ErrIssueResolved must be reported")
+	}
+	if !LinkedIssueResolved((&issueWriteGuard{inner: &movingDriver{err: issuetracker.ErrIssueResolved}}).MoveToColumn(context.Background(), 1, 2, forge.ColumnMove{})) {
+		t.Error("the write guard must keep ErrIssueResolved in the chain")
+	}
+	for _, e := range []error{nil, issuetracker.ErrColumnNotMapped, ErrIssueWriteNotOffered, errors.New("503")} {
+		if LinkedIssueResolved(e) {
+			t.Errorf("LinkedIssueResolved(%v) = true, want false", e)
+		}
+	}
+	// Neither a skip nor a refusal: each has its own caller handling.
+	if IssueWriteSkippable(issuetracker.ErrIssueResolved) || ColumnMoveRefused(issuetracker.ErrIssueResolved) {
+		t.Error("ErrIssueResolved must be neither IssueWriteSkippable nor ColumnMoveRefused")
+	}
+}
+
 func TestColumnMoveRefusedNamesOnlyTheDriversRefusals(t *testing.T) {
 	tests := []struct {
 		name string
@@ -429,6 +447,9 @@ func TestReopenIssueOnALinkedRepoIsOneMoveThenTheCache(t *testing.T) {
 		}
 		if len(d.moves) != 1 || d.moves[0].Column != "In Progress" {
 			t.Fatalf("moves = %v, want one move to In Progress", d.moves)
+		}
+		if !d.moves[0].Reopen {
+			t.Fatalf("move = %+v, want Reopen set so the driver writes over a resolved issue", d.moves[0])
 		}
 		if len(st.reopens) != 1 || len(st.columnWrites) != 1 || st.columnWrites[0].IssueTrackerColumn != "In Progress" {
 			t.Fatalf("reopens=%v columnWrites=%v", st.reopens, st.columnWrites)

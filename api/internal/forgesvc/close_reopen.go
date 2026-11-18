@@ -95,9 +95,11 @@ func (s *Service) ReopenIssue(ctx context.Context, f forge.IssueTracker, forgePr
 // success does the cache change: ReopenIssueState (state opened, board_position
 // nulled), then SetIssueTrackerColumn. A failure between the two statements leaves
 // the row opened in the Open lane, the same partial-failure contract as the unlinked
-// reopen. The target "" is the Open column and uses the stored open State.
+// reopen. The target "" is the Open column and uses the stored open State. The move
+// sets Reopen, so the driver writes over an issue resolved in the issue tracker; an
+// automatic move leaves it false and is refused for such an issue.
 func (s *Service) reopenLinkedIssue(ctx context.Context, f forge.IssueTracker, forgeProjectID int64, issue store.Issue, target string) (store.Issue, error) {
-	if err := f.MoveToColumn(ctx, forgeProjectID, issue.ForgeIssueIid, forge.ColumnMove{Column: target}); err != nil {
+	if err := f.MoveToColumn(ctx, forgeProjectID, issue.ForgeIssueIid, forge.ColumnMove{Column: target, Reopen: true}); err != nil {
 		return store.Issue{}, err
 	}
 	if issue.State != string(forge.StateOpened) {

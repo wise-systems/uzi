@@ -343,6 +343,9 @@ func contextFromRow(mc store.GetRunMoveContextRow) moveContext {
 //   - forge move succeeds → record board_column and clear the marker;
 //   - manual drag / closed issue / unknown baseline → clear the marker (a
 //     definitive skip that retrying cannot fix);
+//   - an issue a person resolved in the linked issue tracker since the last sync
+//     (the cache still shows it open) → the driver refuses the write and the marker
+//     is cleared, the same outcome as the cached closed issue;
 //   - forge error, or a move the linked issue tracker refused (no State mapped for
 //     the column) → leave the marker for a later reconcile retry;
 //   - a linked issue missing from the cache → probeUncachedLinkedIssue decides.
@@ -420,6 +423,14 @@ func (l *Lifecycle) apply(ctx context.Context, runID uuid.UUID, mc moveContext, 
 			// skip, logged once) instead of retrying to the give-up window. The run's
 			// code-host side is unaffected.
 			slog.Info("run lifecycle: issue move skipped on linked repo", "run", runID, "target", dec.target, "reason", err)
+			l.clearPending(ctx, runID)
+			return
+		}
+		if forgesvc.LinkedIssueResolved(err) {
+			// A person resolved the issue in the issue tracker and the cache has not caught
+			// up. Their resolution wins: no State was written, and retrying cannot help
+			// (same outcome as the cached closed-issue guard above).
+			slog.Info("run lifecycle: issue move skipped, the issue is resolved in the issue tracker", "run", runID, "target", dec.target)
 			l.clearPending(ctx, runID)
 			return
 		}

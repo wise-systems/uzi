@@ -26,8 +26,12 @@ var (
 	// ErrRedirectRefused is returned when the server answers with a redirect.
 	// The client never follows one, so the token cannot be forwarded.
 	ErrRedirectRefused = errors.New("issuetracker: redirect refused")
+	// ErrIssueResolved is returned by MoveToColumn for an issue that is resolved
+	// in the issue tracker when the move is not an explicit reopen. Nothing is
+	// written.
+	ErrIssueResolved = errors.New("issuetracker: issue is resolved in the issue tracker")
 )
 
 // packageSentinels lists every sentinel above. redactor.sentinel keeps only
 // these in an error chain, so a new sentinel must be added here too.
-var packageSentinels = []error{ErrUnsupportedKind, ErrProjectNotBound, ErrProjectMismatch, ErrStateMappingUnset, ErrColumnNotMapped, ErrStateNotAllowed, ErrInvalidLabelName, ErrRedirectRefused}
+var packageSentinels = []error{ErrUnsupportedKind, ErrProjectNotBound, ErrProjectMismatch, ErrStateMappingUnset, ErrColumnNotMapped, ErrStateNotAllowed, ErrInvalidLabelName, ErrRedirectRefused, ErrIssueResolved}

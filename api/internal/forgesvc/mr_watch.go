@@ -269,8 +269,15 @@ func (s *Service) guardedMRMove(ctx context.Context, repoID uuid.UUID, forgeProj
 			slog.Info("forgesvc: MR-state move skipped for a linked repo", "repo", repoID, "issue", issueIID, "target", target, "reason", err)
 			return moveSkipped
 		}
+		if LinkedIssueResolved(err) {
+			// A person resolved the issue in the issue tracker since the last sync, so the
+			// cache still shows it open. Their resolution wins: consume the edge without a
+			// move, as for a closed issue in the cache.
+			slog.Info("forgesvc: MR-state move skipped, the issue is resolved in the issue tracker", "repo", repoID, "issue", issueIID, "target", target)
+			return moveSkipped
+		}
 		if ColumnMoveRefused(err) {
-			// The linked tracker refused the move before any request: the target
+			// The linked issue tracker refused the move before any request: the target
 			// column has no State mapped, the mapping is unset, or the State is not
 			// allowed. Unlike the run lifecycle, the MR watch does not replay it: the
 			// MR state is recorded and the card stays where it is (a manual drag

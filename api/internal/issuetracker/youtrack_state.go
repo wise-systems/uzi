@@ -45,12 +45,14 @@ func (y *youTrack) SetIssueState(ctx context.Context, projectID, issueIID int64,
 // the open state. A column with no mapped State is ErrColumnNotMapped, and
 // neither case sends a request before the check. The target is then checked
 // against the project's State bundle and the issue against the bound project, as
-// SetIssueState does.
+// SetIssueState does. An issue the issue tracker already shows as resolved is
+// ErrIssueResolved with no write unless move.Reopen is set, so an automatic move
+// never reopens an issue a person resolved there between two syncs.
 func (y *youTrack) MoveToColumn(ctx context.Context, projectID, issueIID int64, move forge.ColumnMove) error {
-	return y.moveToColumn(ctx, projectID, issueIID, move.Column)
+	return y.moveToColumn(ctx, projectID, issueIID, move.Column, move.Reopen)
 }
 
-func (y *youTrack) moveToColumn(ctx context.Context, projectID, issueIID int64, column string) error {
+func (y *youTrack) moveToColumn(ctx context.Context, projectID, issueIID int64, column string, reopen bool) error {
 	if _, err := y.requireProject(projectID); err != nil {
 		return err
 	}
@@ -74,6 +76,9 @@ func (y *youTrack) moveToColumn(ctx context.Context, projectID, issueIID int64, 
 	w, err := y.resolveIssue(ctx, projectID, issueIID)
 	if err != nil {
 		return err
+	}
+	if w.Resolved != nil && !reopen {
+		return y.red.sentinel(ErrIssueResolved, 0, "")
 	}
 	return y.writeState(ctx, w, target)
 }
