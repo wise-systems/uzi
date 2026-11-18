@@ -23,7 +23,7 @@ import (
 var ErrIssueWriteNotOffered = issuesource.ErrIssueWriteNotOffered
 
 // linkedIssueError marks an *forge.IssueNotFoundError returned by a linked
-// repo's issue reads. A forge not-found is never marked, so IssueWriteSkippable
+// repo's issue reads and writes. A forge not-found is never marked, so IssueWriteSkippable
 // can tell "the linked issue moved or is gone" (D10: skip, never retry forever)
 // from an ordinary forge not-found that existing callers handle on their own.
 type linkedIssueError struct{ err error }
@@ -61,9 +61,9 @@ func ColumnMoveRefused(err error) bool {
 }
 
 // issueWriteGuard wraps a linked repo's issue tracker driver. Reads pass
-// through, as do the move, State, create and label writes (PRD #4173 M5); every other
-// write is refused before any request until its own unit lifts it, and so is a label
-// write that removes the eligibility name.
+// through, as do all writes (PRD #4173 M5), each marked when the issue moved away; the
+// only write refused before any request is a label write that removes the eligibility
+// name.
 type issueWriteGuard struct {
 	inner forge.IssueTracker
 	// eligibility is the link's stored eligibility tag name; "" when none is known
@@ -198,9 +198,10 @@ func (g *issueWriteGuard) CreateIssueNote(ctx context.Context, projectID, issueI
 // UnavailableIssueTracker is the issue side handed to a linked repo whose resolver
 // failed (for example a connection removed from the allowlist): every read returns
 // cause, which is NOT skippable so no marker is settled over an outage, as does a
-// move, State, create, note, description or label write; the only write the guard
-// itself refuses is the eligibility-tag removal. It lets the poller's issue-side steps fail or skip per candidate while the
-// code-host steps carry on, instead of dereferencing a nil tracker.
+// move, State, create, note, description or label write (it has no eligibility name,
+// so the guard refuses nothing). It lets the poller's issue-side steps fail or skip
+// per candidate while the code-host steps carry on, instead of dereferencing a nil
+// tracker.
 func UnavailableIssueTracker(cause error) forge.IssueTracker {
 	return &issueWriteGuard{inner: unavailableIssueTracker{cause: cause}}
 }

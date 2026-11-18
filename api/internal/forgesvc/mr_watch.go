@@ -263,7 +263,7 @@ func (s *Service) guardedMRMove(ctx context.Context, repoID uuid.UUID, forgeProj
 
 	if _, err := s.AutoMove(ctx, tr, forgeProjectID, issue, cols, target); err != nil {
 		if IssueWriteSkippable(err) {
-			// The write is not offered for this repo or the linked issue is gone:
+			// The linked issue is gone or the write is not offered:
 			// consume the edge so recordMRState still records the MR state, and never
 			// retry forever (PRD #4173 D10).
 			slog.Info("forgesvc: MR-state move skipped for a linked repo", "repo", repoID, "issue", issueIID, "target", target, "reason", err)

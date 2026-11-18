@@ -145,8 +145,9 @@ func TestLinkedCIAutofixCommentsOnAMovedAwayIssueAreLoggedAndTheRunContinuesLive
 	}
 }
 
-// A YouTrack 500 on the comment is logged and the run continues.
-func TestLinkedCIAutofixCommentFailureOnA500IsLoggedAndTheRunContinuesLiveDB(t *testing.T) {
+// A failed comment write (a stub standing in for the tracker; youtracktest cannot
+// answer a 500) is logged and the run continues.
+func TestLinkedCIAutofixCommentFailureIsLoggedAndTheRunContinuesLiveDB(t *testing.T) {
 	_, _, tr, n := linkedCommentFixture(t)
 	logs := captureLogs(t, slog.LevelDebug)
 	st := &cfStore{candidates: []store.ListCIAutofixCandidateRefsRow{ciCand(branchFor(n), 9001)}}

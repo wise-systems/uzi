@@ -261,9 +261,9 @@ func TestIssueTrackerForRepoLinkedBuildsTheBoundDriverBehindTheGuard(t *testing.
 	if accepted != 7 || len(errs) != 0 {
 		t.Fatalf("accepted %d writes with errors %v, want all 7 accepted", accepted, errs)
 	}
-	want5 := []string{"UpdateIssueLabels", "CreateIssueNote", "CreateIssue", "SetIssueState", "MoveToColumn", "UpdateIssueDescription", "EnsureLabels"}
-	if !slices.Equal(d.driver.writes, want5) {
-		t.Fatalf("writes that reached the driver = %v, want %v", d.driver.writes, want5)
+	wantWrites := []string{"UpdateIssueLabels", "CreateIssueNote", "CreateIssue", "SetIssueState", "MoveToColumn", "UpdateIssueDescription", "EnsureLabels"}
+	if !slices.Equal(d.driver.writes, wantWrites) {
+		t.Fatalf("writes that reached the driver = %v, want %v", d.driver.writes, wantWrites)
 	}
 	// The guard was built with the row's stored eligibility name ("uzi"): removing it is
 	// refused before the driver, adding it is not.
@@ -273,7 +273,7 @@ func TestIssueTrackerForRepoLinkedBuildsTheBoundDriverBehindTheGuard(t *testing.
 	if err := tr.UpdateIssueLabels(context.Background(), 4242, 9, []string{"uzi"}, nil); err != nil {
 		t.Fatalf("adding the eligibility name: %v", err)
 	}
-	if len(d.driver.writes) != len(want5)+1 {
+	if len(d.driver.writes) != len(wantWrites)+1 {
 		t.Fatalf("writes that reached the driver = %v, want only the add after the refused removal", d.driver.writes)
 	}
 	if _, err := tr.ListIssues(context.Background(), 4242, forge.ListIssuesOptions{}); err != nil {
