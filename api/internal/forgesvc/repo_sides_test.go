@@ -255,20 +255,15 @@ func TestIssueTrackerForRepoLinkedBuildsTheBoundDriverBehindTheGuard(t *testing.
 		t.Errorf("a linked repo's issue side must not build the forge driver")
 	}
 
-	// The move, State, create, ensure and label writes are offered (PRD #4173 M5); the
-	// description and the note are still refused before any request.
+	// Every write is offered (PRD #4173 M5, U6 lifts the note and description); only the
+	// eligibility-tag removal is refused, below.
 	accepted, errs := writeAll(context.Background(), tr, 4242)
-	if accepted != 5 || len(errs) != 2 {
-		t.Fatalf("accepted %d writes with %d errors, want 5 accepted and 2 refused", accepted, len(errs))
+	if accepted != 7 || len(errs) != 0 {
+		t.Fatalf("accepted %d writes with errors %v, want all 7 accepted", accepted, errs)
 	}
-	for _, e := range errs {
-		if !errors.Is(e, ErrIssueWriteNotOffered) || !IssueWriteSkippable(e) {
-			t.Errorf("write error = %v, want ErrIssueWriteNotOffered", e)
-		}
-	}
-	want5 := []string{"UpdateIssueLabels", "CreateIssue", "SetIssueState", "MoveToColumn", "EnsureLabels"}
+	want5 := []string{"UpdateIssueLabels", "CreateIssueNote", "CreateIssue", "SetIssueState", "MoveToColumn", "UpdateIssueDescription", "EnsureLabels"}
 	if !slices.Equal(d.driver.writes, want5) {
-		t.Fatalf("writes that reached the driver = %v, want only %v", d.driver.writes, want5)
+		t.Fatalf("writes that reached the driver = %v, want %v", d.driver.writes, want5)
 	}
 	// The guard was built with the row's stored eligibility name ("uzi"): removing it is
 	// refused before the driver, adding it is not.

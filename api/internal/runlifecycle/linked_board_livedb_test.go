@@ -1,11 +1,14 @@
 package runlifecycle
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -274,5 +277,61 @@ func TestLinkedMovedAwayCachedIssueClearsTheMarkerLiveDB(t *testing.T) {
 	var cached pgtype.Text
 	if err := f.pool.QueryRow(context.Background(), `SELECT issue_tracker_column FROM issues WHERE repo_id = $1 AND forge_issue_iid = $2`, f.repo, n).Scan(&cached); err != nil || cached.Valid {
 		t.Fatalf("cached column = %+v (%v), want NULL", cached, err)
+	}
+}
+
+// PRD #4173 M5 U6: the autopilot terminal comment reaches the YouTrack issue through the
+// resolver, the guard and the driver. A moved-away issue is logged and the lifecycle
+// carries on (the move marker is still cleared).
+func autopilotCompletedRun(t *testing.T, f *linkedLifecycleLive, n int64) uuid.UUID {
+	t.Helper()
+	f.cacheIssue(t, n)
+	runID := f.completedRun(t, n)
+	f.exec(t, `UPDATE runs SET auto_approve = true WHERE id = $1`, runID)
+	return runID
+}
+
+func TestLinkedTerminalCommentLandsOnTheYouTrackIssueLiveDB(t *testing.T) {
+	f := newLinkedLifecycleLive(t)
+	saveStateMapping(t, f.pool, f.repo)
+	n := f.srv.SeedIssue("a card", "b", youtracktest.EligibilityTagID)
+	runID := autopilotCompletedRun(t, f, n)
+
+	f.lifecycle().notifyOnce(context.Background(), runID, "completed")
+
+	tr, err := f.svc.IssueTrackerForRepo(context.Background(), f.user, f.repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cs, err := tr.ListIssueComments(context.Background(), 77, n)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cs) != 1 || !strings.HasPrefix(cs[0].Body, "**Autopilot opened a merge request.**") || !strings.Contains(cs[0].Body, "!13") {
+		t.Fatalf("YouTrack comments = %+v, want the terminal comment", cs)
+	}
+}
+
+func TestLinkedTerminalCommentOnAMovedAwayIssueIsLoggedAndTheLifecycleContinuesLiveDB(t *testing.T) {
+	f := newLinkedLifecycleLive(t)
+	saveStateMapping(t, f.pool, f.repo)
+	n := f.srv.SeedIssue("a card", "b", youtracktest.EligibilityTagID)
+	runID := autopilotCompletedRun(t, f, n)
+	f.srv.MoveIssue(n, youtracktest.OtherProjectID)
+	var logs bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	f.lifecycle().notifyOnce(context.Background(), runID, "completed")
+
+	if w := f.writes(); len(w) != 0 {
+		t.Fatalf("a write reached the moved-away issue: %+v", w)
+	}
+	if !strings.Contains(logs.String(), "autopilot terminal comment skipped, the linked issue is gone or moved") {
+		t.Fatalf("the skipped comment was not logged: %s", logs.String())
+	}
+	if pending, _ := f.pending(t, runID); pending {
+		t.Fatal("the move marker was left set")
 	}
 }

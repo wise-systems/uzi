@@ -12,12 +12,11 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/issuetracker"
 )
 
-// ErrIssueWriteNotOffered is returned by the write guard for the writes to a linked
-// external issue tracker that are not offered: UpdateIssueDescription and
-// CreateIssueNote until their unit lifts them, and an UpdateIssueLabels that removes
-// the eligibility name (the eligibility tag is never stripped). No request is sent.
-// MoveToColumn, SetIssueState, CreateIssue, EnsureLabels and the other label writes
-// pass through (PRD #4173 M5).
+// ErrIssueWriteNotOffered is returned by the write guard for the one write to a linked
+// external issue tracker that is not offered: an UpdateIssueLabels that removes the
+// eligibility name (the eligibility tag is never stripped). No request is sent.
+// MoveToColumn, SetIssueState, CreateIssue, CreateIssueNote, UpdateIssueDescription,
+// EnsureLabels and the other label writes pass through (PRD #4173 M5).
 //
 // It is the issuesource sentinel itself, so a package that cannot import forgesvc
 // (workersvc) can wrap and match the same value.
@@ -178,8 +177,9 @@ func (g *issueWriteGuard) MoveToColumn(ctx context.Context, projectID, issueIID 
 	return markNotFound(g.inner.MoveToColumn(ctx, projectID, issueIID, move))
 }
 
-func (g *issueWriteGuard) UpdateIssueDescription(context.Context, int64, int64, string) error {
-	return g.refuse("update issue description")
+// UpdateIssueDescription passes through (PRD #4173 M5); a moved-away issue is marked.
+func (g *issueWriteGuard) UpdateIssueDescription(ctx context.Context, projectID, issueIID int64, description string) error {
+	return markNotFound(g.inner.UpdateIssueDescription(ctx, projectID, issueIID, description))
 }
 
 // SetIssueState passes through to the issue tracker driver, which writes the
@@ -188,15 +188,18 @@ func (g *issueWriteGuard) SetIssueState(ctx context.Context, projectID, issueIID
 	return markNotFound(g.inner.SetIssueState(ctx, projectID, issueIID, state))
 }
 
-func (g *issueWriteGuard) CreateIssueNote(context.Context, int64, int64, string) (forge.IssueNote, error) {
-	return forge.IssueNote{}, g.refuse("create issue note")
+// CreateIssueNote passes through (PRD #4173 M5): the note lands as a comment on the
+// linked issue; a moved-away issue is marked.
+func (g *issueWriteGuard) CreateIssueNote(ctx context.Context, projectID, issueIID int64, body string) (forge.IssueNote, error) {
+	n, err := g.inner.CreateIssueNote(ctx, projectID, issueIID, body)
+	return n, markNotFound(err)
 }
 
 // UnavailableIssueTracker is the issue side handed to a linked repo whose resolver
 // failed (for example a connection removed from the allowlist): every read returns
 // cause, which is NOT skippable so no marker is settled over an outage, as does a
-// move, State, create or label write; the writes still refused by the write guard stay
-// refused. It lets the poller's issue-side steps fail or skip per candidate while the
+// move, State, create, note, description or label write; the only write the guard
+// itself refuses is the eligibility-tag removal. It lets the poller's issue-side steps fail or skip per candidate while the
 // code-host steps carry on, instead of dereferencing a nil tracker.
 func UnavailableIssueTracker(cause error) forge.IssueTracker {
 	return &issueWriteGuard{inner: unavailableIssueTracker{cause: cause}}

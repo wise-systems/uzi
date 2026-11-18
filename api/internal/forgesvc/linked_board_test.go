@@ -30,6 +30,19 @@ type movingDriver struct {
 	creates  [][]string
 	ensured  [][]forge.Label
 	labelOps [][2][]string
+	// The description and note writes PRD #4173 M5 U6 lifts through the guard.
+	descriptions []string
+	notes        []string
+}
+
+func (d *movingDriver) UpdateIssueDescription(_ context.Context, _, _ int64, desc string) error {
+	d.descriptions = append(d.descriptions, desc)
+	return d.err
+}
+
+func (d *movingDriver) CreateIssueNote(_ context.Context, _, _ int64, body string) (forge.IssueNote, error) {
+	d.notes = append(d.notes, body)
+	return forge.IssueNote{}, d.err
 }
 
 func (d *movingDriver) CreateIssue(_ context.Context, _ int64, _, _ string, labels []string) (forge.Issue, error) {
@@ -134,8 +147,8 @@ func TestGuardPassesMovesAndStateWritesThroughAndMarksNotFound(t *testing.T) {
 	})
 
 	// Converted from "every other write is still refused without reaching the driver": create,
-	// ensure and label writes are lifted by PRD #4173 M5; the description and note writes stay
-	// refused until their unit.
+	// ensure and label writes are lifted by PRD #4173 M5; the description and note writes are
+	// lifted by U6.
 	t.Run("create and label writes reach the driver", func(t *testing.T) {
 		d := &movingDriver{}
 		g := &issueWriteGuard{inner: d, eligibility: "ready"}
@@ -198,13 +211,43 @@ func TestGuardPassesMovesAndStateWritesThroughAndMarksNotFound(t *testing.T) {
 		}
 	})
 
-	t.Run("description and note writes are still refused without reaching the driver", func(t *testing.T) {
-		g := &issueWriteGuard{inner: &movingDriver{}}
-		if err := g.UpdateIssueDescription(ctx, 1, 2, "d"); !errors.Is(err, ErrIssueWriteNotOffered) {
-			t.Errorf("desc: %v, want ErrIssueWriteNotOffered", err)
+	// Converted from "description and note writes are still refused without reaching the
+	// driver": PRD #4173 M5 U6 lifts both, so they reach the driver.
+	t.Run("description and note writes reach the driver", func(t *testing.T) {
+		d := &movingDriver{}
+		g := &issueWriteGuard{inner: d}
+		if err := g.UpdateIssueDescription(ctx, 1, 2, "d"); err != nil {
+			t.Errorf("desc: %v", err)
 		}
-		if _, err := g.CreateIssueNote(ctx, 1, 2, "n"); !errors.Is(err, ErrIssueWriteNotOffered) {
-			t.Errorf("note: %v, want ErrIssueWriteNotOffered", err)
+		if _, err := g.CreateIssueNote(ctx, 1, 2, "n"); err != nil {
+			t.Errorf("note: %v", err)
+		}
+		if len(d.descriptions) != 1 || d.descriptions[0] != "d" || len(d.notes) != 1 || d.notes[0] != "n" {
+			t.Fatalf("driver saw descriptions=%v notes=%v", d.descriptions, d.notes)
+		}
+	})
+
+	t.Run("a moved-away issue on a note and a description is a skippable linked error", func(t *testing.T) {
+		g := &issueWriteGuard{inner: &movingDriver{err: &forge.IssueNotFoundError{Err: errors.New("404")}}}
+		_, noteErr := g.CreateIssueNote(ctx, 1, 2, "n")
+		for name, err := range map[string]error{
+			"note": noteErr,
+			"desc": g.UpdateIssueDescription(ctx, 1, 2, "d"),
+		} {
+			if !LinkedIssueGone(err) || !IssueWriteSkippable(err) || errors.Is(err, ErrIssueWriteNotOffered) {
+				t.Errorf("%s: %v must be a marked, skippable not-found", name, err)
+			}
+		}
+	})
+
+	t.Run("an unavailable driver's note and description writes return its cause", func(t *testing.T) {
+		cause := errors.New("connection removed")
+		g := UnavailableIssueTracker(cause)
+		if _, err := g.CreateIssueNote(ctx, 1, 2, "n"); !errors.Is(err, cause) || IssueWriteSkippable(err) {
+			t.Errorf("note: %v", err)
+		}
+		if err := g.UpdateIssueDescription(ctx, 1, 2, "d"); !errors.Is(err, cause) || IssueWriteSkippable(err) {
+			t.Errorf("desc: %v", err)
 		}
 	})
 

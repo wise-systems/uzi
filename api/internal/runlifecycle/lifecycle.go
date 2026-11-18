@@ -575,8 +575,8 @@ func (l *Lifecycle) maybeTerminalComment(ctx context.Context, runID uuid.UUID, s
 		return
 	}
 	// Only the issue side of the driver is used here. PRD #4173: a linked repo's
-	// comment goes through the resolver, whose write guard refuses it (writes arrive
-	// in M5); like any terminal-comment failure it is logged and the lifecycle continues.
+	// comment goes through the resolver and lands on the linked issue (M5); like any
+	// terminal-comment failure it is logged and the lifecycle continues.
 	tracker, err := issuesource.For(ctx, l.issueSources, mc.IssueTrackerConnectionID.Valid, mc.UserID, uuid.UUID(mc.RepoID.Bytes), f)
 	if err != nil {
 		slog.Warn("run lifecycle: resolve issue tracker for terminal comment", "run", runID, "error", err)
@@ -586,7 +586,7 @@ func (l *Lifecycle) maybeTerminalComment(ctx context.Context, runID uuid.UUID, s
 	if _, err := tracker.CreateIssueNote(ctx, mc.ForgeProjectID, mc.IssueIid.Int64, body); err != nil {
 		// Already PAT-redacted by the driver. Recorded but lost (never retried).
 		if forgesvc.IssueWriteSkippable(err) {
-			slog.Info("run lifecycle: autopilot terminal comment skipped on linked repo", "run", runID, "reason", err)
+			slog.Info("run lifecycle: autopilot terminal comment skipped, the linked issue is gone or moved", "run", runID, "reason", err)
 			return
 		}
 		slog.Warn("run lifecycle: post autopilot terminal comment", "run", runID, "error", err)

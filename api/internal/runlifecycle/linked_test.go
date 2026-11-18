@@ -1,9 +1,12 @@
 package runlifecycle
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -268,19 +271,44 @@ func TestUnlinkedMoveNeverConsultsResolver(t *testing.T) {
 	}
 }
 
-func TestLinkedTerminalCommentUsesResolverAndLogsSkip(t *testing.T) {
+// Converted from TestLinkedTerminalCommentUsesResolverAndLogsSkip (PRD #4173 M5 U6): the
+// note is no longer refused with ErrIssueWriteNotOffered, it lands on the resolver's
+// tracker for the run's issue.
+func TestLinkedTerminalCommentLandsOnTheResolversTracker(t *testing.T) {
 	fs, _, src, l, runID, _, _ := linkedFixture("failed", nil)
 	fs.moveCtx.AutoApprove = true
-	note := &fakeForge{noteErr: fmt.Errorf("create issue note: %w", forgesvc.ErrIssueWriteNotOffered)}
+	note := &fakeForge{}
 	src.tr = note
 
 	l.notifyOnce(context.Background(), runID, "failed")
 
-	if len(note.notes) != 1 {
-		t.Fatalf("the comment goes to the resolver's tracker, got %d notes", len(note.notes))
+	if len(note.notes) != 1 || note.notes[0].issueIID != fs.moveCtx.IssueIid.Int64 || !strings.Contains(note.notes[0].body, "Autopilot") {
+		t.Fatalf("the comment goes to the resolver's tracker for the run's issue, got %+v", note.notes)
 	}
 	if fs.claimCalls != 1 {
 		t.Fatalf("record-then-comment is unchanged, claims=%d", fs.claimCalls)
+	}
+}
+
+// A failed linked comment (the issue tracker answers an error) is logged and the
+// lifecycle carries on: one attempt, no retry.
+func TestLinkedTerminalCommentFailureIsLogged(t *testing.T) {
+	fs, _, src, l, runID, _, _ := linkedFixture("failed", nil)
+	fs.moveCtx.AutoApprove = true
+	note := &fakeForge{noteErr: errors.New("youtrack answered 500")}
+	src.tr = note
+	var logs bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	l.notifyOnce(context.Background(), runID, "failed")
+
+	if len(note.notes) != 1 || fs.claimCalls != 1 {
+		t.Fatalf("notes=%d claims=%d", len(note.notes), fs.claimCalls)
+	}
+	if !strings.Contains(logs.String(), "post autopilot terminal comment") || !strings.Contains(logs.String(), "500") {
+		t.Fatalf("the failure was not logged: %s", logs.String())
 	}
 }
 
