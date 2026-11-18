@@ -396,3 +396,46 @@ func TestRepoSidesPassBuilderErrorThrough(t *testing.T) {
 		t.Errorf("CodeHostForRepo = (%v, %v), want (nil, builder error)", ch, err)
 	}
 }
+
+// errStore fails the repo-source read with a fixed error.
+type errStore struct {
+	IssueStore
+	err error
+}
+
+func (s errStore) GetRepoIssueSourceForUser(context.Context, store.GetRepoIssueSourceForUserParams) (store.GetRepoIssueSourceForUserRow, error) {
+	return store.GetRepoIssueSourceForUserRow{}, s.err
+}
+
+func TestIssueTrackerForRepoClassifiesARepoSourceReadFailure(t *testing.T) {
+	box, err := secretbox.New([]byte("0123456789abcdefghijklmnopqrstuv"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	build := func(q IssueStore) *Service {
+		return NewWithForgeBuilder(q, box, time.Second, nil, func(forge.Type, string, string, time.Duration) (forge.Forge, error) {
+			return nil, errors.New("unused")
+		})
+	}
+	ctx := context.Background()
+
+	t.Run("a database error is transient and keeps its cause", func(t *testing.T) {
+		inner := errors.New("conn reset")
+		_, err := build(errStore{err: inner}).IssueTrackerForRepo(ctx, uuid.New(), uuid.New())
+		if !errors.Is(err, errRepoSourceRead) || !errors.Is(err, inner) {
+			t.Fatalf("err = %v, want errRepoSourceRead wrapping the inner error", err)
+		}
+	})
+	t.Run("a missing row is permanent", func(t *testing.T) {
+		_, err := build(errStore{err: pgx.ErrNoRows}).IssueTrackerForRepo(ctx, uuid.New(), uuid.New())
+		if err == nil || errors.Is(err, errRepoSourceRead) {
+			t.Fatalf("err = %v, want a non-transient error", err)
+		}
+	})
+	t.Run("no store is not transient", func(t *testing.T) {
+		_, err := build(nil).IssueTrackerForRepo(ctx, uuid.New(), uuid.New())
+		if !errors.Is(err, errNoRepoStore) || errors.Is(err, errRepoSourceRead) {
+			t.Fatalf("err = %v, want errNoRepoStore only", err)
+		}
+	})
+}

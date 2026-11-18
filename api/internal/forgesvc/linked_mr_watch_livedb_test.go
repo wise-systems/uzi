@@ -478,6 +478,31 @@ func TestLinkedMRCloseIsDeferredOnATransientRepoSourceReadFailureLiveDB(t *testi
 	}
 }
 
+// During a deferral only linked issue-lane candidates are skipped: a self_improve run
+// (issue_iid set) and an issue-less helper run on the same repo are still recorded.
+func TestLinkedMRDeferralStillRecordsNonIssueLaneRunsLiveDB(t *testing.T) {
+	f := newLinkedMRWatch(t, humanReviewMapping)
+	n := f.card(t, board.ColumnHumanReview)
+	issueRun := f.run(t, n, 13, "opened", time.Minute)
+	selfRun := f.run(t, n, 14, "opened", 2*time.Minute)
+	f.exec(t, `UPDATE runs SET kind = 'self_improve' WHERE id = $1`, selfRun)
+	helperRun := f.run(t, n, 15, "opened", 3*time.Minute)
+	f.exec(t, `UPDATE runs SET kind = 'task', issue_iid = NULL WHERE id = $1`, helperRun)
+	f.tr = UnavailableIssueTracker(fmt.Errorf("read repo issue source: %w: %w", errRepoSourceRead, errors.New("conn reset")))
+	f.srv.ResetRequests()
+
+	f.sync(t, map[int64]string{13: forge.MRStateClosed, 14: forge.MRStateClosed, 15: forge.MRStateClosed})
+	if got := f.mrState(t, issueRun); got != forge.MRStateOpened {
+		t.Fatalf("issue-lane mr_state = %q, want opened (deferred)", got)
+	}
+	if got := f.mrState(t, selfRun); got != forge.MRStateClosed {
+		t.Fatalf("self_improve mr_state = %q, want closed (recorded during the deferral)", got)
+	}
+	if got := f.mrState(t, helperRun); got != forge.MRStateClosed {
+		t.Fatalf("issue-less mr_state = %q, want closed (recorded during the deferral)", got)
+	}
+}
+
 // A self_improve run carries an issue_iid but is not an issue-lane run: its close edge is
 // recorded and moves no card, even over a Human Review card. (A prompt run cannot carry an
 // issue_iid: runs_kind_shape refuses it, so only self_improve can reach the kind check.)

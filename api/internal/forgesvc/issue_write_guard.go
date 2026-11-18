@@ -253,7 +253,8 @@ func isUnavailableTracker(tr forge.IssueTracker) bool {
 
 // isTransientUnavailableTracker reports whether tr is the UnavailableIssueTracker built
 // from a failed repo-source database read (errRepoSourceRead), the only unavailable cause
-// expected to clear on its own.
+// classified as transient. Other transient failures, such as the connection-row read inside
+// DriverFor, are not classified: they are recorded without a move.
 func isTransientUnavailableTracker(tr forge.IssueTracker) bool {
 	g, ok := tr.(*issueWriteGuard)
 	if !ok {
