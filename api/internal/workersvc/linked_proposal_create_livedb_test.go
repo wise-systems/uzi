@@ -18,8 +18,10 @@ import (
 )
 
 // PRD #4173 M5: the chat-proposal confirm and the scheduled-proposal filing create their
-// issue in the YouTrack project a linked repo is bound to, through the production
-// resolver (issuetrackersvc), never the forge. Skipped unless UZI_TEST_DATABASE_URL points
+// issue in the YouTrack project a linked repo is bound to, never the forge, through the
+// real issue tracker driver that issuetrackersvc builds. The resolver is a local stand-in
+// for forgesvc.IssueTrackerForRepo (forgesvc imports workersvc), without its write guard;
+// the handler LiveDB tests cover the production resolver. Skipped unless UZI_TEST_DATABASE_URL points
 // at a throwaway Postgres.
 
 type linkedProposalFix struct {
