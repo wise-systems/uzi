@@ -152,7 +152,7 @@ func TestLinkedRepoCreateIssueCardCarriesTheIssueKeyLiveDB(t *testing.T) {
 	}
 }
 
-// When the cache write after a create fails the issue still exists on the tracker, and the
+// When the cache write after a create fails the issue still exists on the issue tracker, and the
 // fallback card carries the key too. A trigger that rejects inserts into issues makes the
 // upsert fail; it is dropped on cleanup.
 func TestLinkedRepoCreateIssueFallbackCardCarriesTheIssueKeyLiveDB(t *testing.T) {

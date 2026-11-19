@@ -64,7 +64,8 @@ column settings.
 The web shows an issue's key (for example `ABC-12`, from the project short name
 stored at link time) on the board (cards, search, screen-reader labels), the
 issue page (header, breadcrumb), the runs list and run page heading, created-issue
-lists and the findings group-file notice. It still shows `#number` in the
+lists, the findings group-file notice, the board's needs-attention strip and
+the run options name. It still shows `#number` in the
 overview run row, the needs-decision card, triage, a schedule's last fire,
 proposal cards, the command menu and the capacity rail.
 

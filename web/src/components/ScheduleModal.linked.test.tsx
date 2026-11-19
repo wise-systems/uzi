@@ -156,4 +156,15 @@ describe("ScheduleModal — the label warning knows a repo linked to an issue tr
     await waitFor(() => expect(seen.has("repo-plain")).toBe(true));
     expect(seen.get("repo-plain")).toBe(false);
   });
+
+  it("create: with a linked and a plain repo both selected, each warning gets its own linked", async () => {
+    setRepos([plainRepo, linkedRepo]);
+    renderCreate();
+    await waitFor(() => expect(seen.has("repo-plain")).toBe(true));
+    // The default selection is the first repo; add the other so both are selected.
+    fireEvent.click(await screen.findByRole("checkbox", { name: /acme\/linked/ }));
+    await waitFor(() => expect(seen.has("repo-linked")).toBe(true));
+    expect(seen.get("repo-plain")).toBe(false);
+    expect(seen.get("repo-linked")).toBe(true);
+  });
 });

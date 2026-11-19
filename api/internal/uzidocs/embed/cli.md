@@ -2026,7 +2026,7 @@ uzi repo issue-tracker-states group/proj   # a linked repo's State mapping
   created and last verified time.
 - **`uzi repo issue-tracker-states <repo>`** takes the repo by path or id. A path
   resolves only for a repo `uzi repo list` shows; a repo is linked before it is
-  first enabled, so a repo not yet enabled needs its id from the web Repos page.
+  first enabled, so a repo not yet enabled needs its id, shown in the Map States panel on the web Repos page.
   It shows the open and closed States, each mapped board column's State, and the
   project's States with whether each can close or open an issue. It ends a
   mapping with "Columns not listed are unmapped: a move into one is refused

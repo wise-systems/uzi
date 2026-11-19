@@ -366,7 +366,7 @@ func TestForgeConnForRunCarriesTheRunsIssueBinding(t *testing.T) {
 	}
 }
 
-// PRD #4173 M6: a confirmed proposal on a linked repo reports the tracker key; on an
+// PRD #4173 M6: a confirmed proposal on a linked repo reports the issue tracker key; on an
 // unlinked repo it reports none.
 func TestConfirmProposalReportsTheLinkedIssueKey(t *testing.T) {
 	svc, fs, _ := confirmFixture(t)

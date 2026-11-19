@@ -301,3 +301,13 @@ describe("IssueTrackerStatesPanel", () => {
     expect(onClose).toHaveBeenCalled();
   });
 });
+
+describe("IssueTrackerStatesPanel repo id", () => {
+  it("shows the repo id as selectable text with the CLI it is for", async () => {
+    renderPanel();
+    await screen.findByLabelText("Open");
+    const id = screen.getByText("repo-1");
+    expect(id.tagName).toBe("CODE");
+    expect(id.parentElement?.textContent).toContain("uzi repo issue-tracker-states");
+  });
+});

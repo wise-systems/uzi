@@ -175,6 +175,9 @@ export function IssueTrackerStatesPanel({
             Issue tracker States
           </h3>
           <p className="mt-0.5 break-all text-xs text-muted">{repoLabel}</p>
+          <p className="mt-0.5 break-all text-xs text-muted">
+            Repo id: <code className="select-text">{repoId}</code> (for <code>uzi repo issue-tracker-states</code>)
+          </p>
         </div>
         <Button variant="ghost" size="sm" onClick={onClose} disabled={saving}>
           Close

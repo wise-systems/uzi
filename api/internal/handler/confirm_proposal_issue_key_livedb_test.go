@@ -15,7 +15,7 @@ import (
 
 // Confirming a proposal on a repo linked to an issue tracker answers with the created issue
 // carrying its derived key (<project short name>-<number>) next to the number, so the web
-// client and the CLI show the key the tracker shows.
+// client and the CLI show the key the issue tracker shows.
 func TestConfirmProposalOnLinkedRepoResponseCarriesTheIssueKeyLiveDB(t *testing.T) {
 	f := newLinkedHandlerFixture(t, true)
 	f.h.wsvc.SetForges(f.h.svc)

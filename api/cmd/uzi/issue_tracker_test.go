@@ -99,7 +99,7 @@ func TestRepoIssueTrackerStatesByPath(t *testing.T) {
 	if code != uzicli.ExitUsage {
 		t.Errorf("unknown path exit = %d, want %d", code, uzicli.ExitUsage)
 	}
-	if !strings.Contains(errOut, "not yet enabled") || !strings.Contains(errOut, "web Repos page") {
+	if !strings.Contains(errOut, "not yet enabled") || !strings.Contains(errOut, "Map States panel on the web Repos page") {
 		t.Errorf("hint must say a not-yet-enabled repo is passed by id (web Repos page):\n%s", errOut)
 	}
 }

@@ -79,7 +79,7 @@ func newRepoIssueTrackerStatesCmd(env Env, gf *globalFlags) *cobra.Command {
 				return err
 			}
 			repoID, err := resolveProjectSyncRepoHint(cmd.Context(), c, args[0],
-				"; pass the repo id instead (a repo not yet enabled is not listed by 'uzi repo list'; its id is shown on the web Repos page)")
+				"; pass the repo id instead (a repo not yet enabled is not listed by 'uzi repo list'; its id is shown in the Map States panel on the web Repos page)")
 			if err != nil {
 				return err
 			}
