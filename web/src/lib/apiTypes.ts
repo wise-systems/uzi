@@ -2623,6 +2623,9 @@ export interface Schedule {
   target: ScheduleTarget;
   // Set only for target "issue"; null otherwise.
   issue_iid: number | null;
+  /** The issue tracker key ("ABC-12") of issue_iid on a repo linked to an issue tracker
+   *  (PRD #4173 M6); absent on an unlinked repo and for a schedule with no issue. */
+  issue_key?: string;
   // Sweep label selector; null (empty) ⇒ the PRD label at fire time (Decision 9).
   labels: string[] | null;
   // Stored prompt for target "prompt"; "" otherwise (Decision 10).
@@ -3720,6 +3723,10 @@ export interface Run {
   kind: RunKind;
   /** The worked issue for an issue run; null for a ci_fix or chat run (no issue). */
   issue_iid: number | null;
+  /** The issue tracker key ("ABC-12") of issue_iid on a repo linked to an issue tracker
+   *  (PRD #4173 M6); absent on an unlinked repo and for a run with no issue. Optional for
+   *  older API responses. */
+  issue_key?: string;
   /** Optional for older API responses; task continuation metadata, separate from issue_iid. */
   continued_issue_iid?: number | null;
   issue_title: string;
@@ -3836,7 +3843,7 @@ export interface Run {
    *  issue is no longer cached. Rendered through isHttpsUrl into the #<iid> link. */
   issue_web_url: string | null;
   /** Confirmed issues created by a scheduled prompt; detail read only. */
-  created_issues?: { iid: number; title: string; web_url: string }[];
+  created_issues?: { iid: number; issue_key?: string; title: string; web_url: string }[];
   /** PRD #764 M2: whether the run's issue links a `prds/*.md` file, so the run view can
    *  show a neutral "PRD" presence badge. OPTIONAL for api/web rollout skew: a pre-#764
    *  api pod omits the key, and an absent value reads as no PRD (the badge stays hidden). */
@@ -5612,6 +5619,9 @@ export interface IncidentalFinding {
   dismiss_reason?: string;
   set_via?: string;
   filed_issue_iid?: number;
+  // filed_issue_key is the issue tracker key ("ABC-12") of filed_issue_iid on a repo linked to
+  // an issue tracker (PRD #4173 M6); absent on an unlinked repo.
+  filed_issue_key?: string;
   // filed_issue_url is the stored forge URL a filed coordinate produced (stamped at settle
   // time). It is the DTO-carried source the backlog links "Filed #<iid>" through — present for a
   // backlog-loaded filed row too, not just one filed this session — and is undefined until
@@ -5649,6 +5659,8 @@ export interface IncidentalFindingIssueDraft {
 // (mirrors the handler's createdIssueDTO): only what the click produced.
 export interface IncidentalFindingFiledIssue {
   iid: number;
+  /** The issue tracker key of iid on a linked repo (PRD #4173 M6); absent otherwise. */
+  issue_key?: string;
   web_url: string;
   title: string;
 }
@@ -5879,6 +5891,8 @@ export interface ChatListResponse {
 // human's Create click produced. The card renders its link (https-guarded).
 export interface CreatedIssue {
   iid: number;
+  /** The issue tracker key of iid on a linked repo (PRD #4173 M6); absent otherwise. */
+  issue_key?: string;
   web_url: string;
   title: string;
 }
