@@ -20,6 +20,7 @@ import {
   mockBlockedRepoMeta,
   mockConnection,
   mockForgeConfig,
+  mockLinkableRepo,
   mockRepoToolProfiles,
   mockRepos,
   mockToolAllowlist,
@@ -90,6 +91,9 @@ repos = [
     guardrail_blocked: false,
   },
 ];
+// PRD #4173 M6: one never-enabled repo on the default connection, so "Link to an issue
+// tracker" shows on the Repos page (mockApi/issueTrackers.ts serves the link).
+repos = [...repos, { ...mockLinkableRepo }];
 // Cross-user admin-only fixtures leave the existing owner-list demo intact.
 // UUID IDs can round-trip through the settings validator.
 
@@ -284,6 +288,8 @@ export const forgeApi = {
       });
     }
     r.enabled = enabled;
+    // The first enable ends the window in which a repo can be linked (PRD #4173 D13).
+    if (enabled) r.issue_tracker_linkable = false;
     return delay({ repo: { ...r } });
   },
   // Explicit per-repo remove (PRD #357). Mirrors deleteConnection: drops the repo

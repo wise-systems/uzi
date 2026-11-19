@@ -96,7 +96,11 @@ import type {
   HealthDoc,
   IssueTrackerConfig,
   IssueTrackerConnection,
+  IssueTrackerLinkRequest,
+  IssueTrackerLinkResult,
   IssueTrackerProject,
+  IssueTrackerStateMapping,
+  IssueTrackerStatesView,
   IssueTrackerTag,
   HostedConfig,
   IncidentalFinding,
@@ -1018,6 +1022,27 @@ const realApi = {
     request<{ tags: IssueTrackerTag[] }>(
       "GET",
       `/issue-trackers/connections/${encodeURIComponent(id)}/tags`,
+    ),
+  // Link a never-enabled repo to one issue tracker project and eligibility tag. Session
+  // only; the link is permanent (no unlink or relink).
+  linkRepoToIssueTracker: (repoId: string, body: IssueTrackerLinkRequest) =>
+    request<{ link: IssueTrackerLinkResult }>(
+      "PUT",
+      `/repos/${encodeURIComponent(repoId)}/issue-tracker-link`,
+      body,
+    ),
+  // A linked repo's State mapping and its project's States. The GET also takes a CLI
+  // token; the PUT is session-only and replaces the whole mapping.
+  getIssueTrackerStates: (repoId: string) =>
+    request<IssueTrackerStatesView>(
+      "GET",
+      `/repos/${encodeURIComponent(repoId)}/issue-tracker-link/states`,
+    ),
+  putIssueTrackerStates: (repoId: string, mapping: IssueTrackerStateMapping) =>
+    request<{ mapping: IssueTrackerStateMapping }>(
+      "PUT",
+      `/repos/${encodeURIComponent(repoId)}/issue-tracker-link/states`,
+      mapping,
     ),
 
   listRepos: () => request<{ repos: Repo[] }>("GET", "/repos"),

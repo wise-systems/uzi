@@ -145,6 +145,8 @@ export function Button({
 }: ButtonHTMLAttributes<HTMLButtonElement> & {
   variant?: ButtonVariant;
   size?: ButtonSize;
+  // React 19 passes ref as a prop; the spread below forwards it to the <button>.
+  ref?: Ref<HTMLButtonElement>;
 }) {
   return (
     <button

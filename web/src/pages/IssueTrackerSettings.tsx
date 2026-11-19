@@ -15,6 +15,7 @@ import { api, type IssueTrackerConnection } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
 import { useAsyncData } from "../lib/useAsyncData";
 import { stripUnsafeChars } from "../lib/safeText";
+import { issueTrackerKindLabel } from "../lib/issueTrackerText";
 import { DOC_ISSUE_TRACKERS } from "../lib/doclinks";
 import { useDemoMode } from "../lib/demoMode";
 import { maskHost, maskUsername } from "../lib/demoMask";
@@ -22,13 +23,6 @@ import { Alert, Badge, Button, Card, EmptyState, Field, PasswordInput, SectionTi
 import { SettingsShell } from "../components/SettingsShell";
 import { DocLink } from "../components/DocLink";
 import { BoardIcon } from "../components/icons";
-
-// issueTrackerKindLabel names a kind the way the issue tracker names itself. An
-// unknown kind (a newer API than this bundle) shows its raw, sanitized value.
-function issueTrackerKindLabel(kind: string): string {
-  if (kind === "youtrack") return "YouTrack";
-  return stripUnsafeChars(kind);
-}
 
 const TOKEN_FIELD_ID = "issue-tracker-token";
 
@@ -49,6 +43,10 @@ export function IssueTrackerSettings() {
   // heading, or to the empty state when the last connection went, once that renders.
   const listFocusRef = useRef<HTMLDivElement & HTMLHeadingElement>(null);
   const [focusList, setFocusList] = useState(false);
+  // After Cancel, Escape or a refused delete the confirm closes and its focused element
+  // goes away: focus returns to that row's Delete button, never to <body>.
+  const deleteButtons = useRef(new Map<string, HTMLButtonElement>());
+  const [returnFocusId, setReturnFocusId] = useState<string | null>(null);
 
   const { data, loading, error: loadError, reload } = useAsyncData(
     async () => {
@@ -68,6 +66,12 @@ export function IssueTrackerSettings() {
   useEffect(() => {
     if (confirmingId) confirmRef.current?.focus();
   }, [confirmingId]);
+
+  useEffect(() => {
+    if (!returnFocusId) return;
+    deleteButtons.current.get(returnFocusId)?.focus();
+    setReturnFocusId(null);
+  }, [returnFocusId]);
 
   useEffect(() => {
     if (!focusList) return;
@@ -114,6 +118,7 @@ export function IssueTrackerSettings() {
     } catch (err) {
       setConfirmingId(null);
       setRowError({ id, message: stripUnsafeChars(errorMessage(err, "Delete failed")) });
+      setReturnFocusId(id);
     } finally {
       setDeletingId(null);
     }
@@ -152,7 +157,7 @@ export function IssueTrackerSettings() {
           <p className="mt-2 max-w-prose text-sm text-muted">
             uzi reads and writes a linked repo&apos;s issues as the account the token belongs to. In YouTrack, open
             Profile, Account Security, New token, and give it the scope YouTrack. The token is write-only: it is
-            stored encrypted and never shown again. Step-by-step instructions are in the{" "}
+            stored sealed and never shown again. Step-by-step instructions are in the{" "}
             <DocLink slug={DOC_ISSUE_TRACKERS}>issue trackers setup guide</DocLink>.
           </p>
           <form className="mt-4 space-y-4" onSubmit={connect}>
@@ -223,11 +228,18 @@ export function IssueTrackerSettings() {
                 busy={deletingId !== null}
                 error={rowError?.id === c.id ? rowError.message : ""}
                 confirmRef={confirmRef}
+                deleteButtonRef={(el) => {
+                  if (el) deleteButtons.current.set(c.id, el);
+                  else deleteButtons.current.delete(c.id);
+                }}
                 onAskDelete={() => {
                   setRowError(null);
                   setConfirmingId(c.id);
                 }}
-                onCancel={() => setConfirmingId(null)}
+                onCancel={() => {
+                  setConfirmingId(null);
+                  setReturnFocusId(c.id);
+                }}
                 onDelete={() => remove(c.id)}
               />
             ))}
@@ -251,6 +263,7 @@ function ConnectionRow({
   busy,
   error,
   confirmRef,
+  deleteButtonRef,
   onAskDelete,
   onCancel,
   onDelete,
@@ -262,6 +275,7 @@ function ConnectionRow({
   busy: boolean;
   error: string;
   confirmRef: React.RefObject<HTMLDivElement | null>;
+  deleteButtonRef: (el: HTMLButtonElement | null) => void;
   onAskDelete: () => void;
   onCancel: () => void;
   onDelete: () => void;
@@ -294,6 +308,7 @@ function ConnectionRow({
         </div>
         {!confirming && (
           <Button
+            ref={deleteButtonRef}
             variant="danger"
             size="sm"
             disabled={busy}

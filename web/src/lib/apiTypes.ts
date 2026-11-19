@@ -1452,6 +1452,52 @@ export interface IssueTrackerTag {
   others_can_apply: boolean;
 }
 
+// PUT /api/repos/{id}/issue-tracker-link body (PRD #4173 M6). There is no unlink or
+// relink: a refusal is a 409 (400 for a project the connection cannot see) whose text
+// the web shows verbatim.
+export interface IssueTrackerLinkRequest {
+  connection_id: string;
+  project_id: string;
+  tag_id: string;
+}
+
+// The PUT's answer: the stored link, with the repo it belongs to.
+export interface IssueTrackerLinkResult extends RepoIssueTrackerLink {
+  repo_id: string;
+}
+
+// One board column of a linked repo mapped to the State it stands for. A column absent
+// from a mapping is unmapped: a move into it is refused until it is mapped.
+export interface IssueTrackerColumnState {
+  label_name: string;
+  state: string;
+}
+
+// A linked repo's State mapping (GET/PUT /api/repos/{id}/issue-tracker-link/states). The
+// PUT replaces the whole mapping; no two roles may share a State.
+export interface IssueTrackerStateMapping {
+  open_state: string;
+  closed_state: string;
+  columns: IssueTrackerColumnState[];
+}
+
+// A State of the linked project. closable: it may be the closed State (resolved and
+// means done, never "Won't fix"); openable: it may be the open State or a column's.
+export interface IssueTrackerState {
+  name: string;
+  resolved: boolean;
+  archived: boolean;
+  closable: boolean;
+  openable: boolean;
+}
+
+// GET …/issue-tracker-link/states: the saved mapping (null until one is saved) and the
+// project's States.
+export interface IssueTrackerStatesView {
+  mapping: IssueTrackerStateMapping | null;
+  states: IssueTrackerState[];
+}
+
 // AppSettings is the instance-level settings surface (PRD #19). Admin-only. The
 // API always returns every known key (a missing row reads as its default), so
 // every field is always present. default_theme is the instance-default UI theme

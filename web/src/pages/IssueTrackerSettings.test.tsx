@@ -222,6 +222,97 @@ describe("IssueTrackerSettings", () => {
     expect(screen.queryByRole("button", { name: "Connect" })).toBeNull();
   });
 
+  describe("API text with invisible characters", () => {
+    // Built at runtime so the source holds no invisible character a reviewer cannot see.
+    const RLO = String.fromCharCode(0x202e);
+    const ZWSP = String.fromCharCode(0x200b);
+    const UNSAFE = new RegExp(`[${RLO}${ZWSP}]`);
+    const dirtyConn = () =>
+      conn({ base_url: `${BASE}${RLO}${ZWSP}`, account_login: `uzi${RLO}-bot${ZWSP}` });
+
+    function expectClean(container: HTMLElement) {
+      expect(container.textContent).not.toMatch(UNSAFE);
+      for (const el of container.querySelectorAll("[aria-label]")) {
+        expect(el.getAttribute("aria-label")).not.toMatch(UNSAFE);
+      }
+    }
+
+    it("strips them from a connection's base URL and account login, in text and labels", async () => {
+      mockApi.listIssueTrackerConnections.mockResolvedValue({ connections: [dirtyConn()] });
+      const { container } = renderPage();
+      const row = await findRow();
+      expect(within(row).getByText(BASE)).toBeTruthy();
+      expect(within(row).getByRole("button", { name: `Delete the YouTrack connection to ${BASE}` })).toBeTruthy();
+      fireEvent.click(within(row).getByRole("button", { name: /^Delete the YouTrack connection/ }));
+      expect(within(row).getByRole("group").getAttribute("aria-label")).toBe(
+        `Confirm deleting the YouTrack connection to ${BASE}`,
+      );
+      expectClean(container);
+    });
+
+    it("strips them from the connect notice and a connect refusal", async () => {
+      mockApi.createIssueTrackerConnection.mockResolvedValueOnce({ connection: dirtyConn() });
+      const { container } = renderPage();
+      await findRow();
+      await submitToken();
+      await screen.findByText(`Connected to ${BASE} as uzi-bot.`);
+      expectClean(container);
+
+      mockApi.createIssueTrackerConnection.mockRejectedValueOnce(
+        new ApiError(400, `base URL${RLO} is not${ZWSP} allowed`),
+      );
+      await submitToken();
+      expect((await screen.findByRole("alert")).textContent).toBe("base URL is not allowed");
+      expectClean(container);
+    });
+
+    it("strips them from a delete refusal", async () => {
+      mockApi.deleteIssueTrackerConnection.mockRejectedValue(new ApiError(409, `linked${RLO} repo${ZWSP}`));
+      const { container } = renderPage();
+      const row = await findRow();
+      fireEvent.click(within(row).getByRole("button", { name: /^Delete the YouTrack connection/ }));
+      fireEvent.click(within(row).getByRole("button", { name: "Delete connection" }));
+      expect((await within(row).findByRole("alert")).textContent).toBe("linked repo");
+      expectClean(container);
+    });
+  });
+
+  describe("focus after the delete confirm closes", () => {
+    const deleteButton = () => screen.getByRole("button", { name: `Delete the YouTrack connection to ${BASE}` });
+
+    it("returns to the row's Delete button after Cancel", async () => {
+      renderPage();
+      await findRow();
+      fireEvent.click(deleteButton());
+      fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+      await waitFor(() => expect(document.activeElement).toBe(deleteButton()));
+    });
+
+    it("returns to the row's Delete button after Escape", async () => {
+      renderPage();
+      await findRow();
+      fireEvent.click(deleteButton());
+      fireEvent.keyDown(screen.getByRole("group"), { key: "Escape" });
+      await waitFor(() => expect(document.activeElement).toBe(deleteButton()));
+    });
+
+    it("returns to the row's Delete button after a refused delete", async () => {
+      mockApi.deleteIssueTrackerConnection.mockRejectedValue(new ApiError(409, "refused"));
+      renderPage();
+      const row = await findRow();
+      fireEvent.click(deleteButton());
+      fireEvent.click(within(row).getByRole("button", { name: "Delete connection" }));
+      await within(row).findByRole("alert");
+      await waitFor(() => expect(document.activeElement).toBe(deleteButton()));
+    });
+  });
+
+  it("says the token is stored sealed", async () => {
+    renderPage();
+    await findRow();
+    expect(screen.getByText(/it is stored sealed and never shown again/)).toBeTruthy();
+  });
+
   it("shows a load failure", async () => {
     mockApi.issueTrackerConfig.mockRejectedValue(new ApiError(500, "boom"));
     renderPage();

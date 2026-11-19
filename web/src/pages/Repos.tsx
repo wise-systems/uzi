@@ -3,7 +3,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
-import { api, ApiError, isHttpsUrl, type AgentSource, type ForgeConnection, type GuardrailFinding, type ProjectSyncOwnerKind, type ProjectSyncStatus, type Repo, type ToolAllowlistEntry } from "../lib/api";
+import { api, ApiError, isHttpsUrl, type AgentSource, type ForgeConnection, type IssueTrackerConnection, type IssueTrackerLinkResult, type GuardrailFinding, type ProjectSyncOwnerKind, type ProjectSyncStatus, type Repo, type ToolAllowlistEntry } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
 import { repoFindings } from "../lib/privilege";
 import { useAuth } from "../auth/AuthContext";
@@ -20,6 +20,9 @@ import { CAPABILITY_VOCABULARY } from "../lib/capabilityVocabulary";
 import { useDemoMode } from "../lib/demoMode";
 import { maskEmail, maskHost, maskRepoPath, maskUsername } from "../lib/demoMask";
 import { stripUnsafeChars } from "../lib/safeText";
+import { issueTrackerKindLabel } from "../lib/issueTrackerText";
+import { IssueTrackerLinkDialog } from "../components/IssueTrackerLinkDialog";
+import { IssueTrackerStatesPanel } from "../components/IssueTrackerStatesPanel";
 
 export function Repos() {
   // The guardrail override write is admin-only (PRD #66 D8): a member sees the block
@@ -155,6 +158,13 @@ export function Repos() {
   // from the admin Allow-anyway modal state above — same required-reason pattern, but
   // it POSTs the member override-request endpoint instead of the admin override.
   const [requestRepoId, setRequestRepoId] = useState<string | null>(null);
+  // Issue trackers (PRD #4173 M6): the link dialog's repo, the States panel's repo, and
+  // the issue tracker connections, read only once a listed repo is linked, to name the
+  // kind on its row. The States panel returns focus to its row trigger on close.
+  const [linkRepoId, setLinkRepoId] = useState<string | null>(null);
+  const [statesRepoId, setStatesRepoId] = useState<string | null>(null);
+  const [issueTrackerConns, setIssueTrackerConns] = useState<IssueTrackerConnection[] | null>(null);
+  const statesTriggerRef = useRef<HTMLButtonElement | null>(null);
   const [requestReason, setRequestReason] = useState("");
   const [requestBusy, setRequestBusy] = useState(false);
   const [requestError, setRequestError] = useState("");
@@ -531,6 +541,51 @@ export function Repos() {
   useEffect(() => {
     if (connectionId) loadProjects(connectionId);
   }, [connectionId, loadProjects]);
+
+  // The kind on a linked row comes from the issue tracker connection list. A failed read
+  // only loses the kind: the row then says "issue tracker".
+  const anyLinked = repos.some((r) => r.issue_tracker_link);
+  useEffect(() => {
+    if (!anyLinked || issueTrackerConns !== null) return;
+    let live = true;
+    (async () => {
+      try {
+        const { connections } = await api.listIssueTrackerConnections();
+        if (live) setIssueTrackerConns(connections);
+      } catch {
+        if (live) setIssueTrackerConns([]);
+      }
+    })();
+    return () => {
+      live = false;
+    };
+  }, [anyLinked, issueTrackerConns]);
+
+  const onIssueTrackerLinked = (link: IssueTrackerLinkResult, conn: IssueTrackerConnection | null) => {
+    const { repo_id: repoId, ...stored } = link;
+    setRepos((prev) =>
+      prev.map((r) => (r.id === repoId ? { ...r, issue_tracker_link: stored, issue_tracker_linkable: false } : r)),
+    );
+    if (conn) setIssueTrackerConns((prev) => (prev?.some((c) => c.id === conn.id) ? prev : [...(prev ?? []), conn]));
+    setLinkRepoId(null);
+    // The next step on a linked repo is its State mapping: open it right away.
+    statesTriggerRef.current = null;
+    setStatesRepoId(repoId);
+  };
+
+  // Focus returns to the row's Map States button, also when the panel opened straight
+  // after a link (there was no click on it then).
+  const closeStates = () => {
+    const repoId = statesRepoId;
+    setStatesRepoId(null);
+    const trigger =
+      statesTriggerRef.current?.isConnected === true
+        ? statesTriggerRef.current
+        : Array.from(document.querySelectorAll<HTMLButtonElement>("button[data-states-trigger]")).find(
+            (b) => b.dataset.statesTrigger === repoId,
+          );
+    trigger?.focus();
+  };
 
   const toggle = async (repo: Repo) => {
     setError("");
@@ -1041,6 +1096,12 @@ export function Repos() {
                           ) : (
                             <span className="font-medium text-fg">{maskRepoPath(r.path_with_namespace, demo)}</span>
                           )}
+                          {r.issue_tracker_link && (
+                            <IssueSourceLine
+                              link={r.issue_tracker_link}
+                              kind={issueTrackerConns?.find((c) => c.id === r.issue_tracker_link?.connection_id)?.kind}
+                            />
+                          )}
                         </td>
                         <td className="px-4 py-3 font-mono text-xs text-muted">
                           <div className="flex flex-wrap items-center gap-1.5">
@@ -1373,7 +1434,31 @@ export function Repos() {
                               </div>
                             </div>
                           ) : (
-                            <div className="flex justify-end gap-2">
+                            <div className="flex flex-wrap justify-end gap-2">
+                              {/* PRD #4173 M6: a never-enabled repo can take its issues from an
+                                  issue tracker; a linked one maps its columns to States. There
+                                  is no unlink or relink control. */}
+                              {r.issue_tracker_link ? (
+                                <Button
+                                  variant="secondary"
+                                  size="sm"
+                                  aria-expanded={statesRepoId === r.id}
+                                  data-states-trigger={r.id}
+                                  aria-label={`Map issue tracker States for ${maskRepoPath(r.path_with_namespace, demo)}`}
+                                  onClick={(e) => {
+                                    statesTriggerRef.current = e.currentTarget;
+                                    setStatesRepoId((id) => (id === r.id ? null : r.id));
+                                  }}
+                                >
+                                  Map States
+                                </Button>
+                              ) : (
+                                r.issue_tracker_linkable && (
+                                  <Button variant="secondary" size="sm" onClick={() => setLinkRepoId(r.id)}>
+                                    Link to an issue tracker
+                                  </Button>
+                                )
+                              )}
                               {r.enabled && (
                                 <Link to={`/repos/${r.id}/board`}>
                                   <Button variant="secondary" size="sm">
@@ -1410,6 +1495,20 @@ export function Repos() {
                 </tbody>
               </table>
             </div>
+
+            {/* The issue tracker States panel (PRD #4173 M6), outside the table's
+                scroll box like the panels below. */}
+            {(() => {
+              const statesRepo = repos.find((r) => r.id === statesRepoId && r.issue_tracker_link);
+              return statesRepo ? (
+                <IssueTrackerStatesPanel
+                  key={statesRepo.id}
+                  repoId={statesRepo.id}
+                  repoLabel={maskRepoPath(statesRepo.path_with_namespace, demo)}
+                  onClose={closeStates}
+                />
+              ) : null;
+            })()}
 
             {/* The Trusted-repo panel (PRD #246). Rendered OUTSIDE the
                 overflow-x-auto div above so its security copy stays fully readable
@@ -2277,6 +2376,19 @@ export function Repos() {
         </Modal>
       )}
 
+      {(() => {
+        const linkRepo = repos.find((r) => r.id === linkRepoId);
+        return linkRepo ? (
+          <IssueTrackerLinkDialog
+            repoId={linkRepo.id}
+            repoLabel={maskRepoPath(linkRepo.path_with_namespace, demo)}
+            demo={demo}
+            onLinked={onIssueTrackerLinked}
+            onClose={() => setLinkRepoId(null)}
+          />
+        ) : null;
+      })()}
+
       {/* Request-admin-approval modal (issue #1432): a member whose WAIVABLE enable was
           refused asks an admin to allow the repo. Cloned from the Allow-anyway modal —
           same required-reason pattern — but the reason is the member's justification and
@@ -2355,6 +2467,19 @@ export function Repos() {
 }
 
 // Smooth scrolling unless the user asked for reduced motion (same rule as AdminHealth).
+// IssueSourceLine names a linked repo's issue source under its path: the issue tracker
+// kind (when the connection list has it), the project short name and the eligibility tag,
+// all as stored at link time.
+function IssueSourceLine({ link, kind }: { link: NonNullable<Repo["issue_tracker_link"]>; kind?: string }) {
+  return (
+    <p className="mt-1 text-xs text-muted" data-testid="repo-issue-source">
+      Issues: {kind ? issueTrackerKindLabel(kind) : "issue tracker"} project{" "}
+      <span className="font-medium text-fg">{stripUnsafeChars(link.project_short_name)}</span>, tag{" "}
+      <span className="font-medium text-fg">{stripUnsafeChars(link.tag_name)}</span>
+    </p>
+  );
+}
+
 function reducedMotion(): boolean {
   try {
     return window.matchMedia("(prefers-reduced-motion: reduce)").matches;
