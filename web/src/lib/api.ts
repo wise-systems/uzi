@@ -94,6 +94,10 @@ import type {
   ForgeConfig,
   ForgeConnection,
   HealthDoc,
+  IssueTrackerConfig,
+  IssueTrackerConnection,
+  IssueTrackerProject,
+  IssueTrackerTag,
   HostedConfig,
   IncidentalFinding,
   IncidentalFindingBacklog,
@@ -982,6 +986,38 @@ const realApi = {
     request<{ repos: Repo[] }>(
       "GET",
       `/forge/connections/${connectionId}/projects`,
+    ),
+
+  // Issue tracker connections (PRD #4173 M6). Session-only, except the list, which a
+  // CLI token can read too. The token is write-only: it travels only in the create
+  // body and no response carries it. Reconnecting with the same base URL replaces it.
+  issueTrackerConfig: () =>
+    request<IssueTrackerConfig>("GET", "/issue-trackers/config"),
+  listIssueTrackerConnections: () =>
+    request<{ connections: IssueTrackerConnection[] }>(
+      "GET",
+      "/issue-trackers/connections",
+    ),
+  createIssueTrackerConnection: (kind: string, baseUrl: string, token: string) =>
+    request<{ connection: IssueTrackerConnection }>(
+      "POST",
+      "/issue-trackers/connections",
+      { kind, base_url: baseUrl, token },
+    ),
+  deleteIssueTrackerConnection: (id: string) =>
+    request<null>(
+      "DELETE",
+      `/issue-trackers/connections/${encodeURIComponent(id)}`,
+    ),
+  listIssueTrackerProjects: (id: string) =>
+    request<{ projects: IssueTrackerProject[] }>(
+      "GET",
+      `/issue-trackers/connections/${encodeURIComponent(id)}/projects`,
+    ),
+  listIssueTrackerTags: (id: string) =>
+    request<{ tags: IssueTrackerTag[] }>(
+      "GET",
+      `/issue-trackers/connections/${encodeURIComponent(id)}/tags`,
     ),
 
   listRepos: () => request<{ repos: Repo[] }>("GET", "/repos"),

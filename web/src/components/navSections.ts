@@ -28,6 +28,7 @@ const SETTINGS_TABS: SectionDef[] = [
   { label: "Appearance", to: "/settings/appearance", keywords: ["theme", "dark", "light", "typeface", "mode"] },
   { label: "Run defaults", to: "/settings/run-defaults", keywords: ["run", "defaults", "model", "harness"] },
   { label: "Forge", to: "/settings/forge", keywords: ["github", "gitlab", "connection", "repo"] },
+  { label: "Issue trackers", to: "/settings/issue-trackers", keywords: ["youtrack", "issues", "connection", "project"] },
   { label: "Access", to: "/settings/access", keywords: ["tokens", "permissions", "sharing", "oauth"] },
   { label: "Memory", to: "/settings/memory", keywords: ["notes", "context", "remember"] },
   { label: "Workers", to: "/workers", keywords: ["fleet", "hosted", "docker", "runner"] },

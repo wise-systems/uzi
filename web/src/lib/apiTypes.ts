@@ -1401,6 +1401,57 @@ export interface IssueTrackerConfig {
   kinds: string[];
 }
 
+// An issue tracker connection (PRD #4173 M6, GET/POST /api/issue-trackers/connections).
+// It carries no token field: the token is write-only, sent once in the create body.
+export interface IssueTrackerConnection {
+  id: string;
+  kind: string;
+  base_url: string;
+  account_id: string;
+  account_login: string;
+  // RFC 3339.
+  created_at: string;
+  last_verified_at: string;
+}
+
+// A project the connection's account can see (GET …/connections/{id}/projects).
+export interface IssueTrackerProject {
+  id: string;
+  short_name: string;
+  name: string;
+}
+
+export interface IssueTrackerAccount {
+  id: string;
+  login: string;
+}
+
+// A named group in a tag's sharing settings. users_count is 0 when the issue tracker
+// did not report it, which never counts as members (PRD #4173 D14).
+export interface IssueTrackerGroup {
+  id: string;
+  name: string;
+  all_users: boolean;
+  users_count: number;
+}
+
+export interface IssueTrackerSharing {
+  groups: IssueTrackerGroup[];
+  users: IssueTrackerAccount[];
+}
+
+// A tag with its see (`read`) and apply (`use`) sharing settings and the two link
+// verdicts judged for the connection's account (GET …/connections/{id}/tags).
+export interface IssueTrackerTag {
+  id: string;
+  name: string;
+  owner: IssueTrackerAccount;
+  read: IssueTrackerSharing;
+  use: IssueTrackerSharing;
+  account_can_apply: boolean;
+  others_can_apply: boolean;
+}
+
 // AppSettings is the instance-level settings surface (PRD #19). Admin-only. The
 // API always returns every known key (a missing row reads as its default), so
 // every field is always present. default_theme is the instance-default UI theme

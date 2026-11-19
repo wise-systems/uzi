@@ -9,6 +9,7 @@ export * from "./findings";
 export * from "./judge";
 export * from "./secrets";
 export * from "./forge";
+export * from "./issueTrackers";
 export * from "./boards";
 export * from "./workers";
 export * from "./health";
