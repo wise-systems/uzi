@@ -58,6 +58,7 @@ import { JudgeRunBadge } from "../components/JudgeRunBadge";
 import { RunCredential } from "../components/RunCredential";
 import { HarnessBadge } from "../components/HarnessBadge";
 import { stripUnsafeChars } from "../lib/safeText";
+import { issueRef } from "../lib/issueRef";
 import { formatUptimeSince } from "../lib/formatUptimeSince";
 import { anthropicTokenCount, codexCredentialCount, showsRunAccounts } from "../lib/hasToken";
 import { usePollWhileVisible } from "../lib/usePollWhileVisible";
@@ -413,7 +414,7 @@ export function RunRow({
         // distinct, meaningful accessible names — the title now sits under the overlay
         // and no longer contributes to the link name on its own. issue_title is untrusted
         // forge text, so it stays sanitized (same stripUnsafeChars as the visible title).
-        aria-label={`Open run${run.issue_iid != null ? ` for issue #${run.issue_iid}` : ""}${
+        aria-label={`Open run${run.issue_iid != null ? ` for issue ${issueRef(run.issue_iid, run.issue_key)}` : ""}${
           run.issue_title.trim() ? `: ${stripUnsafeChars(run.issue_title)}` : ""
         }`}
         className="absolute inset-0 rounded-lg"
@@ -461,6 +462,7 @@ export function RunRow({
                 <span className="shrink-0">
                   <RunIssueRef
                     issueIid={run.issue_iid}
+                    issueKey={run.issue_key}
                     issueWebUrl={run.issue_web_url}
                     kind={run.kind}
                     forgeType={run.forge_type}

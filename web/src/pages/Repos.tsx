@@ -925,7 +925,7 @@ export function Repos() {
   // web_url. The Project-sync cell renders only when this is true.
   const isGithub = connections.find((c) => c.id === connectionId)?.forge_type === "github";
   // The repo whose Project-sync panel is expanded (rendered below the table).
-  const syncRepo = repos.find((r) => r.id === syncRepoId) ?? null;
+  const syncRepo = repos.find((r) => r.id === syncRepoId && !r.issue_tracker_link) ?? null;
 
   // The repo whose Trusted-repo panel is expanded (rendered below the table,
   // outside its horizontal scroll container).
@@ -1348,7 +1348,11 @@ export function Repos() {
                           {/* Project sync (PRD #534) is GitHub-only, and — like the
                               Trusted/Tools cells — offered only on an enabled repo. A
                               non-GitHub or disabled repo shows nothing actionable. */}
-                          {!isGithub || !r.enabled ? (
+                          {r.issue_tracker_link ? (
+                            // The API refuses project sync on a linked repo (PRD 4173 M6),
+                            // so the controls are not drawn at all.
+                            <span className="text-xs text-muted">Not offered on a repo linked to an issue tracker</span>
+                          ) : !isGithub || !r.enabled ? (
                             <span className="text-xs text-faint">—</span>
                           ) : (
                             <div className="flex flex-wrap items-center gap-2">

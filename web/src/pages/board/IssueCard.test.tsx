@@ -222,3 +222,77 @@ it("shows #iid when the card has no issue key", () => {
   const { container } = renderCard();
   expect(container.textContent).toContain("#7");
 });
+
+// PRD 4173 M6: on a repo linked to an issue tracker the card's screen-reader labels and
+// its forge link name the issue key, never "#iid" or a forge.
+describe("IssueCard — a card carrying an issue key (PRD 4173 M6)", () => {
+  // renderCard hands the card no neighbours, so its move buttons do not render.
+  function renderMovable(over: Partial<Card>) {
+    return render(
+      <MemoryRouter>
+        <IssueCard
+          card={aCard(over)}
+          repoId="repo-1"
+          chips={[]}
+          laneLabel="Review"
+          canMoveUp
+          canMoveDown
+          onMoveUp={vi.fn()}
+          onMoveDown={vi.fn()}
+          insertionEdge={null}
+          gate={{ enabled: true, reason: "" }}
+          starting={false}
+          onStart={vi.fn()}
+          fixCiBusy={false}
+          onFixCi={vi.fn()}
+          uziLabel="uzi"
+          isEligible
+          canPromote={false}
+          promoting={false}
+          onPromote={vi.fn()}
+          onDragStart={vi.fn()}
+          onDragEnd={vi.fn()}
+          dimmed={false}
+        />
+      </MemoryRouter>,
+    );
+  }
+
+  it("names the key in the move buttons' aria-label and title", () => {
+    renderMovable({ issue_key: "ABC-12" });
+    for (const dir of ["up", "down"]) {
+      const btn = screen.getByLabelText(`Move issue ABC-12 ${dir} in Review`);
+      expect(btn.getAttribute("title")).toBe(`Move issue ABC-12 ${dir} in Review`);
+    }
+    expect(screen.queryByLabelText(/Move issue #7/)).toBeNull();
+  });
+
+  it("keeps #iid in the move labels when the card has no key", () => {
+    renderMovable({});
+    expect(screen.getByLabelText("Move issue #7 up in Review")).toBeTruthy();
+  });
+
+  it("names the key in the Options button", () => {
+    renderCard({ issue_key: "ABC-12" }, { onOptions: vi.fn() });
+    expect(screen.getByRole("button", { name: "Run options for ABC-12" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Run options for #7" })).toBeNull();
+  });
+
+  it("reads the forge link as Open in issue tracker, not Open on a forge", () => {
+    renderCard({ issue_key: "ABC-12" });
+    const link = screen.getByRole("link", { name: "Open in issue tracker" });
+    expect(link.getAttribute("title")).toBe("Open in issue tracker");
+    expect(screen.queryByRole("link", { name: "Open on GitLab" })).toBeNull();
+  });
+
+  it("keeps Open on GitLab on an unlinked card", () => {
+    renderCard();
+    expect(screen.getByRole("link", { name: "Open on GitLab" })).toBeTruthy();
+  });
+
+  it("strips format characters out of the key it renders and names", () => {
+    renderCard({ issue_key: "AB‮C-12" }, { onOptions: vi.fn() });
+    expect(screen.getByText("ABC-12")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Run options for ABC-12" })).toBeTruthy();
+  });
+});

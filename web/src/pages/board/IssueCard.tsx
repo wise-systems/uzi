@@ -20,6 +20,7 @@ import { forgePlatform } from "../../lib/forgeNoun";
 import { mergeRequestUrl } from "../../lib/forgeUrls";
 import { ExternalLinkIcon } from "../../components/icons";
 import { stripUnsafeChars } from "../../lib/safeText";
+import { issueRef } from "../../lib/issueRef";
 import { useDemoMode } from "../../lib/demoMode";
 import { useMaintenance } from "../../lib/useMaintenance";
 import { maskName, maskUsername } from "../../lib/demoMask";
@@ -188,6 +189,12 @@ export function IssueCard({
   // on the card root. Inert on every other theme (only Shadow styles the attributes);
   // computed once here so both attributes read one derivation.
   const shadow = shadowSignal(run);
+  // The card's name for screen readers and tooltips: its issue tracker key on a linked
+  // repo (PRD 4173 M6), else "#iid". Board.tsx builds the same name for the refocus after
+  // a keyboard move, so both come from issueRef.
+  const ref = issueRef(card.iid, card.issue_key);
+  // A keyed card is a linked repo's, whose web_url is the issue tracker's, not a forge's.
+  const webLinkName = card.issue_key ? "Open in issue tracker" : `Open on ${forgePlatform(card.forge_type)}`;
   // PRD #3454: a maintenance-held card's tooltip carries the admin's reason.
   const maintenanceReason = useMaintenance().status?.reason;
   const badge = run ? runBadge(run, Date.now(), maintenanceReason) : null;
@@ -360,8 +367,8 @@ export function IssueCard({
                 draggable={false}
                 disabled={!canMoveUp}
                 onClick={onMoveUp}
-                aria-label={`Move issue #${card.iid} up in ${laneLabel}`}
-                title={`Move issue #${card.iid} up in ${laneLabel}`}
+                aria-label={`Move issue ${ref} up in ${laneLabel}`}
+                title={`Move issue ${ref} up in ${laneLabel}`}
                 className="inline-flex min-h-6 min-w-6 items-center justify-center rounded text-xs leading-none text-faint transition-colors hover:text-fg disabled:opacity-30"
               >
                 ↑
@@ -371,8 +378,8 @@ export function IssueCard({
                 draggable={false}
                 disabled={!canMoveDown}
                 onClick={onMoveDown}
-                aria-label={`Move issue #${card.iid} down in ${laneLabel}`}
-                title={`Move issue #${card.iid} down in ${laneLabel}`}
+                aria-label={`Move issue ${ref} down in ${laneLabel}`}
+                title={`Move issue ${ref} down in ${laneLabel}`}
                 className="inline-flex min-h-6 min-w-6 items-center justify-center rounded text-xs leading-none text-faint transition-colors hover:text-fg disabled:opacity-30"
               >
                 ↓
@@ -385,14 +392,14 @@ export function IssueCard({
               target="_blank"
               rel="noreferrer"
               draggable={false}
-              aria-label={`Open on ${forgePlatform(card.forge_type)}`}
-              title={`Open on ${forgePlatform(card.forge_type)}`}
+              aria-label={webLinkName}
+              title={webLinkName}
               className="text-faint transition-colors hover:text-brand"
             >
               <ExternalLinkIcon />
             </a>
           )}
-          <span className="font-mono text-xs text-faint">{card.issue_key || `#${card.iid}`}</span>
+          <span className="font-mono text-xs text-faint">{ref}</span>
         </div>
       </div>
       <div className="mt-2 flex flex-wrap items-center gap-1.5">
@@ -548,7 +555,7 @@ export function IssueCard({
                 variant="secondary"
                 size="sm"
                 disabled={!gate.enabled || starting}
-                aria-label={`Run options for #${card.iid}`}
+                aria-label={`Run options for ${ref}`}
                 title={gate.enabled ? "Choose the harness, token, model or effort for this run" : gate.reason}
                 onClick={onOptions}
               >

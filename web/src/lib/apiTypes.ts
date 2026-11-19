@@ -1259,8 +1259,8 @@ export interface Card {
   state: string;
   labels: string[];
   // The issue tracker's readable id (e.g. "ABC-12", PRD 4173 M4), set only for a repo linked
-  // to an issue tracker. Shown in place of `#iid`, and a keyed card is eligible by its
-  // issue tracker tag, so the board treats it as uzi's without the `uzi` label.
+  // to an issue tracker. Shown in place of `#iid`. It does not decide eligibility: the
+  // board payload's `eligibility_label` does.
   issue_key?: string;
   // Forge user ids assigned to the issue (PRD #767 M5). The board widens "is this card
   // uzi's to run" to "carries the `uzi` label OR the board's bot is one of these ids",
