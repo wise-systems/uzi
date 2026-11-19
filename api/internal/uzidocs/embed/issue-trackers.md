@@ -22,8 +22,9 @@ not supported. See [Configuration](./configuration.md).
 
 1. In YouTrack, open Profile, Account Security, New token. Give it the scope
    YouTrack, for the account uzi acts as.
-2. In uzi, open Settings, Issue trackers, and add a connection: kind YouTrack,
-   base URL, token.
+2. In uzi, open Settings, Issue trackers, and add a connection: pick the base
+   URL from the operator's allowed list and paste the token. (A kind picker
+   shows only once more than one kind is supported; today YouTrack is implicit.)
 
 The token is write-only: it is stored sealed, never shown again, and never sent
 to the worker. Reconnecting with the same base URL replaces the token; if a repo
@@ -33,11 +34,12 @@ with a linked repo cannot be deleted.
 ## Link a repo
 
 A repo that was never enabled offers "Link to an issue tracker" on the Repos
-page. Choose the connection, the project and the eligibility tag. The choice
-cannot be changed afterwards (no unlink or relink). A repo that was ever enabled
-cannot be linked: that includes every repo that existed when issue tracker links
-were added and a repo removed and listed again. Link in the web before anything
-enables the repo, including `/server setup`.
+page. Choose the connection, the project and the eligibility tag, and tick
+"They can edit issues in this project". The choice cannot be changed afterwards
+(no unlink or relink). A repo that was ever enabled cannot be linked: that
+includes every repo that existed when issue tracker links were added and a repo
+that was enabled, then removed and listed again. Link in the web before
+anything enables the repo, including `/server setup`.
 
 Issues carrying the eligibility tag come into uzi. The tag is chosen by id: a
 same-named tag of another user does not count, and renaming it keeps working.
@@ -56,18 +58,21 @@ same-named tag of another user does not count, and renaming it keeps working.
 On a linked repo each board column maps to one State, plus the open State and
 the closed State. The closed State must mean done (for example Fixed or Done),
 never Won't fix; uzi refuses it. Moving a card into an unmapped column is
-refused until it is mapped. Map them from the repo row or the board's column
-settings. The board, the issue page and run lists show an issue's key (for
-example `ABC-12`, from the project short name stored at link time). Triage,
-a schedule's last fire, proposal cards and the command menu still show `#number`.
+refused until it is mapped. Use "Map States" on the repo row or in the board's
+column settings.
+
+The web shows an issue's key (for example `ABC-12`, from the project short name
+stored at link time) on the board (cards, search, screen-reader labels), the
+issue page (header, breadcrumb), the runs list and run page heading, created-issue
+lists and the findings group-file notice. It still shows `#number` in the
+overview run row, the needs-decision card, triage, a schedule's last fire,
+proposal cards, the command menu and the capacity rail.
 
 ## Not offered on a linked repo
 
-- Autopilot.
-- GitHub Projects v2 sync.
-- Creating repo labels.
-- Eligibility by assigning the issue to the uzi bot.
-- Changing the issue source after the first enable.
+Autopilot, GitHub Projects v2 sync, creating repo labels, eligibility by
+assigning the issue to the uzi bot, and changing the issue source after the
+first enable.
 
 There is no author mapping setting: only the connection's own YouTrack account
 counts as a uzi user. Comments by anyone else are withheld from runs, and a
@@ -78,7 +83,8 @@ and whose title and body only it edited.
 
 It gets a new number there, so uzi treats it as gone from the linked project.
 Later issue writes for a live run are skipped and logged, the run's code side
-(branch, MR, CI) continues, and the next full sync (every `FORGE_RECONCILE_EVERY`-th poll, default 10) removes it from the board.
+(branch, MR, CI) continues, and the next full sync (every
+`FORGE_RECONCILE_EVERY`-th poll, default 10) removes it from the board.
 
 ## From the CLI
 

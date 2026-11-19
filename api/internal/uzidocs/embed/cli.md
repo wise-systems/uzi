@@ -2024,10 +2024,13 @@ uzi repo issue-tracker-states group/proj   # a linked repo's State mapping
 
 - **`uzi issue-tracker list`** shows each connection's kind, base URL, account,
   created and last verified time.
-- **`uzi repo issue-tracker-states <repo>`** takes the repo by path or id (a repo
-  is linked before it is first enabled, so it may not be in `uzi repo list`). It
-  shows the open and closed States, each mapped board column's State (a column not listed is unmapped: see the board's column settings in the web), and
-  the project's States with whether each can close or open an issue.
+- **`uzi repo issue-tracker-states <repo>`** takes the repo by path or id. A path
+  resolves only for a repo `uzi repo list` shows; a repo is linked before it is
+  first enabled, so a repo not yet enabled needs its id from the web Repos page.
+  It shows the open and closed States, each mapped board column's State, and the
+  project's States with whether each can close or open an issue. It ends a
+  mapping with "Columns not listed are unmapped: a move into one is refused
+  until it is mapped."; map them with "Map States" in the web.
 
 Both support `--json`. On a repo linked to an issue tracker, the CLI and TUI show
 an issue's key (`ABC-12`) instead of `#number` in run, schedule, finding and
