@@ -861,6 +861,17 @@ export interface PipelineStatus {
   synced_at: string;
 }
 
+// A repo's link to an issue tracker project and eligibility tag, as stored at link time.
+export interface RepoIssueTrackerLink {
+  connection_id: string;
+  project_id: string;
+  project_short_name: string;
+  tag_id: string;
+  tag_name: string;
+  // RFC 3339.
+  linked_at: string;
+}
+
 export interface Repo {
   ignored_inferred_capabilities?: string[];
   /** Separate checker consent; absent on older APIs means off. */
@@ -918,6 +929,13 @@ export interface Repo {
   // and zero eligible online workers. Drives the Setup chip's info escalation; computed
   // from eligibility, not the sweeper's health text. Set by the list handlers.
   docker_blocked: boolean;
+  // The repo's link to an external issue tracker project (PRD #4173 M6), null when the
+  // repo is not linked. Optional: an OLD api replica during a rollout skew omits it,
+  // which reads as not linked.
+  issue_tracker_link?: RepoIssueTrackerLink | null;
+  // Advisory: the repo still awaits its first enable and is not linked, so the link
+  // control is offered. The link service decides and refuses; the web shows its answer.
+  issue_tracker_linkable?: boolean;
   // Caller-scoped GitHub Projects v2 sync-health summary (PRD #576 M2), null/absent
   // when the repo is not linked. Drives the Sync badge tone: linked && healthy → green
   // (ok), linked && !healthy (last_error set) → danger, absent → neutral. Derived from
@@ -1304,6 +1322,10 @@ export interface Board {
   // repo. Optional: an OLD api replica during a rollout skew omits it, which the board
   // treats the same as null (no banner).
   initial_import?: InitialImport | null;
+  // The stored eligibility tag name of a repo linked to an issue tracker (PRD #4173 M6):
+  // an issue is uzi's when its labels include it. Absent on an unlinked repo, where the
+  // configured uzi label decides.
+  eligibility_label?: string;
 }
 
 // InitialImport is a just-enabled repo's first issue import, as the board reports it.
@@ -1361,11 +1383,22 @@ export interface IssueDetail {
   // skew may omit it entirely, which the consumer treats as "no bot" (0), the same as
   // unresolved.
   bot_forge_user_id?: number;
+  // The issue's key ("ABC-12") and the stored eligibility tag name, on a repo linked to
+  // an issue tracker only (PRD #4173 M6); absent on an unlinked repo.
+  issue_key?: string;
+  eligibility_label?: string;
 }
 
 export interface ForgeConfig {
   allowed_base_urls: string[];
   forge_types: string[];
+}
+
+// GET /api/issue-trackers/config (PRD #4173 M6): the operator's issue tracker base URL
+// allowlist (always an array; empty means an operator must set it) and the supported kinds.
+export interface IssueTrackerConfig {
+  allowed_base_urls: string[];
+  kinds: string[];
 }
 
 // AppSettings is the instance-level settings surface (PRD #19). Admin-only. The

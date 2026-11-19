@@ -883,7 +883,10 @@ func TestRepoDTOTags(t *testing.T) {
 		"docker_allowlisted",
 		// PRD #361 M3: the computed, caller-scoped "is a run on this repo actually
 		// blocked by the Docker-allowlist gap right now" bool, from eligibility directly.
-		"docker_blocked")
+		"docker_blocked",
+		// PRD #4173 M6: the repo's link to an issue tracker project (null when unlinked)
+		// and the advisory "may be linked now" flag.
+		"issue_tracker_link", "issue_tracker_linkable")
 }
 
 func TestGuardrailOverrideDTOTags(t *testing.T) {

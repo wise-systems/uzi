@@ -202,6 +202,22 @@ func repoToDTO(r store.Repo) apitypes.RepoDTO {
 		}
 		dto.GuardrailOverride = ov
 	}
+	if r.IssueTrackerConnectionID.Valid {
+		link := &apitypes.RepoIssueTrackerLinkDTO{
+			ConnectionID:     uuid.UUID(r.IssueTrackerConnectionID.Bytes).String(),
+			ProjectID:        r.IssueTrackerProjectID.String,
+			ProjectShortName: r.IssueTrackerProjectShort.String,
+			TagID:            r.EligibilityTagID.String,
+			TagName:          r.EligibilityTagName.String,
+		}
+		if r.IssueTrackerLinkedAt.Valid {
+			link.LinkedAt = r.IssueTrackerLinkedAt.Time
+		}
+		dto.IssueTrackerLink = link
+	} else {
+		// PRD #4173 M6: advisory only; the link service still decides.
+		dto.IssueTrackerLinkable = r.AwaitingFirstEnable
+	}
 	return dto
 }
 

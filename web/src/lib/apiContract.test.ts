@@ -36,6 +36,7 @@ import type {
   RunSummaryItem,
   RunJob,
   Repo,
+  RepoIssueTrackerLink,
   AdminDockerAllowlistRepo,
   AdminDockerAllowlistRepos,
   RunMessage,
@@ -512,6 +513,11 @@ void _releaseCheckStatusFull;
   void _repoExtra;
   void _repoZero;
   void _repoFull;
+  // The link block's own key set (PRD #4173 M6), read off the populated fixture.
+  const _linkMissing: never = null as unknown as Exclude<keyof RepoIssueTrackerLink, keyof typeof repoFull.issue_tracker_link>;
+  const _linkExtra: never = null as unknown as Exclude<keyof typeof repoFull.issue_tracker_link, keyof RepoIssueTrackerLink>;
+  void _linkMissing;
+  void _linkExtra;
 }
 
 // ── Admin Docker allowlist picker ───────────────────────────────────────────

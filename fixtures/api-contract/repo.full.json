@@ -46,5 +46,14 @@
     "healthy": true,
     "last_error": "x",
     "last_synced_at": "2020-01-02T03:04:05Z"
-  }
+  },
+  "issue_tracker_link": {
+    "connection_id": "x",
+    "project_id": "x",
+    "project_short_name": "x",
+    "tag_id": "x",
+    "tag_name": "x",
+    "linked_at": "2020-01-02T03:04:05Z"
+  },
+  "issue_tracker_linkable": true
 }

@@ -15,6 +15,10 @@ func (h *Handler) mountIssueTrackerRoutes(r chi.Router, forgeLimiter *mw.Limiter
 	r.Group(func(r chi.Router) {
 		r.Use(h.requireAuth())
 
+		// The operator's allowlist and the supported kinds: local config, no issue tracker
+		// call, so no limiter (like GET /forge/config).
+		r.Get("/issue-trackers/config", h.IssueTrackerConfig)
+
 		r.Route("/issue-trackers/connections", func(r chi.Router) {
 			// Connect, projects and tags call the issue tracker, so they ride the
 			// per-user budget the forge routes use; list and delete read only the store.
