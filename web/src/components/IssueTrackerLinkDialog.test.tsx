@@ -178,6 +178,39 @@ describe("IssueTrackerLinkDialog", () => {
     });
   });
 
+  it.each([
+    ["project", "Project", "0-7"],
+    ["tag", "Eligibility tag", "6-20"],
+  ])("clears the confirmation when the %s changes, so Link needs a fresh one", async (_what, label, value) => {
+    renderDialog();
+    await choose();
+    fireEvent.click(confirmBox());
+    expect(linkButton().disabled).toBe(false);
+
+    fireEvent.change(screen.getByLabelText(label), { target: { value } });
+    expect(confirmBox().checked).toBe(false);
+    expect(linkButton().disabled).toBe(true);
+    fireEvent.click(linkButton());
+    expect(mockApi.linkRepoToIssueTracker).not.toHaveBeenCalled();
+  });
+
+  it("clears the confirmation when the connection changes", async () => {
+    const OTHER: IssueTrackerConnection = { ...CONN, id: "itc-2", base_url: "https://youtrack-2.example.com" };
+    mockApi.listIssueTrackerConnections.mockResolvedValue({ connections: [CONN, OTHER] });
+    renderDialog();
+    await choose();
+    fireEvent.click(confirmBox());
+    expect(linkButton().disabled).toBe(false);
+
+    fireEvent.change(screen.getByLabelText("Connection"), { target: { value: "itc-2" } });
+    await waitFor(() => expect(mockApi.listIssueTrackerProjects).toHaveBeenCalledWith("itc-2"));
+    expect(confirmBox().checked).toBe(false);
+    // Re-picking the same project and tag under the new connection still needs a fresh confirmation.
+    await choose();
+    expect(confirmBox().checked).toBe(false);
+    expect(linkButton().disabled).toBe(true);
+  });
+
   it("describes the chosen tag's owner, who can see it and who can apply it", async () => {
     renderDialog();
     await choose("6-20");

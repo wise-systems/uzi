@@ -121,6 +121,11 @@ describe("mock issue tracker links and State mappings", () => {
     const repo = (await mockApi.listProjects("conn-1")).repos.find((r) => r.id === LINKABLE)!;
     expect(repo.issue_tracker_linkable).toBe(false);
     expect(repo.issue_tracker_link).toMatchObject({ project_short_name: "ATL", tag_name: "uzi" });
+    // Like the server, the board opens only at the first enable (refuseNeverEnabled).
+    const neverEnabled = await refusal(mockApi.getBoard(LINKABLE));
+    expect(neverEnabled.status).toBe(409);
+    expect(neverEnabled.message).toBe("the repo has never been enabled; enable it first");
+    await mockApi.setRepoEnabled(LINKABLE, true);
     const { board } = await mockApi.getBoard(LINKABLE);
     expect(board.eligibility_label).toBe("uzi");
     expect(board.columns.map((c) => c.label_name)).toEqual(["Ready", "In progress", "Human Review"]);
@@ -181,6 +186,8 @@ describe("mock issue tracker links and State mappings", () => {
   it("serves States and saves a valid mapping", async () => {
     const { mockApi } = await load();
     await mockApi.linkRepoToIssueTracker(LINKABLE, body());
+    // Column States need the board, which the first enable opens.
+    await mockApi.setRepoEnabled(LINKABLE, true);
     const view = await mockApi.getIssueTrackerStates(LINKABLE);
     expect(view.mapping).toBeNull();
     expect(view.states.filter((s) => s.closable).map((s) => s.name)).toEqual(["Fixed"]);

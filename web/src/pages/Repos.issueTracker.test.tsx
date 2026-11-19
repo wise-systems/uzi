@@ -95,6 +95,10 @@ const LINKABLE = repo({
 });
 const LINKED = repo({ id: "repo-linked", path_with_namespace: "acme/atlas-api", issue_tracker_link: LINK });
 
+// The plain enabled repo's row text as rendered before M6 (its Setup tooltip included).
+const UNLINKED_ROW_TEXT =
+  "acme/uzimainEnabledSetupSetupFour optional capabilities, each off by default for safety.offRepo skillsLoad skills from the repo’s own .claude/skills/.Set in Trusted repo settingsoffRepo instructionsLet the lead read the repo’s root CLAUDE.md as reference context.Set in Trusted repo settingsoffTool profileInstall this repo’s own devbox packages before each run.Set in ToolsoffDocker workersadminLet Docker workers run this repo.Set in Admin → Docker workersDefault agents for my runs: not set (today’s behaviour)Defaults are off on purpose; each one widens what an agent may do.OffManageDefaultManageTools—Open boardDisable";
+
 function rowFor(name: string): HTMLElement {
   // The States panel repeats the path below the table: take the table row's copy.
   const tr = screen
@@ -158,7 +162,7 @@ describe("Repos: issue trackers", () => {
       expect(within(row).getByTestId("repo-issue-source").textContent).toBe("Issues: YouTrack project ATL, tag uzi"),
     );
     expect(within(row).getByRole("button", { name: "Map issue tracker States for acme/atlas-api" })).toBeTruthy();
-    expect(within(row).queryByRole("button", { name: /unlink|relink|link to an issue tracker/i })).toBeNull();
+    expect(within(row).queryByRole("button", { name: /unlink|relink|to an issue tracker/i })).toBeNull();
   });
 
   it("names the issue tracker generically when the connection list cannot be read", async () => {
@@ -172,13 +176,33 @@ describe("Repos: issue trackers", () => {
   });
 
   it("leaves a repo that is neither linked nor linkable unchanged", async () => {
-    mockApi.listProjects.mockResolvedValue({ repos: [{ ...PLAIN }] });
+    // The M6 shape of a plain repo: no link, not linkable.
+    mockApi.listProjects.mockResolvedValue({
+      repos: [{ ...PLAIN, issue_tracker_link: null, issue_tracker_linkable: false }],
+    });
     renderPage();
     await screen.findByText("acme/uzi");
     const row = rowFor("acme/uzi");
     expect(within(row).queryByTestId("repo-issue-source")).toBeNull();
     expect(row.textContent).not.toMatch(/issue tracker|Issues:|States/);
     expect(within(row).queryByRole("button", { name: /issue tracker|States/ })).toBeNull();
+    // The row reads exactly as it did before M6: any new text in it fails here.
+    expect(row.textContent).toBe(UNLINKED_ROW_TEXT);
+    expect(
+      within(row)
+        .getAllByRole("button")
+        .map((b) => b.getAttribute("aria-label") ?? b.textContent),
+    ).toEqual([
+      "Setup",
+      "Trusted repo settings for acme/uzi",
+      "Code cross-check settings for acme/uzi",
+      "Tools",
+      "Open board",
+      "Disable",
+    ]);
+    // Its actions keep the pre-M6 layout: only a row with an issue tracker button wraps.
+    const actions = within(row).getByRole("button", { name: "Disable" }).parentElement as HTMLElement;
+    expect(actions.className).toBe("flex justify-end gap-2");
     // Nothing on the page asks for issue tracker data.
     expect(mockApi.listIssueTrackerConnections).not.toHaveBeenCalled();
   });
@@ -189,7 +213,9 @@ describe("Repos: issue trackers", () => {
     await screen.findByText("acme/atlas-web");
     const row = rowFor("acme/atlas-web");
     expect(within(row).queryByTestId("repo-issue-source")).toBeNull();
-    fireEvent.click(within(row).getByRole("button", { name: "Link to an issue tracker" }));
+    const linkTrigger = within(row).getByRole("button", { name: "Link acme/atlas-web to an issue tracker" });
+    expect(linkTrigger.textContent).toBe("Link to an issue tracker");
+    fireEvent.click(linkTrigger);
 
     const dialog = await screen.findByRole("dialog", { name: "Link acme/atlas-web to an issue tracker" });
     const project = (await within(dialog).findByLabelText("Project")) as HTMLSelectElement;
@@ -209,7 +235,7 @@ describe("Repos: issue trackers", () => {
     });
     const linkedRow = rowFor("acme/atlas-web");
     expect(within(linkedRow).getByTestId("repo-issue-source").textContent).toBe("Issues: YouTrack project ATL, tag uzi");
-    expect(within(linkedRow).queryByRole("button", { name: "Link to an issue tracker" })).toBeNull();
+    expect(within(linkedRow).queryByRole("button", { name: "Link acme/atlas-web to an issue tracker" })).toBeNull();
     // The States panel opens for the new link; a never-enabled repo has no board yet.
     await screen.findByRole("heading", { name: "Issue tracker States" });
     expect(await screen.findByTestId("states-board-note")).toBeTruthy();

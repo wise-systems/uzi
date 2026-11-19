@@ -185,6 +185,70 @@ describe("IssueTrackerStatesPanel", () => {
     );
   });
 
+  it("marks a saved State the project no longer offers and does not resend it", async () => {
+    const STALE_NOTE = (alt: string) =>
+      `The saved State is no longer offered by the project. Choose ${alt}; Save stays off until then.`;
+    mockApi.getIssueTrackerStates.mockResolvedValue({
+      // "Triage" was renamed away; "Won't fix" is still a State but cannot be the closed one.
+      mapping: {
+        open_state: "Open",
+        closed_state: "Won't fix",
+        columns: [
+          { label_name: "Ready", state: "Triage" },
+          { label_name: "In progress", state: "In Progress" },
+        ],
+      },
+      states: STATES,
+    });
+    mockApi.putIssueTrackerStates.mockImplementation(async (_id, mapping) => ({ mapping }));
+    renderPanel();
+    await screen.findByLabelText("Ready");
+
+    // The column keeps its saved value, marked, with the note instead of the unmapped one.
+    const ready = select("Ready");
+    expect(ready.value).toBe("Triage");
+    expect(optionFor(ready, "Triage").textContent).toBe("Triage (no longer a State of the project)");
+    expect(optionFor(ready, "Triage").disabled).toBe(true);
+    expect(within(rowOf("Ready")).getByText(STALE_NOTE("another State or Unmapped"))).toBeTruthy();
+    expect(within(rowOf("Ready")).queryByText(UNMAPPED)).toBeNull();
+    // The closed row shows its saved non-closable State the same way.
+    expect(select("Closed").value).toBe("Won't fix");
+    expect(within(rowOf("Closed")).getByText(STALE_NOTE("another State"))).toBeTruthy();
+    // Rows still offered stay unmarked.
+    expect(within(rowOf("Open")).queryByText(/no longer offered/)).toBeNull();
+
+    const save = screen.getByRole("button", { name: "Save States" }) as HTMLButtonElement;
+    expect(save.disabled).toBe(true);
+    fireEvent.click(save);
+    expect(mockApi.putIssueTrackerStates).not.toHaveBeenCalled();
+
+    fireEvent.change(ready, { target: { value: "" } });
+    expect(within(rowOf("Ready")).getByText(UNMAPPED)).toBeTruthy();
+    expect(save.disabled).toBe(true);
+    fireEvent.change(select("Closed"), { target: { value: "Fixed" } });
+    expect(save.disabled).toBe(false);
+    fireEvent.click(save);
+    await waitFor(() =>
+      expect(mockApi.putIssueTrackerStates).toHaveBeenCalledWith("repo-1", {
+        open_state: "Open",
+        closed_state: "Fixed",
+        columns: [{ label_name: "In progress", state: "In Progress" }],
+      }),
+    );
+  });
+
+  it("marks a saved open State that is no longer openable", async () => {
+    mockApi.getIssueTrackerStates.mockResolvedValue({
+      mapping: { open_state: "Fixed", closed_state: "Fixed", columns: [] },
+      states: STATES,
+    });
+    renderPanel([]);
+    await screen.findByLabelText("Open");
+    expect(select("Open").value).toBe("Fixed");
+    expect(optionFor(select("Open"), "Fixed").textContent).toBe("Fixed (no longer offered for this row)");
+    expect((screen.getByRole("button", { name: "Save States" }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
   it("shows a load refusal", async () => {
     mockApi.getIssueTrackerStates.mockRejectedValue(new ApiError(409, "this repo is not linked to an issue tracker project"));
     renderPanel();

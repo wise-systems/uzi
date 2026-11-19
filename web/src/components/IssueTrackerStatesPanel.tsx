@@ -9,6 +9,11 @@
 // already uses is not offered twice. The server still decides; a refused save shows its
 // message verbatim and the choices stay on screen.
 //
+// A saved State the project no longer offers for its row (renamed, removed or archived in
+// the issue tracker since) stays visible as the row's value, marked and with a note, and
+// Save stays off until each such row gets a State the project still offers: the panel
+// never resends a State it knows is gone, and never drops one without saying so.
+//
 // State names and column labels are API text: rendered as JSX text through
 // stripUnsafeChars. Option values keep the exact names, which the PUT must send back.
 
@@ -138,6 +143,27 @@ export function IssueTrackerStatesPanel({
   };
 
   const openable = loaded?.states.filter((s) => s.openable) ?? [];
+  // A saved value the row does not offer: its option is drawn here, disabled.
+  const isOffered = (value: string, role: "open" | "closed") =>
+    value === "" ||
+    (loaded?.states ?? []).some((st) => st.name === value && (role === "open" ? st.openable : st.closable));
+  const staleOption = (value: string, role: "open" | "closed") =>
+    isOffered(value, role) ? null : (
+      <option value={value} disabled>
+        {stripUnsafeChars(value)}{" "}
+        {(loaded?.states ?? []).some((st) => st.name === value)
+          ? "(no longer offered for this row)"
+          : "(no longer a State of the project)"}
+      </option>
+    );
+  const staleNote = (value: string, role: "open" | "closed", alternative: string) =>
+    isOffered(value, role)
+      ? undefined
+      : `The saved State is no longer offered by the project. Choose ${alternative}; Save stays off until then.`;
+  const anyStale =
+    !isOffered(openState, "open") ||
+    !isOffered(closedState, "closed") ||
+    (loaded?.columns ?? []).some((label) => !isOffered(columnStates[label] ?? "", "open"));
 
   return (
     <section
@@ -183,6 +209,7 @@ export function IssueTrackerStatesPanel({
               label="Open"
               hint="A new or reopened issue starts here."
               marker="start"
+              note={staleNote(openState, "open", "another State")}
             >
               <Select
                 id={`${ids}-open`}
@@ -191,6 +218,7 @@ export function IssueTrackerStatesPanel({
                 onChange={(e) => edit(() => setOpenState(e.target.value))}
               >
                 <option value="">Choose a State</option>
+                {staleOption(openState, "open")}
                 {openable.map((st) => (
                   <option key={st.name} value={st.name} disabled={takenElsewhere(st.name, openState)}>
                     {optionText(st, openState)}
@@ -210,7 +238,9 @@ export function IssueTrackerStatesPanel({
                   hint="Board column"
                   marker="column"
                   note={
-                    value === "" ? "Unmapped — a move into this column is refused until it is mapped." : undefined
+                    value === ""
+                      ? "Unmapped — a move into this column is refused until it is mapped."
+                      : staleNote(value, "open", "another State or Unmapped")
                   }
                 >
                   <Select
@@ -220,6 +250,7 @@ export function IssueTrackerStatesPanel({
                     onChange={(e) => edit(() => setColumnStates((prev) => ({ ...prev, [label]: e.target.value })))}
                   >
                     <option value="">Unmapped</option>
+                    {staleOption(value, "open")}
                     {openable.map((st) => (
                       <option key={st.name} value={st.name} disabled={takenElsewhere(st.name, value)}>
                         {optionText(st, value)}
@@ -235,6 +266,7 @@ export function IssueTrackerStatesPanel({
               label="Closed"
               hint="uzi writes it when an issue is done. It must mean done, never Won't fix."
               marker="end"
+              note={staleNote(closedState, "closed", "another State")}
             >
               <Select
                 id={`${ids}-closed`}
@@ -243,6 +275,7 @@ export function IssueTrackerStatesPanel({
                 onChange={(e) => edit(() => setClosedState(e.target.value))}
               >
                 <option value="">Choose a State</option>
+                {!loaded.states.some((st) => st.name === closedState) && staleOption(closedState, "closed")}
                 {loaded.states.map((st) =>
                   st.closable ? (
                     <option key={st.name} value={st.name} disabled={takenElsewhere(st.name, closedState)}>
@@ -261,7 +294,7 @@ export function IssueTrackerStatesPanel({
           {saveError && <Alert message={saveError} />}
           {saved && <Alert tone="success" message="State mapping saved." />}
           <div className="flex justify-end">
-            <Button onClick={save} disabled={saving || !openState || !closedState}>
+            <Button onClick={save} disabled={saving || !openState || !closedState || anyStale}>
               {saving ? "Saving…" : "Save States"}
             </Button>
           </div>

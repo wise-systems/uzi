@@ -1438,10 +1438,16 @@ export function Repos() {
                               </div>
                             </div>
                           ) : (
-                            <div className="flex flex-wrap justify-end gap-2">
+                            <div
+                              className={cx(
+                                "flex justify-end gap-2",
+                                (r.issue_tracker_link || r.issue_tracker_linkable) && "flex-wrap",
+                              )}
+                            >
                               {/* PRD #4173 M6: a never-enabled repo can take its issues from an
                                   issue tracker; a linked one maps its columns to States. There
-                                  is no unlink or relink control. */}
+                                  is no unlink or relink control. Only a row with the extra
+                                  button wraps; every other row keeps its actions as before. */}
                               {r.issue_tracker_link ? (
                                 <Button
                                   variant="secondary"
@@ -1458,7 +1464,12 @@ export function Repos() {
                                 </Button>
                               ) : (
                                 r.issue_tracker_linkable && (
-                                  <Button variant="secondary" size="sm" onClick={() => setLinkRepoId(r.id)}>
+                                  <Button
+                                    variant="secondary"
+                                    size="sm"
+                                    aria-label={`Link ${maskRepoPath(r.path_with_namespace, demo)} to an issue tracker`}
+                                    onClick={() => setLinkRepoId(r.id)}
+                                  >
                                     Link to an issue tracker
                                   </Button>
                                 )
@@ -2470,7 +2481,6 @@ export function Repos() {
   );
 }
 
-// Smooth scrolling unless the user asked for reduced motion (same rule as AdminHealth).
 // IssueSourceLine names a linked repo's issue source under its path: the issue tracker
 // kind (when the connection list has it), the project short name and the eligibility tag,
 // all as stored at link time.
@@ -2484,6 +2494,7 @@ function IssueSourceLine({ link, kind }: { link: NonNullable<Repo["issue_tracker
   );
 }
 
+// Smooth scrolling unless the user asked for reduced motion (same rule as AdminHealth).
 function reducedMotion(): boolean {
   try {
     return window.matchMedia("(prefers-reduced-motion: reduce)").matches;

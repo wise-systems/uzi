@@ -6,7 +6,9 @@
 // tag it shows the owner, who can see it, who can apply it, and the two verdicts the
 // server judged for the connection's account, in plain words, with what to change in
 // YouTrack when either fails. Link stays disabled until both verdicts pass and the admin
-// confirms the one thing uzi cannot check (who can edit issues in the project).
+// confirms the one thing uzi cannot check (who can edit issues in the project). The
+// confirmation is about one project and tag, so changing the connection, project or tag
+// clears it.
 //
 // The server still decides: a refusal (enabled before, already linked, project not
 // found, either tag verdict, issue numbers already stored) shows verbatim and every
@@ -74,7 +76,7 @@ export function IssueTrackerLinkDialog({
   }, []);
 
   // Projects and tags belong to a connection: a new connection reloads both and clears
-  // the picks made under the previous one.
+  // the picks made under the previous one, and the confirmation with them.
   useEffect(() => {
     if (!connectionId) return;
     let live = true;
@@ -82,6 +84,7 @@ export function IssueTrackerLinkDialog({
     setTags({ state: "loading" });
     setProjectId("");
     setTagId("");
+    setConfirmed(false);
     api.listIssueTrackerProjects(connectionId).then(
       ({ projects }) => live && setProjects({ state: "ok", items: projects }),
       (err: unknown) =>
@@ -199,6 +202,7 @@ export function IssueTrackerLinkDialog({
                     disabled={linking || projects.state !== "ok"}
                     onChange={(e) => {
                       setProjectId(e.target.value);
+                      setConfirmed(false);
                       setLinkError("");
                     }}
                   >
@@ -223,6 +227,7 @@ export function IssueTrackerLinkDialog({
                     disabled={linking || tags.state !== "ok"}
                     onChange={(e) => {
                       setTagId(e.target.value);
+                      setConfirmed(false);
                       setLinkError("");
                     }}
                   >

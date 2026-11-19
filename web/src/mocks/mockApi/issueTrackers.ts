@@ -7,7 +7,17 @@
 // checked for presence and then dropped: nothing here stores, returns or logs it.
 //
 // The data lives in ../data/issueTrackers.ts (connection, projects, tags, States, the
-// linkable repo), so a later named scenario can swap it in one place.
+// linkable and linked repos). The issue-tracker-* scenarios (PRD #4173 M8, see
+// issueTrackerScenario) pick what is seeded:
+//
+//   ?mock=issue-tracker-none           → no connection
+//   ?mock=issue-tracker-unlinked       → one connection and the never-enabled linkable
+//                                        repo (also the default)
+//   ?mock=issue-tracker-linked         → plus an enabled linked repo, completely mapped,
+//                                        with keyed cards and a keyed run
+//   ?mock=issue-tracker-unmapped       → the same repo with one column left unmapped
+//   ?mock=issue-tracker-link-refused   → a valid link is refused (mockLinkRefusal)
+//   ?mock=issue-tracker-allowlist-empty → no allowed base URL and no connection
 
 import type {
   IssueTrackerConnection,
@@ -16,19 +26,32 @@ import type {
 } from "../../lib/api";
 import { ApiError } from "../../lib/apiError";
 import {
+  issueTrackerScenario,
   mockIssueTrackerConfig,
   mockIssueTrackerConnection,
   mockIssueTrackerProjects,
   mockIssueTrackerStates,
   mockIssueTrackerTags,
-  mockLinkedBoardColumns,
+  mockLinkedMapping,
+  mockLinkedRepo,
+  mockLinkRefusal,
+  mockUnmappedMapping,
 } from "../data";
 import { state } from "../store";
 import { repos } from "./forge";
-import { delay, requireSession } from "./shared";
+import { delay, mockScenario, requireSession } from "./shared";
+
+const scenario = issueTrackerScenario(mockScenario());
 
 // The saved State mapping of each linked repo, keyed by repo id; absent until saved.
 const stateMappings = new Map<string, IssueTrackerStateMapping>();
+if (scenario === "issue-tracker-linked") stateMappings.set(mockLinkedRepo.id, cloneMapping(mockLinkedMapping));
+if (scenario === "issue-tracker-unmapped") stateMappings.set(mockLinkedRepo.id, cloneMapping(mockUnmappedMapping));
+
+const config = {
+  allowed_base_urls: scenario === "issue-tracker-allowlist-empty" ? [] : [...mockIssueTrackerConfig.allowed_base_urls],
+  kinds: [...mockIssueTrackerConfig.kinds],
+};
 
 function findRepo(id: string) {
   const r = repos.find((x) => x.id === id);
@@ -88,7 +111,10 @@ function checkMapping(m: IssueTrackerStateMapping, columns: string[]) {
   }
 }
 
-let connections: IssueTrackerConnection[] = [{ ...mockIssueTrackerConnection }];
+let connections: IssueTrackerConnection[] =
+  scenario === "issue-tracker-none" || scenario === "issue-tracker-allowlist-empty"
+    ? []
+    : [{ ...mockIssueTrackerConnection }];
 
 function findConnection(id: string): IssueTrackerConnection {
   const c = connections.find((x) => x.id === id);
@@ -99,10 +125,7 @@ function findConnection(id: string): IssueTrackerConnection {
 export const issueTrackersApi = {
   issueTrackerConfig: async () => {
     requireSession();
-    return delay({
-      allowed_base_urls: [...mockIssueTrackerConfig.allowed_base_urls],
-      kinds: [...mockIssueTrackerConfig.kinds],
-    });
+    return delay({ allowed_base_urls: [...config.allowed_base_urls], kinds: [...config.kinds] });
   },
   listIssueTrackerConnections: async () => {
     requireSession();
@@ -110,11 +133,11 @@ export const issueTrackersApi = {
   },
   createIssueTrackerConnection: async (kind: string, baseUrl: string, token: string) => {
     requireSession();
-    if (!mockIssueTrackerConfig.kinds.includes(kind)) {
+    if (!config.kinds.includes(kind)) {
       throw new ApiError(400, "unsupported issue tracker kind; supported values: youtrack");
     }
     if (token.trim() === "") throw new ApiError(400, "a token is required");
-    if (!mockIssueTrackerConfig.allowed_base_urls.includes(baseUrl)) {
+    if (!config.allowed_base_urls.includes(baseUrl)) {
       throw new ApiError(400, "base URL is not in the allowed issue tracker list");
     }
     const now = new Date().toISOString();
@@ -186,6 +209,9 @@ export const issueTrackersApi = {
         "nobody other than the connection's account can apply this tag; in the issue tracker, share the tag's use settings with named users or with All Users. This only checks who can apply the tag; it does not show who can edit issues in the project",
       );
     }
+    // The server's last check, under the repo lock: a repo whose stored rows already
+    // carry forge issue numbers cannot take issue tracker ones.
+    if (scenario === "issue-tracker-link-refused") throw new ApiError(409, mockLinkRefusal);
     const link = {
       connection_id: body.connection_id,
       project_id: project.id,
@@ -196,20 +222,7 @@ export const issueTrackersApi = {
     };
     r.issue_tracker_link = link;
     r.issue_tracker_linkable = false;
-    // A linked repo's board, so the State mapping has columns to map and the board's
-    // column settings offer it after the first enable.
-    if (!state.boards.has(r.id)) {
-      state.boards.set(r.id, {
-        repo_id: r.id,
-        path_with_namespace: r.path_with_namespace,
-        web_url: r.web_url,
-        forge_type: "gitlab",
-        columns: mockLinkedBoardColumns.map((label_name, position) => ({ label_name, position })),
-        cards: [],
-        pipeline: null,
-        eligibility_label: tag.name,
-      });
-    }
+    // No board yet: the repo still awaits its first enable, which opens it (forge.ts).
     return delay({ link: { repo_id: r.id, ...link } }, 500);
   },
   getIssueTrackerStates: async (repoId: string) => {

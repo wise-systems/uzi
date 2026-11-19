@@ -35,6 +35,14 @@ import {
   mockRuns,
   mockSeededMessages,
   mockUnreadableQuestionMessages,
+  issueTrackerScenario,
+  mockLinkedBoard,
+  mockLinkedMapping,
+  mockLinkedRepo,
+  mockLinkedRunId,
+  mockLinkedRunIssue,
+  mockUnmappedMapping,
+  seedsLinkedRepo,
 } from "./data";
 
 export interface MockState {
@@ -254,6 +262,34 @@ function seed(): MockState {
         } : null,
       })),
     });
+  }
+  // ?mock=issue-tracker-linked / issue-tracker-unmapped (PRD #4173 M8): the linked repo's
+  // board with keyed cards placed by its State mapping, and one finished run on ATL-23
+  // (a copy of run-done without its one-off fixtures), so the runs list and the issue page
+  // show issue keys.
+  const issueTracker = issueTrackerScenario(mockScenario());
+  if (seedsLinkedRepo(issueTracker)) {
+    const mapping = issueTracker === "issue-tracker-linked" ? mockLinkedMapping : mockUnmappedMapping;
+    boards.set(mockLinkedRepo.id, mockLinkedBoard(mockLinkedRepo, mapping));
+    const done = runs.get("run-done");
+    if (done) {
+      const { completion_pending: _pending, semantic_drift: _drift, ...base } = done;
+      const key = `${mockLinkedRepo.issue_tracker_link?.project_short_name}-${mockLinkedRunIssue.n}`;
+      runs.set(mockLinkedRunId, {
+        ...base,
+        id: mockLinkedRunId,
+        repo_id: mockLinkedRepo.id,
+        issue_iid: mockLinkedRunIssue.n,
+        issue_key: key,
+        issue_title: mockLinkedRunIssue.title,
+        issue_description: "Uploads that fail on a weak signal should retry on their own.",
+        branch: `agent/issue-${mockLinkedRunIssue.n}`,
+        mr_web_url: `${mockLinkedRepo.web_url}/-/merge_requests/7`,
+        mr_iid: 7,
+        mr_state: "opened",
+      });
+      messages.set(mockLinkedRunId, [...mockDoneMessages]);
+    }
   }
   if (mockScenario() === "account-cooldown") {
     for (const board of boards.values()) for (const card of board.cards) {
