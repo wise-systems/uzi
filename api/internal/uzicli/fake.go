@@ -641,6 +641,12 @@ type FakeClient struct {
 	LastResyncProjectSyncRepoID string
 	ResyncProjectSyncErr        error
 
+	// Issue tracker CLI reads (PRD #4173 M6): the canned connections and states replies;
+	// LastIssueTrackerStatesRepoID records the repo id the states read was asked about.
+	IssueTrackerConnections      []IssueTrackerConnection
+	IssueTrackerStatesResult     IssueTrackerStates
+	LastIssueTrackerStatesRepoID string
+
 	// GetRunHook, when non-nil, drives GetRun instead of the static RunByID map. It
 	// is the sequencing seam `uzi run wait`'s tests need: a poll loop calls GetRun
 	// repeatedly, so a test scripts a per-call STATUS SEQUENCE (and injects a
