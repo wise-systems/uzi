@@ -34,8 +34,10 @@ with a linked repo cannot be deleted.
 
 A repo that was never enabled offers "Link to an issue tracker" on the Repos
 page. Choose the connection, the project and the eligibility tag. The choice
-cannot be changed afterwards (no unlink or relink), and a repo that was ever
-enabled cannot be linked.
+cannot be changed afterwards (no unlink or relink). A repo that was ever enabled
+cannot be linked: that includes every repo that existed when issue tracker links
+were added and a repo removed and listed again. Link in the web before anything
+enables the repo, including `/server setup`.
 
 Issues carrying the eligibility tag come into uzi. The tag is chosen by id: a
 same-named tag of another user does not count, and renaming it keeps working.
@@ -55,8 +57,9 @@ On a linked repo each board column maps to one State, plus the open State and
 the closed State. The closed State must mean done (for example Fixed or Done),
 never Won't fix; uzi refuses it. Moving a card into an unmapped column is
 refused until it is mapped. Map them from the repo row or the board's column
-settings. A linked repo shows issues by key (for example `ABC-12`), using the
-project short name stored at link time.
+settings. The board, the issue page and run lists show an issue's key (for
+example `ABC-12`, from the project short name stored at link time). Triage,
+a schedule's last fire, proposal cards and the command menu still show `#number`.
 
 ## Not offered on a linked repo
 
@@ -66,15 +69,16 @@ project short name stored at link time.
 - Eligibility by assigning the issue to the uzi bot.
 - Changing the issue source after the first enable.
 
-Comments from an issue tracker author who is not mapped to a uzi user are
-withheld from runs. A scheduled run on an issue with an unmapped author waits
-for a person to approve the plan.
+There is no author mapping setting: only the connection's own YouTrack account
+counts as a uzi user. Comments by anyone else are withheld from runs, and a
+scheduled run auto-approves its plan only for an issue that account reported
+and whose title and body only it edited.
 
 ## An issue moved to another YouTrack project
 
 It gets a new number there, so uzi treats it as gone from the linked project.
 Later issue writes for a live run are skipped and logged, the run's code side
-(branch, MR, CI) continues, and the next sync removes it from the board.
+(branch, MR, CI) continues, and the next full sync (every `FORGE_RECONCILE_EVERY`-th poll, default 10) removes it from the board.
 
 ## From the CLI
 

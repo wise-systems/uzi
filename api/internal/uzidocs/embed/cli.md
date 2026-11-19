@@ -2026,11 +2026,12 @@ uzi repo issue-tracker-states group/proj   # a linked repo's State mapping
   created and last verified time.
 - **`uzi repo issue-tracker-states <repo>`** takes the repo by path or id (a repo
   is linked before it is first enabled, so it may not be in `uzi repo list`). It
-  shows the open and closed States, each board column's State or `unmapped`, and
+  shows the open and closed States, each mapped board column's State (a column not listed is unmapped: see the board's column settings in the web), and
   the project's States with whether each can close or open an issue.
 
 Both support `--json`. On a repo linked to an issue tracker, the CLI and TUI show
-an issue's key (`ABC-12`) instead of `#number`.
+an issue's key (`ABC-12`) instead of `#number` in run, schedule, finding and
+created-issue output; `uzi schedule` fire output and continued issues still show `#number`.
 
 ## Watching runs live: `uzi tui`
 
