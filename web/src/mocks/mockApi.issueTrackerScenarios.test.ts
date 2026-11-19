@@ -93,6 +93,9 @@ describe("issue tracker demo scenarios", () => {
     const run = runs.find((r) => r.repo_id === LINKED);
     expect(run).toMatchObject({ issue_iid: 23, issue_key: "ATL-23", repo_path: "vtmocanu/atlas-mobile" });
     expect((await api.listRuns({ repoId: LINKED, issueIid: 23 })).runs.map((r) => r.id)).toEqual([run!.id]);
+    // The ATL-23 card shows that run as its latest run.
+    expect(board.cards.find((c) => c.iid === 23)?.latest_run).toMatchObject({ id: run!.id, status: run!.status });
+    expect(board.cards.filter((c) => c.latest_run).map((c) => c.iid)).toEqual([23]);
     // Unlinked repos' runs and issues carry no key.
     expect(runs.filter((r) => r.repo_id !== LINKED).some((r) => r.issue_key)).toBe(false);
   });

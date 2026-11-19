@@ -215,6 +215,21 @@ function linkedCards(repo: Repo, mapping: IssueTrackerStateMapping): Card[] {
   });
 }
 
+// The board an unlinked repo opens at its first enable: a plain forge board with the
+// columns the other demo repos use, no cards until an issue is imported.
+export function mockForgeBoard(repo: Repo): Board {
+  return {
+    repo_id: repo.id,
+    path_with_namespace: repo.path_with_namespace,
+    web_url: repo.web_url,
+    forge_type: "gitlab",
+    initial_import: null,
+    columns: ["Ready", "In progress", "Review"].map((label_name, position) => ({ label_name, position })),
+    cards: [],
+    pipeline: null,
+  };
+}
+
 // The board of a linked repo. A first enable gets the columns and no cards yet; the
 // seeded scenarios pass their mapping to place the project's issues.
 export function mockLinkedBoard(repo: Repo, mapping?: IssueTrackerStateMapping): Board {

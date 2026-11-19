@@ -186,8 +186,8 @@ describe("IssueTrackerStatesPanel", () => {
   });
 
   it("marks a saved State the project no longer offers and does not resend it", async () => {
-    const STALE_NOTE = (alt: string) =>
-      `The saved State is no longer offered by the project. Choose ${alt}; Save stays off until then.`;
+    const STALE_NOTE = (why: string, alt: string) =>
+      `The saved State ${why}. Choose ${alt}; Save stays off until then.`;
     mockApi.getIssueTrackerStates.mockResolvedValue({
       // "Triage" was renamed away; "Won't fix" is still a State but cannot be the closed one.
       mapping: {
@@ -209,13 +209,13 @@ describe("IssueTrackerStatesPanel", () => {
     expect(ready.value).toBe("Triage");
     expect(optionFor(ready, "Triage").textContent).toBe("Triage (no longer a State of the project)");
     expect(optionFor(ready, "Triage").disabled).toBe(true);
-    expect(within(rowOf("Ready")).getByText(STALE_NOTE("another State or Unmapped"))).toBeTruthy();
+    expect(within(rowOf("Ready")).getByText(STALE_NOTE("is no longer a State of the project", "another State or Unmapped"))).toBeTruthy();
     expect(within(rowOf("Ready")).queryByText(UNMAPPED)).toBeNull();
-    // The closed row shows its saved non-closable State the same way.
+    // The closed row shows its saved non-closable State, saying it is not allowed there.
     expect(select("Closed").value).toBe("Won't fix");
-    expect(within(rowOf("Closed")).getByText(STALE_NOTE("another State"))).toBeTruthy();
+    expect(within(rowOf("Closed")).getByText(STALE_NOTE("is not allowed for this row", "another State"))).toBeTruthy();
     // Rows still offered stay unmarked.
-    expect(within(rowOf("Open")).queryByText(/no longer offered/)).toBeNull();
+    expect(within(rowOf("Open")).queryByText(/The saved State/)).toBeNull();
 
     const save = screen.getByRole("button", { name: "Save States" }) as HTMLButtonElement;
     expect(save.disabled).toBe(true);
@@ -246,6 +246,11 @@ describe("IssueTrackerStatesPanel", () => {
     await screen.findByLabelText("Open");
     expect(select("Open").value).toBe("Fixed");
     expect(optionFor(select("Open"), "Fixed").textContent).toBe("Fixed (no longer offered for this row)");
+    expect(
+      within(rowOf("Open")).getByText(
+        "The saved State is not allowed for this row. Choose another State; Save stays off until then.",
+      ),
+    ).toBeTruthy();
     expect((screen.getByRole("button", { name: "Save States" }) as HTMLButtonElement).disabled).toBe(true);
   });
 

@@ -22,6 +22,7 @@ import {
   mockForgeConfig,
   issueTrackerScenario,
   mockLinkableRepo,
+  mockForgeBoard,
   mockLinkedBoard,
   mockLinkedRepo,
   mockRepoToolProfiles,
@@ -299,11 +300,12 @@ export const forgeApi = {
     }
     r.enabled = enabled;
     // The first enable ends the window in which a repo can be linked (PRD #4173 D13) and
-    // opens the board; a linked repo's board gets its columns then.
+    // opens the board: a linked repo's board gets its three columns, an unlinked one a
+    // plain forge board.
     if (enabled) {
       r.issue_tracker_linkable = false;
       awaitingFirstEnable.delete(r.id);
-      if (r.issue_tracker_link && !state.boards.has(r.id)) state.boards.set(r.id, mockLinkedBoard(r));
+      if (!state.boards.has(r.id)) state.boards.set(r.id, r.issue_tracker_link ? mockLinkedBoard(r) : mockForgeBoard(r));
     }
     return delay({ repo: { ...r } });
   },

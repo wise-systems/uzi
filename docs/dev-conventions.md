@@ -748,7 +748,8 @@ scenarios are mutually exclusive by construction. Known values:
   `issue-tracker-unlinked` (also the default) has that connection and the
   never-enabled repo `vtmocanu/atlas-web`, whose row on `/repos` offers
   Link to an issue tracker. Its board is refused until the first enable, as
-  the server refuses it; that enable opens a board with three columns.
+  the server refuses it. After a link, the first enable opens a board with
+  three columns; without a link it opens a plain forge board.
   `issue-tracker-none` has no connection: `/settings/issue-trackers` shows an
   empty list and the link dialog on `/repos` says to connect one first.
   `issue-tracker-linked` adds the enabled repo `vtmocanu/atlas-mobile`, linked
@@ -756,8 +757,9 @@ scenarios are mutually exclusive by construction. Known values:
   `/repos` row). Its board, `/repos/repo-atlas-mobile/board`, shows keyed
   cards (`ATL-21`…), one of them not tagged `uzi`. The issue page
   `/repos/repo-atlas-mobile/issues/23` shows the key `ATL-23`, and
-  `/runs/history` lists a finished run on `ATL-23`. `issue-tracker-unmapped` is the same repo with the
-  Human Review column unmapped. `issue-tracker-link-refused` refuses every
+  `/runs/history` and the `ATL-23` card show a finished run on it.
+  `issue-tracker-unmapped` is the same repo with the Human Review column
+  unmapped. `issue-tracker-link-refused` refuses every
   valid link with the server's "already stores issue numbers" text, so the
   dialog's refusal shows. `issue-tracker-allowlist-empty` has no allowed base
   URL and no connection, so `/settings/issue-trackers` shows the operator

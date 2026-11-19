@@ -270,12 +270,13 @@ function seed(): MockState {
   const issueTracker = issueTrackerScenario(mockScenario());
   if (seedsLinkedRepo(issueTracker)) {
     const mapping = issueTracker === "issue-tracker-linked" ? mockLinkedMapping : mockUnmappedMapping;
-    boards.set(mockLinkedRepo.id, mockLinkedBoard(mockLinkedRepo, mapping));
+    const linkedBoard = mockLinkedBoard(mockLinkedRepo, mapping);
+    boards.set(mockLinkedRepo.id, linkedBoard);
     const done = runs.get("run-done");
     if (done) {
       const { completion_pending: _pending, semantic_drift: _drift, ...base } = done;
       const key = `${mockLinkedRepo.issue_tracker_link?.project_short_name}-${mockLinkedRunIssue.n}`;
-      runs.set(mockLinkedRunId, {
+      const seeded = {
         ...base,
         id: mockLinkedRunId,
         repo_id: mockLinkedRepo.id,
@@ -287,8 +288,22 @@ function seed(): MockState {
         mr_web_url: `${mockLinkedRepo.web_url}/-/merge_requests/7`,
         mr_iid: 7,
         mr_state: "opened",
-      });
+      };
+      runs.set(mockLinkedRunId, seeded);
       messages.set(mockLinkedRunId, [...mockDoneMessages]);
+      // The ATL-23 card shows that run, as the server's board does for an issue's latest run.
+      const card = linkedBoard.cards.find((c) => c.iid === mockLinkedRunIssue.n);
+      if (card) {
+        card.latest_run = {
+          id: seeded.id, status: seeded.status, mr_iid: seeded.mr_iid, mr_web_url: seeded.mr_web_url,
+          mr_state: seeded.mr_state, failure_reason: seeded.failure_reason, fail_origin: seeded.fail_origin ?? null,
+          stop_kind: seeded.stop_kind, stop_reason: seeded.stop_reason, health: seeded.health,
+          health_reason: seeded.health_reason, health_since: seeded.health_since,
+          owner_name: "Robin Diaz", worker_name: seeded.worker_name ?? null, is_mine: true, run_count: 1,
+          first_started_at: seeded.first_started_at ?? null, finished_at: seeded.finished_at,
+          auto_approve_blocked_reasons: [], created_at: seeded.created_at, updated_at: seeded.updated_at,
+        };
+      }
     }
   }
   if (mockScenario() === "account-cooldown") {

@@ -147,19 +147,18 @@ export function IssueTrackerStatesPanel({
   const isOffered = (value: string, role: "open" | "closed") =>
     value === "" ||
     (loaded?.states ?? []).some((st) => st.name === value && (role === "open" ? st.openable : st.closable));
+  const isProjectState = (value: string) => (loaded?.states ?? []).some((st) => st.name === value);
   const staleOption = (value: string, role: "open" | "closed") =>
     isOffered(value, role) ? null : (
       <option value={value} disabled>
         {stripUnsafeChars(value)}{" "}
-        {(loaded?.states ?? []).some((st) => st.name === value)
-          ? "(no longer offered for this row)"
-          : "(no longer a State of the project)"}
+        {isProjectState(value) ? "(no longer offered for this row)" : "(no longer a State of the project)"}
       </option>
     );
   const staleNote = (value: string, role: "open" | "closed", alternative: string) =>
     isOffered(value, role)
       ? undefined
-      : `The saved State is no longer offered by the project. Choose ${alternative}; Save stays off until then.`;
+      : `The saved State ${isProjectState(value) ? "is not allowed for this row" : "is no longer a State of the project"}. Choose ${alternative}; Save stays off until then.`;
   const anyStale =
     !isOffered(openState, "open") ||
     !isOffered(closedState, "closed") ||

@@ -173,6 +173,16 @@ describe("mock issue tracker links and State mappings", () => {
     expect(err.message).toBe(message);
   });
 
+  it("opens a plain forge board at the first enable of an unlinked repo", async () => {
+    const { mockApi } = await load();
+    expect((await refusal(mockApi.getBoard(LINKABLE))).status).toBe(409);
+    await mockApi.setRepoEnabled(LINKABLE, true);
+    const { board } = await mockApi.getBoard(LINKABLE);
+    expect(board).toMatchObject({ repo_id: LINKABLE, path_with_namespace: "vtmocanu/atlas-web", cards: [] });
+    expect(board.columns.map((c) => c.label_name)).toEqual(["Ready", "In progress", "Review"]);
+    expect(board.eligibility_label).toBeUndefined();
+  });
+
   it("refuses to link once the repo was enabled", async () => {
     const { mockApi } = await load();
     await mockApi.setRepoEnabled(LINKABLE, true);
