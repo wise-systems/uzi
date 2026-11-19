@@ -366,7 +366,7 @@ func (h *Handler) ConfirmProposal(w http.ResponseWriter, r *http.Request) {
 	}
 
 	httpx.JSON(w, http.StatusOK, map[string]any{
-		"issue": createdIssueDTO{IID: created.IID, WebURL: created.WebURL, Title: created.Title},
+		"issue": createdIssueDTO{IID: created.IID, IssueKey: created.IssueKey, WebURL: created.WebURL, Title: created.Title},
 	})
 }
 
