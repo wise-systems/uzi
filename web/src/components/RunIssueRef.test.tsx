@@ -208,7 +208,7 @@ describe("RunIssueRef — a run on a repo linked to an issue tracker (PRD 4173 M
       <RunIssueRef issueIid={26} issueKey="ABC-26" issueWebUrl={URL26} kind="issue" forgeType="gitlab" />,
     );
     const link = screen.getByRole("link");
-    expect(link.getAttribute("aria-label")).toBe("Open issue ABC-26 on GitLab");
+    expect(link.getAttribute("aria-label")).toBe("Open issue ABC-26 in the issue tracker");
     expect(link.textContent).toContain("ABC-26");
     expect(link.textContent).not.toContain("#26");
   });

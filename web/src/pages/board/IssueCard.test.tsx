@@ -296,3 +296,50 @@ describe("IssueCard — a card carrying an issue key (PRD 4173 M6)", () => {
     expect(screen.getByRole("button", { name: "Run options for ABC-12" })).toBeTruthy();
   });
 });
+
+describe("IssueCard — Promote title names a tag on a card of a linked repo (PRD 4173 M6)", () => {
+  function renderPromotable(over: Partial<Card> = {}) {
+    return render(
+      <MemoryRouter>
+        <IssueCard
+          card={aCard({ labels: [], ...over })}
+          repoId="repo-1"
+          chips={[]}
+          laneLabel="Review"
+          canMoveUp={false}
+          canMoveDown={false}
+          onMoveUp={vi.fn()}
+          onMoveDown={vi.fn()}
+          insertionEdge={null}
+          gate={{ enabled: true, reason: "" }}
+          starting={false}
+          onStart={vi.fn()}
+          fixCiBusy={false}
+          onFixCi={vi.fn()}
+          uziLabel="send-to-uzi"
+          isEligible={false}
+          canPromote
+          promoting={false}
+          onPromote={vi.fn()}
+          onDragStart={vi.fn()}
+          onDragEnd={vi.fn()}
+          dimmed={false}
+        />
+      </MemoryRouter>,
+    );
+  }
+
+  it("says tag on a keyed card", () => {
+    renderPromotable({ issue_key: "ABC-12" });
+    expect(screen.getByRole("button", { name: /Promote to send-to-uzi/ }).getAttribute("title")).toBe(
+      "Add the send-to-uzi tag so uzi can work this issue",
+    );
+  });
+
+  it("keeps label on an unkeyed card", () => {
+    renderPromotable();
+    expect(screen.getByRole("button", { name: /Promote to send-to-uzi/ }).getAttribute("title")).toBe(
+      "Add the send-to-uzi label so uzi can work this issue",
+    );
+  });
+});

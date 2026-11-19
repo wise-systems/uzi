@@ -58,7 +58,7 @@ export const SELF_IMPROVE_LABEL = "uzi-self-improve";
  * predicate falls back to label-only rather than throwing on `undefined.includes`.
  */
 export function isUziCard(
-  // issue_key stays in the Pick so a keyed Card still type-checks; it decides nothing here.
+  // issue_key stays in the Pick so test literals carrying a key type-check; it decides nothing here.
   card: Pick<Card, "labels" | "assignee_ids" | "issue_key">,
   uziLabel: string,
   botForgeUserID: number | undefined,

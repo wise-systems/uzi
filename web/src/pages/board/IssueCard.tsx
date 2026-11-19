@@ -526,7 +526,7 @@ export function IssueCard({
             variant="secondary"
             size="sm"
             disabled={promoting}
-            title={`Add the ${uziLabel} label so uzi can work this issue`}
+            title={`Add the ${uziLabel} ${card.issue_key ? "tag" : "label"} so uzi can work this issue`}
             onClick={onPromote}
             className="w-full"
           >

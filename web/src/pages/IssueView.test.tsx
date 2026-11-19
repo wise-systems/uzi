@@ -1863,4 +1863,16 @@ describe("IssueView — a repo linked to an issue tracker (PRD 4173 M6)", () => 
     await screen.findByText("A small typo fix");
     expect(screen.getByRole("button", { name: "Open on GitLab" })).toBeTruthy();
   });
+
+  it("follows the eligibility tag, not the configured uzi label, in the run badge", async () => {
+    setAuth(); // the configured uzi label is "uzi"
+    mockApi.getIssue.mockResolvedValue({
+      issue: linked({ eligibility_label: "ready-for-uzi", labels: ["ready-for-uzi"] }),
+    });
+    renderIssueView();
+    await screen.findByText("A small typo fix");
+    const badge = screen.getByTitle("This issue carries the ready-for-uzi tag, so uzi will run it.");
+    expect(badge.textContent).toBe("ready-for-uzi");
+    expect(screen.queryByTitle(/assigned to the uzi bot/)).toBeNull();
+  });
 });

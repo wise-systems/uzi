@@ -59,7 +59,10 @@ export function RunIssueRef({
 
   // Branches 2 & 3: cached issue → guarded forge link, or plain #iid when no valid https url.
   const ref = issueRef(issueIid, issueKey);
-  const label = `Open issue ${ref} on ${forgePlatform(forgeType)}`;
+  // A keyed run's URL is the issue tracker's issue, so the label must not name a forge.
+  const label = issueKey
+    ? `Open issue ${ref} in the issue tracker`
+    : `Open issue ${ref} on ${forgePlatform(forgeType)}`;
   // Branch 2 colour: default forces text-faint with a hover-to-brand affordance; inherit
   // reads the parent colour and uses a warn-safe hover:underline (no non-warn colour).
   const anchorTone = inherit
