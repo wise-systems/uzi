@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"strconv"
 	"testing"
 
@@ -120,5 +121,100 @@ func TestLinkedRepoBoardCardsCarryTheDerivedKeyAndEligibilityLabelLiveDB(t *test
 	}
 	if len(b.Board.Cards) == 0 {
 		t.Fatal("the board has no cards")
+	}
+}
+
+// cardKey decodes the key of the {"card": ...} body a create or move returns.
+func cardKey(t *testing.T, body []byte) string {
+	t.Helper()
+	var resp struct {
+		Card struct {
+			IssueKey string `json:"issue_key"`
+		} `json:"card"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		t.Fatalf("decode %s: %v", body, err)
+	}
+	return resp.Card.IssueKey
+}
+
+// The create response card of a linked repo carries the derived key although the cached row
+// (written by the create path) has no issue_key of its own.
+func TestLinkedRepoCreateIssueCardCarriesTheIssueKeyLiveDB(t *testing.T) {
+	f := newLinkedHandlerFixture(t, true)
+	rr := f.call(f.h.CreateIssue, http.MethodPost, map[string]string{"title": "t", "description": "d"})
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("status = %d body = %s", rr.Code, rr.Body.String())
+	}
+	n := createdIID(t, rr.Body.Bytes())
+	if got := cardKey(t, rr.Body.Bytes()); got != wantKey(n) {
+		t.Errorf("created card issue_key = %q, want %q", got, wantKey(n))
+	}
+}
+
+// When the cache write after a create fails the issue still exists on the tracker, and the
+// fallback card carries the key too. A trigger that rejects inserts into issues makes the
+// upsert fail; it is dropped on cleanup.
+func TestLinkedRepoCreateIssueFallbackCardCarriesTheIssueKeyLiveDB(t *testing.T) {
+	f := newLinkedHandlerFixture(t, true)
+	ctx := context.Background()
+	for _, stmt := range []string{
+		`CREATE FUNCTION m2r_reject_issue_write() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'm2r reject'; END $$`,
+		`CREATE TRIGGER m2r_reject_issue_write BEFORE INSERT OR UPDATE ON issues FOR EACH ROW EXECUTE FUNCTION m2r_reject_issue_write()`,
+	} {
+		if _, err := f.pool.Exec(ctx, stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(func() {
+		_, _ = f.pool.Exec(ctx, `DROP TRIGGER IF EXISTS m2r_reject_issue_write ON issues`)
+		_, _ = f.pool.Exec(ctx, `DROP FUNCTION IF EXISTS m2r_reject_issue_write()`)
+	})
+	rr := f.call(f.h.CreateIssue, http.MethodPost, map[string]string{"title": "t", "description": "d"})
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("status = %d body = %s", rr.Code, rr.Body.String())
+	}
+	n := createdIID(t, rr.Body.Bytes())
+	var cached int
+	if err := f.pool.QueryRow(ctx, `SELECT count(*) FROM issues WHERE repo_id = $1 AND forge_issue_iid = $2`, f.repo, n).Scan(&cached); err != nil || cached != 0 {
+		t.Fatalf("cached rows for the created issue = %d (%v), want 0 so the fallback path ran", cached, err)
+	}
+	if got := cardKey(t, rr.Body.Bytes()); got != wantKey(n) {
+		t.Errorf("fallback card issue_key = %q, want %q", got, wantKey(n))
+	}
+}
+
+// The single-card response of a drag on a linked board carries the key.
+func TestLinkedBoardMoveCardCarriesTheIssueKeyLiveDB(t *testing.T) {
+	f := newStateMappingFixture(t)
+	f.boardMapping(t)
+	rr := f.call(f.h.MoveIssue, http.MethodPost, map[string]string{"to_column": "In Progress"})
+	if rr.Code != http.StatusOK {
+		t.Fatalf("move = %d %s", rr.Code, rr.Body.String())
+	}
+	if got := cardKey(t, rr.Body.Bytes()); got != wantKey(f.issueN) {
+		t.Errorf("moved card issue_key = %q, want %q", got, wantKey(f.issueN))
+	}
+}
+
+// The issue tracker config route is session-only: neither no credential nor a CLI token
+// header reaches it.
+func TestIssueTrackerConfigRefusesNoCredentialAndACLIToken(t *testing.T) {
+	router := issueTrackerTestRouter()
+	for _, tc := range []struct{ name, header string }{
+		{"no credential", ""},
+		{"cli token", "Bearer " + "uzc_" + "whatever"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/api/issue-trackers/config", nil)
+			if tc.header != "" {
+				req.Header.Set("Authorization", tc.header)
+			}
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, req)
+			if rec.Code != http.StatusUnauthorized {
+				t.Fatalf("status = %d, want 401\n%s", rec.Code, rec.Body.String())
+			}
+		})
 	}
 }
