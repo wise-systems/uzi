@@ -158,17 +158,12 @@ func TestLinkedRepoCreateIssueCardCarriesTheIssueKeyLiveDB(t *testing.T) {
 func TestLinkedRepoCreateIssueFallbackCardCarriesTheIssueKeyLiveDB(t *testing.T) {
 	f := newLinkedHandlerFixture(t, true)
 	ctx := context.Background()
-	for _, stmt := range []string{
-		`CREATE FUNCTION m2r_reject_issue_write() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'm2r reject'; END $$`,
-		`CREATE TRIGGER m2r_reject_issue_write BEFORE INSERT OR UPDATE ON issues FOR EACH ROW EXECUTE FUNCTION m2r_reject_issue_write()`,
-	} {
-		if _, err := f.pool.Exec(ctx, stmt); err != nil {
-			t.Fatal(err)
-		}
-	}
+	mustExecT(ctx, t, f.pool, `CREATE FUNCTION m2r_reject_issue_write() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'm2r reject'; END $$`)
+	mustExecT(ctx, t, f.pool, `CREATE TRIGGER m2r_reject_issue_write BEFORE INSERT OR UPDATE ON issues FOR EACH ROW
+		WHEN (NEW.repo_id = '`+f.repo.String()+`') EXECUTE FUNCTION m2r_reject_issue_write()`)
 	t.Cleanup(func() {
-		_, _ = f.pool.Exec(ctx, `DROP TRIGGER IF EXISTS m2r_reject_issue_write ON issues`)
-		_, _ = f.pool.Exec(ctx, `DROP FUNCTION IF EXISTS m2r_reject_issue_write()`)
+		mustExecT(context.Background(), t, f.pool, `DROP TRIGGER IF EXISTS m2r_reject_issue_write ON issues`)
+		mustExecT(context.Background(), t, f.pool, `DROP FUNCTION IF EXISTS m2r_reject_issue_write()`)
 	})
 	rr := f.call(f.h.CreateIssue, http.MethodPost, map[string]string{"title": "t", "description": "d"})
 	if rr.Code != http.StatusCreated {

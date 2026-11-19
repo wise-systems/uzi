@@ -3,6 +3,7 @@ package main
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/uzicli"
@@ -95,6 +96,66 @@ func TestIssueKeyInFindingsFile(t *testing.T) {
 	}
 }
 
+func TestIssueKeyInFindingsFileGroup(t *testing.T) {
+	for _, tc := range []struct{ key, want string }{{"ABC-9", "filed issue ABC-9:"}, {"", "filed issue #9:"}} {
+		fc := groupFake()
+		fc.FileFindingGroupResult.Issue.IssueKey = tc.key
+		out, _, code := runCLI(t, fakeEnv(fc), "findings", "file", "e-1", "e-2")
+		if code != uzicli.ExitOK || !strings.Contains(out, tc.want) {
+			t.Errorf("key %q: exit %d, want %q in:\n%s", tc.key, code, tc.want, out)
+		}
+	}
+}
+
+func TestIssueKeyInWorkerDetail(t *testing.T) {
+	iid := int64(12)
+	long := "LONGKEY-" + strings.Repeat("9", 60)
+	for _, tc := range []struct{ name, key, want string }{
+		{"linked", "ABC-12", "ABC-12"},
+		{"unlinked", "", "#12"},
+		{"long key is capped", long, "LONGKEY-999999999999999…"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := workerRenderModel(true)
+			w := &m.workers.rows[0].w
+			w.ReportedRuns = []apitypes.WorkerReportedRunDTO{{RunID: "run-1", Phase: "running"}}
+			w.RunDisk = []apitypes.WorkerRunDiskDTO{{RunID: "run-1", SampledAt: time.Now()}}
+			m.board.runs = []apitypes.RunListItemDTO{{RunDTO: apitypes.RunDTO{ID: "run-1", IssueTitle: "t", IssueIID: &iid, IssueKey: tc.key}}}
+			m.board.runsAdmin = m.board.admin
+			lines, _ := m.workerDetailLines(time.Now())
+			var runLine, diskLine string
+			for _, line := range strings.Split(stripANSI(strings.Join(lines, "\n")), "\n") {
+				if strings.Contains(line, "▌ ") {
+					runLine = line
+				}
+				if strings.Contains(line, "largest HOME") {
+					diskLine = line
+				}
+			}
+			for _, line := range []string{runLine, diskLine} {
+				if !strings.Contains(line, tc.want) {
+					t.Errorf("want %q in %q", tc.want, line)
+				}
+				if tc.key == long && strings.Contains(line, strings.Repeat("9", 30)) {
+					t.Errorf("long key not capped: %q", line)
+				}
+			}
+		})
+	}
+}
+
+func TestIssueKeyDetailCrumbCapped(t *testing.T) {
+	iid := int64(12)
+	long := "LONGKEY-" + strings.Repeat("9", 60)
+	run := apitypes.RunDTO{ID: "aaaa1111-2222", Kind: "issue", Status: "running", IssueTitle: "t", IssueIID: &iid, IssueKey: long}
+	detail := tuiTestModel(t, &uzicli.FakeClient{Runs: []apitypes.RunListItemDTO{{RunDTO: run}}}, run.ID)
+	detail = applyDetail(detail, run, nil)
+	out := stripANSI(strings.Join(detail.detailHeaderLines(), "\n"))
+	if !strings.Contains(out, "LONGKEY-999999999999999…") || strings.Contains(out, strings.Repeat("9", 30)) {
+		t.Errorf("crumb key not capped:\n%s", out)
+	}
+}
+
 func TestIssueKeyInReviewFile(t *testing.T) {
 	for _, tc := range []struct{ key, want string }{{"ABC-42", "filed issue ABC-42:"}, {"", "filed issue #42:"}} {
 		fc := reviewFake()
@@ -123,6 +184,9 @@ func TestIssueKeyInCreatedIssuesAndScheduleTarget(t *testing.T) {
 	iid := int64(158)
 	if got := scheduleTarget(apitypes.ScheduleDTO{Target: schedTargetIssue, IssueIID: &iid, IssueKey: "ABC-158"}); got != "ABC-158" {
 		t.Errorf("keyed schedule target = %q", got)
+	}
+	if got := scheduleTarget(apitypes.ScheduleDTO{Target: schedTargetIssue, IssueIID: &iid, IssueKey: "\x1b\x07"}); got != "#158" {
+		t.Errorf("key sanitizing to empty must fall back to the real iid, got %q", got)
 	}
 	if got := scheduleTarget(apitypes.ScheduleDTO{Target: schedTargetIssue, IssueIID: &iid}); got != "#158" {
 		t.Errorf("plain schedule target = %q", got)

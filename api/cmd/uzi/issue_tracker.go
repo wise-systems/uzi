@@ -78,7 +78,8 @@ func newRepoIssueTrackerStatesCmd(env Env, gf *globalFlags) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			repoID, err := resolveProjectSyncRepo(cmd.Context(), c, args[0])
+			repoID, err := resolveProjectSyncRepoHint(cmd.Context(), c, args[0],
+				"; pass the repo id instead (a repo not yet enabled is not listed by 'uzi repo list'; its id is shown on the web Repos page)")
 			if err != nil {
 				return err
 			}
@@ -96,19 +97,16 @@ func newRepoIssueTrackerStatesCmd(env Env, gf *globalFlags) *cobra.Command {
 			if m := res.Mapping; m == nil {
 				p.Println("no State mapping saved")
 			} else {
-				p.Printf("OPEN state:    %s\n", m.OpenState)
-				p.Printf("CLOSED state:  %s\n", m.ClosedState)
+				p.Printf("OPEN state:    %s\n", cellText(m.OpenState))
+				p.Printf("CLOSED state:  %s\n", cellText(m.ClosedState))
 				rows := make([][]string, 0, len(m.Columns))
 				for _, col := range m.Columns {
-					state := col.State
-					if state == "" {
-						state = "unmapped"
-					}
-					rows = append(rows, []string{col.LabelName, state})
+					rows = append(rows, []string{col.LabelName, col.State})
 				}
 				if err := p.Table([]string{"COLUMN", "STATE"}, rows); err != nil {
 					return err
 				}
+				p.Println("Columns not listed are unmapped: a move into one is refused until it is mapped.")
 			}
 			p.Println()
 			rows := make([][]string, 0, len(res.States))

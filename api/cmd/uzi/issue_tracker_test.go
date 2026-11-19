@@ -61,7 +61,7 @@ const itRepoID = "22222222-2222-2222-2222-222222222222"
 func statesFake() *uzicli.FakeClient {
 	return &uzicli.FakeClient{IssueTrackerStatesResult: uzicli.IssueTrackerStates{
 		Mapping: &uzicli.IssueTrackerStateMapping{OpenState: "Open", ClosedState: "Done",
-			Columns: []uzicli.IssueTrackerColumnState{{LabelName: "In Review", State: "Review\x1b[2J"}, {LabelName: "Blocked"}}},
+			Columns: []uzicli.IssueTrackerColumnState{{LabelName: "In Review", State: "Review\x1b[2J"}}},
 		States: []uzicli.IssueTrackerState{
 			{Name: "Open", Openable: true},
 			{Name: "Done", Resolved: true, Closable: true},
@@ -78,7 +78,7 @@ func TestRepoIssueTrackerStatesTableByUUID(t *testing.T) {
 	if fc.LastIssueTrackerStatesRepoID != itRepoID {
 		t.Errorf("queried %q, want the UUID verbatim", fc.LastIssueTrackerStatesRepoID)
 	}
-	for _, want := range []string{"OPEN state", "Open", "CLOSED state", "Done", "In Review", "Review", "Blocked", "unmapped", "CLOSABLE", "OPENABLE"} {
+	for _, want := range []string{"OPEN state", "Open", "CLOSED state", "Done", "In Review", "Review", "Columns not listed are unmapped: a move into one is refused until it is mapped.", "CLOSABLE", "OPENABLE"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("output missing %q:\n%s", want, out)
 		}
@@ -95,9 +95,32 @@ func TestRepoIssueTrackerStatesByPath(t *testing.T) {
 	if code != uzicli.ExitOK || fc.LastIssueTrackerStatesRepoID != itRepoID {
 		t.Errorf("exit %d, queried %q, want the resolved id %q", code, fc.LastIssueTrackerStatesRepoID, itRepoID)
 	}
-	_, _, code = runCLI(t, fakeEnv(fc), "repo", "issue-tracker-states", "group/unknown")
+	_, errOut, code := runCLI(t, fakeEnv(fc), "repo", "issue-tracker-states", "group/unknown")
 	if code != uzicli.ExitUsage {
 		t.Errorf("unknown path exit = %d, want %d", code, uzicli.ExitUsage)
+	}
+	if !strings.Contains(errOut, "not yet enabled") || !strings.Contains(errOut, "web Repos page") {
+		t.Errorf("hint must say a not-yet-enabled repo is passed by id (web Repos page):\n%s", errOut)
+	}
+}
+
+func TestRepoIssueTrackerStatesHostileStatesAndBaseURL(t *testing.T) {
+	fc := statesFake()
+	fc.IssueTrackerStatesResult.Mapping.OpenState = "Open\n\x1b[2JFORGED CLOSED state:  x"
+	fc.IssueTrackerStatesResult.Mapping.ClosedState = "Done\r\x1b]0;pwn\x07"
+	out, _, code := runCLI(t, fakeEnv(fc), "repo", "issue-tracker-states", itRepoID)
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d", code)
+	}
+	if strings.Contains(out, "\x1b") || strings.Contains(out, "\r") || strings.Count(out, "\nCLOSED state:") != 1 || strings.Count(out, "OPEN state:") != 1 {
+		t.Errorf("hostile state escaped its line:\n%q", out)
+	}
+	conns := &uzicli.FakeClient{IssueTrackerConnections: []uzicli.IssueTrackerConnection{
+		{ID: "c1", Kind: "youtrack", BaseURL: "https://yt\x1b[2J.example\n\u202e.com"},
+	}}
+	out, _, _ = runCLI(t, fakeEnv(conns), "issue-tracker", "list")
+	if strings.ContainsAny(out, "\x1b\u202e") || strings.Count(out, "\n") > 2 {
+		t.Errorf("hostile base_url reached the table:\n%q", out)
 	}
 }
 
