@@ -144,6 +144,25 @@ func TestIssueKeyInWorkerDetail(t *testing.T) {
 	}
 }
 
+func TestIssueKeyBoardRowCapped(t *testing.T) {
+	iid := int64(12)
+	long := "LONGKEY-" + strings.Repeat("9", 192)
+	runs := []apitypes.RunListItemDTO{{RunDTO: apitypes.RunDTO{ID: "aaaa1111-2222", Kind: "issue", Status: "running",
+		IssueTitle: "t", IssueIID: &iid, IssueKey: long}}}
+	board := tuiTestModel(t, &uzicli.FakeClient{Runs: runs}, "")
+	next, _ := board.Update(boardRunsMsg{reqID: board.board.waitID, runs: runs})
+	board = next.(tuiModel)
+	out := stripANSI(board.View().Content)
+	if !strings.Contains(out, "LONGKEY-999999999999999…") || strings.Contains(out, strings.Repeat("9", 30)) {
+		t.Errorf("board row key not capped:\n%s", out)
+	}
+	for _, line := range strings.Split(out, "\n") {
+		if w := visualWidth(line); w > board.width {
+			t.Errorf("board line is %d cells, terminal is %d wide: %q", w, board.width, line)
+		}
+	}
+}
+
 func TestIssueKeyDetailCrumbCapped(t *testing.T) {
 	iid := int64(12)
 	long := "LONGKEY-" + strings.Repeat("9", 60)

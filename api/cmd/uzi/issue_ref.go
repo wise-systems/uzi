@@ -16,4 +16,5 @@ func issueRef(iid int64, key string) string {
 // tuiIssueKeyCells caps an issue tracker key drawn in a TUI cell (through m.renderer.Plain,
 // the D7 rule for untrusted cells): real keys ("ABC-12") are
 // short, and the cap keeps a hostile 200-rune key from blowing out a row or the crumb.
+// The cap counts runes, not columns: a wide rune takes two columns.
 const tuiIssueKeyCells = 24
