@@ -34,7 +34,7 @@ func TestRepoIssueTrackerLinkableLiveDB(t *testing.T) {
 		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
 			t.Fatal(err)
 		}
-		return out.Repo.Linkable, string(out.Repo.Link) != "null"
+		return out.Repo.Linkable, len(out.Repo.Link) > 0 && string(out.Repo.Link) != "null"
 	}
 
 	t.Run("nothing configured: no allowlist and no connection", func(t *testing.T) {

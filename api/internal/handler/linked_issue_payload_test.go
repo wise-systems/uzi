@@ -66,8 +66,8 @@ func TestRepoToDTOIssueTrackerLink(t *testing.T) {
 		if err := json.Unmarshal(b, &m); err != nil {
 			t.Fatal(err)
 		}
-		if string(m["issue_tracker_link"]) != "null" {
-			t.Errorf("issue_tracker_link = %s, want null", m["issue_tracker_link"])
+		if _, ok := m["issue_tracker_link"]; ok {
+			t.Errorf("issue_tracker_link = %s, want the key omitted", m["issue_tracker_link"])
 		}
 	})
 }
