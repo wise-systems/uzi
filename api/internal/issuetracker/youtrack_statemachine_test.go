@@ -49,7 +49,7 @@ func TestCheckStateField(t *testing.T) {
 			t.Fatalf("CheckStateField = %v, want a plain error", err)
 		}
 	})
-	t.Run("another custom field run by a state machine does not count", func(t *testing.T) {
+	t.Run("the sample requests only the State custom field, so another state-machine field is never read", func(t *testing.T) {
 		y, srv := newFakeDriver(t)
 		srv.SeedIssue("a", "")
 		srv.SetExtraStateMachineField(youtracktest.ProjectID, "Workflow")

@@ -1178,7 +1178,7 @@ func (h *Handler) MoveIssue(w http.ResponseWriter, r *http.Request) {
 		}
 		// On a linked repo a refused move (409) or a moved-away issue (404) leaves the
 		// cache unchanged, so the card snaps back; any other failure is a 502.
-		if repo.IssueTrackerConnectionID.Valid && writeLinkedMoveError(w, err) {
+		if repo.IssueTrackerConnectionID.Valid && writeLinkedMoveError(w, err, repo.IssueTrackerProjectShort.String) {
 			return
 		}
 		httpx.Error(w, http.StatusBadGateway, "could not update the issue on the forge: "+err.Error())

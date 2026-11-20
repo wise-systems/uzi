@@ -98,6 +98,7 @@ func TestColumnMoveRefusedNamesOnlyTheDriversRefusals(t *testing.T) {
 		{"column not mapped", issuetracker.ErrColumnNotMapped, true},
 		{"mapping unset", issuetracker.ErrStateMappingUnset, true},
 		{"state not allowed", issuetracker.ErrStateNotAllowed, true},
+		{"state machine field", issuetracker.ErrStateMachineField, true},
 		{"wrapped", fmt.Errorf("move: %w", issuetracker.ErrColumnNotMapped), true},
 		{"write not offered is not a refusal", ErrIssueWriteNotOffered, false},
 		{"moved away is not a refusal", &linkedIssueError{err: &forge.IssueNotFoundError{Err: errors.New("404")}}, false},

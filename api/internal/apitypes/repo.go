@@ -84,8 +84,9 @@ type RepoDTO struct {
 	// IssueTrackerLink is the repo's link to an external issue tracker project (PRD
 	// #4173 M6), null when the repo is not linked. Set by repoToDTO from the repo row.
 	IssueTrackerLink *RepoIssueTrackerLinkDTO `json:"issue_tracker_link"`
-	// IssueTrackerLinkable is advisory: the repo still awaits its first enable and is not
-	// linked, so the web offers the link control. The link service decides and refuses.
+	// IssueTrackerLinkable is advisory: the repo has never been enabled, is not linked, and
+	// the operator set an issue tracker allowlist or the user has a connection, so the web
+	// offers the link control. The link service decides and refuses.
 	IssueTrackerLinkable bool `json:"issue_tracker_linkable"`
 }
 

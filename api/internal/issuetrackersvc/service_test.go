@@ -102,6 +102,12 @@ type fakeDriver struct {
 	projectErr error
 	tags       []issuetracker.Tag
 	tagErr     error
+	// stateFieldErr is what CheckStateField returns; nil means a plain State field.
+	stateFieldErr error
+}
+
+func (d *fakeDriver) CheckStateField(context.Context, issuetracker.ProjectRef) error {
+	return d.stateFieldErr
 }
 
 func (d *fakeDriver) ListTags(context.Context) ([]issuetracker.Tag, error) {
