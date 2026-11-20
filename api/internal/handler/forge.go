@@ -226,7 +226,13 @@ func repoToDTO(r store.Repo) apitypes.RepoDTO {
 // issueTrackerLinkOffered). Advisory only; the link service still decides (PRD #4173 M6
 // follow-up, issue #27).
 func linkableFor(r store.Repo, offered bool) bool {
-	return r.AwaitingFirstEnable && !r.IssueTrackerConnectionID.Valid && offered
+	return awaitingLink(r) && offered
+}
+
+// awaitingLink reports whether a repo could take a link at all: never enabled and not
+// yet linked. It is the part of linkableFor that needs no query.
+func awaitingLink(r store.Repo) bool {
+	return r.AwaitingFirstEnable && !r.IssueTrackerConnectionID.Valid
 }
 
 // issueTrackerLinkOffered reports whether linking is possible at all for this user: the
@@ -248,9 +254,11 @@ func (h *Handler) issueTrackerLinkOffered(ctx context.Context, userID uuid.UUID)
 // repoDTOForUser is repoToDTO plus the user-facing issue_tracker_linkable flag, for the
 // handlers that answer with one repo.
 func (h *Handler) repoDTOForUser(ctx context.Context, userID uuid.UUID, r store.Repo) apitypes.RepoDTO {
-	dtos := []apitypes.RepoDTO{repoToDTO(r)}
-	h.setLinkable(ctx, userID, []store.Repo{r}, dtos)
-	return dtos[0]
+	d := repoToDTO(r)
+	if awaitingLink(r) {
+		d.IssueTrackerLinkable = h.issueTrackerLinkOffered(ctx, userID)
+	}
+	return d
 }
 
 // setLinkable fills IssueTrackerLinkable on the DTOs of repos, asking
@@ -258,7 +266,7 @@ func (h *Handler) repoDTOForUser(ctx context.Context, userID uuid.UUID, r store.
 func (h *Handler) setLinkable(ctx context.Context, userID uuid.UUID, repos []store.Repo, dtos []apitypes.RepoDTO) {
 	offered, asked := false, false
 	for i, rp := range repos {
-		if !rp.AwaitingFirstEnable || rp.IssueTrackerConnectionID.Valid {
+		if !awaitingLink(rp) {
 			continue
 		}
 		if !asked {

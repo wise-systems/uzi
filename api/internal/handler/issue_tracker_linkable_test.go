@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/config"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -25,7 +26,7 @@ func TestLinkableFor(t *testing.T) {
 		{"linked", linked, true, false},
 		{"never-enabled, link offered", store.Repo{AwaitingFirstEnable: true}, true, true},
 		{"never-enabled, nothing configured", store.Repo{AwaitingFirstEnable: true}, false, false},
-		{"enabled", store.Repo{Enabled: true}, true, false},
+		{"once enabled is not awaiting", store.Repo{AwaitingFirstEnable: false, Enabled: true}, true, false},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -92,6 +93,50 @@ func TestIssueTrackerLinkOffered(t *testing.T) {
 			h := &Handler{q: store.New(&db), cfg: config.Config{IssueTrackerAllowedBaseURLs: tc.allowlist}}
 			if got := h.issueTrackerLinkOffered(context.Background(), uuid.New()); got != tc.want {
 				t.Errorf("offered = %v, want %v", got, tc.want)
+			}
+			if db.queries != tc.wantQueries {
+				t.Errorf("queries = %d, want %d", db.queries, tc.wantQueries)
+			}
+		})
+	}
+}
+
+func TestSetLinkableAsksOnce(t *testing.T) {
+	linkedID := pgtype.UUID{Bytes: uuid.New(), Valid: true}
+	awaiting := store.Repo{AwaitingFirstEnable: true}
+	tests := []struct {
+		name        string
+		repos       []store.Repo
+		db          linkOfferDB
+		want        []bool
+		wantQueries int
+	}{
+		{
+			"several awaiting repos share one connections query",
+			[]store.Repo{awaiting, {AwaitingFirstEnable: true, IssueTrackerConnectionID: linkedID}, awaiting, {Enabled: true}, awaiting},
+			linkOfferDB{rows: 1}, []bool{true, false, true, false, true}, 1,
+		},
+		{
+			"no connection reads as not linkable for all",
+			[]store.Repo{awaiting, awaiting},
+			linkOfferDB{}, []bool{false, false}, 1,
+		},
+		{
+			"no awaiting repo asks nothing",
+			[]store.Repo{{AwaitingFirstEnable: true, IssueTrackerConnectionID: linkedID}, {Enabled: true}},
+			linkOfferDB{rows: 1}, []bool{false, false}, 0,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			db := tc.db
+			h := &Handler{q: store.New(&db)}
+			dtos := make([]apitypes.RepoDTO, len(tc.repos))
+			h.setLinkable(context.Background(), uuid.New(), tc.repos, dtos)
+			for i, d := range dtos {
+				if d.IssueTrackerLinkable != tc.want[i] {
+					t.Errorf("repo %d linkable = %v, want %v", i, d.IssueTrackerLinkable, tc.want[i])
+				}
 			}
 			if db.queries != tc.wantQueries {
 				t.Errorf("queries = %d, want %d", db.queries, tc.wantQueries)
