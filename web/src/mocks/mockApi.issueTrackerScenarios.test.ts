@@ -139,6 +139,19 @@ describe("issue tracker demo scenarios", () => {
     expect(repo).toMatchObject({ issue_tracker_link: null, issue_tracker_linkable: true });
   });
 
+  it("issue-tracker-state-machine: the link and the linked repo's states are refused with the server's text", async () => {
+    const api = await load("issue-tracker-state-machine");
+    const reason =
+      "project ATL uses a state-machine workflow on its State field; uzi needs a plain State field. Link a project with a plain State field, or remove the state-machine rule from the State field in YouTrack.";
+    const err = await refusal(api.linkRepoToIssueTracker(LINKABLE, goodLink));
+    expect([err.status, err.message]).toEqual([409, reason]);
+    const repos = (await api.listProjects("conn-1")).repos;
+    expect(repos.find((r) => r.id === LINKABLE)).toMatchObject({ issue_tracker_link: null, issue_tracker_linkable: true });
+    expect(repos.find((r) => r.id === LINKED)?.issue_tracker_link?.project_short_name).toBe("ATL");
+    const states = await refusal(api.getIssueTrackerStates(LINKED));
+    expect([states.status, states.message]).toEqual([409, reason]);
+  });
+
   it("issue-tracker-allowlist-empty: no allowed base URL, no connection, and connecting is refused", async () => {
     const api = await load("issue-tracker-allowlist-empty");
     expect(await api.issueTrackerConfig()).toEqual({ allowed_base_urls: [], kinds: ["youtrack"] });

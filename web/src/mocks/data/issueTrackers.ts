@@ -119,6 +119,7 @@ export const ISSUE_TRACKER_SCENARIOS = [
   "issue-tracker-linked",
   "issue-tracker-unmapped",
   "issue-tracker-link-refused",
+  "issue-tracker-state-machine",
   "issue-tracker-allowlist-empty",
 ] as const;
 export type IssueTrackerScenario = (typeof ISSUE_TRACKER_SCENARIOS)[number];
@@ -131,15 +132,21 @@ export function issueTrackerScenario(name: string): IssueTrackerScenario {
 
 // Whether the scenario seeds the enabled linked repo (its board, State mapping and run).
 export function seedsLinkedRepo(s: IssueTrackerScenario): boolean {
-  return s === "issue-tracker-linked" || s === "issue-tracker-unmapped";
+  return s === "issue-tracker-linked" || s === "issue-tracker-unmapped" || s === "issue-tracker-state-machine";
 }
 
 // The refusal issue-tracker-link-refused answers every otherwise valid link with: one
 // the dialog cannot foresee, so the server's text is what the admin reads.
 export const mockLinkRefusal = "this repo already stores issue numbers and cannot be linked to an issue tracker";
 
-// The enabled repo linked to project ATL with tag uzi (issue-tracker-linked and
-// issue-tracker-unmapped).
+// The refusal issue-tracker-state-machine answers a link with, and the linked repo's
+// states read: the server's StateMachineRefusal for project ATL, whose State field a
+// state machine runs.
+const mockStateMachineProject = "ATL";
+export const mockStateMachineRefusal = `project ${mockStateMachineProject} uses a state-machine workflow on its State field; uzi needs a plain State field. Link a project with a plain State field, or remove the state-machine rule from the State field in YouTrack.`;
+
+// The enabled repo linked to project ATL with tag uzi (issue-tracker-linked,
+// issue-tracker-unmapped and issue-tracker-state-machine).
 export const mockLinkedRepo: Repo = {
   ...mockLinkableRepo,
   id: "repo-atlas-mobile",

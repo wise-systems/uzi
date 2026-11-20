@@ -98,7 +98,7 @@ repos = [
 ];
 // PRD #4173 M6: one never-enabled repo on the default connection, so "Link to an issue
 // tracker" shows on the Repos page (mockApi/issueTrackers.ts serves the link). The
-// issue-tracker-linked and issue-tracker-unmapped scenarios (M8) add an enabled linked repo.
+// issue-tracker-linked, issue-tracker-unmapped and issue-tracker-state-machine scenarios (M8) add an enabled linked repo.
 repos = [...repos, { ...mockLinkableRepo }];
 if (seedsLinkedRepo(issueTrackerScenario(mockScenario()))) repos = [...repos, structuredClone(mockLinkedRepo)];
 // The repos awaiting their first enable (the server's awaiting_first_enable): the board

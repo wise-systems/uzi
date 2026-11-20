@@ -742,7 +742,7 @@ scenarios are mutually exclusive by construction. Known values:
   `uzi_demo_mode` toggle to mask the source URL and ref in screenshots (#4367).
 - `issue-tracker-none`, `issue-tracker-unlinked`, `issue-tracker-linked`,
   `issue-tracker-unmapped`, `issue-tracker-link-refused`,
-  `issue-tracker-allowlist-empty` — the issue tracker screens (PRD #4173 M6)
+  `issue-tracker-state-machine`, `issue-tracker-allowlist-empty` — the issue tracker screens (PRD #4173 M6)
   without a YouTrack. The fixtures hold no token; the connection is
   `https://youtrack.example.com` acting as `uzi-bot`.
   `issue-tracker-unlinked` (also the default) has that connection and the
@@ -762,7 +762,11 @@ scenarios are mutually exclusive by construction. Known values:
   `issue-tracker-unmapped` is the same repo with the Human Review column
   unmapped. `issue-tracker-link-refused` refuses every
   valid link with the server's "already stores issue numbers" text, so the
-  dialog's refusal shows. `issue-tracker-allowlist-empty` has no allowed base
+  dialog's refusal shows. `issue-tracker-state-machine` has the linked repo
+  of `issue-tracker-linked`, but project ATL's State field is run by a state
+  machine: a link is refused with 409 and the server's "uses a state-machine
+  workflow on its State field" text, and the linked repo's Map States panel
+  shows the same text as its load error. `issue-tracker-allowlist-empty` has no allowed base
   URL and no connection, so `/settings/issue-trackers` shows the operator
   message and no `/repos` row offers the link control. The mock derives that
   control from the server's rule (never enabled, not linked, and a non-empty

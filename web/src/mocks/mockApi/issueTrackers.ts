@@ -17,6 +17,10 @@
 //                                        with keyed cards and a keyed run
 //   ?mock=issue-tracker-unmapped       → the same repo with one column left unmapped
 //   ?mock=issue-tracker-link-refused   → a valid link is refused (mockLinkRefusal)
+//   ?mock=issue-tracker-state-machine  → a link is refused because project ATL's State field
+//                                        is run by a state machine; the linked repo's states
+//                                        read is refused with the same text
+//                                        (mockStateMachineRefusal)
 //   ?mock=issue-tracker-allowlist-empty → no allowed base URL and no connection
 
 import type {
@@ -35,6 +39,7 @@ import {
   mockLinkedMapping,
   mockLinkedRepo,
   mockLinkRefusal,
+  mockStateMachineRefusal,
   mockUnmappedMapping,
 } from "../data";
 import { state } from "../store";
@@ -45,7 +50,7 @@ const scenario = issueTrackerScenario(mockScenario());
 
 // The saved State mapping of each linked repo, keyed by repo id; absent until saved.
 const stateMappings = new Map<string, IssueTrackerStateMapping>();
-if (scenario === "issue-tracker-linked") stateMappings.set(mockLinkedRepo.id, cloneMapping(mockLinkedMapping));
+if (scenario === "issue-tracker-linked" || scenario === "issue-tracker-state-machine") stateMappings.set(mockLinkedRepo.id, cloneMapping(mockLinkedMapping));
 if (scenario === "issue-tracker-unmapped") stateMappings.set(mockLinkedRepo.id, cloneMapping(mockUnmappedMapping));
 
 const config = {
@@ -216,6 +221,7 @@ export const issueTrackersApi = {
     // The server's last check, under the repo lock: a repo whose stored rows already
     // carry forge issue numbers cannot take issue tracker ones.
     if (scenario === "issue-tracker-link-refused") throw new ApiError(409, mockLinkRefusal);
+    if (scenario === "issue-tracker-state-machine") throw new ApiError(409, mockStateMachineRefusal);
     const link = {
       connection_id: body.connection_id,
       project_id: project.id,
@@ -231,6 +237,7 @@ export const issueTrackersApi = {
   getIssueTrackerStates: async (repoId: string) => {
     requireSession();
     const r = linkedRepo(repoId);
+    if (scenario === "issue-tracker-state-machine") throw new ApiError(409, mockStateMachineRefusal);
     const saved = stateMappings.get(r.id);
     return delay(
       {
