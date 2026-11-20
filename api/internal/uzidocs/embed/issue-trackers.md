@@ -80,9 +80,9 @@ issue's own field again.
 On a repo that is already linked to such a project, nothing is written:
 
 - The "Map States" panel shows the reason.
-- Moving a card answers 409 with the reason.
-- A run keeps retrying its State move without writing, and the merge request
-  watch skips it.
+- Moving or closing a card answers 409 with the reason.
+- A run retries its State move for up to 30 minutes without writing, then
+  gives up; the merge request watch skips the move.
 
 To fix it, link another project (a new link needs a repo that was never enabled)
 or remove the state-machine rule from the State field in YouTrack.
