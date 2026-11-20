@@ -223,6 +223,9 @@ func TestStateMappingMapsAListStatesFailure(t *testing.T) {
 	if e := wantKind(t, err, KindBadGateway); !strings.HasPrefix(e.Message, "could not list states: ") {
 		t.Errorf("message = %q", e.Message)
 	}
+	if len(h.built) == 0 {
+		t.Fatal("no driver was built")
+	}
 	for _, o := range h.built {
 		if o.Project != (issuetracker.ProjectRef{}) {
 			t.Errorf("built with Project %+v, want an empty one", o.Project)
@@ -239,11 +242,15 @@ func TestStateMappingRefusesAStoredInvalidProjectID(t *testing.T) {
 	ctx := context.Background()
 	for _, bad := range []string{"", "abc", "0-1/../x", "1-", "0-1\n"} {
 		repo := linkedFakeRepo(t, h, user, bad)
-		// A listing error would surface as a bad gateway if the id were not checked first.
+		// The id is refused before a driver is built, so no request can carry it.
 		h.template.listStatesErr = errors.New("must not be reached")
+		h.built = nil
 		_, err := h.svc.GetStateMapping(ctx, user, repo)
 		wantMappingErr(t, err, KindBadRequest, "invalid project id")
 		_, err = h.svc.SetStateMapping(ctx, user, repo, validMapping())
 		wantMappingErr(t, err, KindBadRequest, "invalid project id")
+		if len(h.built) != 0 {
+			t.Errorf("id %q: a driver was built for an invalid stored project id", bad)
+		}
 	}
 }

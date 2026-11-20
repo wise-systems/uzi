@@ -82,6 +82,11 @@ func (s *Service) linkedSource(ctx context.Context, userID, repoID uuid.UUID) (s
 // (PRD #4173, StateMachineRefusal), then lists its States. The check comes first so nothing
 // is saved or shown for a project uzi cannot write.
 func (s *Service) listCheckedStates(ctx context.Context, userID uuid.UUID, src store.GetRepoIssueSourceForUserRow) ([]issuetracker.State, error) {
+	// The stored project id goes into every driver request, so it is checked before a
+	// driver is built.
+	if !issuetracker.ValidProjectID(src.IssueTrackerProjectID.String) {
+		return nil, &Error{Kind: KindBadRequest, Message: "invalid project id"}
+	}
 	connID := uuid.UUID(src.LinkedConnectionID.Bytes)
 	d, err := s.DriverFor(ctx, userID, connID, issuetracker.Binding{}, issuetracker.StateMapping{})
 	if err != nil {
@@ -93,8 +98,8 @@ func (s *Service) listCheckedStates(ctx context.Context, userID uuid.UUID, src s
 	return listStates(ctx, d, src.IssueTrackerProjectID.String)
 }
 
-// listStates lists the issue states of one project through d. The project id is checked
-// first, since it goes into a driver request; a driver failure is a bad gateway.
+// listStates lists the issue states of one project through d; a driver failure is a bad
+// gateway. The project id check repeats the caller's, as a backstop for a new caller.
 func listStates(ctx context.Context, d issuetracker.Driver, projectID string) ([]issuetracker.State, error) {
 	if !issuetracker.ValidProjectID(projectID) {
 		return nil, &Error{Kind: KindBadRequest, Message: "invalid project id"}
