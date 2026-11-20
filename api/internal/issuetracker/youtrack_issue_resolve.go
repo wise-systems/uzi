@@ -22,6 +22,11 @@ import (
 // several writes (UpdateIssueLabels, one per tag) can land more than one. That window
 // is documented (PRD #4173 D10), not closed.
 func (y *youTrack) resolveIssue(ctx context.Context, projectID, issueIID int64) (ytIssue, error) {
+	return y.resolveIssueFields(ctx, projectID, issueIID, issueFields)
+}
+
+// resolveIssueFields is resolveIssue reading the given fields.
+func (y *youTrack) resolveIssueFields(ctx context.Context, projectID, issueIID int64, fields string) (ytIssue, error) {
 	p, err := y.requireProject(projectID)
 	if err != nil {
 		return ytIssue{}, err
@@ -34,7 +39,7 @@ func (y *youTrack) resolveIssue(ctx context.Context, projectID, issueIID int64) 
 	status, _, err := y.do(ctx, ytCall{
 		method: http.MethodGet,
 		path:   []string{"issues", readable},
-		query:  url.Values{"fields": {issueFields}},
+		query:  url.Values{"fields": {fields}},
 		limit:  objectBytes,
 		prov:   forge.ResponseIssueSuccess,
 	}, &w)

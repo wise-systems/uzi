@@ -33,7 +33,7 @@ func (y *youTrack) SetIssueState(ctx context.Context, projectID, issueIID int64,
 	if err != nil {
 		return err
 	}
-	w, err := y.resolveIssue(ctx, projectID, issueIID)
+	w, err := y.resolveIssueForStateWrite(ctx, projectID, issueIID)
 	if err != nil {
 		return err
 	}
@@ -76,7 +76,7 @@ func (y *youTrack) moveToColumn(ctx context.Context, projectID, issueIID int64, 
 	if err != nil {
 		return err
 	}
-	w, err := y.resolveIssue(ctx, projectID, issueIID)
+	w, err := y.resolveIssueForStateWrite(ctx, projectID, issueIID)
 	if err != nil {
 		return err
 	}
@@ -125,4 +125,73 @@ func (y *youTrack) checkTargetState(ctx context.Context, name string, closing bo
 		return State{}, y.red.sentinel(ErrStateNotAllowed, 0, "the state is not allowed in this role: "+quoteName(name))
 	}
 	return State{}, y.red.sentinel(ErrStateNotAllowed, 0, "the project's state bundle has no such state: "+quoteName(name))
+}
+
+// stateMachineType is the $type YouTrack gives a State field that a
+// state-machine workflow runs.
+const stateMachineType = "StateMachineIssueCustomField"
+
+// runByStateMachine reports whether the issue's State field is one a state
+// machine runs. w must have been read with customFields(name,$type).
+func (y *youTrack) runByStateMachine(w ytIssue) bool {
+	for _, f := range w.CustomFields {
+		if f.Name == y.stateField && f.Type == stateMachineType {
+			return true
+		}
+	}
+	return false
+}
+
+// resolveIssueForStateWrite is resolveIssue for a State write. Its one GET also
+// asks for customFields(name,$type), and an issue whose State field a state
+// machine runs is ErrStateMachineField, before any write and with no fallback.
+func (y *youTrack) resolveIssueForStateWrite(ctx context.Context, projectID, issueIID int64) (ytIssue, error) {
+	w, err := y.resolveIssueFields(ctx, projectID, issueIID, issueFields+","+stateCheckFields)
+	if err != nil {
+		return ytIssue{}, err
+	}
+	if y.runByStateMachine(w) {
+		return ytIssue{}, y.red.sentinel(ErrStateMachineField, 0, "")
+	}
+	return w, nil
+}
+
+// stateCheckFields is what the State-write read adds to issueFields, and what
+// CheckStateField reads of each sampled issue besides its id and project.
+const stateCheckFields = "customFields(name,$type)"
+
+// CheckStateField implements Driver. It reads the first page of the project's
+// issues (pageSize items, the listing's query) asking only for each issue's
+// project and its State custom field's name and type, and never writes. An
+// issue of another project is ignored, so the ref's id decides, not only its
+// short name.
+func (y *youTrack) CheckStateField(ctx context.Context, project ProjectRef) error {
+	if err := ValidProjectRef(project); err != nil {
+		return err
+	}
+	if project == (ProjectRef{}) {
+		return y.fail("youtrack: no project to check")
+	}
+	query := url.Values{
+		"query":        {issueQuery(project.ShortName, forge.ListIssuesOptions{})},
+		"fields":       {"id,project(id)," + stateCheckFields},
+		"customFields": {y.stateField},
+	}
+	found := false
+	err := ytPages(ctx, y, []string{"issues"}, query, func(page []ytIssue) bool {
+		for _, w := range page {
+			if w.Project != nil && w.Project.ID == project.ID && y.runByStateMachine(w) {
+				found = true
+				break
+			}
+		}
+		return true
+	})
+	if err != nil {
+		return err
+	}
+	if found {
+		return y.red.sentinel(ErrStateMachineField, 0, "")
+	}
+	return nil
 }

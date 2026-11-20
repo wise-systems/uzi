@@ -349,3 +349,25 @@ func (s *Server) IssueState(n int64) string {
 	}
 	return ""
 }
+
+// SetStateMachine makes the State field of the project with id projectID one a
+// state-machine workflow runs (or a plain one again). Its issues then list a
+// StateMachineIssueCustomField, and a value write to one answers 400.
+func (s *Server) SetStateMachine(projectID string, on bool) {
+	s.t.Helper()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p := s.m.projectByID(projectID)
+	if p == nil {
+		s.t.Fatalf("youtracktest: no project %q", projectID)
+	}
+	p.stateMachine = on
+}
+
+// FailIssueListing makes every issues search (GET /api/issues) answer status,
+// for example 403 or 404; 0 restores normal answers.
+func (s *Server) FailIssueListing(status int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.m.listFailure = status
+}
