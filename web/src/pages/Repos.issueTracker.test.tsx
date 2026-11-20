@@ -228,7 +228,7 @@ describe("Repos: issue trackers", () => {
       expect(within(row).queryByRole("button", linkButton)).toBeNull();
     });
 
-    it("an enabled repo that is not linkable shows no link button", async () => {
+    it("an enabled repo whose payload is not linkable shows no link button", async () => {
       mockApi.listProjects.mockResolvedValue({
         repos: [{ ...PLAIN, issue_tracker_link: null, issue_tracker_linkable: false }],
       });

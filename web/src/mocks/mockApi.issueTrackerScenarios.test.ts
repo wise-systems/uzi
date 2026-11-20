@@ -41,6 +41,13 @@ describe("issue tracker demo scenarios", () => {
     expect(repos.some((r) => r.issue_tracker_link)).toBe(false);
   });
 
+  it("default scenario: a repo setter's response after the first enable is not linkable", async () => {
+    const api = await load("");
+    await api.setRepoEnabled(LINKABLE, true);
+    const { repo } = await api.setRepoSkillsEnabled(LINKABLE, true);
+    expect(repo.issue_tracker_linkable).toBe(false);
+  });
+
   it("issue-tracker-allowlist-empty: no allowed base URL and no connection, so no repo offers the link control", async () => {
     const api = await load("issue-tracker-allowlist-empty");
     expect((await api.issueTrackerConfig()).allowed_base_urls).toEqual([]);

@@ -766,8 +766,8 @@ scenarios are mutually exclusive by construction. Known values:
   URL and no connection, so `/settings/issue-trackers` shows the operator
   message and no `/repos` row offers the link control. The mock derives that
   control from the server's rule (never enabled, not linked, and a non-empty
-  allowlist or at least one issue tracker connection), so it also appears once
-  a connection is created in the session. (PRD #4173 M8.)
+  allowlist or at least one issue tracker connection). The connections half of
+  the rule mirrors the server and is not observable in mock mode. (PRD #4173 M8.)
 
 ### What keeps the mock build current
 

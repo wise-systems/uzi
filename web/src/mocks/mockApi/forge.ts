@@ -108,8 +108,8 @@ export const awaitingFirstEnable = new Set<string>([mockLinkableRepo.id]);
 // Whether the issue tracker link control is offered to this user at all (the server's
 // issueTrackerLinkOffered: a non-empty allowlist or at least one issue tracker connection).
 // mockApi/issueTrackers.ts owns both facts and registers the predicate; until it does, the
-// control is offered.
-let issueTrackerLinkOffered: () => boolean = () => true;
+// control is not offered (fail closed, as the server does).
+let issueTrackerLinkOffered: () => boolean = () => false;
 export function setIssueTrackerLinkOffered(fn: () => boolean) {
   issueTrackerLinkOffered = fn;
 }
@@ -337,13 +337,13 @@ export const forgeApi = {
     const r = repos.find((x) => x.id === id);
     if (!r) throw new ApiError(404, "repo not found");
     r.repo_skills_enabled = enabled;
-    return delay({ repo: { ...r } });
+    return delay({ repo: listed(r) });
   },
   setRepoClaudemdEnabled: async (id: string, enabled: boolean) => {
     const r = repos.find((x) => x.id === id);
     if (!r) throw new ApiError(404, "repo not found");
     r.repo_claudemd_enabled = enabled;
-    return delay({ repo: { ...r } });
+    return delay({ repo: listed(r) });
   },
   // Trusted-repo master control (PRD #246): sets whichever of the two trust flags
   // are present in one call, mirroring the server's atomic both-flags path.
@@ -355,7 +355,7 @@ export const forgeApi = {
     if (!r) throw new ApiError(404, "repo not found");
     if (flags.repo_skills_enabled !== undefined) r.repo_skills_enabled = flags.repo_skills_enabled;
     if (flags.repo_claudemd_enabled !== undefined) r.repo_claudemd_enabled = flags.repo_claudemd_enabled;
-    return delay({ repo: { ...r } });
+    return delay({ repo: listed(r) });
   },
   // PRD #2170 M3: the code cross-check owner inputs, its own exclusive PATCH group.
   // Mirrors PatchRepo: a key from another group is a 400, an empty request is a 400,
@@ -388,13 +388,13 @@ export const forgeApi = {
     if (inputs.cross_check_repo_instructions_enabled !== undefined) {
       r.cross_check_repo_instructions_enabled = inputs.cross_check_repo_instructions_enabled;
     }
-    return delay({ repo: { ...r } });
+    return delay({ repo: listed(r) });
   },
   setRepoDevboxOptIn: async (id: string, enabled: boolean) => {
     const r = repos.find((x) => x.id === id);
     if (!r) throw new ApiError(404, "repo not found");
     r.repo_devbox_opt_in = enabled;
-    return delay({ repo: { ...r } });
+    return delay({ repo: listed(r) });
   },
   // PRD #686: per-repo self-improve dogfooding capability. Owner-or-admin on the
   // server; the mock just flips the flag and echoes the repo.
@@ -402,13 +402,13 @@ export const forgeApi = {
     const r = repos.find((x) => x.id === id);
     if (!r) throw new ApiError(404, "repo not found");
     r.repo_fold_improve_uzi_backlog = enabled;
-    return delay({ repo: { ...r } });
+    return delay({ repo: listed(r) });
   },
   setRepoAgentSourceDefault: async (id: string, value: AgentSource | null) => {
     const r = repos.find((x) => x.id === id);
     if (!r) throw new ApiError(404, "repo not found");
     r.agent_source_default = value;
-    return delay({ repo: { ...r } });
+    return delay({ repo: listed(r) });
   },
   // PRD #84 M2: static per-repo capability hint. Mirrors the server's
   // capability.Filter to the {docker, jvm} vocabulary so only valid names persist.
@@ -416,14 +416,14 @@ export const forgeApi = {
     const r = repos.find((x) => x.id === id);
     if (!r) throw new ApiError(404, "repo not found");
     r.ignored_inferred_capabilities = CAPABILITY_VOCABULARY.filter((cap) => caps.includes(cap));
-    return delay({ repo: { ...r } });
+    return delay({ repo: listed(r) });
   },
   setRepoRequiredCapabilities: async (id: string, caps: string[]) => {
     const r = repos.find((x) => x.id === id);
     if (!r) throw new ApiError(404, "repo not found");
     const vocab = new Set<string>(CAPABILITY_VOCABULARY);
     r.required_capabilities = caps.filter((c) => vocab.has(c));
-    return delay({ repo: { ...r } });
+    return delay({ repo: listed(r) });
   },
   // PRD #66 M9 (D8): admin per-repo guardrail override. Requires a non-empty reason
   // (mirrors the server 400). Setting it clears guardrail_blocked in the demo (the
@@ -434,7 +434,7 @@ export const forgeApi = {
     if (reason.trim() === "") throw new ApiError(400, "a non-empty reason is required to override the guardrail");
     r.guardrail_override = { reason: reason.trim(), by: "you@example.com", at: new Date().toISOString() };
     r.guardrail_blocked = false;
-    return delay({ repo: { ...r } });
+    return delay({ repo: listed(r) });
   },
   clearRepoGuardrailOverride: async (id: string) => {
     const r = repos.find((x) => x.id === id);
@@ -444,7 +444,7 @@ export const forgeApi = {
     // underlying findings are still waivable blocks (mock stand-in: seeded block
     // messages). This is what makes Revoke round-trip back to "runs blocked".
     r.guardrail_blocked = (mockBlockedRepoMeta[id]?.block_messages.length ?? 0) > 0;
-    return delay({ repo: { ...r } });
+    return delay({ repo: listed(r) });
   },
 
   // ── GitHub Projects v2 sync (PRD #534) ───────────────────────────────────────

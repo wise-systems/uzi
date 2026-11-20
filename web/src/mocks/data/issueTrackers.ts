@@ -90,7 +90,7 @@ export const mockLinkableRepo: Repo = {
   docker_allowlisted: false,
   docker_blocked: false,
   issue_tracker_link: null,
-  issue_tracker_linkable: true,
+  issue_tracker_linkable: false,
 };
 
 // The board columns a linked repo's board gets in mock mode at its first enable.
