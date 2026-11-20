@@ -38,13 +38,22 @@ func TestCheckStateField(t *testing.T) {
 			t.Fatalf("CheckStateField = %v, want nil", err)
 		}
 	})
-	t.Run("an issue of another project does not count", func(t *testing.T) {
+	t.Run("an issue of another project does not count and a page of them is an error", func(t *testing.T) {
 		y, srv := newFakeDriver(t)
 		srv.SeedIssue("a", "")
 		srv.SetStateMachine(youtracktest.ProjectID, true)
 		// The ref names the main project's short name but another project's id.
 		ref := ProjectRef{ID: youtracktest.OtherProjectID, ShortName: youtracktest.ProjectShortName}
-		if err := y.CheckStateField(context.Background(), ref); err != nil {
+		err := y.CheckStateField(context.Background(), ref)
+		if err == nil || errors.Is(err, ErrStateMachineField) {
+			t.Fatalf("CheckStateField = %v, want a plain error", err)
+		}
+	})
+	t.Run("another custom field run by a state machine does not count", func(t *testing.T) {
+		y, srv := newFakeDriver(t)
+		srv.SeedIssue("a", "")
+		srv.SetExtraStateMachineField(youtracktest.ProjectID, "Workflow")
+		if err := y.CheckStateField(context.Background(), mainRef); err != nil {
 			t.Fatalf("CheckStateField = %v, want nil", err)
 		}
 	})
@@ -158,5 +167,18 @@ func TestMoveToColumnOnAPlainProjectStillWrites(t *testing.T) {
 	}
 	if got := srv.IssueState(n); got != "In Progress" {
 		t.Errorf("state = %q", got)
+	}
+}
+
+func TestAnotherStateMachineFieldDoesNotBlockTheStateWrite(t *testing.T) {
+	y, srv := columnDriver(t, nil)
+	n := srv.SeedIssue("t", "")
+	srv.SetExtraStateMachineField(youtracktest.ProjectID, "Workflow")
+	srv.ResetRequests()
+	if err := y.MoveToColumn(context.Background(), testProjectID, n, forge.ColumnMove{Column: "In Progress"}); err != nil {
+		t.Fatalf("MoveToColumn = %v, want nil", err)
+	}
+	if w := writesOf(srv); len(w) != 1 || !strings.HasPrefix(w[0], "POST /api/issues/") {
+		t.Errorf("writes = %v, want one POST to the issue", w)
 	}
 }

@@ -364,6 +364,20 @@ func (s *Server) SetStateMachine(projectID string, on bool) {
 	p.stateMachine = on
 }
 
+// SetExtraStateMachineField adds to every issue of the project with id
+// projectID a second custom field, named name and run by a state machine, next
+// to its plain State field; an empty name removes it.
+func (s *Server) SetExtraStateMachineField(projectID, name string) {
+	s.t.Helper()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p := s.m.projectByID(projectID)
+	if p == nil {
+		s.t.Fatalf("youtracktest: no project %q", projectID)
+	}
+	p.extraMachineField = name
+}
+
 // FailIssueListing makes every issues search (GET /api/issues) answer status,
 // for example 403 or 404; 0 restores normal answers.
 func (s *Server) FailIssueListing(status int) {

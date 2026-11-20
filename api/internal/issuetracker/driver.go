@@ -51,8 +51,11 @@ type Driver interface {
 	// CheckStateField reports whether uzi can write the project's State field.
 	// It returns ErrStateMachineField when a sample of the project's issues
 	// shows the field run by a state machine, nil when the sample is empty or
-	// plain, and the (redacted) read error when the sample cannot be read, so a
-	// failed read never counts as a pass. It never writes. A sample is one page
+	// its issues of the project are plain, and a plain error (never nil, never
+	// ErrStateMachineField) when the sample is not empty but holds no issue of
+	// the project, as with a stale short name. A (redacted) read error is
+	// returned when the sample cannot be read, so a failed read never counts as
+	// a pass. It never writes. A sample is one page
 	// of issues, so a project that mixes both kinds is judged by that page only.
 	CheckStateField(ctx context.Context, project ProjectRef) error
 }

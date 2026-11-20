@@ -415,14 +415,19 @@ func TestOnlyTheListingAsksForCustomFields(t *testing.T) {
 		t.Fatal(err)
 	}
 	noCustomFields("GetIssue and CreateIssue")
-	for name, call := range map[string]func() error{
-		"MoveToColumn": func() error {
+	// In order: closing the issue first would make the move fail as resolved.
+	for _, tc := range []struct {
+		name string
+		call func() error
+	}{
+		{"MoveToColumn", func() error {
 			return y.MoveToColumn(ctx, testProjectID, n, forge.ColumnMove{Column: "In Progress"})
-		},
-		"SetIssueState": func() error { return y.SetIssueState(ctx, testProjectID, n, forge.StateClosed) },
+		}},
+		{"SetIssueState", func() error { return y.SetIssueState(ctx, testProjectID, n, forge.StateClosed) }},
 	} {
+		name := tc.name
 		srv.ResetRequests()
-		if err := call(); err != nil {
+		if err := tc.call(); err != nil {
 			t.Fatal(err)
 		}
 		resolves := 0

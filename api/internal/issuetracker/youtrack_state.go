@@ -164,7 +164,8 @@ const stateCheckFields = "customFields(name,$type)"
 // issues (pageSize items, the listing's query) asking only for each issue's
 // project and its State custom field's name and type, and never writes. An
 // issue of another project is ignored, so the ref's id decides, not only its
-// short name.
+// short name. A non-empty page with no issue of the project is an error, since
+// nothing was checked.
 func (y *youTrack) CheckStateField(ctx context.Context, project ProjectRef) error {
 	if err := ValidProjectRef(project); err != nil {
 		return err
@@ -177,10 +178,15 @@ func (y *youTrack) CheckStateField(ctx context.Context, project ProjectRef) erro
 		"fields":       {"id,project(id)," + stateCheckFields},
 		"customFields": {y.stateField},
 	}
-	found := false
+	var sampled, inProject, found bool
 	err := ytPages(ctx, y, []string{"issues"}, query, func(page []ytIssue) bool {
+		sampled = len(page) > 0
 		for _, w := range page {
-			if w.Project != nil && w.Project.ID == project.ID && y.runByStateMachine(w) {
+			if w.Project == nil || w.Project.ID != project.ID {
+				continue
+			}
+			inProject = true
+			if y.runByStateMachine(w) {
 				found = true
 				break
 			}
@@ -192,6 +198,11 @@ func (y *youTrack) CheckStateField(ctx context.Context, project ProjectRef) erro
 	}
 	if found {
 		return y.red.sentinel(ErrStateMachineField, 0, "")
+	}
+	if sampled && !inProject {
+		// A page of issues, none of them in the project: the stored short name
+		// no longer names it, so nothing was checked and that is no pass.
+		return y.fail("youtrack: the sampled issues are not in the linked project")
 	}
 	return nil
 }
