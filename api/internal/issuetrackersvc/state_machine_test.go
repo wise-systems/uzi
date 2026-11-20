@@ -98,7 +98,7 @@ func TestStateFieldCheckFailureIsABadGatewayNamingTheProject(t *testing.T) {
 				t.Errorf("GetStateMapping message = %q", e.Message)
 			}
 			_, err = h.svc.SetStateMapping(context.Background(), h.user, repo, validMapping())
-			wantKind(t, err, KindBadGateway)
+			_ = wantKind(t, err, KindBadGateway)
 		})
 	}
 }
