@@ -82,8 +82,8 @@ type RepoDTO struct {
 	// last_error/last_synced_at — a pure store read, no forge call.
 	GithubProjectSync *RepoProjectSyncHealth `json:"github_project_sync,omitempty"`
 	// IssueTrackerLink is the repo's link to an external issue tracker project (PRD
-	// #4173 M6), absent when the repo is not linked. Set by repoToDTO from the repo row. Omitted
-	// from the payload when unlinked, so an unlinked repo serialises as it did before M6.
+	// #4173 M6), set by repoToDTO from the repo row. Omitted when the repo is not linked, so
+	// an unlinked repo serialises as it did before M6.
 	IssueTrackerLink *RepoIssueTrackerLinkDTO `json:"issue_tracker_link,omitempty"`
 	// IssueTrackerLinkable is advisory: the repo has never been enabled, is not linked, and
 	// the operator set an issue tracker allowlist or the user has a connection, so the web
