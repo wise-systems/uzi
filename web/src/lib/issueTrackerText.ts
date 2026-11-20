@@ -38,3 +38,10 @@ export function describeSharing(
   if (parts.length === 0) return "only the owner";
   return `the owner and ${parts.join(", ")}`;
 }
+
+// issueKey is the issue tracker key of issue number under a project short name, the short
+// name, a dash and the number ("ABC-12"). It is the one place the web assembles the key,
+// matching the API's issuetracker.IssueKey.
+export function issueKey(projectShort: string, number: number): string {
+  return `${projectShort}-${number}`;
+}

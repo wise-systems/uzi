@@ -3,11 +3,11 @@ package handler
 import (
 	"context"
 	"log/slog"
-	"strconv"
 
 	"github.com/google/uuid"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/issuetracker"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -19,7 +19,7 @@ func issueKeyFromShort(short string, iid int64) string {
 	if short == "" {
 		return ""
 	}
-	return short + "-" + strconv.FormatInt(iid, 10)
+	return issuetracker.IssueKey(short, iid)
 }
 
 // stampRunIssueKey sets dto.IssueKey from the stored project short name of the run's repo.

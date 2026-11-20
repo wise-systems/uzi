@@ -19,7 +19,5 @@
   "guardrail_override": null,
   "guardrail_blocked": false,
   "docker_allowlisted": false,
-  "docker_blocked": false,
-  "issue_tracker_link": null,
-  "issue_tracker_linkable": false
+  "docker_blocked": false
 }

@@ -42,6 +42,12 @@ const (
 type project struct {
 	id, shortName, name string
 	next                int64 // last number handed out in this project
+	// stateMachine makes the project's State field one a state-machine
+	// workflow runs, so its issues render the state-machine shape.
+	stateMachine bool
+	// extraMachineField, when set, adds a second custom field of that name,
+	// run by a state machine, to the project's issues. Inert when empty.
+	extraMachineField string
 }
 
 type user struct{ id, login string }
@@ -137,6 +143,8 @@ type model struct {
 	clock      int64
 	seq        int64
 	textSeq    int64 // separate from seq so recording text activities shifts no other id
+	// listFailure, when non-zero, is the status the issues listing answers.
+	listFailure int
 }
 
 func newModel() *model {
@@ -372,9 +380,23 @@ func (m *model) customFieldsJSON(i *issue) []map[string]any {
 	}
 	var value any
 	if v != nil {
-		value = map[string]any{"$type": "StateBundleElement", "name": v.name}
+		value = map[string]any{"$type": "StateBundleElement", "name": v.name, "id": v.id}
 	}
-	return []map[string]any{{"$type": "StateIssueCustomField", "name": m.stateField, "value": value}}
+	if i.project.stateMachine {
+		// The documented state-machine shape: the value, plus the events that
+		// can fire from it.
+		return []map[string]any{{
+			"$type": "StateMachineIssueCustomField", "name": m.stateField, "id": "92-" + i.id, "value": value,
+			"possibleEvents": []map[string]any{{"$type": "Event", "id": "93-" + i.id, "presentation": "Start progress"}},
+		}}
+	}
+	fields := []map[string]any{{"$type": "StateIssueCustomField", "name": m.stateField, "value": value}}
+	if n := i.project.extraMachineField; n != "" {
+		fields = append(fields, map[string]any{
+			"$type": "StateMachineIssueCustomField", "name": n, "id": "94-" + i.id, "value": value,
+		})
+	}
+	return fields
 }
 
 // userJSON is the wire user for a login. A login the fake does not know is

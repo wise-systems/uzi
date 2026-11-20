@@ -41,6 +41,22 @@ describe("issue tracker demo scenarios", () => {
     expect(repos.some((r) => r.issue_tracker_link)).toBe(false);
   });
 
+  it("default scenario: a repo setter's response after the first enable is not linkable", async () => {
+    const api = await load("");
+    await api.setRepoEnabled(LINKABLE, true);
+    const { repo } = await api.setRepoSkillsEnabled(LINKABLE, true);
+    expect(repo.issue_tracker_linkable).toBe(false);
+  });
+
+  it("issue-tracker-allowlist-empty: no allowed base URL and no connection, so no repo offers the link control", async () => {
+    const api = await load("issue-tracker-allowlist-empty");
+    expect((await api.issueTrackerConfig()).allowed_base_urls).toEqual([]);
+    expect((await api.listIssueTrackerConnections()).connections).toEqual([]);
+    const { repos } = await api.listProjects("conn-1");
+    expect(repos.filter((r) => r.issue_tracker_linkable)).toEqual([]);
+    expect(repos.some((r) => r.issue_tracker_link)).toBe(false);
+  });
+
   it.each(["", "issue-tracker-unlinked", "health-degraded"])(
     "issue-tracker-unlinked (also %j): a connection and a never-enabled repo without a board",
     async (scenario) => {
@@ -121,6 +137,22 @@ describe("issue tracker demo scenarios", () => {
     ]);
     const repo = (await api.listProjects("conn-1")).repos.find((r) => r.id === LINKABLE)!;
     expect(repo).toMatchObject({ issue_tracker_link: null, issue_tracker_linkable: true });
+  });
+
+  it("issue-tracker-state-machine: the link and the linked repo's states are refused with the server's text", async () => {
+    const api = await load("issue-tracker-state-machine");
+    const reason =
+      "project ATL uses a state-machine workflow on its State field; uzi needs a plain State field. Link a project with a plain State field, or remove the state-machine rule from the State field in YouTrack.";
+    const err = await refusal(api.linkRepoToIssueTracker(LINKABLE, goodLink));
+    expect([err.status, err.message]).toEqual([409, reason]);
+    const repos = (await api.listProjects("conn-1")).repos;
+    expect(repos.find((r) => r.id === LINKABLE)).toMatchObject({ issue_tracker_link: null, issue_tracker_linkable: true });
+    expect(repos.find((r) => r.id === LINKED)?.issue_tracker_link?.project_short_name).toBe("ATL");
+    const states = await refusal(api.getIssueTrackerStates(LINKED));
+    expect([states.status, states.message]).toEqual([409, reason]);
+    // Only ATL's State field is a state machine: a link to OPS goes through.
+    const { link } = await api.linkRepoToIssueTracker(LINKABLE, { ...goodLink, project_id: "0-7" });
+    expect(link.project_short_name).toBe("OPS");
   });
 
   it("issue-tracker-allowlist-empty: no allowed base URL, no connection, and connecting is refused", async () => {

@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"strconv"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -14,6 +13,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/issueinput"
 	"github.com/vtmocanu/uzi/api/internal/issuesource"
+	"github.com/vtmocanu/uzi/api/internal/issuetracker"
 	"github.com/vtmocanu/uzi/api/internal/privcheck"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -186,7 +186,7 @@ func (s *Service) ConfirmProposalForUser(ctx context.Context, userID, runID, pro
 	}
 	var issueKey string
 	if repo.IssueTrackerConnectionID.Valid && repo.IssueTrackerProjectShort.Valid && repo.IssueTrackerProjectShort.String != "" {
-		issueKey = repo.IssueTrackerProjectShort.String + "-" + strconv.FormatInt(created.IID, 10)
+		issueKey = issuetracker.IssueKey(repo.IssueTrackerProjectShort.String, created.IID)
 	}
 	return CreatedIssue{IID: created.IID, IssueKey: issueKey, WebURL: created.WebURL, Title: created.Title}, nil
 }

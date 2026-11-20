@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/issuetracker/youtracktest"
+	"github.com/vtmocanu/uzi/api/internal/issuetrackersvc"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -161,6 +162,26 @@ func TestLinkedBoardMoveToAnUnmappedColumnIsRefusedLiveDB(t *testing.T) {
 	f.assertCache(t, "opened", "In Progress")
 	if col, _ := f.boardCard(t); col != "In Progress" {
 		t.Fatalf("the card snapped to %q, want it to stay in In Progress", col)
+	}
+}
+
+// A drag on a repo whose project's State field a state machine runs (set up after the
+// mapping was saved) is a 409 with the state-machine reason; the YouTrack fake sees no write
+// and the cache is unchanged so the card snaps back.
+func TestLinkedBoardDragOnAStateMachineProjectIs409LiveDB(t *testing.T) {
+	f := newStateMappingFixture(t)
+	f.boardMapping(t)
+	f.srv.SetStateMachine(youtracktest.ProjectID, true)
+	f.srv.ResetRequests()
+
+	code, body := f.move("In Progress")
+	if code != http.StatusConflict || !strings.Contains(body, issuetrackersvc.StateMachineRefusal(youtracktest.ProjectShortName)) {
+		t.Fatalf("move = %d %s, want 409 with the state-machine reason", code, body)
+	}
+	f.assertNoYouTrackWrites(t)
+	f.assertCache(t, "opened", "")
+	if col, _ := f.boardCard(t); col == "In Progress" {
+		t.Fatalf("the card moved to %q, want it to snap back", col)
 	}
 }
 

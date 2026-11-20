@@ -17,6 +17,10 @@
 //                                        with keyed cards and a keyed run
 //   ?mock=issue-tracker-unmapped       → the same repo with one column left unmapped
 //   ?mock=issue-tracker-link-refused   → a valid link is refused (mockLinkRefusal)
+//   ?mock=issue-tracker-state-machine  → a link is refused because project ATL's State field
+//                                        is run by a state machine; the linked repo's states
+//                                        read is refused with the same text
+//                                        (mockStateMachineRefusal)
 //   ?mock=issue-tracker-allowlist-empty → no allowed base URL and no connection
 
 import type {
@@ -35,17 +39,19 @@ import {
   mockLinkedMapping,
   mockLinkedRepo,
   mockLinkRefusal,
+  mockStateMachineProject,
+  mockStateMachineRefusal,
   mockUnmappedMapping,
 } from "../data";
 import { state } from "../store";
-import { repos } from "./forge";
+import { awaitingFirstEnable, repos, setIssueTrackerLinkOffered } from "./forge";
 import { delay, mockScenario, requireSession } from "./shared";
 
 const scenario = issueTrackerScenario(mockScenario());
 
 // The saved State mapping of each linked repo, keyed by repo id; absent until saved.
 const stateMappings = new Map<string, IssueTrackerStateMapping>();
-if (scenario === "issue-tracker-linked") stateMappings.set(mockLinkedRepo.id, cloneMapping(mockLinkedMapping));
+if (scenario === "issue-tracker-linked" || scenario === "issue-tracker-state-machine") stateMappings.set(mockLinkedRepo.id, cloneMapping(mockLinkedMapping));
 if (scenario === "issue-tracker-unmapped") stateMappings.set(mockLinkedRepo.id, cloneMapping(mockUnmappedMapping));
 
 const config = {
@@ -115,6 +121,8 @@ let connections: IssueTrackerConnection[] =
   scenario === "issue-tracker-none" || scenario === "issue-tracker-allowlist-empty"
     ? []
     : [{ ...mockIssueTrackerConnection }];
+
+setIssueTrackerLinkOffered(() => config.allowed_base_urls.length > 0 || connections.length > 0);
 
 function findConnection(id: string): IssueTrackerConnection {
   const c = connections.find((x) => x.id === id);
@@ -186,7 +194,9 @@ export const issueTrackersApi = {
     if (r.issue_tracker_link) {
       throw new ApiError(409, "this repo is already linked to an issue tracker project; a link cannot be changed");
     }
-    if (!r.issue_tracker_linkable) {
+    // The server refuses by its own rule (never enabled), not by the listing flag, which
+    // also folds in whether the link control is offered.
+    if (!awaitingFirstEnable.has(r.id)) {
       throw new ApiError(
         409,
         "only a repo that has never been enabled can be linked to an issue tracker; this one was enabled before",
@@ -212,6 +222,10 @@ export const issueTrackersApi = {
     // The server's last check, under the repo lock: a repo whose stored rows already
     // carry forge issue numbers cannot take issue tracker ones.
     if (scenario === "issue-tracker-link-refused") throw new ApiError(409, mockLinkRefusal);
+    // Only ATL's State field is run by a state machine; another project links as usual.
+    if (scenario === "issue-tracker-state-machine" && project.short_name === mockStateMachineProject) {
+      throw new ApiError(409, mockStateMachineRefusal);
+    }
     const link = {
       connection_id: body.connection_id,
       project_id: project.id,
@@ -221,13 +235,13 @@ export const issueTrackersApi = {
       linked_at: new Date().toISOString(),
     };
     r.issue_tracker_link = link;
-    r.issue_tracker_linkable = false;
     // No board yet: the repo still awaits its first enable, which opens it (forge.ts).
     return delay({ link: { repo_id: r.id, ...link } }, 500);
   },
   getIssueTrackerStates: async (repoId: string) => {
     requireSession();
     const r = linkedRepo(repoId);
+    if (scenario === "issue-tracker-state-machine") throw new ApiError(409, mockStateMachineRefusal);
     const saved = stateMappings.get(r.id);
     return delay(
       {

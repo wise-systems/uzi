@@ -742,7 +742,7 @@ scenarios are mutually exclusive by construction. Known values:
   `uzi_demo_mode` toggle to mask the source URL and ref in screenshots (#4367).
 - `issue-tracker-none`, `issue-tracker-unlinked`, `issue-tracker-linked`,
   `issue-tracker-unmapped`, `issue-tracker-link-refused`,
-  `issue-tracker-allowlist-empty` — the issue tracker screens (PRD #4173 M6)
+  `issue-tracker-state-machine`, `issue-tracker-allowlist-empty` — the issue tracker screens (PRD #4173 M6)
   without a YouTrack. The fixtures hold no token; the connection is
   `https://youtrack.example.com` acting as `uzi-bot`.
   `issue-tracker-unlinked` (also the default) has that connection and the
@@ -751,7 +751,8 @@ scenarios are mutually exclusive by construction. Known values:
   the server refuses it. After a link, the first enable opens a board with
   three columns; without a link it opens a plain forge board.
   `issue-tracker-none` has no connection: `/settings/issue-trackers` shows an
-  empty list and the link dialog on `/repos` says to connect one first.
+  empty list and the link dialog on `/repos` says to connect one first. Its
+  allowlist is set, so `vtmocanu/atlas-web` still offers the link control.
   `issue-tracker-linked` adds the enabled repo `vtmocanu/atlas-mobile`, linked
   to project ATL with the tag `uzi` and fully mapped (Map States on its
   `/repos` row). Its board, `/repos/repo-atlas-mobile/board`, shows keyed
@@ -761,9 +762,18 @@ scenarios are mutually exclusive by construction. Known values:
   `issue-tracker-unmapped` is the same repo with the Human Review column
   unmapped. `issue-tracker-link-refused` refuses every
   valid link with the server's "already stores issue numbers" text, so the
-  dialog's refusal shows. `issue-tracker-allowlist-empty` has no allowed base
-  URL and no connection, so `/settings/issue-trackers` shows the operator
-  message. (PRD #4173 M8.)
+  dialog's refusal shows. `issue-tracker-state-machine` has the linked repo
+  of `issue-tracker-linked`, but project ATL's State field is run by a state
+  machine: a link to ATL is refused with 409 and the server's "uses a
+  state-machine workflow on its State field" text (another project links as
+  usual), and the linked repo's Map States panel shows the same text as its
+  load error. Card moves and a States save are not refused in this scenario,
+  though the server refuses them too. `issue-tracker-allowlist-empty` has no
+  allowed base URL and no connection, so `/settings/issue-trackers` shows the operator
+  message and no `/repos` row offers the link control. The mock derives that
+  control from the server's rule (never enabled, not linked, and a non-empty
+  allowlist or at least one issue tracker connection). The connections half of
+  the rule mirrors the server and is not observable in mock mode. (PRD #4173 M8.)
 
 ### What keeps the mock build current
 

@@ -2,6 +2,7 @@ package issuetrackersvc
 
 import (
 	"context"
+	"errors"
 
 	"github.com/google/uuid"
 
@@ -73,22 +74,6 @@ func (s *Service) ListProjects(ctx context.Context, userID, connID uuid.UUID) ([
 	return projects, nil
 }
 
-// ListStates lists the issue states of one project of the connection.
-func (s *Service) ListStates(ctx context.Context, userID, connID uuid.UUID, projectID string) ([]issuetracker.State, error) {
-	if !issuetracker.ValidProjectID(projectID) {
-		return nil, &Error{Kind: KindBadRequest, Message: "invalid project id"}
-	}
-	d, err := s.DriverFor(ctx, userID, connID, issuetracker.Binding{}, issuetracker.StateMapping{})
-	if err != nil {
-		return nil, err
-	}
-	states, err := d.ListStates(ctx, projectID)
-	if err != nil {
-		return nil, &Error{Kind: KindBadGateway, Message: "could not list states: " + err.Error()}
-	}
-	return states, nil
-}
-
 // ListTags lists the tags the connection's token can see, with their owners and
 // sharing settings.
 func (s *Service) ListTags(ctx context.Context, userID, connID uuid.UUID) ([]issuetracker.Tag, error) {
@@ -101,4 +86,25 @@ func (s *Service) ListTags(ctx context.Context, userID, connID uuid.UUID) ([]iss
 		return nil, &Error{Kind: KindBadGateway, Message: "could not list tags: " + err.Error()}
 	}
 	return tags, nil
+}
+
+// StateMachineRefusal is the reason a project whose State field is run by a state machine
+// is refused: at link, on the state mapping, and on a board move of a linked repo.
+func StateMachineRefusal(short string) string {
+	return "project " + short + " uses a state-machine workflow on its State field; uzi needs a plain State field. " +
+		"Link a project with a plain State field, or remove the state-machine rule from the State field in YouTrack."
+}
+
+// checkStateField runs the driver's State field check: a state machine is a Conflict
+// with StateMachineRefusal, any other failure a BadGateway naming the project.
+func checkStateField(ctx context.Context, d issuetracker.Driver, project issuetracker.ProjectRef) error {
+	err := d.CheckStateField(ctx, project)
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, issuetracker.ErrStateMachineField):
+		return &Error{Kind: KindConflict, Message: StateMachineRefusal(project.ShortName)}
+	default:
+		return &Error{Kind: KindBadGateway, Message: "could not check project " + project.ShortName + "'s State field: " + err.Error()}
+	}
 }

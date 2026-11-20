@@ -260,6 +260,16 @@ describe("IssueTrackerStatesPanel", () => {
     expect((await screen.findByRole("alert")).textContent).toBe("this repo is not linked to an issue tracker project");
   });
 
+  it("shows the state-machine refusal as its load error", async () => {
+    const reason =
+      "project ATL uses a state-machine workflow on its State field; uzi needs a plain State field. Link a project with a plain State field, or remove the state-machine rule from the State field in YouTrack.";
+    mockApi.getIssueTrackerStates.mockRejectedValue(new ApiError(409, reason));
+    renderPanel();
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toBe(reason);
+    expect(screen.queryByRole("button", { name: "Save" })).toBeNull();
+  });
+
   it("disables Save until the open and the closed State are chosen", async () => {
     renderPanel();
     await screen.findByLabelText("Ready");
