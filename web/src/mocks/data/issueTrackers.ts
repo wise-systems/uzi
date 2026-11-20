@@ -142,7 +142,7 @@ export const mockLinkRefusal = "this repo already stores issue numbers and canno
 // The refusal issue-tracker-state-machine answers a link with, and the linked repo's
 // states read: the server's StateMachineRefusal for project ATL, whose State field a
 // state machine runs.
-const mockStateMachineProject = "ATL";
+export const mockStateMachineProject = "ATL";
 export const mockStateMachineRefusal = `project ${mockStateMachineProject} uses a state-machine workflow on its State field; uzi needs a plain State field. Link a project with a plain State field, or remove the state-machine rule from the State field in YouTrack.`;
 
 // The enabled repo linked to project ATL with tag uzi (issue-tracker-linked,

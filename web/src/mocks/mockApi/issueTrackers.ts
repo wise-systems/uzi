@@ -39,6 +39,7 @@ import {
   mockLinkedMapping,
   mockLinkedRepo,
   mockLinkRefusal,
+  mockStateMachineProject,
   mockStateMachineRefusal,
   mockUnmappedMapping,
 } from "../data";
@@ -221,7 +222,10 @@ export const issueTrackersApi = {
     // The server's last check, under the repo lock: a repo whose stored rows already
     // carry forge issue numbers cannot take issue tracker ones.
     if (scenario === "issue-tracker-link-refused") throw new ApiError(409, mockLinkRefusal);
-    if (scenario === "issue-tracker-state-machine") throw new ApiError(409, mockStateMachineRefusal);
+    // Only ATL's State field is run by a state machine; another project links as usual.
+    if (scenario === "issue-tracker-state-machine" && project.short_name === mockStateMachineProject) {
+      throw new ApiError(409, mockStateMachineRefusal);
+    }
     const link = {
       connection_id: body.connection_id,
       project_id: project.id,

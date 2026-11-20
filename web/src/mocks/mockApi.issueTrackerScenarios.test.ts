@@ -150,6 +150,9 @@ describe("issue tracker demo scenarios", () => {
     expect(repos.find((r) => r.id === LINKED)?.issue_tracker_link?.project_short_name).toBe("ATL");
     const states = await refusal(api.getIssueTrackerStates(LINKED));
     expect([states.status, states.message]).toEqual([409, reason]);
+    // Only ATL's State field is a state machine: a link to OPS goes through.
+    const { link } = await api.linkRepoToIssueTracker(LINKABLE, { ...goodLink, project_id: "0-7" });
+    expect(link.project_short_name).toBe("OPS");
   });
 
   it("issue-tracker-allowlist-empty: no allowed base URL, no connection, and connecting is refused", async () => {

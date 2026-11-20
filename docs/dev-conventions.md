@@ -764,10 +764,12 @@ scenarios are mutually exclusive by construction. Known values:
   valid link with the server's "already stores issue numbers" text, so the
   dialog's refusal shows. `issue-tracker-state-machine` has the linked repo
   of `issue-tracker-linked`, but project ATL's State field is run by a state
-  machine: a link is refused with 409 and the server's "uses a state-machine
-  workflow on its State field" text, and the linked repo's Map States panel
-  shows the same text as its load error. `issue-tracker-allowlist-empty` has no allowed base
-  URL and no connection, so `/settings/issue-trackers` shows the operator
+  machine: a link to ATL is refused with 409 and the server's "uses a
+  state-machine workflow on its State field" text (another project links as
+  usual), and the linked repo's Map States panel shows the same text as its
+  load error. Card moves and a States save are not refused in this scenario,
+  though the server refuses them too. `issue-tracker-allowlist-empty` has no
+  allowed base URL and no connection, so `/settings/issue-trackers` shows the operator
   message and no `/repos` row offers the link control. The mock derives that
   control from the server's rule (never enabled, not linked, and a non-empty
   allowlist or at least one issue tracker connection). The connections half of
