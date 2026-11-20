@@ -74,22 +74,6 @@ func (s *Service) ListProjects(ctx context.Context, userID, connID uuid.UUID) ([
 	return projects, nil
 }
 
-// ListStates lists the issue states of one project of the connection.
-func (s *Service) ListStates(ctx context.Context, userID, connID uuid.UUID, projectID string) ([]issuetracker.State, error) {
-	if !issuetracker.ValidProjectID(projectID) {
-		return nil, &Error{Kind: KindBadRequest, Message: "invalid project id"}
-	}
-	d, err := s.DriverFor(ctx, userID, connID, issuetracker.Binding{}, issuetracker.StateMapping{})
-	if err != nil {
-		return nil, err
-	}
-	states, err := d.ListStates(ctx, projectID)
-	if err != nil {
-		return nil, &Error{Kind: KindBadGateway, Message: "could not list states: " + err.Error()}
-	}
-	return states, nil
-}
-
 // ListTags lists the tags the connection's token can see, with their owners and
 // sharing settings.
 func (s *Service) ListTags(ctx context.Context, userID, connID uuid.UUID) ([]issuetracker.Tag, error) {

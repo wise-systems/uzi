@@ -90,7 +90,12 @@ func (s *Service) listCheckedStates(ctx context.Context, userID uuid.UUID, src s
 	if err := checkStateField(ctx, d, issuetracker.ProjectRef{ID: src.IssueTrackerProjectID.String, ShortName: src.IssueTrackerProjectShort.String}); err != nil {
 		return nil, err
 	}
-	projectID := src.IssueTrackerProjectID.String
+	return listStates(ctx, d, src.IssueTrackerProjectID.String)
+}
+
+// listStates lists the issue states of one project through d. The project id is checked
+// first, since it goes into a driver request; a driver failure is a bad gateway.
+func listStates(ctx context.Context, d issuetracker.Driver, projectID string) ([]issuetracker.State, error) {
 	if !issuetracker.ValidProjectID(projectID) {
 		return nil, &Error{Kind: KindBadRequest, Message: "invalid project id"}
 	}

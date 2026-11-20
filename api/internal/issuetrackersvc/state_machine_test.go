@@ -110,7 +110,9 @@ func TestCheckStateFieldMapsDriverErrors(t *testing.T) {
 	if e := wantKind(t, checkStateField(context.Background(), d, ref), KindConflict); e.Message != StateMachineRefusal("ABC") {
 		t.Errorf("message = %q", e.Message)
 	}
-	wantKind(t, checkStateField(context.Background(), &fakeDriver{stateFieldErr: errors.New("x")}, ref), KindBadGateway)
+	if e := wantKind(t, checkStateField(context.Background(), &fakeDriver{stateFieldErr: errors.New("x")}, ref), KindBadGateway); !strings.HasPrefix(e.Message, "could not check project ABC's State field: ") {
+		t.Errorf("message = %q", e.Message)
+	}
 	if err := checkStateField(context.Background(), &fakeDriver{}, ref); err != nil {
 		t.Errorf("plain State field: %v", err)
 	}
