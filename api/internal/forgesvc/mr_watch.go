@@ -279,9 +279,11 @@ func (s *Service) guardedMRMove(ctx context.Context, repoID uuid.UUID, forgeProj
 		if ColumnMoveRefused(err) {
 			// The linked issue tracker refused the move before any write: the target
 			// column has no State mapped, the mapping is unset, the State is not
-			// allowed, or the issue's State field is run by a state machine. Unlike the run lifecycle, the MR watch does not replay it: the
-			// MR state is recorded and the card stays where it is (a manual drag
-			// fixes it). Accepted exception, PRD #4173 M5.
+			// allowed, or the issue's State field is run by a state machine. Unlike
+			// the run lifecycle, the MR watch does not replay it: the MR state is
+			// recorded and the card stays where it is. A manual drag fixes a mapping
+			// refusal; a state-machine refusal heals only when the YouTrack workflow
+			// changes (a drag is refused too). Accepted exception, PRD #4173 M5.
 			slog.Info("forgesvc: MR-state move refused by the issue tracker, edge consumed without a move", "repo", repoID, "issue", issueIID, "target", target, "reason", err)
 			return moveSkipped
 		}

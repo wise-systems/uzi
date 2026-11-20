@@ -53,8 +53,20 @@ func TestCheckStateField(t *testing.T) {
 		y, srv := newFakeDriver(t)
 		srv.SeedIssue("a", "")
 		srv.SetExtraStateMachineField(youtracktest.ProjectID, "Workflow")
+		srv.ResetRequests()
 		if err := y.CheckStateField(context.Background(), mainRef); err != nil {
 			t.Fatalf("CheckStateField = %v, want nil", err)
+		}
+		rs := srv.Requests()
+		if len(rs) != 1 {
+			t.Fatalf("requests = %v, want one", rs)
+		}
+		q, err := url.ParseQuery(rs[0].RawQuery)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := q["customFields"]; len(got) != 1 || got[0] != "State" {
+			t.Errorf("customFields = %v, want [State]", got)
 		}
 	})
 	t.Run("a malformed ref sends no request", func(t *testing.T) {

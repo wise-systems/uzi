@@ -90,7 +90,15 @@ func (s *Service) listCheckedStates(ctx context.Context, userID uuid.UUID, src s
 	if err := checkStateField(ctx, d, issuetracker.ProjectRef{ID: src.IssueTrackerProjectID.String, ShortName: src.IssueTrackerProjectShort.String}); err != nil {
 		return nil, err
 	}
-	return s.ListStates(ctx, userID, connID, src.IssueTrackerProjectID.String)
+	projectID := src.IssueTrackerProjectID.String
+	if !issuetracker.ValidProjectID(projectID) {
+		return nil, &Error{Kind: KindBadRequest, Message: "invalid project id"}
+	}
+	states, err := d.ListStates(ctx, projectID)
+	if err != nil {
+		return nil, &Error{Kind: KindBadGateway, Message: "could not list states: " + err.Error()}
+	}
+	return states, nil
 }
 
 // GetStateMapping returns the saved state mapping of a linked repo and the States of its

@@ -53,8 +53,8 @@ func LinkedIssueGone(err error) bool {
 // card move or State write before any write: the column has no State mapped, the
 // mapping is unset, the target State is not allowed (PRD #4173 M5), or the issue's
 // State field is run by a state machine (issuetracker.ErrStateMachineField). The
-// last one is found after the driver's issue read, so it costs one GET per attempt
-// and never a write; it heals only when the YouTrack workflow changes, not by
+// last one is found after the driver's issue read, so it costs the State bundle read
+// and one issue GET per attempt and never a write; it heals only when the YouTrack workflow changes, not by
 // anything the owner saves in uzi. It is deliberately not part of
 // IssueWriteSkippable: a refused move may succeed later, so a caller keeps its
 // retry marker for it.
