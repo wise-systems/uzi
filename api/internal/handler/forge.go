@@ -214,11 +214,58 @@ func repoToDTO(r store.Repo) apitypes.RepoDTO {
 			link.LinkedAt = r.IssueTrackerLinkedAt.Time
 		}
 		dto.IssueTrackerLink = link
-	} else {
-		// PRD #4173 M6: advisory only; the link service still decides.
-		dto.IssueTrackerLinkable = r.AwaitingFirstEnable
 	}
+	// IssueTrackerLinkable is not set here: whether a link can succeed depends on the
+	// operator's allowlist and the user's connections, which the user-facing handlers
+	// resolve once per request through linkableFor.
 	return dto
+}
+
+// linkableFor reports whether the link control should be offered for a repo: it is
+// never-enabled, not already linked, and a link could succeed (offered, from
+// issueTrackerLinkOffered). Advisory only; the link service still decides (PRD #4173 M6
+// follow-up, issue #27).
+func linkableFor(r store.Repo, offered bool) bool {
+	return r.AwaitingFirstEnable && !r.IssueTrackerConnectionID.Valid && offered
+}
+
+// issueTrackerLinkOffered reports whether linking is possible at all for this user: the
+// operator configured an issue tracker base URL allowlist, or the user already holds a
+// connection. A store error logs and reads as not offered, so the control stays hidden
+// rather than promising a link that may be refused (PRD #4173 M6 follow-up, issue #27).
+func (h *Handler) issueTrackerLinkOffered(ctx context.Context, userID uuid.UUID) bool {
+	if len(h.cfg.IssueTrackerAllowedBaseURLs) > 0 {
+		return true
+	}
+	conns, err := h.q.ListIssueTrackerConnectionsByUser(ctx, userID)
+	if err != nil {
+		slog.Warn("issue tracker link offer: list connections", "error", err)
+		return false
+	}
+	return len(conns) > 0
+}
+
+// repoDTOForUser is repoToDTO plus the user-facing issue_tracker_linkable flag, for the
+// handlers that answer with one repo.
+func (h *Handler) repoDTOForUser(ctx context.Context, userID uuid.UUID, r store.Repo) apitypes.RepoDTO {
+	dtos := []apitypes.RepoDTO{repoToDTO(r)}
+	h.setLinkable(ctx, userID, []store.Repo{r}, dtos)
+	return dtos[0]
+}
+
+// setLinkable fills IssueTrackerLinkable on the DTOs of repos, asking
+// issueTrackerLinkOffered at most once and only if some repo could be linkable.
+func (h *Handler) setLinkable(ctx context.Context, userID uuid.UUID, repos []store.Repo, dtos []apitypes.RepoDTO) {
+	offered, asked := false, false
+	for i, rp := range repos {
+		if !rp.AwaitingFirstEnable || rp.IssueTrackerConnectionID.Valid {
+			continue
+		}
+		if !asked {
+			offered, asked = h.issueTrackerLinkOffered(ctx, userID), true
+		}
+		dtos[i].IssueTrackerLinkable = linkableFor(rp, offered)
+	}
 }
 
 // ── Config ──────────────────────────────────────────────────────────────────
@@ -644,6 +691,7 @@ func (h *Handler) ListProjects(w http.ResponseWriter, r *http.Request) {
 		}
 		out = append(out, d)
 	}
+	h.setLinkable(r.Context(), user.ID, repos, out)
 	httpx.JSON(w, http.StatusOK, map[string]any{"repos": out})
 }
 
@@ -764,6 +812,7 @@ func (h *Handler) ListRepos(w http.ResponseWriter, r *http.Request) {
 		}
 		out = append(out, d)
 	}
+	h.setLinkable(r.Context(), user.ID, repos, out)
 	httpx.JSON(w, http.StatusOK, map[string]any{"repos": out})
 }
 
@@ -868,7 +917,7 @@ func (h *Handler) SetRepoEnabled(w http.ResponseWriter, r *http.Request) {
 		h.requestInitialImport(id)
 	}
 
-	httpx.JSON(w, http.StatusOK, map[string]any{"repo": repoToDTO(repo)})
+	httpx.JSON(w, http.StatusOK, map[string]any{"repo": h.repoDTOForUser(r.Context(), user.ID, repo)})
 }
 
 // DeleteRepo removes a single repo row (PRD #357), cascading its derived data
@@ -1525,7 +1574,7 @@ func (h *Handler) PatchRepo(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	response := map[string]any{"repo": repoToDTO(repo)}
+	response := map[string]any{"repo": h.repoDTOForUser(r.Context(), user.ID, repo)}
 	var overlap []string
 	for _, cap := range repo.RequiredCapabilities {
 		if slices.Contains(repo.IgnoredInferredCapabilities, cap) {

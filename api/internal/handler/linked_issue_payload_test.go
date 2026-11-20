@@ -47,9 +47,9 @@ func TestRepoToDTOIssueTrackerLink(t *testing.T) {
 			t.Error("a linked repo must not be linkable")
 		}
 	})
-	t.Run("a never-enabled unlinked repo is linkable", func(t *testing.T) {
+	t.Run("repoToDTO leaves the linkable flag to the handlers", func(t *testing.T) {
 		dto := repoToDTO(store.Repo{AwaitingFirstEnable: true})
-		if dto.IssueTrackerLink != nil || !dto.IssueTrackerLinkable {
+		if dto.IssueTrackerLink != nil || dto.IssueTrackerLinkable {
 			t.Fatalf("link = %+v linkable = %v", dto.IssueTrackerLink, dto.IssueTrackerLinkable)
 		}
 	})
