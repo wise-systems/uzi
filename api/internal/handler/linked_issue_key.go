@@ -1,8 +1,7 @@
 package handler
 
 import (
-	"strconv"
-
+	"github.com/vtmocanu/uzi/api/internal/issuetracker"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -15,7 +14,7 @@ func linkedIssueKey(repo store.GetRepoForUserRow, iid int64) string {
 	if !repo.IssueTrackerConnectionID.Valid || !repo.IssueTrackerProjectShort.Valid || repo.IssueTrackerProjectShort.String == "" {
 		return ""
 	}
-	return repo.IssueTrackerProjectShort.String + "-" + strconv.FormatInt(iid, 10)
+	return issuetracker.IssueKey(repo.IssueTrackerProjectShort.String, iid)
 }
 
 // stampLinkedIssueKeys sets each card's issue key to the derived one on a linked repo and

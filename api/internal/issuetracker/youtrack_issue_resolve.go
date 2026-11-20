@@ -4,7 +4,6 @@ import (
 	"context"
 	"net/http"
 	"net/url"
-	"strconv"
 
 	"github.com/vtmocanu/uzi/api/internal/forge"
 )
@@ -34,7 +33,7 @@ func (y *youTrack) resolveIssueFields(ctx context.Context, projectID, issueIID i
 	if issueIID <= 0 {
 		return ytIssue{}, &forge.IssueNotFoundError{Err: y.fail("youtrack: issue number %d is out of range", issueIID)}
 	}
-	readable := p.ShortName + "-" + strconv.FormatInt(issueIID, 10)
+	readable := IssueKey(p.ShortName, issueIID)
 	var w ytIssue
 	status, _, err := y.do(ctx, ytCall{
 		method: http.MethodGet,

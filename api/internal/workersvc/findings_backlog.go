@@ -2,12 +2,12 @@ package workersvc
 
 import (
 	"context"
-	"strconv"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/issuetracker"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -215,7 +215,7 @@ func mapIncidentalFindingRow(r store.ListFindingsBacklogRow) apitypes.Incidental
 		dto.FiledIssueIID = &iid
 		if r.IssueTrackerProjectShort != "" {
 			// PRD #4173 M6: the issue tracker key of the filed issue on a linked repo.
-			dto.FiledIssueKey = r.IssueTrackerProjectShort + "-" + strconv.FormatInt(iid, 10)
+			dto.FiledIssueKey = issuetracker.IssueKey(r.IssueTrackerProjectShort, iid)
 		}
 	}
 	if r.ResolvedAt.Valid {

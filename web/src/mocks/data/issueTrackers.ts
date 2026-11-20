@@ -9,6 +9,7 @@ import type {
   IssueTrackerTag,
   Repo,
 } from "../../lib/api";
+import { issueKey } from "../../lib/issueTrackerText";
 import { daysAgo, minsAgo } from "./time";
 
 // ── Issue trackers (PRD #4173 M6) ─────────────────────────────────────────────
@@ -203,11 +204,11 @@ function linkedCards(repo: Repo, mapping: IssueTrackerStateMapping): Card[] {
     const closed = i.ytState === mapping.closed_state;
     return {
       iid: i.n,
-      issue_key: `${short}-${i.n}`,
+      issue_key: issueKey(short, i.n),
       title: i.title,
       state: closed ? "closed" : "opened",
       labels: [...i.tags],
-      web_url: `${mockIssueTrackerConnection.base_url}/issue/${short}-${i.n}`,
+      web_url: `${mockIssueTrackerConnection.base_url}/issue/${issueKey(short, i.n)}`,
       author: "mira",
       forge_type: "gitlab",
       has_prd_link: false,

@@ -9,6 +9,7 @@ import { seedUnifiedProgress } from "./data/unifiedProgress";
 import { mockGatedCheckedMessages } from "./data/planCrossCheckGated";
 import { overviewNextOtherRunOwners, overviewNextOwnAskingMessages, overviewNextRuns } from "./data/overviewNext";
 import { deriveMockProgress, foreignCooldownRun } from "./runProgress";
+import { issueKey } from "../lib/issueTrackerText";
 import { mockScenario } from "./mockScenario";
 import {
   mockAdmin,
@@ -275,7 +276,7 @@ function seed(): MockState {
     const done = runs.get("run-done");
     if (done) {
       const { completion_pending: _pending, semantic_drift: _drift, ...base } = done;
-      const key = `${mockLinkedRepo.issue_tracker_link?.project_short_name}-${mockLinkedRunIssue.n}`;
+      const key = issueKey(mockLinkedRepo.issue_tracker_link?.project_short_name ?? "", mockLinkedRunIssue.n);
       const seeded = {
         ...base,
         id: mockLinkedRunId,
