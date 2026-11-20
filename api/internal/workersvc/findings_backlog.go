@@ -2,6 +2,7 @@ package workersvc
 
 import (
 	"context"
+	"strconv"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -212,6 +213,10 @@ func mapIncidentalFindingRow(r store.ListFindingsBacklogRow) apitypes.Incidental
 	if r.FiledIssueIid.Valid {
 		iid := r.FiledIssueIid.Int64
 		dto.FiledIssueIID = &iid
+		if r.IssueTrackerProjectShort != "" {
+			// PRD #4173 M6: the issue tracker key of the filed issue on a linked repo.
+			dto.FiledIssueKey = r.IssueTrackerProjectShort + "-" + strconv.FormatInt(iid, 10)
+		}
 	}
 	if r.ResolvedAt.Valid {
 		ts := r.ResolvedAt.Time

@@ -36,6 +36,7 @@ import type {
   RunSummaryItem,
   RunJob,
   Repo,
+  RepoIssueTrackerLink,
   AdminDockerAllowlistRepo,
   AdminDockerAllowlistRepos,
   RunMessage,
@@ -512,6 +513,11 @@ void _releaseCheckStatusFull;
   void _repoExtra;
   void _repoZero;
   void _repoFull;
+  // The link block's own key set (PRD #4173 M6), read off the populated fixture.
+  const _linkMissing: never = null as unknown as Exclude<keyof RepoIssueTrackerLink, keyof typeof repoFull.issue_tracker_link>;
+  const _linkExtra: never = null as unknown as Exclude<keyof typeof repoFull.issue_tracker_link, keyof RepoIssueTrackerLink>;
+  void _linkMissing;
+  void _linkExtra;
 }
 
 // ── Admin Docker allowlist picker ───────────────────────────────────────────
@@ -2283,10 +2289,23 @@ describe("harness overflow shared DTO contract", () => {
 it("created issues are optional detail metadata and excluded from summaries", () => {
   expect(runZero).not.toHaveProperty("created_issues");
   expect(runListItemZero).not.toHaveProperty("created_issues");
-  expect(runFull.created_issues).toEqual([{ iid: 1, title: "x", web_url: "x" }]);
+  expect(runFull.created_issues).toEqual([{ iid: 1, issue_key: "x", title: "x", web_url: "x" }]);
   expect(runSummaryItemFull).not.toHaveProperty("created_issues");
   const coordinate: NonNullable<Run["created_issues"]>[number] = { iid: 42, title: "Created issue", web_url: "" };
   expect(coordinate.web_url).toBe("");
   const excluded: never = null as unknown as Extract<keyof RunSummaryItem, "created_issues">;
   void excluded;
+});
+
+it("issue keys are optional on every payload that names an issue and ride the run summary", () => {
+  // PRD #4173 M6: omitted on an unlinked repo (the zero fixtures), present on a linked one.
+  for (const zero of [runZero, runListItemZero, runSummaryItemZero, scheduleZero, findingZero]) {
+    expect(zero).not.toHaveProperty("issue_key");
+    expect(zero).not.toHaveProperty("filed_issue_key");
+  }
+  expect(runFull.issue_key).toBe("x");
+  expect(runListItemFull.issue_key).toBe("x");
+  expect(runSummaryItemFull.issue_key).toBe("x");
+  expect(scheduleFull.issue_key).toBe("x");
+  expect(findingFull.filed_issue_key).toBe("x");
 });

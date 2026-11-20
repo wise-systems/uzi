@@ -85,7 +85,7 @@ func newRepoCmd(env Env, gf *globalFlags) *cobra.Command {
 	}
 	remove.Flags().BoolP("force", "f", false, "skip the confirmation prompt")
 
-	cmd.AddCommand(list, remove)
+	cmd.AddCommand(list, remove, newRepoIssueTrackerStatesCmd(env, gf))
 	return cmd
 }
 

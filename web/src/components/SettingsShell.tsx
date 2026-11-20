@@ -1,8 +1,8 @@
 // SettingsShell: one header + tab bar shared by the user-scoped settings
-// surfaces (Account & tokens, Run defaults, Forge, Access, Memory). Kills the old
-// discoverability problem where the /settings/* pages were URL siblings wired
-// together only by hand-placed corner links — the drift a unified layout
-// header exists to prevent.
+// surfaces (Account & tokens, Appearance, Run defaults, Forge, Issue trackers,
+// Access, Memory). Kills the old discoverability problem where the /settings/*
+// pages were URL siblings wired together only by hand-placed corner links — the
+// drift a unified layout header exists to prevent.
 //
 // Workers is deliberately NOT a tab any more: it is fleet operations (live
 // status, upgrade rolls, an attention badge), not a preference, and its dual
@@ -18,6 +18,7 @@ export const TABS = [
   { to: "/settings/appearance", label: "Appearance", end: false },
   { to: "/settings/run-defaults", label: "Run defaults", end: false },
   { to: "/settings/forge", label: "Forge", end: false },
+  { to: "/settings/issue-trackers", label: "Issue trackers", end: false },
   { to: "/settings/access", label: "Access", end: false },
   { to: "/settings/memory", label: "Memory", end: false },
 ];
@@ -31,8 +32,8 @@ export function SettingsShell({ description, children }: { description: string; 
       <PageHeader title="Settings" description="Your personal uzi configuration." />
       {/* Issue #204: the tab row scrolls WITHIN its own container so the page body never
           scrolls horizontally. Measured when this row held five tabs: at 390px the strip
-          overflowed (scrollWidth 401 vs clientWidth 390). The row now holds six tabs
-          (Appearance was added), so `overflow-x-auto` earns its keep — it lets the strip
+          overflowed (scrollWidth 401 vs clientWidth 390). The row now holds seven tabs
+          (Appearance, then Issue trackers, were added), so `overflow-x-auto` earns its keep — it lets the strip
           scroll rather than forcing the page body sideways. The tabs are
           `shrink-0`/`whitespace-nowrap` so they overflow-and-scroll rather than compress
           to fit (which would defeat overflow-x). */}

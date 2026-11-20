@@ -29,6 +29,7 @@ import { ToolAllowlist } from "./pages/ToolAllowlist";
 import { AdminBlockedRepos } from "./pages/AdminBlockedRepos";
 import { AdminEgressProfiles } from "./pages/AdminEgressProfiles";
 import { ForgeSettings } from "./pages/ForgeSettings";
+import { IssueTrackerSettings } from "./pages/IssueTrackerSettings";
 import { Repos } from "./pages/Repos";
 import { Board } from "./pages/Board";
 import { IssueView } from "./pages/IssueView";
@@ -116,6 +117,8 @@ export const APP_ROUTES: AppRoute[] = [
   // Run-behavior defaults, split out of the overloaded Account tab.
   { path: "/settings/run-defaults", element: <RunDefaults />, guard: "protected" },
   { path: "/settings/forge", element: <ForgeSettings />, guard: "protected" },
+  // External issue tracker connections (PRD #4173 M6).
+  { path: "/settings/issue-trackers", element: <IssueTrackerSettings />, guard: "protected" },
   { path: "/workers", element: <WorkersSettings />, guard: "protected" },
   { path: "/settings/access", element: <AccessSettings />, guard: "protected" },
   { path: "/settings/memory", element: <MemorySettings />, guard: "protected" },

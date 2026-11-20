@@ -279,6 +279,8 @@ uzi docs show <slug>
 uzi docs search <query> [--audience user|operator|design|contributor|all]
 uzi repo list
 uzi repo remove <id> [--force]
+uzi repo issue-tracker-states <repo>
+uzi issue-tracker list
 uzi project-sync status <repo>
 uzi project-sync resync <repo>
 uzi pr list [--repo <repo-id>]
@@ -1894,6 +1896,12 @@ into `file`/`dismiss`/`resolve`. `undo` keys on the `disposition_id` field (read
   repo's board and run history, so it prompts `[y/N]` unless you pass
   `--force`/`-f`. A repo the bot can still see reappears (disabled) on the next
   projects refresh; to keep it out, remove the bot's forge access first.
+- `uzi issue-tracker list` — your issue tracker connections (kind, base URL, account,
+  created, last verified). `uzi repo issue-tracker-states <repo>` — a linked repo's
+  State mapping (open, closed, each column's State) and its project's States with
+  whether each can close or open an issue; `<repo>` is a path or a repo id (a repo is
+  linked before its first enable, so it may not be in `uzi repo list`). Both take
+  `--json`. On a linked repo an issue shows as its key (`ABC-12`), not `#number`.
 - `uzi admin users|runs|workers|health|usage|rate-limits|cli-tokens|guardrail-impact` and
   `uzi admin agent-source get|status` —
   **read-only** factory-wide views. These require an admin-scoped (`uza_`) token; a

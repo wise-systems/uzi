@@ -68,7 +68,7 @@ func (h *Handler) SetRunMrReworkEnabled(w http.ResponseWriter, r *http.Request) 
 		httpx.Error(w, http.StatusNotFound, "run not found")
 		return
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock(), h.cfg.RunMaxRequeues)})
+	httpx.JSON(w, http.StatusOK, map[string]any{"run": h.runDTO(r.Context(), run)})
 }
 
 // startRunReworkRequest is the POST /api/runs/{id}/rework body (PRD #1202): optional owner
@@ -270,5 +270,5 @@ func (h *Handler) StartRunRework(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	httpx.JSON(w, http.StatusCreated, h.createdRunBody(r.Context(), runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock(), h.cfg.RunMaxRequeues)))
+	httpx.JSON(w, http.StatusCreated, h.createdRunBody(r.Context(), h.runDTO(r.Context(), run)))
 }

@@ -20,13 +20,19 @@ import {
   mockBlockedRepoMeta,
   mockConnection,
   mockForgeConfig,
+  issueTrackerScenario,
+  mockLinkableRepo,
+  mockForgeBoard,
+  mockLinkedBoard,
+  mockLinkedRepo,
   mockRepoToolProfiles,
+  seedsLinkedRepo,
   mockRepos,
   mockToolAllowlist,
 } from "../data";
 import { isTerminalRun } from "../../lib/runStatus";
 import { state } from "../store";
-import { delay, requireAdmin, requireSession } from "./shared";
+import { delay, mockScenario, requireAdmin, requireSession } from "./shared";
 // settings → workers → secrets has no runtime edge back to forge. Read settings
 // only inside the method, after module initialization, to use the current value.
 import { settingsApi } from "./settings";
@@ -90,6 +96,15 @@ repos = [
     guardrail_blocked: false,
   },
 ];
+// PRD #4173 M6: one never-enabled repo on the default connection, so "Link to an issue
+// tracker" shows on the Repos page (mockApi/issueTrackers.ts serves the link). The
+// issue-tracker-linked and issue-tracker-unmapped scenarios (M8) add an enabled linked repo.
+repos = [...repos, { ...mockLinkableRepo }];
+if (seedsLinkedRepo(issueTrackerScenario(mockScenario()))) repos = [...repos, structuredClone(mockLinkedRepo)];
+// The repos awaiting their first enable (the server's awaiting_first_enable): the board
+// refuses them until then, as GET board's refuseNeverEnabled does, and the first enable
+// opens a linked repo's board.
+export const awaitingFirstEnable = new Set<string>([mockLinkableRepo.id]);
 // Cross-user admin-only fixtures leave the existing owner-list demo intact.
 // UUID IDs can round-trip through the settings validator.
 
@@ -284,6 +299,14 @@ export const forgeApi = {
       });
     }
     r.enabled = enabled;
+    // The first enable ends the window in which a repo can be linked (PRD #4173 D13) and
+    // opens the board: a linked repo's board gets its three columns, an unlinked one a
+    // plain forge board.
+    if (enabled) {
+      r.issue_tracker_linkable = false;
+      awaitingFirstEnable.delete(r.id);
+      if (!state.boards.has(r.id)) state.boards.set(r.id, r.issue_tracker_link ? mockLinkedBoard(r) : mockForgeBoard(r));
+    }
     return delay({ repo: { ...r } });
   },
   // Explicit per-repo remove (PRD #357). Mirrors deleteConnection: drops the repo

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -40,9 +41,12 @@ type RepoGuard interface {
 // callers (web handler, Slack card) render. Kept local so the return type does not
 // leak forge.Issue across the service boundary.
 type CreatedIssue struct {
-	IID    int64
-	WebURL string
-	Title  string
+	IID int64
+	// IssueKey is the issue tracker key of IID (project short name + "-" + IID) when the
+	// target repo is linked to an issue tracker (PRD #4173 M6); empty otherwise.
+	IssueKey string
+	WebURL   string
+	Title    string
 }
 
 // Composite-op sentinels (PRD #191 M1). The caller (web handler, Slack card) maps
@@ -180,7 +184,11 @@ func (s *Service) ConfirmProposalForUser(ctx context.Context, userID, runID, pro
 		slog.Error("confirm proposal: mark confirmed after issue creation",
 			"proposal", propID.String(), "issue_iid", created.IID, "error", err)
 	}
-	return CreatedIssue{IID: created.IID, WebURL: created.WebURL, Title: created.Title}, nil
+	var issueKey string
+	if repo.IssueTrackerConnectionID.Valid && repo.IssueTrackerProjectShort.Valid && repo.IssueTrackerProjectShort.String != "" {
+		issueKey = repo.IssueTrackerProjectShort.String + "-" + strconv.FormatInt(created.IID, 10)
+	}
+	return CreatedIssue{IID: created.IID, IssueKey: issueKey, WebURL: created.WebURL, Title: created.Title}, nil
 }
 
 // revertProposal best-effort returns a claimed ('confirming') proposal to pending

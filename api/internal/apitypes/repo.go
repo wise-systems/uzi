@@ -81,6 +81,23 @@ type RepoDTO struct {
 	// by repoToDTO/PatchRepo. Derived purely from the github_project_links row's
 	// last_error/last_synced_at — a pure store read, no forge call.
 	GithubProjectSync *RepoProjectSyncHealth `json:"github_project_sync,omitempty"`
+	// IssueTrackerLink is the repo's link to an external issue tracker project (PRD
+	// #4173 M6), null when the repo is not linked. Set by repoToDTO from the repo row.
+	IssueTrackerLink *RepoIssueTrackerLinkDTO `json:"issue_tracker_link"`
+	// IssueTrackerLinkable is advisory: the repo still awaits its first enable and is not
+	// linked, so the web offers the link control. The link service decides and refuses.
+	IssueTrackerLinkable bool `json:"issue_tracker_linkable"`
+}
+
+// RepoIssueTrackerLinkDTO is a repo's link to an issue tracker project and eligibility
+// tag, as stored at link time. LinkedAt is RFC 3339.
+type RepoIssueTrackerLinkDTO struct {
+	ConnectionID     string    `json:"connection_id"`
+	ProjectID        string    `json:"project_id"`
+	ProjectShortName string    `json:"project_short_name"`
+	TagID            string    `json:"tag_id"`
+	TagName          string    `json:"tag_name"`
+	LinkedAt         time.Time `json:"linked_at"`
 }
 
 // RepoProjectSyncHealth is the health readout the sync badge reads (PRD #576 M2). It
