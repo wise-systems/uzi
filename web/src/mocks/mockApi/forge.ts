@@ -105,6 +105,20 @@ if (seedsLinkedRepo(issueTrackerScenario(mockScenario()))) repos = [...repos, st
 // refuses them until then, as GET board's refuseNeverEnabled does, and the first enable
 // opens a linked repo's board.
 export const awaitingFirstEnable = new Set<string>([mockLinkableRepo.id]);
+// Whether the issue tracker link control is offered to this user at all (the server's
+// issueTrackerLinkOffered: a non-empty allowlist or at least one issue tracker connection).
+// mockApi/issueTrackers.ts owns both facts and registers the predicate; until it does, the
+// control is offered.
+let issueTrackerLinkOffered: () => boolean = () => true;
+export function setIssueTrackerLinkOffered(fn: () => boolean) {
+  issueTrackerLinkOffered = fn;
+}
+// A repo as listed: issue_tracker_linkable is derived on every read, with the server's rule
+// (never enabled AND not linked AND the link control is offered), never read from a stored flag.
+function listed(r: (typeof repos)[number]) {
+  const linkable = awaitingFirstEnable.has(r.id) && !r.issue_tracker_link && issueTrackerLinkOffered();
+  return { ...r, issue_tracker_linkable: linkable };
+}
 // Cross-user admin-only fixtures leave the existing owner-list demo intact.
 // UUID IDs can round-trip through the settings validator.
 
@@ -247,9 +261,9 @@ export const forgeApi = {
     connections = connections.filter((x) => x.id !== id);
     return delay(null);
   },
-  listProjects: async (_connectionId: string) => delay({ repos: repos.map((r) => ({ ...r })) }, 350),
+  listProjects: async (_connectionId: string) => delay({ repos: repos.map(listed) }, 350),
 
-  listRepos: async () => delay({ repos: repos.filter((r) => r.enabled).map((r) => ({ ...r })) }),
+  listRepos: async () => delay({ repos: repos.filter((r) => r.enabled).map(listed) }),
   adminListDockerAllowlistRepos: async (): Promise<AdminDockerAllowlistRepos> => {
     requireAdmin();
     const { settings } = await settingsApi.getSettings();
@@ -303,11 +317,10 @@ export const forgeApi = {
     // opens the board: a linked repo's board gets its three columns, an unlinked one a
     // plain forge board.
     if (enabled) {
-      r.issue_tracker_linkable = false;
       awaitingFirstEnable.delete(r.id);
       if (!state.boards.has(r.id)) state.boards.set(r.id, r.issue_tracker_link ? mockLinkedBoard(r) : mockForgeBoard(r));
     }
-    return delay({ repo: { ...r } });
+    return delay({ repo: listed(r) });
   },
   // Explicit per-repo remove (PRD #357). Mirrors deleteConnection: drops the repo
   // from the in-memory list so demo/browser mode reflects the deletion. Enforces

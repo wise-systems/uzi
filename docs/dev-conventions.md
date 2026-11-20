@@ -751,7 +751,8 @@ scenarios are mutually exclusive by construction. Known values:
   the server refuses it. After a link, the first enable opens a board with
   three columns; without a link it opens a plain forge board.
   `issue-tracker-none` has no connection: `/settings/issue-trackers` shows an
-  empty list and the link dialog on `/repos` says to connect one first.
+  empty list and the link dialog on `/repos` says to connect one first. Its
+  allowlist is set, so `vtmocanu/atlas-web` still offers the link control.
   `issue-tracker-linked` adds the enabled repo `vtmocanu/atlas-mobile`, linked
   to project ATL with the tag `uzi` and fully mapped (Map States on its
   `/repos` row). Its board, `/repos/repo-atlas-mobile/board`, shows keyed
@@ -763,7 +764,10 @@ scenarios are mutually exclusive by construction. Known values:
   valid link with the server's "already stores issue numbers" text, so the
   dialog's refusal shows. `issue-tracker-allowlist-empty` has no allowed base
   URL and no connection, so `/settings/issue-trackers` shows the operator
-  message. (PRD #4173 M8.)
+  message and no `/repos` row offers the link control. The mock derives that
+  control from the server's rule (never enabled, not linked, and a non-empty
+  allowlist or at least one issue tracker connection), so it also appears once
+  a connection is created in the session. (PRD #4173 M8.)
 
 ### What keeps the mock build current
 

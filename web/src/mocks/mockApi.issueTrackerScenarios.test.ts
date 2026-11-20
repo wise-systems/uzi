@@ -41,6 +41,15 @@ describe("issue tracker demo scenarios", () => {
     expect(repos.some((r) => r.issue_tracker_link)).toBe(false);
   });
 
+  it("issue-tracker-allowlist-empty: no allowed base URL and no connection, so no repo offers the link control", async () => {
+    const api = await load("issue-tracker-allowlist-empty");
+    expect((await api.issueTrackerConfig()).allowed_base_urls).toEqual([]);
+    expect((await api.listIssueTrackerConnections()).connections).toEqual([]);
+    const { repos } = await api.listProjects("conn-1");
+    expect(repos.filter((r) => r.issue_tracker_linkable)).toEqual([]);
+    expect(repos.some((r) => r.issue_tracker_link)).toBe(false);
+  });
+
   it.each(["", "issue-tracker-unlinked", "health-degraded"])(
     "issue-tracker-unlinked (also %j): a connection and a never-enabled repo without a board",
     async (scenario) => {

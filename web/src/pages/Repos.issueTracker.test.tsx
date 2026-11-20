@@ -207,6 +207,60 @@ describe("Repos: issue trackers", () => {
     expect(mockApi.listIssueTrackerConnections).not.toHaveBeenCalled();
   });
 
+  describe("where the link control shows", () => {
+    const linkButton = { name: /to an issue tracker/i };
+
+    it("a linkable repo offers Link to an issue tracker", async () => {
+      mockApi.listProjects.mockResolvedValue({ repos: [{ ...LINKABLE }] });
+      renderPage();
+      await screen.findByText("acme/atlas-web");
+      expect(within(rowFor("acme/atlas-web")).getByRole("button", linkButton).textContent).toBe(
+        "Link to an issue tracker",
+      );
+    });
+
+    it("a linked repo shows Map States and no link button", async () => {
+      mockApi.listProjects.mockResolvedValue({ repos: [{ ...LINKED }] });
+      renderPage();
+      await screen.findByText("acme/atlas-api");
+      const row = rowFor("acme/atlas-api");
+      expect(within(row).getByRole("button", { name: /Map issue tracker States/ })).toBeTruthy();
+      expect(within(row).queryByRole("button", linkButton)).toBeNull();
+    });
+
+    it("an enabled repo that is not linkable shows no link button", async () => {
+      mockApi.listProjects.mockResolvedValue({
+        repos: [{ ...PLAIN, issue_tracker_link: null, issue_tracker_linkable: false }],
+      });
+      renderPage();
+      await screen.findByText("acme/uzi");
+      expect(within(rowFor("acme/uzi")).queryByRole("button", linkButton)).toBeNull();
+    });
+
+    it("a never-enabled repo with no issue tracker configured renders as a repo that knows nothing of them", async () => {
+      const NONE = repo({
+        id: "repo-none",
+        path_with_namespace: "acme/none",
+        enabled: false,
+        issue_tracker_link: null,
+        issue_tracker_linkable: false,
+      });
+      // The pre-feature shape: neither issue tracker field on the wire at all.
+      const OLD = repo({ id: "repo-old", path_with_namespace: "acme/old", enabled: false });
+      mockApi.listProjects.mockResolvedValue({ repos: [NONE, OLD] });
+      renderPage();
+      await screen.findByText("acme/none");
+      await screen.findByText("acme/old");
+      const none = rowFor("acme/none");
+      const old = rowFor("acme/old");
+      expect(within(none).queryByRole("button", linkButton)).toBeNull();
+      const actionsHtml = (tr: HTMLElement, name: string) =>
+        (tr.querySelector("td:last-child") as HTMLElement).innerHTML.split(name).join("NAME");
+      expect(actionsHtml(none, "acme/none")).not.toBe("");
+      expect(actionsHtml(none, "acme/none")).toBe(actionsHtml(old, "acme/old"));
+    });
+  });
+
   it("links a never-enabled repo, updates its row and opens its State mapping", async () => {
     mockApi.linkRepoToIssueTracker.mockResolvedValue({ link: { repo_id: "repo-new", ...LINK } });
     renderPage();

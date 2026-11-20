@@ -38,7 +38,7 @@ import {
   mockUnmappedMapping,
 } from "../data";
 import { state } from "../store";
-import { repos } from "./forge";
+import { awaitingFirstEnable, repos, setIssueTrackerLinkOffered } from "./forge";
 import { delay, mockScenario, requireSession } from "./shared";
 
 const scenario = issueTrackerScenario(mockScenario());
@@ -116,6 +116,8 @@ let connections: IssueTrackerConnection[] =
     ? []
     : [{ ...mockIssueTrackerConnection }];
 
+setIssueTrackerLinkOffered(() => config.allowed_base_urls.length > 0 || connections.length > 0);
+
 function findConnection(id: string): IssueTrackerConnection {
   const c = connections.find((x) => x.id === id);
   if (!c) throw new ApiError(404, "connection not found");
@@ -186,7 +188,9 @@ export const issueTrackersApi = {
     if (r.issue_tracker_link) {
       throw new ApiError(409, "this repo is already linked to an issue tracker project; a link cannot be changed");
     }
-    if (!r.issue_tracker_linkable) {
+    // The server refuses by its own rule (never enabled), not by the listing flag, which
+    // also folds in whether the link control is offered.
+    if (!awaitingFirstEnable.has(r.id)) {
       throw new ApiError(
         409,
         "only a repo that has never been enabled can be linked to an issue tracker; this one was enabled before",
@@ -221,7 +225,6 @@ export const issueTrackersApi = {
       linked_at: new Date().toISOString(),
     };
     r.issue_tracker_link = link;
-    r.issue_tracker_linkable = false;
     // No board yet: the repo still awaits its first enable, which opens it (forge.ts).
     return delay({ link: { repo_id: r.id, ...link } }, 500);
   },
