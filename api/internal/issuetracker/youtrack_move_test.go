@@ -389,11 +389,11 @@ func TestStateChecksRunBeforeTheIssueIsRead(t *testing.T) {
 	}
 }
 
-// TestOnlyTheListingAsksForCustomFields pins where custom fields are read: the
-// listing, and the one GET that resolves the issue of a State write, which asks
-// for customFields(name,$type) to refuse a state-machine field. Every other
-// per-issue request asks for none.
-func TestOnlyTheListingAsksForCustomFields(t *testing.T) {
+// TestOnlyTheListingAndTheStateWriteResolveAskForCustomFields pins where custom
+// fields are read: the listing, and the one GET that resolves the issue of a
+// State write, which asks for customFields(name,$type) to refuse a State field
+// that is not plain. Every other per-issue request asks for none.
+func TestOnlyTheListingAndTheStateWriteResolveAskForCustomFields(t *testing.T) {
 	y, srv := columnDriver(t, nil)
 	n := srv.SeedIssue("t", "")
 	ctx := context.Background()
