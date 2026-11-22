@@ -37,7 +37,7 @@ type Link struct {
 //
 // The check against the issue tracker is read-only (token, project list, a
 // sample of the project's issues to see whether its State field is run by a
-// state machine, tag list); it never writes to the tracker. The tag must be one the connection's
+// state machine, tag list); it never writes to the issue tracker. The tag must be one the connection's
 // account can apply and that someone else can apply too. That is a statement
 // about the tag's sharing settings only: it does not prove that anyone can edit
 // issues in the project, and no message here says it does. The database part runs
@@ -144,7 +144,7 @@ func errAccountChanged() *Error {
 }
 
 // checkLinkTarget is the read-only part of LinkRepo. It returns the verified
-// account and the project and tag exactly as the tracker listed them.
+// account and the project and tag exactly as the issue tracker listed them.
 func (s *Service) checkLinkTarget(ctx context.Context, userID, connID uuid.UUID, row store.IssueTrackerConnection, projectID, tagID string) (issuetracker.Account, issuetracker.Project, issuetracker.Tag, error) {
 	var (
 		noAccount issuetracker.Account
