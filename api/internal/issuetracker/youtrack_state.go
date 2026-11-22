@@ -210,9 +210,9 @@ const stateCheckFields = "customFields(name,$type)"
 // issues (pageSize items, the listing's query) asking only for each issue's
 // ids, project and its State custom field's name and type, and never writes.
 // A sampled issue of the project run by a state machine is
-// ErrStateMachineField, which wins; else one that does not list a plain State
-// field (stateFieldKind) is ErrStateFieldUnreadable, naming the first such
-// issue. An issue of another project is ignored, so the ref's id decides, not
+// ErrStateMachineField, which wins; else one that does not list the State
+// field as a plain StateIssueCustomField only (stateFieldKind) is
+// ErrStateFieldUnreadable, naming the first such issue. An issue of another project is ignored, so the ref's id decides, not
 // only its short name. A non-empty page with no issue of the project is an
 // error, since nothing was checked.
 func (y *youTrack) CheckStateField(ctx context.Context, project ProjectRef) error {
