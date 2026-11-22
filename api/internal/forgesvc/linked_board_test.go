@@ -388,6 +388,7 @@ func TestAutoMoveOnALinkedRepoCachesOnlyTheColumn(t *testing.T) {
 func TestAutoMoveOnALinkedRepoLeavesTheCacheOnAFailure(t *testing.T) {
 	for name, cause := range map[string]error{
 		"refused":     issuetracker.ErrColumnNotMapped,
+		"unreadable":  issuetracker.ErrStateFieldUnreadable,
 		"unreachable": errors.New("503"),
 		"moved away":  &forge.IssueNotFoundError{Err: errors.New("404")},
 	} {
@@ -469,6 +470,7 @@ func TestReopenIssueOnALinkedRepoIsOneMoveThenTheCache(t *testing.T) {
 		for name, cause := range map[string]error{
 			"unmapped column": issuetracker.ErrColumnNotMapped,
 			"not allowed":     issuetracker.ErrStateNotAllowed,
+			"unreadable":      issuetracker.ErrStateFieldUnreadable,
 			"unreachable":     errors.New("503"),
 		} {
 			st := &fakeStore{}
