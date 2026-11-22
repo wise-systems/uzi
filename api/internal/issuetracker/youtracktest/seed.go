@@ -342,10 +342,10 @@ func (s *Server) IssueState(n int64) string {
 	if i == nil {
 		s.t.Fatalf("youtracktest: no issue %d", n)
 	}
-	for _, cf := range s.m.customFieldsJSON(i) {
-		if v, ok := cf["value"].(map[string]any); ok {
-			return v["name"].(string)
-		}
+	// Read from the model, not the wire, so an issue listed in a non-plain
+	// State field shape still reports the State it holds.
+	if v := s.m.issueStateValue(i); v != nil {
+		return v.name
 	}
 	return ""
 }
@@ -360,6 +360,11 @@ func (s *Server) SeedStateFieldShape(n int64, shape StateFieldShape) {
 	i := s.m.byNumber(n)
 	if i == nil {
 		s.t.Fatalf("youtracktest: no issue %d", n)
+	}
+	switch shape {
+	case StateFieldPlain, StateFieldAbsent, StateFieldUntyped:
+	default:
+		s.t.Fatalf("youtracktest: unknown State field shape %q", shape)
 	}
 	i.stateShape = shape
 }

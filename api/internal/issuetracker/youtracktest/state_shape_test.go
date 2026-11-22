@@ -37,6 +37,7 @@ func TestStateFieldShapes(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			srv := NewServer(t)
 			n := srv.SeedIssue("s", "d")
+			held := srv.IssueState(n)
 			srv.SeedStateFieldShape(n, tc.shape)
 			id := "UZI-" + strconv.FormatInt(n, 10)
 
@@ -91,7 +92,13 @@ func TestStateFieldShapes(t *testing.T) {
 			if status != tc.wantWrite {
 				t.Errorf("write: status %d, want %d: %s", status, tc.wantWrite, body)
 			}
-			_ = srv.IssueState(n) // must not panic on any shape
+			if tc.wantWrite != http.StatusOK {
+				// The refused write changed nothing, and IssueState reads the
+				// model, not the wire shape.
+				if got := srv.IssueState(n); got != held || got == "" {
+					t.Errorf("IssueState = %q, want %q", got, held)
+				}
+			}
 		})
 	}
 }
@@ -111,4 +118,54 @@ func TestSeedIDReadableOverridesOnlyTheWireValue(t *testing.T) {
 			t.Errorf("idReadable = %q, want %q", it.IDReadable, override)
 		}
 	}
+}
+
+// An issue's shape overrides the project's state-machine shape, and the absent
+// shape keeps any other custom field.
+func TestStateFieldShapeOverridesTheProject(t *testing.T) {
+	stateEntry := func(t *testing.T, srv *Server, n int64) (map[string]any, []map[string]any) {
+		t.Helper()
+		id := "UZI-" + strconv.FormatInt(n, 10)
+		status, body := call(t, srv, http.MethodGet, "/api/issues/"+id+"?fields=id,customFields(name,$type,possibleEvents(id),value(name))", "")
+		if status != http.StatusOK {
+			t.Fatalf("get: status %d: %s", status, body)
+		}
+		var one shapeIssue
+		decodeShape(t, body, &one)
+		for _, cf := range one.CustomFields {
+			if cf["name"] == "State" {
+				return cf, one.CustomFields
+			}
+		}
+		return nil, one.CustomFields
+	}
+	t.Run("untyped on a state-machine project", func(t *testing.T) {
+		srv := NewServer(t)
+		n := srv.SeedIssue("s", "d")
+		srv.SetStateMachine(ProjectID, true)
+		srv.SeedStateFieldShape(n, StateFieldUntyped)
+		e, all := stateEntry(t, srv, n)
+		if e == nil {
+			t.Fatalf("no State entry: %v", all)
+		}
+		if _, has := e["$type"]; has {
+			t.Errorf("State entry has $type: %v", e)
+		}
+		if _, has := e["possibleEvents"]; has {
+			t.Errorf("State entry has possibleEvents: %v", e)
+		}
+	})
+	t.Run("absent keeps another field", func(t *testing.T) {
+		srv := NewServer(t)
+		n := srv.SeedIssue("s", "d")
+		srv.SetExtraStateMachineField(ProjectID, "Workflow")
+		srv.SeedStateFieldShape(n, StateFieldAbsent)
+		e, all := stateEntry(t, srv, n)
+		if e != nil {
+			t.Fatalf("State entry present: %v", e)
+		}
+		if len(all) != 1 || all[0]["name"] != "Workflow" {
+			t.Errorf("custom fields = %v, want only Workflow", all)
+		}
+	})
 }

@@ -396,9 +396,10 @@ func (m *model) issueJSON(i *issue) map[string]any {
 	}
 }
 
-// customFieldsJSON is the issue's custom fields: its State, under the current
-// name of the State field and of the State value, as YouTrack lists it.
-func (m *model) customFieldsJSON(i *issue) []map[string]any {
+// issueStateValue is the State value issue i holds, whatever shape it is
+// listed in: its recorded value, or for a resolved issue with none the first
+// resolved one (so it never reads as open), or else the first state.
+func (m *model) issueStateValue(i *issue) *stateValue {
 	v := m.stateByID(i.stateID)
 	if v == nil && i.resolved != nil {
 		// A resolved issue with no recorded State value reads as the first
@@ -412,6 +413,13 @@ func (m *model) customFieldsJSON(i *issue) []map[string]any {
 	} else if v == nil && len(m.states) > 0 {
 		v = &m.states[0]
 	}
+	return v
+}
+
+// customFieldsJSON is the issue's custom fields: its State, under the current
+// name of the State field and of the State value, as YouTrack lists it.
+func (m *model) customFieldsJSON(i *issue) []map[string]any {
+	v := m.issueStateValue(i)
 	var value any
 	if v != nil {
 		value = map[string]any{"$type": "StateBundleElement", "name": v.name, "id": v.id}
