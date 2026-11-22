@@ -436,11 +436,13 @@ func (l *Lifecycle) apply(ctx context.Context, runID uuid.UUID, mc moveContext, 
 		}
 		if forgesvc.ColumnMoveRefused(err) {
 			// The issue tracker refused the move before any write: the column has no State
-			// mapped, the target State is not allowed, or the issue's State field is run by a
-			// state machine. Unlike a skip this can heal (the owner saves the mapping, or the
-			// YouTrack workflow changes), so the marker stays and reconciliation retries
-			// inside its window; a retry costs the State bundle read and one issue GET and never a write (PRD #4173
-			// M5; specs/human.md, failed column moves retry).
+			// mapped, the target State is not allowed, the issue's State field is run by a
+			// state machine, or it cannot be read as a plain State field. Unlike a skip this
+			// can heal (the owner saves the mapping, or the YouTrack workflow or the
+			// connection's visibility changes), so the marker stays and reconciliation
+			// retries inside its window; a retry costs the State bundle read and one
+			// issue GET and never a write (PRD #4173 M5; specs/human.md, failed column
+			// moves retry).
 			slog.Warn("run lifecycle: issue tracker refused the column move, will retry", "run", runID, "target", dec.target, "error", err)
 			return
 		}

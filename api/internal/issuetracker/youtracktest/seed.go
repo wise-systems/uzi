@@ -342,12 +342,45 @@ func (s *Server) IssueState(n int64) string {
 	if i == nil {
 		s.t.Fatalf("youtracktest: no issue %d", n)
 	}
-	for _, cf := range s.m.customFieldsJSON(i) {
-		if v, ok := cf["value"].(map[string]any); ok {
-			return v["name"].(string)
-		}
+	// Read from the model, not the wire, so an issue listed in a non-plain
+	// State field shape still reports the State it holds.
+	if v := s.m.issueStateValue(i); v != nil {
+		return v.name
 	}
 	return ""
+}
+
+// SeedStateFieldShape sets how issue number n of the main project lists its
+// State field. The non-plain shapes are this fake's own (see StateFieldShape);
+// a State value write to such an issue answers 400.
+func (s *Server) SeedStateFieldShape(n int64, shape StateFieldShape) {
+	s.t.Helper()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	i := s.m.byNumber(n)
+	if i == nil {
+		s.t.Fatalf("youtracktest: no issue %d", n)
+	}
+	switch shape {
+	case StateFieldPlain, StateFieldAbsent, StateFieldUntyped:
+	default:
+		s.t.Fatalf("youtracktest: unknown State field shape %q", shape)
+	}
+	i.stateShape = shape
+}
+
+// SeedIDReadable makes issue number n of the main project serve id as its
+// "idReadable", empty included. This is the fake's own: it lets a test serve an
+// over-long or empty id-readable. The issue still resolves by its real one.
+func (s *Server) SeedIDReadable(n int64, id string) {
+	s.t.Helper()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	i := s.m.byNumber(n)
+	if i == nil {
+		s.t.Fatalf("youtracktest: no issue %d", n)
+	}
+	i.idReadableSet, i.idReadableOverride = true, id
 }
 
 // SetStateMachine makes the State field of the project with id projectID one a

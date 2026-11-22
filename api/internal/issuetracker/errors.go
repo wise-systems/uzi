@@ -36,8 +36,15 @@ var (
 	// directly. CheckStateField returns it for a project and a State write
 	// returns it for an issue; nothing is written.
 	ErrStateMachineField = errors.New("issuetracker: the State field is run by a state machine")
+	// ErrStateFieldUnreadable is returned when an issue's response does not
+	// list the State field as a plain StateIssueCustomField only: no entry, an
+	// entry with no or another $type, or such an entry next to a plain one, as
+	// when the token cannot see the field. CheckStateField returns it
+	// for a project and a State write returns it for an issue; nothing is
+	// written.
+	ErrStateFieldUnreadable = errors.New("issuetracker: the State field could not be read as a plain State field")
 )
 
 // packageSentinels lists every sentinel above. redactor.sentinel keeps only
 // these in an error chain, so a new sentinel must be added here too.
-var packageSentinels = []error{ErrUnsupportedKind, ErrProjectNotBound, ErrProjectMismatch, ErrStateMappingUnset, ErrColumnNotMapped, ErrStateNotAllowed, ErrInvalidLabelName, ErrRedirectRefused, ErrIssueResolved, ErrStateMachineField}
+var packageSentinels = []error{ErrUnsupportedKind, ErrProjectNotBound, ErrProjectMismatch, ErrStateMappingUnset, ErrColumnNotMapped, ErrStateNotAllowed, ErrInvalidLabelName, ErrRedirectRefused, ErrIssueResolved, ErrStateMachineField, ErrStateFieldUnreadable}

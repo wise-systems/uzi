@@ -57,8 +57,10 @@ same-named tag of another user does not count, and renaming it keeps working.
 
 ## A plain State field is required
 
-uzi needs the project's State field to be a plain one. A project whose State
-field is run by a state-machine workflow rule in YouTrack is not supported.
+uzi needs the project's State field to be a plain one it can read. A project
+whose State field is run by a state-machine workflow rule in YouTrack is not
+supported, and neither is one whose State field the connection's account cannot
+read as a plain State field.
 
 At link time uzi reads the first page (up to 100) of the project's issues, with
 the same permission it uses to take issues in, and refuses the project if any
@@ -68,24 +70,44 @@ issue's State field is run by a state machine. The link is refused with:
 > plain State field. Link a project with a plain State field, or remove the
 > state-machine rule from the State field in YouTrack.
 
+The link is also refused if an issue's response lists no State field, or lists
+one that is not a plain State field, for example because the connection's
+account is not allowed to see the field, or the project has no field by that
+name. It is refused with:
+
+> uzi could not read project ABC's State field as a plain State field
+> (issuetracker: the State field could not be read as a plain State field: issue
+> "ABC-12"). The connection's account may not be allowed to see the State field,
+> or the project has no field by that name. Let that account see the State field
+> in YouTrack, or link a project whose State field it can read.
+
+The same refusal is shown on the "Map States" panel (reading and saving the
+mapping). Nothing is linked or saved. If issues in the first page show both
+problems, the state-machine reason is shown, because it is the more specific one.
+
 If the check cannot be made (YouTrack answers 403 or 404, is unreachable, or
 returns issues none of which is in that project), the link fails with `could not check project
 ABC's State field` and the reason. Nothing is linked.
 
 A project with no issues yet links, because there is nothing to check. It is
 checked on its first State write, and that write fails closed if the State field
-turns out to be run by a state machine. Before every State write uzi checks the
-issue's own field again.
+turns out to be run by a state machine or cannot be read as a plain State field.
+Before every State write uzi checks the issue's own field again.
 
-On a repo that is already linked to such a project, nothing is written:
+On a repo that is already linked to such a project (state machine or unreadable
+State field), nothing is written:
 
 - The "Map States" panel shows the reason.
-- Moving or closing a card answers 409 with the reason.
+- Moving, closing or reopening a card answers 409 with the reason, and the card
+  stays where it was.
 - A run retries its State move for up to 30 minutes without writing, then
   gives up; the merge request watch skips the move.
 
 To fix it, link another project (a new link needs a repo that was never enabled)
-or remove the state-machine rule from the State field in YouTrack.
+or remove the state-machine rule from the State field in YouTrack. For an
+unreadable State field, let the connection's account see the State field in
+YouTrack (field visibility and permissions), check that the project has a State
+field, or link a project whose State field it can read.
 
 ## Map board columns to States
 
