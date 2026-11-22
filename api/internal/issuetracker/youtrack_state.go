@@ -208,11 +208,12 @@ const stateCheckFields = "customFields(name,$type)"
 // CheckStateField implements Driver. It reads the first page of the project's
 // issues (pageSize items, the listing's query) asking only for each issue's
 // ids, project and its State custom field's name and type, and never writes.
-// A sampled issue of the project run by a state machine is ErrStateMachineField,
-// which wins; else one listing no plain State field is ErrStateFieldUnreadable,
-// naming the first such issue. An issue of another project is ignored, so the
-// ref's id decides, not only its short name. A non-empty page with no issue of the project is an error, since
-// nothing was checked.
+// A sampled issue of the project run by a state machine is
+// ErrStateMachineField, which wins; else one that does not list a plain State
+// field (stateFieldKind) is ErrStateFieldUnreadable, naming the first such
+// issue. An issue of another project is ignored, so the ref's id decides, not
+// only its short name. A non-empty page with no issue of the project is an
+// error, since nothing was checked.
 func (y *youTrack) CheckStateField(ctx context.Context, project ProjectRef) error {
 	if err := ValidProjectRef(project); err != nil {
 		return err
@@ -226,7 +227,7 @@ func (y *youTrack) CheckStateField(ctx context.Context, project ProjectRef) erro
 		"customFields": {y.stateField},
 	}
 	var sampled, inProject, found bool
-	var unreadable *ytIssue
+	var unreadableAt string
 	err := ytPages(ctx, y, []string{"issues"}, query, func(page []ytIssue) bool {
 		sampled = len(page) > 0
 		for _, w := range page {
@@ -238,8 +239,8 @@ func (y *youTrack) CheckStateField(ctx context.Context, project ProjectRef) erro
 			case stateFieldMachine:
 				found = true
 			case stateFieldUnreadable:
-				if unreadable == nil {
-					unreadable = &w
+				if unreadableAt == "" {
+					unreadableAt = unreadableDetail(w)
 				}
 			}
 			if found {
@@ -254,8 +255,8 @@ func (y *youTrack) CheckStateField(ctx context.Context, project ProjectRef) erro
 	if found {
 		return y.red.sentinel(ErrStateMachineField, 0, "")
 	}
-	if unreadable != nil {
-		return y.red.sentinel(ErrStateFieldUnreadable, 0, unreadableDetail(*unreadable))
+	if unreadableAt != "" {
+		return y.red.sentinel(ErrStateFieldUnreadable, 0, unreadableAt)
 	}
 	if sampled && !inProject {
 		// A page of issues, none of them in the project: the stored short name

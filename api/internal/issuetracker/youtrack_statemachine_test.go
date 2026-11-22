@@ -239,10 +239,9 @@ func TestStateWriteRefusesAnUnreadableStateField(t *testing.T) {
 	}
 }
 
-// The State-write resolve refuses a malformed idReadable (checkIssue) before it
-// classifies the State field, so the empty and over-long id-readable cases of
-// the error's naming are reachable through CheckStateField, which reads no
-// further than the sample.
+// The State-write resolve refuses an empty idReadable (checkIssue) before it
+// classifies the State field, so the fallback to the issue's id is reachable
+// only through CheckStateField, which does not check the sampled ids.
 func TestCheckStateFieldUnreadableNamesTheIDWhenIDReadableIsEmpty(t *testing.T) {
 	y, srv := newFakeDriver(t)
 	n := srv.SeedIssue("t", "")
@@ -281,8 +280,9 @@ func TestStateWriteRefusesAMalformedIDReadableBeforeAnyWrite(t *testing.T) {
 	srv.SeedIDReadable(n, "")
 	srv.ResetRequests()
 	err := y.SetIssueState(context.Background(), testProjectID, n, forge.StateClosed)
-	if err == nil {
-		t.Fatal("SetIssueState = nil, want a refusal")
+	// checkIssue refuses first, so the error is not the State field refusal.
+	if err == nil || errors.Is(err, ErrStateFieldUnreadable) {
+		t.Fatalf("SetIssueState = %v, want the malformed-id refusal", err)
 	}
 	if w := writesOf(srv); len(w) != 0 {
 		t.Errorf("writes sent: %v", w)
@@ -373,5 +373,56 @@ func TestCheckStateFieldAsksForIDReadable(t *testing.T) {
 	}
 	if !slices.Contains(strings.Split(q.Get("fields"), ","), "idReadable") {
 		t.Errorf("fields = %q, want idReadable among them", q.Get("fields"))
+	}
+}
+
+// A long idReadable that checkIssue accepts reaches the write path's refusal,
+// and quoteName bounds it there too.
+func TestStateWriteRefusalBoundsALongIDReadable(t *testing.T) {
+	y, srv := columnDriver(t, nil)
+	n := srv.SeedIssue("t", "")
+	srv.SeedStateFieldShape(n, youtracktest.StateFieldUntyped)
+	srv.SeedIDReadable(n, strings.Repeat("A", 500)+"-"+strconv.FormatInt(n, 10))
+	srv.ResetRequests()
+	err := y.MoveToColumn(context.Background(), testProjectID, n, forge.ColumnMove{Column: "In Progress"})
+	if !errors.Is(err, ErrStateFieldUnreadable) {
+		t.Fatalf("MoveToColumn = %v, want ErrStateFieldUnreadable", err)
+	}
+	if strings.Contains(err.Error(), strings.Repeat("A", maxQuotedNameLen+1)) {
+		t.Errorf("error holds more than %d characters of the id: %q", maxQuotedNameLen, err)
+	}
+	if w := writesOf(srv); len(w) != 0 {
+		t.Errorf("writes sent: %v", w)
+	}
+}
+
+// The classifier over hand-built responses, including the shapes the fake
+// cannot serve (two entries of the State field's name).
+func TestStateFieldKind(t *testing.T) {
+	f := func(name, typ string) ytCustomField { return ytCustomField{Name: name, Type: typ} }
+	plain, machine := f("State", plainStateType), f("State", stateMachineType)
+	for _, tc := range []struct {
+		name   string
+		fields []ytCustomField
+		want   stateKind
+	}{
+		{"no entry", nil, stateFieldUnreadable},
+		{"untyped", []ytCustomField{f("State", "")}, stateFieldUnreadable},
+		{"another type", []ytCustomField{f("State", "EnumIssueCustomField")}, stateFieldUnreadable},
+		{"plain", []ytCustomField{plain}, stateFieldPlain},
+		{"two plain", []ytCustomField{plain, plain}, stateFieldPlain},
+		{"plain and untyped", []ytCustomField{plain, f("State", "")}, stateFieldUnreadable},
+		{"untyped and plain", []ytCustomField{f("State", ""), plain}, stateFieldUnreadable},
+		{"plain and another type", []ytCustomField{plain, f("State", "EnumIssueCustomField")}, stateFieldUnreadable},
+		{"plain and machine", []ytCustomField{plain, machine}, stateFieldMachine},
+		{"untyped and machine", []ytCustomField{f("State", ""), machine}, stateFieldMachine},
+		{"machine", []ytCustomField{machine}, stateFieldMachine},
+		{"another field's machine and plain", []ytCustomField{f("Workflow", stateMachineType), plain}, stateFieldPlain},
+		{"another name only", []ytCustomField{f("state", plainStateType)}, stateFieldUnreadable},
+	} {
+		y := &youTrack{stateField: "State"}
+		if got := y.stateFieldKind(ytIssue{CustomFields: tc.fields}); got != tc.want {
+			t.Errorf("%s: stateFieldKind = %d, want %d", tc.name, got, tc.want)
+		}
 	}
 }
