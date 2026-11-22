@@ -443,9 +443,10 @@ func (s *Server) updateIssue(w http.ResponseWriter, r *http.Request) {
 		if cf.Value.ID != "" {
 			v = s.m.stateByID(cf.Value.ID)
 		}
-		// A value write to a state-machine field answers 400 here. That is this
-		// fake's own choice: YouTrack documents no answer for it.
-		if cf.Name != s.m.stateField || cf.Type != "StateIssueCustomField" || v == nil || i.project.stateMachine {
+		// A value write to a state-machine field, or to a State the issue lists
+		// in a non-plain shape (absent or untyped), answers 400 here. That is
+		// this fake's own choice: YouTrack documents no answer for either.
+		if cf.Name != s.m.stateField || cf.Type != "StateIssueCustomField" || v == nil || i.project.stateMachine || i.stateShape != StateFieldPlain {
 			writeError(w, http.StatusBadRequest, "Bad Request", "unsupported custom field update")
 			return
 		}
