@@ -9,6 +9,7 @@ import type {
   IssueTrackerTag,
   Repo,
 } from "../../lib/api";
+import { issueKey } from "../../lib/issueTrackerText";
 import { daysAgo, minsAgo } from "./time";
 
 // ── Issue trackers (PRD #4173 M6) ─────────────────────────────────────────────
@@ -90,7 +91,7 @@ export const mockLinkableRepo: Repo = {
   docker_allowlisted: false,
   docker_blocked: false,
   issue_tracker_link: null,
-  issue_tracker_linkable: true,
+  issue_tracker_linkable: false,
 };
 
 // The board columns a linked repo's board gets in mock mode at its first enable.
@@ -119,6 +120,7 @@ export const ISSUE_TRACKER_SCENARIOS = [
   "issue-tracker-linked",
   "issue-tracker-unmapped",
   "issue-tracker-link-refused",
+  "issue-tracker-state-machine",
   "issue-tracker-allowlist-empty",
 ] as const;
 export type IssueTrackerScenario = (typeof ISSUE_TRACKER_SCENARIOS)[number];
@@ -131,15 +133,21 @@ export function issueTrackerScenario(name: string): IssueTrackerScenario {
 
 // Whether the scenario seeds the enabled linked repo (its board, State mapping and run).
 export function seedsLinkedRepo(s: IssueTrackerScenario): boolean {
-  return s === "issue-tracker-linked" || s === "issue-tracker-unmapped";
+  return s === "issue-tracker-linked" || s === "issue-tracker-unmapped" || s === "issue-tracker-state-machine";
 }
 
 // The refusal issue-tracker-link-refused answers every otherwise valid link with: one
 // the dialog cannot foresee, so the server's text is what the admin reads.
 export const mockLinkRefusal = "this repo already stores issue numbers and cannot be linked to an issue tracker";
 
-// The enabled repo linked to project ATL with tag uzi (issue-tracker-linked and
-// issue-tracker-unmapped).
+// The refusal issue-tracker-state-machine answers a link with, and the linked repo's
+// states read: the server's StateMachineRefusal for project ATL, whose State field a
+// state machine runs.
+export const mockStateMachineProject = "ATL";
+export const mockStateMachineRefusal = `project ${mockStateMachineProject} uses a state-machine workflow on its State field; uzi needs a plain State field. Link a project with a plain State field, or remove the state-machine rule from the State field in YouTrack.`;
+
+// The enabled repo linked to project ATL with tag uzi (issue-tracker-linked,
+// issue-tracker-unmapped and issue-tracker-state-machine).
 export const mockLinkedRepo: Repo = {
   ...mockLinkableRepo,
   id: "repo-atlas-mobile",
@@ -196,11 +204,11 @@ function linkedCards(repo: Repo, mapping: IssueTrackerStateMapping): Card[] {
     const closed = i.ytState === mapping.closed_state;
     return {
       iid: i.n,
-      issue_key: `${short}-${i.n}`,
+      issue_key: issueKey(short, i.n),
       title: i.title,
       state: closed ? "closed" : "opened",
       labels: [...i.tags],
-      web_url: `${mockIssueTrackerConnection.base_url}/issue/${short}-${i.n}`,
+      web_url: `${mockIssueTrackerConnection.base_url}/issue/${issueKey(short, i.n)}`,
       author: "mira",
       forge_type: "gitlab",
       has_prd_link: false,

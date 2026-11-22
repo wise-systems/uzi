@@ -9,6 +9,7 @@ import { seedUnifiedProgress } from "./data/unifiedProgress";
 import { mockGatedCheckedMessages } from "./data/planCrossCheckGated";
 import { overviewNextOtherRunOwners, overviewNextOwnAskingMessages, overviewNextRuns } from "./data/overviewNext";
 import { deriveMockProgress, foreignCooldownRun } from "./runProgress";
+import { issueKey } from "../lib/issueTrackerText";
 import { mockScenario } from "./mockScenario";
 import {
   mockAdmin,
@@ -263,19 +264,19 @@ function seed(): MockState {
       })),
     });
   }
-  // ?mock=issue-tracker-linked / issue-tracker-unmapped (PRD #4173 M8): the linked repo's
+  // ?mock=issue-tracker-linked / issue-tracker-unmapped / issue-tracker-state-machine (PRD #4173 M8): the linked repo's
   // board with keyed cards placed by its State mapping, and one finished run on ATL-23
   // (a copy of run-done without its one-off fixtures), so the runs list and the issue page
   // show issue keys.
   const issueTracker = issueTrackerScenario(mockScenario());
   if (seedsLinkedRepo(issueTracker)) {
-    const mapping = issueTracker === "issue-tracker-linked" ? mockLinkedMapping : mockUnmappedMapping;
+    const mapping = issueTracker === "issue-tracker-unmapped" ? mockUnmappedMapping : mockLinkedMapping;
     const linkedBoard = mockLinkedBoard(mockLinkedRepo, mapping);
     boards.set(mockLinkedRepo.id, linkedBoard);
     const done = runs.get("run-done");
     if (done) {
       const { completion_pending: _pending, semantic_drift: _drift, ...base } = done;
-      const key = `${mockLinkedRepo.issue_tracker_link?.project_short_name}-${mockLinkedRunIssue.n}`;
+      const key = issueKey(mockLinkedRepo.issue_tracker_link?.project_short_name ?? "", mockLinkedRunIssue.n);
       const seeded = {
         ...base,
         id: mockLinkedRunId,

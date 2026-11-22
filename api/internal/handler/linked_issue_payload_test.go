@@ -47,9 +47,9 @@ func TestRepoToDTOIssueTrackerLink(t *testing.T) {
 			t.Error("a linked repo must not be linkable")
 		}
 	})
-	t.Run("a never-enabled unlinked repo is linkable", func(t *testing.T) {
+	t.Run("repoToDTO leaves the linkable flag to the handlers", func(t *testing.T) {
 		dto := repoToDTO(store.Repo{AwaitingFirstEnable: true})
-		if dto.IssueTrackerLink != nil || !dto.IssueTrackerLinkable {
+		if dto.IssueTrackerLink != nil || dto.IssueTrackerLinkable {
 			t.Fatalf("link = %+v linkable = %v", dto.IssueTrackerLink, dto.IssueTrackerLinkable)
 		}
 	})
@@ -66,8 +66,8 @@ func TestRepoToDTOIssueTrackerLink(t *testing.T) {
 		if err := json.Unmarshal(b, &m); err != nil {
 			t.Fatal(err)
 		}
-		if string(m["issue_tracker_link"]) != "null" {
-			t.Errorf("issue_tracker_link = %s, want null", m["issue_tracker_link"])
+		if _, ok := m["issue_tracker_link"]; ok {
+			t.Errorf("issue_tracker_link = %s, want the key omitted", m["issue_tracker_link"])
 		}
 	})
 }

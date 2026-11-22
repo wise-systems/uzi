@@ -929,12 +929,12 @@ export interface Repo {
   // and zero eligible online workers. Drives the Setup chip's info escalation; computed
   // from eligibility, not the sweeper's health text. Set by the list handlers.
   docker_blocked: boolean;
-  // The repo's link to an external issue tracker project (PRD #4173 M6), null when the
-  // repo is not linked. Optional: an OLD api replica during a rollout skew omits it,
-  // which reads as not linked.
+  // The repo's link to an external issue tracker project (PRD #4173 M6). The key is
+  // absent when the repo is not linked; null is tolerated and reads the same.
   issue_tracker_link?: RepoIssueTrackerLink | null;
-  // Advisory: the repo still awaits its first enable and is not linked, so the link
-  // control is offered. The link service decides and refuses; the web shows its answer.
+  // Advisory, absent when false: the repo still awaits its first enable, is not linked,
+  // and an issue tracker allowlist or connection exists, so the link control is offered.
+  // The link service decides and refuses; the web shows its answer.
   issue_tracker_linkable?: boolean;
   // Caller-scoped GitHub Projects v2 sync-health summary (PRD #576 M2), null/absent
   // when the repo is not linked. Drives the Sync badge tone: linked && healthy → green

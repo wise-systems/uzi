@@ -30,8 +30,14 @@ var (
 	// in the issue tracker when the move is not an explicit reopen. Nothing is
 	// written.
 	ErrIssueResolved = errors.New("issuetracker: issue is resolved in the issue tracker")
+	// ErrStateMachineField is returned when a project's State field is run by a
+	// state machine (YouTrack's StateMachineIssueCustomField): the issue tracker
+	// then owns which transitions are allowed, so uzi cannot write the State
+	// directly. CheckStateField returns it for a project and a State write
+	// returns it for an issue; nothing is written.
+	ErrStateMachineField = errors.New("issuetracker: the State field is run by a state machine")
 )
 
 // packageSentinels lists every sentinel above. redactor.sentinel keeps only
 // these in an error chain, so a new sentinel must be added here too.
-var packageSentinels = []error{ErrUnsupportedKind, ErrProjectNotBound, ErrProjectMismatch, ErrStateMappingUnset, ErrColumnNotMapped, ErrStateNotAllowed, ErrInvalidLabelName, ErrRedirectRefused, ErrIssueResolved}
+var packageSentinels = []error{ErrUnsupportedKind, ErrProjectNotBound, ErrProjectMismatch, ErrStateMappingUnset, ErrColumnNotMapped, ErrStateNotAllowed, ErrInvalidLabelName, ErrRedirectRefused, ErrIssueResolved, ErrStateMachineField}

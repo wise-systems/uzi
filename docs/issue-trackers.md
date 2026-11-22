@@ -33,8 +33,10 @@ with a linked repo cannot be deleted.
 
 ## Link a repo
 
-A repo that was never enabled offers "Link to an issue tracker" on the Repos
-page. Choose the connection, the project and the eligibility tag, and tick
+A repo that was never enabled and is not yet linked offers "Link to an issue
+tracker" on the Repos page, but only when the operator has set the allowed base
+URLs or you have an issue tracker connection. With neither, the Repos page looks
+as it did before. Choose the connection, the project and the eligibility tag, and tick
 "They can edit issues in this project". The choice cannot be changed afterwards
 (no unlink or relink). A repo that was ever enabled cannot be linked: that
 includes every repo that existed when issue tracker links were added and a repo
@@ -52,6 +54,38 @@ same-named tag of another user does not count, and renaming it keeps working.
   at link time: share the eligibility tag with named users or with All Users.
 - Tag sharing is checked at link time. Whether those people can edit issues in
   the project is not checked, and the admin confirms it.
+
+## A plain State field is required
+
+uzi needs the project's State field to be a plain one. A project whose State
+field is run by a state-machine workflow rule in YouTrack is not supported.
+
+At link time uzi reads the first page (up to 100) of the project's issues, with
+the same permission it uses to take issues in, and refuses the project if any
+issue's State field is run by a state machine. The link is refused with:
+
+> project ABC uses a state-machine workflow on its State field; uzi needs a
+> plain State field. Link a project with a plain State field, or remove the
+> state-machine rule from the State field in YouTrack.
+
+If the check cannot be made (YouTrack answers 403 or 404, is unreachable, or
+returns issues none of which is in that project), the link fails with `could not check project
+ABC's State field` and the reason. Nothing is linked.
+
+A project with no issues yet links, because there is nothing to check. It is
+checked on its first State write, and that write fails closed if the State field
+turns out to be run by a state machine. Before every State write uzi checks the
+issue's own field again.
+
+On a repo that is already linked to such a project, nothing is written:
+
+- The "Map States" panel shows the reason.
+- Moving or closing a card answers 409 with the reason.
+- A run retries its State move for up to 30 minutes without writing, then
+  gives up; the merge request watch skips the move.
+
+To fix it, link another project (a new link needs a repo that was never enabled)
+or remove the state-machine rule from the State field in YouTrack.
 
 ## Map board columns to States
 

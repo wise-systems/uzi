@@ -261,6 +261,10 @@ describe("IssueTrackerLinkDialog", () => {
       "nobody other than the connection's account can apply this tag; in the issue tracker, share the tag's use settings with named users or with All Users. This only checks who can apply the tag; it does not show who can edit issues in the project",
     ],
     [409, "this repo already stores issue numbers and cannot be linked to an issue tracker"],
+    [
+      409,
+      "project ATL uses a state-machine workflow on its State field; uzi needs a plain State field. Link a project with a plain State field, or remove the state-machine rule from the State field in YouTrack.",
+    ],
     [409, "this repo is already linked to an issue tracker project; a link cannot be changed"],
   ])("shows a %i refusal verbatim and keeps every selection: %s", async (status, message) => {
     mockApi.linkRepoToIssueTracker.mockRejectedValue(new ApiError(status, message));
