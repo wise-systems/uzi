@@ -252,13 +252,12 @@ func (h *Handler) issueTrackerLinkOffered(ctx context.Context, userID uuid.UUID)
 }
 
 // repoDTOForUser is repoToDTO plus the user-facing issue_tracker_linkable flag, for the
-// handlers that answer with one repo.
+// handlers that answer with one repo. It runs setLinkable over that one repo, so the
+// rule lives in one place.
 func (h *Handler) repoDTOForUser(ctx context.Context, userID uuid.UUID, r store.Repo) apitypes.RepoDTO {
-	d := repoToDTO(r)
-	if awaitingLink(r) {
-		d.IssueTrackerLinkable = h.issueTrackerLinkOffered(ctx, userID)
-	}
-	return d
+	dtos := []apitypes.RepoDTO{repoToDTO(r)}
+	h.setLinkable(ctx, userID, []store.Repo{r}, dtos)
+	return dtos[0]
 }
 
 // setLinkable fills IssueTrackerLinkable on the DTOs of repos, asking
