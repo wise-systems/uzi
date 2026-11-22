@@ -185,8 +185,9 @@ func unreadableDetail(w ytIssue) string {
 
 // resolveIssueForStateWrite is resolveIssue for a State write. Its one GET also
 // asks for customFields(name,$type). An issue whose State field a state machine
-// runs is ErrStateMachineField, and one whose response lists no plain State
-// field is ErrStateFieldUnreadable, before any write and with no fallback.
+// runs is ErrStateMachineField, and one whose response does not list the State
+// field as a plain StateIssueCustomField only (stateFieldKind) is
+// ErrStateFieldUnreadable, before any write and with no fallback.
 func (y *youTrack) resolveIssueForStateWrite(ctx context.Context, projectID, issueIID int64) (ytIssue, error) {
 	w, err := y.resolveIssueFields(ctx, projectID, issueIID, issueFields+","+stateCheckFields)
 	if err != nil {

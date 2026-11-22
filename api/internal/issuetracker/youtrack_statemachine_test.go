@@ -388,8 +388,8 @@ func TestStateWriteRefusalBoundsALongIDReadable(t *testing.T) {
 	if !errors.Is(err, ErrStateFieldUnreadable) {
 		t.Fatalf("MoveToColumn = %v, want ErrStateFieldUnreadable", err)
 	}
-	if strings.Contains(err.Error(), strings.Repeat("A", maxQuotedNameLen+1)) {
-		t.Errorf("error holds more than %d characters of the id: %q", maxQuotedNameLen, err)
+	if msg := err.Error(); strings.Contains(msg, strings.Repeat("A", maxQuotedNameLen+1)) || !strings.Contains(msg, strings.Repeat("A", maxQuotedNameLen)) {
+		t.Errorf("error does not hold exactly the first %d characters of the id: %q", maxQuotedNameLen, err)
 	}
 	if w := writesOf(srv); len(w) != 0 {
 		t.Errorf("writes sent: %v", w)
